@@ -1,13 +1,13 @@
 //! Cross-platform native VFS backed by `tokio::fs`. Advisory locks use a
-// VFS module: unsafe is permitted for platform lock primitives (fcntl on Unix,
-// LockFileEx on Windows).
-#![allow(unsafe_code)]
-//!
 //! two-layer protocol: an in-process state machine provides fast single-process
 //! exclusion, and `fcntl(F_SETLK)` on Unix and `LockFileEx` on Windows back
 //! each lock with a real OS-level exclusive/shared mutex for cross-process
 //! exclusion. On other targets only the in-process layer is used. The trait
 //! contract from `traits.rs` is the durable surface.
+//!
+//! `unsafe` is permitted here for platform lock primitives (fcntl on Unix,
+//! LockFileEx on Windows).
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -182,7 +182,8 @@ impl OsLockFileExHandle {
 impl Drop for OsLockFileExHandle {
     fn drop(&mut self) {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::IO::{OVERLAPPED, UnlockFileEx};
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
 
         let handle = self.file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
         // SAFETY: `handle` is valid (file is still open at drop time — the
