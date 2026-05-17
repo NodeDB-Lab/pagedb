@@ -1,0 +1,11 @@
+[runner]
+warmup_time = "1s"
+measurement_time = "3s"
+isolation = "process"
+
+[allocator]
+track = true
+
+[output]
+format = "human"
+directory = "target/fluxbench"

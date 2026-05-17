@@ -1,0 +1,10 @@
+[profile.default]
+# Serial group for crash / recovery tests (used by later slices).
+test-threads = "num-cpus"
+
+[[profile.default.overrides]]
+filter = "test(/crash/)"
+test-group = "serial"
+
+[test-groups]
+serial = { max-threads = 1 }
