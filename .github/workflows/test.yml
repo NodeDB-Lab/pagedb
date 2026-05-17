@@ -1,0 +1,241 @@
+# Reusable test workflow.
+#
+# Called by:
+#   - ci.yml      (PR checks + manual)
+#   - release.yml (pre-publish gate)
+#
+# Not triggered directly — `workflow_call` only.
+#
+# Jobs:
+#   lint        — rustfmt + clippy + doc + doctests + checklist-scaffold gate
+#   test        — `cargo nextest run` on Linux / macOS / Windows. Crash tests
+#                 are serialised by `.config/nextest.toml`, which `cargo test`
+#                 ignores — that is why this workflow always uses nextest.
+#   cross       — `cargo check` across every Tier-1/Tier-2 target the VFS
+#                 backend matrix in resource/architecture.md §8 covers, so a
+#                 platform-specific backend never regresses unnoticed.
+#   wasm        — `cargo check` for wasm32-unknown-unknown (OPFS) and
+#                 wasm32-wasip1 (WASI VFS).
+#   features    — build with every feature flag combination that ships.
+#   bench       — fluxbench dry-run (compiles benches, runs the smallest
+#                 measurement so a broken bench fails CI without burning a
+#                 long benchmark slot).
+
+name: Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint, Format & Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: lint
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (all targets, all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+
+      - name: Run doctests
+        run: cargo test --doc --all-features
+
+      # Enforces the rule in CLAUDE.md: no checklist-letter or build-order
+      # scaffolding may leak into source / Cargo.toml / README. Greps for
+      # the explicit forbidden patterns; fails the job if any are present.
+      - name: Checklist-scaffold leak gate
+        run: |
+          set -euo pipefail
+          if rg --color=never -n \
+                -e '\b(step_[a-z]_|phase_[a-z]_|m[0-9]+_)\w*' \
+                -e '(?i)\b(added in step|step [A-Z]\b|phase [A-Z]\b|milestone M[0-9])' \
+                src/ Cargo.toml README.md; then
+            echo "::error::Checklist-scaffold leaked into source — see CLAUDE.md 'Code rules'."
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: test-${{ matrix.os }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # Always nextest — crash-recovery tests rely on the serial group in
+      # .config/nextest.toml that `cargo test` ignores.
+      - name: Run tests
+        run: cargo nextest run --all-features --no-fail-fast
+
+      - name: Upload nextest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-${{ matrix.os }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Per-platform VFS backends (architecture.md §8) must each at least
+  # type-check on every target they exist for. Compile-only — running on
+  # these targets would require emulators / Apple runners we don't gate
+  # every PR on.
+  cross:
+    name: Cross check (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-gnu
+            label: windows-gnu (IocpVfs)
+          - target: aarch64-apple-darwin
+            label: macos-aarch64 (GcdVfs)
+          - target: x86_64-apple-darwin
+            label: macos-x86_64 (GcdVfs)
+          - target: aarch64-apple-ios
+            label: ios-aarch64 (GcdVfs)
+          - target: aarch64-linux-android
+            label: android-aarch64 (IouringVfs)
+          - target: armv7-linux-androideabi
+            label: android-armv7 (AndroidVfs / thread-pool)
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cross-${{ matrix.target }}
+
+      - name: cargo check --lib
+        run: cargo check --target ${{ matrix.target }} --lib
+
+  # ─────────────────────────────────────────────────────────────────────────
+  wasm:
+    name: WASM / WASI check (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: wasm32-unknown-unknown
+            features: --features opfs
+            label: wasm32 (OpfsVfs)
+          - target: wasm32-wasip1
+            features: ""
+            label: wasi (WasiVfs)
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: wasm-${{ matrix.target }}
+
+      - name: cargo check --lib
+        run: cargo check --target ${{ matrix.target }} --lib ${{ matrix.features }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  features:
+    name: Feature matrix (${{ matrix.flags }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flags:
+          - ""                           # default features
+          - "--no-default-features"
+          - "--features compression"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: features
+
+      - name: cargo check
+        run: cargo check --lib --bins --tests --benches ${{ matrix.flags }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  bench:
+    name: Benchmark (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bench
+
+      # Compile-only smoke; running fluxbench in CI is a separate, manually-
+      # dispatched workflow so we don't pay the runtime on every PR. This
+      # job catches "the bench no longer compiles" regressions.
+      - name: Build benches
+        run: cargo bench --no-run --bench btree --bench segment
+
+  # ─────────────────────────────────────────────────────────────────────────
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Run cargo-deny
+        run: cargo deny check --exclude-dev

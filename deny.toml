@@ -1,0 +1,72 @@
+# cargo-deny configuration.
+#
+# Run locally: `cargo deny check`
+# CI gate:     .github/workflows/test.yml :: audit job
+
+[graph]
+# Check every target the VFS backend matrix covers. A vulnerable Windows-only
+# dep that never appears on Linux still ships to users.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-ios" },
+    { triple = "aarch64-linux-android" },
+    { triple = "armv7-linux-androideabi" },
+    { triple = "wasm32-unknown-unknown" },
+    { triple = "wasm32-wasip1" },
+]
+
+# ────────────────────────────────────────────────────────────────────────
+# Security advisories — the load-bearing check for a crypto-dependent
+# crate. Any RustSec advisory against a dep (transitive or direct) fails CI.
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Add advisory IDs here with a comment explaining the exception, e.g.
+    # "RUSTSEC-YYYY-NNNN", # only triggers on a code path we don't use; see #123
+]
+
+# ────────────────────────────────────────────────────────────────────────
+# Licenses — allow-list. Anything not on this list fails CI.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0", # weak-copyleft on file-level; fine for libraries we link
+]
+confidence-threshold = 0.93
+
+# ────────────────────────────────────────────────────────────────────────
+# Banned / required crates. Empty for now; populate as policies emerge.
+[bans]
+multiple-versions = "warn"   # warn (not deny) — common in transitive trees
+wildcards = "deny"            # no `foo = "*"` deps in our Cargo.toml
+highlight = "all"
+deny = [
+    # { name = "openssl", version = "<0.10" },  # example
+]
+skip-tree = [
+    # Some transitive trees legitimately pull multiple versions; list them
+    # here once known. Empty start = surface everything as a warning.
+]
+
+# ────────────────────────────────────────────────────────────────────────
+# Where deps may be sourced from. crates.io only — no git-pin deps.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

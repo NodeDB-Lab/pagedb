@@ -1,0 +1,184 @@
+# Release pipeline. Triggered by pushing a tag of the form `vX.Y.Z` or
+# `vX.Y.Z-label.N` (pre-release).
+#
+# Flow:
+#   1. validate-version  — tag matches Cargo.toml version, format is sane.
+#   2. ci                — gate on the full reusable test workflow.
+#   3. build-binaries    — build `pagedb-fsck` for every shipped triple.
+#   4. github-release    — publish a GitHub release with the binaries attached.
+#
+# Crate publish: skipped. The crate's `publish = false` in Cargo.toml — this
+# repo ships binaries and a library API surface for embedders pulling from
+# git, not via crates.io. Flip the flag and add a `publish-crates` job
+# modeled on the NodeDB / oxipdf workflows if that ever changes.
+
+name: Release
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Validate tag ────────────────────────────────────────────────────────
+  validate-version:
+    name: Validate Version Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_full_release: ${{ steps.version.outputs.is_full_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate tag against Cargo.toml
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          TAG_VERSION="${TAG#v}"
+
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name == "pagedb") | .version')
+          CARGO_BASE=$(echo "$CARGO_VERSION" | grep -oP '^\d+\.\d+\.\d+')
+
+          echo "Tag version:        $TAG_VERSION"
+          echo "Cargo.toml version: $CARGO_VERSION"
+          echo "Cargo.toml base:    $CARGO_BASE"
+
+          if [[ ! "$TAG_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[a-zA-Z]+\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid tag format '$TAG'. Expected: vX.Y.Z or vX.Y.Z-label.N"
+            exit 1
+          fi
+
+          TAG_BASE="${BASH_REMATCH[1]}"
+
+          if [[ "$TAG_BASE" != "$CARGO_BASE" ]]; then
+            echo "::error::Base version mismatch! Tag '$TAG_BASE' != Cargo.toml '$CARGO_BASE'"
+            exit 1
+          fi
+
+          if [[ "$TAG_VERSION" == *-* ]]; then
+            echo "is_full_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_full_release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+  # ── CI gate (full reusable workflow) ────────────────────────────────────
+  ci:
+    name: CI Gate
+    needs: validate-version
+    uses: ./.github/workflows/ci.yml
+
+  # ── Build pagedb-fsck binary per target ─────────────────────────────────
+  build-binaries:
+    name: Build fsck (${{ matrix.label }})
+    needs: [validate-version, ci]
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+            ext: ""
+          - runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: linux-arm64
+            ext: ""
+          - runs-on: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+            ext: ""
+          - runs-on: macos-13
+            target: x86_64-apple-darwin
+            label: macos-x64
+            ext: ""
+          - runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fsck-${{ matrix.target }}
+
+      - name: Build pagedb-fsck
+        run: cargo build --release --bin pagedb-fsck --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          chmod +x pagedb-fsck
+          tar czf pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz pagedb-fsck
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          $name = "pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.zip"
+          Compress-Archive -Path "pagedb-fsck${{ matrix.ext }}" -DestinationPath $name
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fsck-${{ matrix.label }}
+          path: |
+            target/${{ matrix.target }}/release/pagedb-fsck-*.tar.gz
+            target/${{ matrix.target }}/release/pagedb-fsck-*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── GitHub Release ──────────────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: [validate-version, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          pattern: "fsck-*"
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: pagedb ${{ needs.validate-version.outputs.version }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ needs.validate-version.outputs.is_full_release == 'false' }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
