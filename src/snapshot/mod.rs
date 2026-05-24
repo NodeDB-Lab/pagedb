@@ -1,6 +1,8 @@
 //! Snapshot export and incremental restore: full and delta transfer across DB instances.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod apply;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod export;
 
 /// Statistics returned by a full or incremental snapshot export operation.

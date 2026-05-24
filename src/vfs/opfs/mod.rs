@@ -2,42 +2,42 @@
 //!
 //! # Browser-side bootstrap
 //!
-//! The embedder must register `OpfsWorker` as a dedicated Web Worker entry
-//! point before constructing any `OpfsVfs`. A minimal JS shim:
+//! The embedder must serve `opfs_worker.js` at a URL the browser can load as
+//! a dedicated Web Worker. The JS source is embedded in this crate and
+//! accessible via [`OPFS_WORKER_JS`]. A minimal bootstrap:
 //!
 //! ```js
-//! // opfs_worker.js  — loaded via new Worker("opfs_worker.js")
-//! import init, { run_opfs_worker } from "./pagedb.js";
-//! await init();
-//! run_opfs_worker();
+//! // Write OPFS_WORKER_JS to a blob URL or serve it statically, then:
+//! const vfs = await openPersistent("/myapp", workerUrl);
 //! ```
 //!
-//! `run_opfs_worker` is exported by the embedder crate (not by pagedb itself)
-//! and calls `OpfsWorker::registrar().register()`.  The `OpfsVfs` in the main
-//! thread opens a bridge to that worker via `OpfsWorker::spawner().spawn(url)`.
+//! The worker is pure JS — it does **not** load any wasm module.
 //!
 //! # Compile gating
 //!
 //! The full implementation is compiled only for
-//! `cfg(all(target_arch = "wasm32", feature = "opfs"))`.  On every other
+//! `cfg(all(target_arch = "wasm32", feature = "opfs"))`. On every other
 //! target (or when the `opfs` feature is absent) a thin shim is compiled
-//! instead; every method returns [`PagedbError::Unsupported`].
+//! instead; every method returns [`crate::errors::PagedbError::Unsupported`].
 
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
 mod handle;
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
-mod worker;
-
-#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
-pub use handle::OpfsFile;
-#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
-pub use worker::OpfsWorker;
-
+mod protocol;
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
 mod vfs_impl;
 
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
-pub use vfs_impl::OpfsVfs;
+pub use handle::OpfsFile;
+#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
+pub use vfs_impl::{OpfsLockHandle, OpfsVfs};
+
+/// Embedded source of the pure-JS OPFS Web Worker.
+///
+/// Embedders can write this to a `Blob` URL or serve it statically and pass
+/// the resulting URL to [`OpfsVfs::new`].
+#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
+pub const OPFS_WORKER_JS: &str = include_str!("opfs_worker.js");
 
 // ── Native / non-wasm32 shim ──────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ mod shim {
 
     impl OpfsVfs {
         /// Always returns `Err(PagedbError::Unsupported)`.
-        pub fn new() -> Result<Self> {
+        pub fn new(_worker_url: &str) -> Result<Self> {
             Err(PagedbError::Unsupported)
         }
     }
@@ -97,12 +97,7 @@ mod shim {
     }
 
     /// Unreachable lock handle for the native shim.
-    ///
-    /// The inner `()` is `Send`; no manual `unsafe impl` needed.
     pub struct OpfsLockHandleShim(());
-
-    // `()` is `Send`, so `OpfsLockHandleShim` is trivially `Send` — the derive
-    // is implicit through the standard rules; no unsafe block required.
 
     impl Vfs for OpfsVfs {
         type File = OpfsFileShim;

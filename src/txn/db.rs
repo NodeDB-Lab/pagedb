@@ -1136,7 +1136,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// Process pending deferred tombstones and delete files in `seg/.tombstone/`.
     /// Returns statistics on reclaimed segments and bytes.
     pub async fn gc_now(&self) -> Result<GcStats> {
-        let _span = tracing::debug_span!("gc.run").entered();
+        let _span = tracing::debug_span!("gc.run");
         self.try_drain_pending_tombstones().await?;
         // Best-effort: drain any queued reader-pin deletes.
         let _ = self.drain_pending_pin_deletes().await;
@@ -1401,7 +1401,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// Returns `Unsupported` if this handle is not in Standalone mode.
     #[allow(clippy::too_many_lines)]
     pub async fn rekey_db(&self, kek: [u8; 32], new_mk_epoch: u64) -> Result<()> {
-        let _span = tracing::debug_span!("rekey.run", new_mk_epoch).entered();
+        let _span = tracing::debug_span!("rekey.run", new_mk_epoch);
         if !matches!(self.mode, crate::txn::mode::DbMode::Standalone) {
             return Err(PagedbError::Unsupported);
         }
@@ -2273,16 +2273,19 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Full verbatim snapshot of the database at the current `latest_commit`.
     ///
+    /// Not available on `wasm32` targets (requires native file system access).
+    ///
     /// Takes a non-abortable `ReadTxn` to pin the state while files are copied,
     /// then writes `<dst_path>/manifest`, `<dst_path>/main.db`, and all live
     /// segment files under `<dst_path>/seg/<hex(id)>`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn snapshot_to(
         &self,
         dst_path: &std::path::Path,
     ) -> crate::Result<crate::snapshot::SnapshotStats> {
         use crate::snapshot::export::{SnapshotManifest, snapshot_full};
 
-        let _span = tracing::debug_span!("snapshot.export").entered();
+        let _span = tracing::debug_span!("snapshot.export");
 
         // Pin the current state via a non-abortable read txn.
         let txn = {
@@ -2335,6 +2338,7 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Verifies the manifest HK-MAC using `kek` before copying; returns
     /// `Corruption` on failure.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn restore_from(
         src_path: &std::path::Path,
         dst_path: &std::path::Path,
@@ -2346,7 +2350,7 @@ impl<V: Vfs + Clone> Db<V> {
         use tokio::fs;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let _span = tracing::debug_span!("snapshot.apply").entered();
+        let _span = tracing::debug_span!("snapshot.apply");
 
         // Verify and parse manifest.
         let manifest_src = src_path.join("manifest");
@@ -2407,6 +2411,7 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Page-diff snapshot since `base_commit`. Emits only pages changed since
     /// the base commit, plus segment files new/changed since that commit.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn snapshot_incremental_to(
         &self,
         base_commit: crate::CommitId,
@@ -2507,6 +2512,7 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Reads `src_path/pages.delta` and writes pages directly to `main.db`,
     /// then promotes segment files, then commits the new header.
+    #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::too_many_lines)]
     pub async fn apply_incremental(
         &self,
@@ -2521,7 +2527,7 @@ impl<V: Vfs + Clone> Db<V> {
         };
         use crate::snapshot::apply::{apply_delta_pages, stage_snapshot_segments};
 
-        let _span = tracing::debug_span!("snapshot.apply").entered();
+        let _span = tracing::debug_span!("snapshot.apply");
 
         if !matches!(self.mode, DbMode::Follower) {
             return Err(crate::errors::PagedbError::IdentityForked);

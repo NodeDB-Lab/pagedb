@@ -17,11 +17,20 @@ hmac = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "fs", "time"] }
 bytes = "1"
 tracing = "0.1"
 parking_lot = "0.12"
 rayon = "1"
+
+# tokio's `rt-multi-thread` and `fs` features are not supported on
+# `wasm32-unknown-unknown`. Split per target so OPFS builds compile.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokio]
+version = "1"
+features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "fs", "time"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.tokio]
+version = "1"
+features = ["rt", "macros", "sync", "io-util", "time"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -46,13 +55,16 @@ wasi = "0.13"
 tempfile = "3"
 memmap2 = "0.9"
 lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["safe-encode", "safe-decode"] }
-gloo-worker = { version = "0.5", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+send_wrapper = { version = "0.6", optional = true }
+futures = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
 web-sys = { version = "0.3", optional = true, features = [
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
@@ -61,6 +73,11 @@ web-sys = { version = "0.3", optional = true, features = [
     "FileSystemRemoveOptions",
     "StorageManager",
     "Navigator",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "MessageEvent",
+    "ErrorEvent",
 ] }
 
 [target.'cfg(any(target_os = "linux", all(target_os = "android", not(target_arch = "arm"))))'.dependencies]
@@ -70,12 +87,14 @@ io-uring = "0.7"
 default = []
 compression = ["dep:lz4_flex"]
 opfs = [
-    "dep:gloo-worker",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
     "dep:web-sys",
     "dep:serde",
+    "dep:serde-wasm-bindgen",
+    "dep:send_wrapper",
+    "dep:futures",
 ]
 
 [dev-dependencies]

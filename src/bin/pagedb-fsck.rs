@@ -6,9 +6,17 @@
 
 use std::process::ExitCode;
 
+#[cfg(not(target_arch = "wasm32"))]
 use pagedb::vfs::tokio_backend::TokioVfs;
+#[cfg(not(target_arch = "wasm32"))]
 use pagedb::{Db, RealmId, run_deep_walk};
 
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    // pagedb-fsck is a native-only tool; it is not functional on wasm32.
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -82,6 +90,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_hex_kek(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
     if s.len() != 64 {
@@ -96,6 +105,7 @@ fn parse_hex_kek(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn hex_val(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),

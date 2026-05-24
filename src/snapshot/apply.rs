@@ -1,6 +1,8 @@
 //! `apply_incremental`: reads a delta snapshot stream and applies it to a
 //! Follower handle by writing pages directly and then swapping the A/B header.
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::path::Path;
 
 use tokio::fs;

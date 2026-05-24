@@ -583,7 +583,9 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// `CommitId`.
     #[allow(clippy::too_many_lines)]
     pub async fn commit(mut self) -> Result<CommitId> {
-        let _span = tracing::debug_span!("txn.commit").entered();
+        let _span = tracing::debug_span!("txn.commit");
+        // Note: span is not entered via `.entered()` to keep this async fn's
+        // future `Send`. Use `tracing::instrument` or enter in sync sections only.
         // Compute commit_id early so we can tag deferred-free entries before
         // the catalog flush.
         let new_commit_id = self.guard.latest_commit_id + 1;

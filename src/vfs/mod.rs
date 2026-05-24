@@ -19,6 +19,7 @@ pub mod iouring;
 pub mod memory;
 #[cfg(feature = "opfs")]
 pub mod opfs;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tokio_backend;
 pub mod traits;
 pub mod types;

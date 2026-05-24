@@ -1,6 +1,8 @@
 //! `snapshot_to` and `snapshot_incremental_to`: serialise the live DB state
 //! into a portable snapshot directory.
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::path::Path;
 
 use hmac::{Hmac, Mac};

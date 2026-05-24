@@ -184,7 +184,7 @@ pub async fn write_chain<V: Vfs>(
     realm_id: RealmId,
     value: &[u8],
     page_size: usize,
-    allocate_page: &mut dyn FnMut() -> u64,
+    allocate_page: &mut (dyn FnMut() -> u64 + Send),
 ) -> Result<u64> {
     let root_cap = overflow_root_capacity(page_size);
     let chain_cap = overflow_page_capacity(page_size);
