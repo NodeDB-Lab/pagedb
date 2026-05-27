@@ -218,17 +218,22 @@ impl Leaf {
     /// True iff encoding `self` into a body of `page_size - 40` bytes fits.
     #[must_use]
     pub fn fits(&self, page_size: usize) -> bool {
+        Self::slice_fits(&self.records, page_size)
+    }
+
+    /// True iff encoding the given record slice fits within `page_size`.
+    #[must_use]
+    pub fn slice_fits(records: &[(Vec<u8>, LeafValue)], page_size: usize) -> bool {
         let cap = body_capacity(page_size);
-        let prefix_len = lcp(&self.records).len();
-        let record_bytes: usize = self
-            .records
+        let prefix_len = lcp(records).len();
+        let record_bytes: usize = records
             .iter()
             .map(|(k, v)| {
                 let suffix_len = k.len().saturating_sub(prefix_len);
                 2 + suffix_len + v.encoded_size()
             })
             .sum();
-        let slot_dir_bytes = self.records.len() * 2;
+        let slot_dir_bytes = records.len() * 2;
         HEADER_LEN + prefix_len + slot_dir_bytes + record_bytes <= cap
     }
 }

@@ -556,7 +556,7 @@ impl<V: Vfs> BTree<V> {
                 .expect("dirty before split")
         };
         let new_leaf_page = self.allocate_page();
-        let (mut left, mut right, sep_key) = split_leaf(leaf, monotonic);
+        let (mut left, mut right, sep_key) = split_leaf(leaf, monotonic, self.page_size);
         let right_page = self.allocate_page();
         left.left_sibling = 0;
         left.right_sibling = 0;
