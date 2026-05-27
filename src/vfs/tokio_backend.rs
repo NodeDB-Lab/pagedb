@@ -6,7 +6,7 @@
 //! contract from `traits.rs` is the durable surface.
 //!
 //! `unsafe` is permitted here for platform lock primitives (fcntl on Unix,
-//! LockFileEx on Windows).
+//! `LockFileEx` on Windows).
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
