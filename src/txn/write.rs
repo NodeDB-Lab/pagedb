@@ -786,7 +786,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
                             let live = crate::segment::writer::live_path(segment_id);
                             let tomb = format!(
                                 "seg/.tombstone/{}.{}",
-                                crate::segment::writer::hex_lower(segment_id),
+                                crate::hex::to_hex_lower(segment_id),
                                 new_commit_id,
                             );
                             self.db.vfs.rename(&live, &tomb).await?;
