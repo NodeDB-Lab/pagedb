@@ -19,9 +19,9 @@ use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
 };
 
-// In windows-sys 0.52 `HANDLE` is `isize`. NULL handles are 0; the wrapper
-// uses the constant below for readability.
-const NULL_HANDLE: HANDLE = 0;
+// In windows-sys 0.61 `HANDLE` is `*mut c_void`. NULL handles are null
+// pointers; the wrapper uses the constant below for readability.
+const NULL_HANDLE: HANDLE = std::ptr::null_mut();
 
 /// Owning wrapper around an IOCP `HANDLE`. Closed on drop.
 pub(crate) struct PortHandle {
