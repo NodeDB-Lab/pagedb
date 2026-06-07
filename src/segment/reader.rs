@@ -31,8 +31,12 @@ pub struct SegmentReader<V: Vfs + Clone> {
     /// but this reader is reading a segment sealed under an older epoch.
     mk_override: Option<crate::crypto::keys::MasterKey>,
     /// Shared budget counter for `mmap_view` scratch bytes. Cloned from `Db`.
+    /// Only read by the native `mmap_view` path; unused on `wasm32`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     mmap_budget_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Maximum bytes allowed across all live mmap views for this Db.
+    /// Only read by the native `mmap_view` path; unused on `wasm32`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     mmap_budget_limit: u64,
     /// v2 extent index, lazily loaded on the first `find_extent` call.
     /// `None` = not yet loaded (or v1 segment).
