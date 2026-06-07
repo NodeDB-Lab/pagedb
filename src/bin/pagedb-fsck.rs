@@ -42,7 +42,7 @@ async fn main() -> ExitCode {
     }
 
     let kek = match kek_hex {
-        Some(s) => match parse_hex_kek(&s) {
+        Some(s) => match pagedb::hex::parse_hex::<32>(&s) {
             Some(k) => k,
             None => {
                 eprintln!("invalid hex KEK (must be 64 hex chars / 32 bytes)");
@@ -87,30 +87,5 @@ async fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn parse_hex_kek(s: &str) -> Option<[u8; 32]> {
-    let s = s.trim();
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let high = hex_val(s.as_bytes()[i * 2])?;
-        let low = hex_val(s.as_bytes()[i * 2 + 1])?;
-        *byte = (high << 4) | low;
-    }
-    Some(out)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
     }
 }

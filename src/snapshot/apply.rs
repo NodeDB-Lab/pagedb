@@ -104,7 +104,7 @@ pub async fn stage_snapshot_segments(
 
     for name in &entries {
         // Each name in seg/ is 32 hex chars encoding the 16-byte segment id.
-        let segment_id = parse_hex32(name).ok_or_else(|| {
+        let segment_id = crate::hex::parse_hex::<16>(name).ok_or_else(|| {
             PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
         })?;
         let src_file = seg_src.join(name);
@@ -126,29 +126,4 @@ pub async fn stage_snapshot_segments(
     }
 
     Ok(staged)
-}
-
-/// Decode a 32-character lowercase hex string into a 16-byte array. Returns
-/// `None` if the input is not exactly 32 hex characters.
-fn parse_hex32(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut out = [0u8; 16];
-    for (i, chunk) in bytes.chunks(2).enumerate() {
-        let hi = hex_digit(chunk[0])?;
-        let lo = hex_digit(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }

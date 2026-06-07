@@ -207,7 +207,7 @@ pub async fn snapshot_full(
     // Copy segment files.
     let mut segments_written: u32 = 0;
     for seg_id in segment_ids {
-        let hex = crate::segment::writer::hex_lower(seg_id);
+        let hex = crate::hex::to_hex_lower(seg_id);
         let seg_src = src_db_root.join("seg").join(&hex);
         let seg_dst_file = seg_dst.join(&hex);
         if let Ok(n) = copy_file_to(&seg_src, &seg_dst_file).await {
@@ -326,7 +326,7 @@ pub async fn snapshot_incremental(
     // Copy new/changed segment files.
     let mut segments_written: u32 = 0;
     for seg_id in segment_ids {
-        let hex = crate::segment::writer::hex_lower(seg_id);
+        let hex = crate::hex::to_hex_lower(seg_id);
         let seg_src = src_db_root.join("seg").join(&hex);
         let seg_dst_file = seg_dst.join(&hex);
         if let Ok(n) = copy_file_to(&seg_src, &seg_dst_file).await {

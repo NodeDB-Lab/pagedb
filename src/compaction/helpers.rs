@@ -200,7 +200,7 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     let old_live = crate::segment::writer::live_path(old_segment_id);
     let tomb = format!(
         "seg/.tombstone/{}.{}",
-        crate::segment::writer::hex_lower(old_segment_id),
+        crate::hex::to_hex_lower(old_segment_id),
         new_commit_id,
     );
     db.vfs.mkdir_all("seg/.tombstone").await?;

@@ -97,7 +97,7 @@ impl DeepWalkReport {
             writeln!(
                 out,
                 "  seg {}: {}",
-                hex_lower(&issue.segment_id),
+                crate::hex::to_hex_lower(&issue.segment_id),
                 issue.description
             )?;
         }
@@ -122,7 +122,7 @@ impl DeepWalkReport {
             writeln!(
                 out,
                 "  seg {}: {}",
-                hex_lower(&issue.segment_id),
+                crate::hex::to_hex_lower(&issue.segment_id),
                 issue.description
             )?;
         }
@@ -135,14 +135,6 @@ impl DeepWalkReport {
         }
         Ok(())
     }
-}
-
-fn hex_lower(bytes: &[u8; 16]) -> String {
-    bytes.iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 /// Run a deep walk against an already-opened `Db<V>`.

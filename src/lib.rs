@@ -15,6 +15,8 @@ pub mod catalog;
 pub mod compaction;
 pub mod crypto;
 pub mod errors;
+#[doc(hidden)]
+pub mod hex;
 pub mod observability;
 pub mod options;
 pub mod pager;

@@ -275,7 +275,7 @@ pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction])
                 let src = crate::segment::writer::live_path(segment_id);
                 let dst = format!(
                     "seg/.tombstone/{}.{}",
-                    crate::segment::writer::hex_lower(segment_id),
+                    crate::hex::to_hex_lower(segment_id),
                     tombstone_commit_id,
                 );
                 let _ = vfs.mkdir_all("seg/.tombstone").await;

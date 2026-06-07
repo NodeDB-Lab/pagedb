@@ -56,8 +56,11 @@ pub async fn reconcile_catalog<V: Vfs + Clone>(
     for (key, value) in rows {
         let meta = Catalog::decode_segment_meta(&value)?;
         expected.push(meta.segment_id);
-        let live = format!("seg/{}", hex_lower(&meta.segment_id));
-        let staging = format!("seg/.staging/{}", hex_lower(&meta.segment_id));
+        let live = format!("seg/{}", crate::hex::to_hex_lower(&meta.segment_id));
+        let staging = format!(
+            "seg/.staging/{}",
+            crate::hex::to_hex_lower(&meta.segment_id)
+        );
         match vfs.open(&live, OpenMode::Read).await {
             Ok(file) => {
                 verify_segment_file::<V>(&file, &meta, hk, &pager, page_size, parent_file_id, &key)
@@ -167,7 +170,7 @@ async fn sweep_orphans<V: Vfs + Clone>(
         if name.starts_with('.') {
             continue;
         }
-        let Some(id) = parse_hex_id(&name) else {
+        let Some(id) = crate::hex::parse_hex::<16>(&name) else {
             continue;
         };
         if !expected.contains(&id) {
@@ -180,7 +183,7 @@ async fn sweep_orphans<V: Vfs + Clone>(
         return Ok(());
     };
     for name in staging_entries {
-        let Some(id) = parse_hex_id(&name) else {
+        let Some(id) = crate::hex::parse_hex::<16>(&name) else {
             continue;
         };
         if !expected.contains(&id) {
@@ -189,36 +192,4 @@ async fn sweep_orphans<V: Vfs + Clone>(
         }
     }
     Ok(())
-}
-
-fn parse_hex_id(name: &str) -> Option<[u8; 16]> {
-    if name.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    let bytes = name.as_bytes();
-    for i in 0..16 {
-        let high = hex_val(bytes[i * 2])?;
-        let low = hex_val(bytes[i * 2 + 1])?;
-        out[i] = (high << 4) | low;
-    }
-    Some(out)
-}
-
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    }
-}
-
-pub(crate) fn hex_lower(bytes: &[u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(32);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
 }

@@ -327,21 +327,11 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
 }
 
 pub(crate) fn staging_path(segment_id: &[u8; 16]) -> String {
-    format!("seg/.staging/{}", hex_lower(segment_id))
+    format!("seg/.staging/{}", crate::hex::to_hex_lower(segment_id))
 }
 
 pub(crate) fn live_path(segment_id: &[u8; 16]) -> String {
-    format!("seg/{}", hex_lower(segment_id))
-}
-
-pub(crate) fn hex_lower(bytes: &[u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(32);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
+    format!("seg/{}", crate::hex::to_hex_lower(segment_id))
 }
 
 fn page_size_to_log2(page_size: usize) -> Result<u8> {

@@ -700,7 +700,7 @@ impl<V: Vfs> Pager<V> {
         }
         let path = match file {
             FileKey::Main => self.cfg.main_db_path.clone(),
-            FileKey::Segment(id) => format!("seg/{}", hex_lower(&id)),
+            FileKey::Segment(id) => format!("seg/{}", crate::hex::to_hex_lower(&id)),
         };
         let f = self.vfs.open(&path, OpenMode::CreateOrOpen).await?;
         let arc = Arc::new(AsyncMutex::new(f));
@@ -733,16 +733,6 @@ fn derive_kind_for_flush(file: FileKey) -> PageKind {
         FileKey::Main => PageKind::BTreeLeaf,
         FileKey::Segment(_) => PageKind::SegmentData,
     }
-}
-
-fn hex_lower(bytes: &[u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(32);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
 }
 
 #[cfg(test)]
