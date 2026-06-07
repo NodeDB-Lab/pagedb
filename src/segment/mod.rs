@@ -1,7 +1,6 @@
 //! Engine-owned encrypted segment files. Append-mostly, sealed atomically,
 //! identity-keyed paths.
 
-pub mod manifest;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mmap;
 pub mod reader;
