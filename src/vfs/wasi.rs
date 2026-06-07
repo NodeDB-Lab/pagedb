@@ -19,10 +19,18 @@
 //! # Directory sync
 //!
 //! WASI preview1 does not have a dedicated directory-sync syscall. `sync_dir`
-//! opens the directory as a file descriptor and calls `fd_sync`. Some sandboxed
-//! runtimes stub `fd_sync` out with `ENOTSUP`; that error is treated as a
-//! no-op (best-effort durability, with a `tracing::debug!` trace emitted so the
-//! caller has observability).
+//! opens the directory as a file descriptor and calls `sync_all` on it. Some
+//! sandboxed runtimes do not support syncing a directory fd and return an
+//! error; that is treated as a no-op (best-effort durability, with a
+//! `tracing::debug!` trace emitted so the caller has observability).
+//!
+//! # Positioned I/O
+//!
+//! Positioned reads and writes use the stable `Seek` + `Read` / `Write` traits
+//! under the file's `Mutex`: each operation seeks to the target offset and then
+//! transfers. The mutex serialises the seek/transfer pair, so the shared file
+//! cursor is never observed in a torn state. This keeps the backend on stable
+//! Rust (no `wasi_ext` / preview1 raw-syscall dependency).
 
 // ── Real WASI implementation ──────────────────────────────────────────────────
 
@@ -139,8 +147,9 @@ mod real {
     /// Handle to an open file on a WASI target.
     ///
     /// Uses `std::fs::File`, which maps directly onto WASI preview1 `fd_*`
-    /// syscalls. Positional reads and writes loop over `std::os::wasi::fs::FileExt`
-    /// `read_at` / `write_at` which correspond to `fd_pread` / `fd_pwrite`.
+    /// syscalls. Positional reads and writes seek the shared cursor under the
+    /// `Mutex` and then transfer, which corresponds to `fd_seek` + `fd_read` /
+    /// `fd_write`.
     pub struct WasiFile {
         /// Mutex so that `read_at(&self, …)` can seek without requiring `&mut`.
         /// On WASI every seek+read pair is already synchronous so this adds no
@@ -247,13 +256,11 @@ mod real {
         ///
         /// WASI preview1 has no dedicated directory-sync syscall. This
         /// implementation opens the directory as a file descriptor and calls
-        /// `wasi::fd_sync` on it. Runtimes that stub out `fd_sync` with
-        /// `ENOTSUP` / `ENOSYS` are treated as a no-op so that pagedb still
+        /// `sync_all` on it. Runtimes that do not support syncing a directory
+        /// fd return an error, which is treated as a no-op so that pagedb still
         /// operates in those environments; a `tracing::debug!` message is
         /// emitted for observability.
         async fn sync_dir(&self, path: &str) -> Result<()> {
-            use std::os::wasi::io::AsRawFd;
-
             let p = self.resolve(path);
             let dir = match std::fs::File::open(&p) {
                 Ok(d) => d,
@@ -261,25 +268,14 @@ mod real {
                 Err(e) => return Err(PagedbError::Io(e)),
             };
 
-            // SAFETY: `dir.as_raw_fd()` is a valid, open file descriptor for
-            // the duration of this call. `wasi::fd_sync` is a pure I/O syscall
-            // that does not move or alias memory.
-            let rc = unsafe { wasi::fd_sync(dir.as_raw_fd()) };
-            match rc {
-                Ok(()) => Ok(()),
-                Err(e) if e == wasi::ERRNO_NOTSUP || e == wasi::ERRNO_NOSYS => {
-                    tracing::debug!(
-                        path = %p.display(),
-                        "sync_dir: fd_sync returned {:?}; treating as no-op \
-                         (runtime does not support directory sync)",
-                        e
-                    );
-                    Ok(())
-                }
-                Err(e) => Err(PagedbError::Io(std::io::Error::from_raw_os_error(
-                    e.raw() as i32
-                ))),
+            if let Err(e) = dir.sync_all() {
+                tracing::debug!(
+                    path = %p.display(),
+                    error = %e,
+                    "sync_dir: directory sync unsupported; treating as no-op"
+                );
             }
+            Ok(())
         }
 
         async fn lock_exclusive(&self, path: &str) -> Result<Self::LockHandle> {
@@ -321,11 +317,11 @@ mod real {
 
     impl VfsFile for WasiFile {
         async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-            use std::os::wasi::fs::FileExt;
-            let f = self.inner.lock();
+            let mut f = self.inner.lock();
+            f.seek(SeekFrom::Start(offset)).map_err(PagedbError::Io)?;
             let mut total = 0usize;
             while total < buf.len() {
-                match f.read_at(&mut buf[total..], offset + total as u64) {
+                match f.read(&mut buf[total..]) {
                     Ok(0) => break,
                     Ok(n) => total += n,
                     Err(e) => return Err(PagedbError::Io(e)),
@@ -335,15 +331,13 @@ mod real {
         }
 
         async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> Result<()> {
-            use std::os::wasi::fs::FileExt;
-            let f = self.inner.lock();
+            let mut f = self.inner.lock();
             for req in reqs.iter_mut() {
+                f.seek(SeekFrom::Start(req.offset))
+                    .map_err(PagedbError::Io)?;
                 let mut total = 0usize;
-                loop {
-                    if total == req.buf.len() {
-                        break;
-                    }
-                    match f.read_at(&mut req.buf[total..], req.offset + total as u64) {
+                while total < req.buf.len() {
+                    match f.read(&mut req.buf[total..]) {
                         Ok(0) => break,
                         Ok(n) => total += n,
                         Err(e) => return Err(PagedbError::Io(e)),
@@ -362,11 +356,11 @@ mod real {
             if !self.writable {
                 return Err(PagedbError::ReadOnly);
             }
-            use std::os::wasi::fs::FileExt;
-            let f = self.inner.lock();
+            let mut f = self.inner.lock();
+            f.seek(SeekFrom::Start(offset)).map_err(PagedbError::Io)?;
             let mut total = 0usize;
             while total < buf.len() {
-                match f.write_at(&buf[total..], offset + total as u64) {
+                match f.write(&buf[total..]) {
                     Ok(0) => {
                         return Err(PagedbError::Io(std::io::Error::from(
                             std::io::ErrorKind::WriteZero,
@@ -383,12 +377,13 @@ mod real {
             if !self.writable {
                 return Err(PagedbError::ReadOnly);
             }
-            use std::os::wasi::fs::FileExt;
-            let f = self.inner.lock();
+            let mut f = self.inner.lock();
             for req in reqs {
+                f.seek(SeekFrom::Start(req.offset))
+                    .map_err(PagedbError::Io)?;
                 let mut total = 0usize;
                 while total < req.buf.len() {
-                    match f.write_at(&req.buf[total..], req.offset + total as u64) {
+                    match f.write(&req.buf[total..]) {
                         Ok(0) => {
                             return Err(PagedbError::Io(std::io::Error::from(
                                 std::io::ErrorKind::WriteZero,
