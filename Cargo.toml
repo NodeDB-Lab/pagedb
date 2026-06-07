@@ -5,7 +5,17 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Encrypted, portable, embedded page store with B+ tree and segment-file surfaces."
-publish = false
+repository = "https://github.com/nodedb-lab/pagedb"
+homepage = "https://github.com/nodedb-lab/pagedb"
+documentation = "https://docs.rs/pagedb"
+readme = "README.md"
+keywords = ["database", "encryption", "storage", "btree", "embedded"]
+categories = ["database-implementations", "cryptography", "embedded"]
+authors = ["Farhan Syah"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 
@@ -54,7 +64,10 @@ wasi = "0.13"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = "3"
 memmap2 = "0.9"
-lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["safe-encode", "safe-decode"] }
+lz4_flex = { version = "0.11", optional = true, default-features = false, features = [
+    "safe-encode",
+    "safe-decode",
+] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
@@ -64,7 +77,9 @@ js-sys = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 send_wrapper = { version = "0.6", optional = true }
-futures = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
+futures = { version = "0.3", optional = true, default-features = false, features = [
+    "alloc",
+] }
 web-sys = { version = "0.3", optional = true, features = [
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
@@ -98,7 +113,12 @@ opfs = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "test-util",
+] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 redb = "2"
 tempfile = "3"
