@@ -96,5 +96,3 @@ dmypy.json
 
 .cargo/
 
-# Library crate lock file
-Cargo.lock
