@@ -172,9 +172,6 @@ pub(crate) fn map_err(reason: &str, kind: ErrKind) -> PagedbError {
             PagedbError::Io(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
         }
         ErrKind::PermissionDenied => PagedbError::ReadOnly,
-        ErrKind::Io | ErrKind::Other => PagedbError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            reason.to_string(),
-        )),
+        ErrKind::Io | ErrKind::Other => PagedbError::Io(std::io::Error::other(reason.to_string())),
     }
 }

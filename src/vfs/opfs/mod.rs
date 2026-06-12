@@ -20,8 +20,14 @@
 //! target (or when the `opfs` feature is absent) a thin shim is compiled
 //! instead; every method returns [`crate::errors::PagedbError::Unsupported`].
 
+// Pure path-rooting helpers — target-independent so they are unit-testable on
+// the host even though the OPFS backend itself is wasm-only.
+mod path;
+
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
 mod handle;
+#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
+mod lock;
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
 mod protocol;
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
@@ -30,7 +36,9 @@ mod vfs_impl;
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
 pub use handle::OpfsFile;
 #[cfg(all(target_arch = "wasm32", feature = "opfs"))]
-pub use vfs_impl::{OpfsLockHandle, OpfsVfs};
+pub use lock::OpfsLockHandle;
+#[cfg(all(target_arch = "wasm32", feature = "opfs"))]
+pub use vfs_impl::OpfsVfs;
 
 /// Embedded source of the pure-JS OPFS Web Worker.
 ///
@@ -60,6 +68,11 @@ mod shim {
     impl OpfsVfs {
         /// Always returns `Err(PagedbError::Unsupported)`.
         pub fn new(_worker_url: &str) -> Result<Self> {
+            Err(PagedbError::Unsupported)
+        }
+
+        /// Always returns `Err(PagedbError::Unsupported)`.
+        pub fn with_root(_worker_url: &str, _root: &str) -> Result<Self> {
             Err(PagedbError::Unsupported)
         }
     }

@@ -20,86 +20,13 @@ use crate::vfs::traits::Vfs;
 use crate::vfs::types::OpenMode;
 
 use super::handle::{OpfsFile, map_err};
+use super::lock::{LockMap, OpfsLockHandle};
 use super::protocol::{OpfsOp, OpfsRequest, OpfsResponse, OpfsResult};
 
 // ── Request registry ──────────────────────────────────────────────────────────
 
 /// Maps in-flight request ids to their response channels.
 type Registry = Arc<Mutex<HashMap<u64, oneshot::Sender<OpfsResult>>>>;
-
-// ── Lock manager ──────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-enum LockKind {
-    Exclusive,
-    Shared,
-}
-
-#[derive(Default)]
-struct LockMap {
-    entries: HashMap<String, (LockKind, u32)>,
-}
-
-impl LockMap {
-    fn try_exclusive(&mut self, path: &str) -> bool {
-        if self.entries.contains_key(path) {
-            return false;
-        }
-        self.entries
-            .insert(path.to_string(), (LockKind::Exclusive, 1));
-        true
-    }
-
-    fn try_shared(&mut self, path: &str) -> bool {
-        match self.entries.get_mut(path) {
-            None => {
-                self.entries.insert(path.to_string(), (LockKind::Shared, 1));
-                true
-            }
-            Some((LockKind::Shared, n)) => {
-                *n += 1;
-                true
-            }
-            Some((LockKind::Exclusive, _)) => false,
-        }
-    }
-
-    fn release(&mut self, path: &str) {
-        let remove = match self.entries.get_mut(path) {
-            Some((_, n)) if *n <= 1 => true,
-            Some((_, n)) => {
-                *n -= 1;
-                false
-            }
-            None => false,
-        };
-        if remove {
-            self.entries.remove(path);
-        }
-    }
-}
-
-// ── Lock handle ───────────────────────────────────────────────────────────────
-
-/// RAII advisory lock handle returned by `lock_exclusive` / `lock_shared`.
-pub struct OpfsLockHandle {
-    path: String,
-    locks: Arc<Mutex<LockMap>>,
-}
-
-// SAFETY: wasm32 is single-threaded by browser spec. All access to
-// OpfsLockHandle happens on the spawning thread. The Arc<Mutex<LockMap>>
-// field contains no JS types and is naturally Send+Sync.
-unsafe impl Send for OpfsLockHandle {}
-unsafe impl Sync for OpfsLockHandle {}
-
-impl Drop for OpfsLockHandle {
-    fn drop(&mut self) {
-        if let Ok(mut map) = self.locks.lock() {
-            map.release(&self.path);
-        }
-    }
-}
 
 // ── OpfsVfs internals ─────────────────────────────────────────────────────────
 
@@ -119,8 +46,13 @@ struct OpfsVfsInner {
     /// hand an `Arc<OpfsVfs>` to each `OpfsFile` without storing the Arc
     /// inside itself (which would create a reference cycle).
     weak_self: Mutex<Weak<OpfsVfsInner>>,
-    /// Keeps the onmessage Closure alive for the lifetime of OpfsVfsInner.
+    /// Keeps the onmessage Closure alive for the lifetime of `OpfsVfsInner`.
     _onmessage: SendWrapper<Closure<dyn FnMut(web_sys::MessageEvent)>>,
+    /// Normalised root directory that every VFS path is resolved under, e.g.
+    /// `/mydb`. Empty means paths are used verbatim against the OPFS origin
+    /// root (legacy behaviour). Used to isolate independent databases in the
+    /// single shared OPFS sandbox.
+    root: String,
 }
 
 // ── OpfsVfs (public newtype) ──────────────────────────────────────────────────
@@ -159,20 +91,36 @@ unsafe impl Send for OpfsVfs {}
 unsafe impl Sync for OpfsVfs {}
 
 impl OpfsVfs {
-    /// Spawn the OPFS worker and return a ready `OpfsVfs`.
+    /// Spawn the OPFS worker and return a ready `OpfsVfs` rooted at the OPFS
+    /// origin directory.
     ///
     /// `worker_url` must point to the pure-JS worker file (`opfs_worker.js`).
     /// Embedders can obtain the JS source via [`crate::vfs::opfs::OPFS_WORKER_JS`]
     /// and serve it at a URL the browser can load.
+    ///
+    /// All databases opened through the returned VFS share the same OPFS paths
+    /// (e.g. `/main.db`). To run several independent databases in one origin,
+    /// use [`OpfsVfs::with_root`] to give each a distinct sub-directory.
     pub fn new(worker_url: &str) -> Result<Self> {
+        Self::with_root(worker_url, "")
+    }
+
+    /// Spawn the OPFS worker and return a `OpfsVfs` whose every path is resolved
+    /// under `root`.
+    ///
+    /// `root` names a sub-directory of the OPFS origin sandbox under which all
+    /// of this database's files (`main.db`, segments, locks, sidecars) live, so
+    /// multiple databases can coexist in the same origin without colliding on
+    /// the fixed `/main.db` path. It is normalised to a single leading-slash
+    /// prefix: surrounding slashes are trimmed and an empty value reproduces the
+    /// legacy origin-root behaviour of [`OpfsVfs::new`].
+    pub fn with_root(worker_url: &str, root: &str) -> Result<Self> {
+        let root = super::path::normalize_root(root);
+
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
 
-        let worker = web_sys::Worker::new(worker_url).map_err(|e| {
-            PagedbError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{:?}", e),
-            ))
-        })?;
+        let worker = web_sys::Worker::new(worker_url)
+            .map_err(|e| PagedbError::Io(std::io::Error::other(format!("{e:?}"))))?;
 
         // Build the onmessage callback. The registry Arc is cloned into it.
         let registry_cb = Arc::clone(&registry);
@@ -182,7 +130,9 @@ impl OpfsVfs {
                 match serde_wasm_bindgen::from_value::<OpfsResponse>(data) {
                     Ok(resp) => {
                         let sender = {
-                            let mut reg = registry_cb.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut reg = registry_cb
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             reg.remove(&resp.id)
                         };
                         if let Some(tx) = sender {
@@ -205,12 +155,24 @@ impl OpfsVfs {
             locks: Arc::new(Mutex::new(LockMap::default())),
             weak_self: Mutex::new(Weak::new()),
             _onmessage: SendWrapper::new(onmessage),
+            root,
         });
 
         // Store the weak self-reference so open() can hand out Arc<OpfsVfsInner>.
-        *inner.weak_self.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&inner);
+        *inner
+            .weak_self
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&inner);
 
         Ok(OpfsVfs(inner))
+    }
+
+    /// Resolve a virtual VFS path under this VFS's configured root.
+    ///
+    /// Thin wrapper over [`super::path::join_root`]; see it for the joining
+    /// contract (separator handling, empty-root passthrough).
+    fn resolve(&self, path: &str) -> String {
+        super::path::join_root(&self.0.root, path)
     }
 
     /// Dispatch a single `OpfsOp` to the worker and await its `OpfsResult`.
@@ -223,16 +185,13 @@ impl OpfsVfs {
                 .0
                 .request_registry
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             reg.insert(id, tx);
         }
 
         let req = OpfsRequest { id, op };
         let js_val = serde_wasm_bindgen::to_value(&req).map_err(|e| {
-            PagedbError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("serialize error: {:?}", e),
-            ))
+            PagedbError::Io(std::io::Error::other(format!("serialize error: {e:?}")))
         })?;
 
         self.0.worker.post_message(&js_val).map_err(|e| {
@@ -241,19 +200,13 @@ impl OpfsVfs {
                 .0
                 .request_registry
                 .lock()
-                .unwrap_or_else(|e2| e2.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             reg.remove(&id);
-            PagedbError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("{:?}", e),
-            ))
+            PagedbError::Io(std::io::Error::other(format!("{e:?}")))
         })?;
 
         rx.await.map_err(|_| {
-            PagedbError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "worker channel closed unexpectedly",
-            ))
+            PagedbError::Io(std::io::Error::other("worker channel closed unexpectedly"))
         })
     }
 
@@ -263,7 +216,7 @@ impl OpfsVfs {
         self.0
             .weak_self
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upgrade()
     }
 }
@@ -288,7 +241,7 @@ impl Vfs for OpfsVfs {
 
         let result = self
             .dispatch(OpfsOp::Open {
-                path: path.to_string(),
+                path: self.resolve(path),
                 create,
                 create_new,
                 read_only,
@@ -313,7 +266,7 @@ impl Vfs for OpfsVfs {
     async fn remove(&self, path: &str) -> Result<()> {
         match self
             .dispatch(OpfsOp::Remove {
-                path: path.to_string(),
+                path: self.resolve(path),
             })
             .await?
         {
@@ -326,8 +279,8 @@ impl Vfs for OpfsVfs {
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         match self
             .dispatch(OpfsOp::Rename {
-                from: from.to_string(),
-                to: to.to_string(),
+                from: self.resolve(from),
+                to: self.resolve(to),
             })
             .await?
         {
@@ -340,7 +293,7 @@ impl Vfs for OpfsVfs {
     async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         match self
             .dispatch(OpfsOp::ListDir {
-                path: path.to_string(),
+                path: self.resolve(path),
             })
             .await?
         {
@@ -353,7 +306,7 @@ impl Vfs for OpfsVfs {
     async fn mkdir_all(&self, path: &str) -> Result<()> {
         match self
             .dispatch(OpfsOp::MkdirAll {
-                path: path.to_string(),
+                path: self.resolve(path),
             })
             .await?
         {
@@ -369,15 +322,16 @@ impl Vfs for OpfsVfs {
     }
 
     async fn lock_exclusive(&self, path: &str) -> Result<Self::LockHandle> {
+        let resolved = self.resolve(path);
         let acquired = self
             .0
             .locks
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .try_exclusive(path);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_exclusive(&resolved);
         if acquired {
             Ok(OpfsLockHandle {
-                path: path.to_string(),
+                path: resolved,
                 locks: Arc::clone(&self.0.locks),
             })
         } else {
@@ -386,15 +340,16 @@ impl Vfs for OpfsVfs {
     }
 
     async fn lock_shared(&self, path: &str) -> Result<Self::LockHandle> {
+        let resolved = self.resolve(path);
         let acquired = self
             .0
             .locks
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .try_shared(path);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_shared(&resolved);
         if acquired {
             Ok(OpfsLockHandle {
-                path: path.to_string(),
+                path: resolved,
                 locks: Arc::clone(&self.0.locks),
             })
         } else {
