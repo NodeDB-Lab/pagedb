@@ -293,7 +293,11 @@ impl<V: Vfs + Clone> SegmentReader<V> {
     }
 
     /// WASM stub — always returns `PagedbError::Unsupported`.
+    ///
+    /// Kept `async` to match the native `mmap_view` signature so callers compile
+    /// unchanged on both targets; the stub itself has nothing to await.
     #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::unused_async)]
     pub async fn mmap_view(&self, _extent: ExtentRef) -> Result<MmapView> {
         Err(PagedbError::Unsupported)
     }
