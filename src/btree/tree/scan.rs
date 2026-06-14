@@ -38,6 +38,20 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
+    /// Return the smallest key in the tree, or `None` if the tree is empty.
+    /// Descends the leftmost spine only — O(tree height), not O(tree size).
+    pub async fn first_key(&self) -> Result<Option<Vec<u8>>> {
+        if self.root_page_id == 0 {
+            return Ok(None);
+        }
+        // The empty key sorts below every stored key, so the descent lands on
+        // the leftmost leaf.
+        let path = self.path_to_leaf_for_key(&[]).await?;
+        let leaf_id = *path.last().expect("non-empty path");
+        let leaf = self.read_leaf(leaf_id).await?;
+        Ok(leaf.records.first().map(|(k, _)| k.clone()))
+    }
+
     /// Reverse range scan: `start` inclusive, `end` exclusive. Returns results
     /// in descending key order. Collects matching records forward then reverses.
     pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

@@ -146,12 +146,13 @@ impl DeepWalkReport {
 pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport> {
     let mut report = DeepWalkReport::default();
 
-    let (next_page_id, catalog_root, catalog_next) = {
+    let (next_page_id, catalog_root, catalog_next, free_list_root) = {
         let state = db.writer.lock().await;
         (
             state.next_page_id,
             state.catalog_root_page_id,
             state.next_page_id,
+            state.free_list_root_page_id,
         )
     };
 
@@ -163,7 +164,51 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     let realm_id = db.realm_id;
 
     // Collect the set of page IDs reachable from all live roots.
-    let reachable = collect_reachable_pages(db).await;
+    let mut reachable = collect_reachable_pages(db).await;
+
+    // Walk and validate the durable free-list chain. Reading it verifies each
+    // chain page's AEAD; a corrupt chain surfaces as a page issue. Validate the
+    // entries (in range, unique, and not also live), then account the chain's
+    // own pages and the free pages it tracks so they are not reported as
+    // orphans — they are legitimately owned by the free-list, not stray.
+    match crate::pager::freelist::read_chain(&db.pager, realm_id, free_list_root).await {
+        Ok((free_entries, chain_pages)) => {
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            for &(_cid, pid) in &free_entries {
+                if pid >= next_page_id {
+                    report.page_issues.push(PageIssue {
+                        page_id: pid,
+                        description: "free-list entry references a page past next_page_id"
+                            .to_string(),
+                    });
+                } else if reachable.contains(&pid) {
+                    report.page_issues.push(PageIssue {
+                        page_id: pid,
+                        description: "page is both live (reachable from a root) and free-listed"
+                            .to_string(),
+                    });
+                }
+                if !seen.insert(pid) {
+                    report.page_issues.push(PageIssue {
+                        page_id: pid,
+                        description: "duplicate free-list entry".to_string(),
+                    });
+                }
+            }
+            for p in chain_pages {
+                reachable.insert(p);
+            }
+            for (_cid, pid) in free_entries {
+                reachable.insert(pid);
+            }
+        }
+        Err(e) => {
+            report.page_issues.push(PageIssue {
+                page_id: free_list_root,
+                description: format!("free-list chain unreadable: {e}"),
+            });
+        }
+    }
 
     let vfs: &V = &db.vfs;
     let main_file_res = vfs.open(main_db_path, OpenMode::Read).await;

@@ -52,14 +52,18 @@ pub struct BTree<V: Vfs> {
     /// parallel-AEAD flush. In-place mutation by subsequent puts targeting
     /// the same leaf is allowed; no further allocation needed.
     pub(super) fresh_leaves: HashMap<u64, Leaf>,
-    /// Cross-commit pool of pre-vetted reusable page IDs, shared (via `Arc`)
-    /// across all `BTree`s opened by the same `Db`. Allocation pops from
-    /// here before bumping `next_page_id`, keeping the file size bounded
-    /// when `OpenOptions::skip_freelist_persistence_when_no_readers` orphans
-    /// would otherwise accumulate. `None` for callers that haven't wired a
-    /// shared cache (compaction, history tree) — those keep bump-only
-    /// allocation.
+    /// Cross-commit pool of reusable page IDs, shared (via `Arc`) across the
+    /// main, catalog, and history `BTree`s of one `Db`. Allocation pops from
+    /// here before bumping `next_page_id`, recycling pages freed by earlier
+    /// commits (once no reader or retained-history root can observe them) so
+    /// the file stays bounded under sustained writes. `None` for callers that
+    /// haven't wired a shared cache (e.g. compaction's repack trees), which
+    /// keep bump-only allocation.
     pub(super) free_page_cache: Option<Arc<parking_lot::Mutex<Vec<u64>>>>,
+    /// Sink recording page ids drawn from `free_page_cache` and reused this
+    /// session. The commit path removes them from the durable free-list (they
+    /// now hold live committed data). Shared (via `Arc`) across the txn's trees.
+    pub(super) free_page_consumed: Option<Arc<parking_lot::Mutex<Vec<u64>>>>,
     /// Last key successfully appended via [`Self::put_append`]. Used to
     /// enforce the monotonic-key invariant on subsequent calls and to
     /// invalidate the cached path when any non-append mutation (regular
@@ -96,6 +100,7 @@ impl<V: Vfs> BTree<V> {
             dirty_parent_paths: HashMap::new(),
             fresh_leaves: HashMap::new(),
             free_page_cache: None,
+            free_page_consumed: None,
             append_last_key: None,
             append_cached_path: None,
         }
@@ -110,22 +115,18 @@ impl<V: Vfs> BTree<V> {
     }
 
     /// Wire in the `Db`'s shared free-page cache. After this call,
-    /// `allocate_page` will pop from the shared pool before bumping
-    /// `next_page_id`. Pages pushed into the pool by an earlier writer
-    /// commit (via [`Self::push_to_shared_cache`]) become reusable here.
+    /// `allocate_page` pops from the shared pool before bumping `next_page_id`.
+    /// The pool is loaded at `begin_write` with the durable free-list's
+    /// floor-safe pages, so recycling from it is always snapshot-safe.
     pub fn set_free_page_cache(&mut self, cache: Arc<parking_lot::Mutex<Vec<u64>>>) {
         self.free_page_cache = Some(cache);
     }
 
-    /// Push `page_ids` into the shared free-page cache, if one is wired.
-    /// Used by the writer commit path when the no-reader fast-free option
-    /// is active: instead of orphaning freed pages, hand them to the next
-    /// txn's allocator.
-    pub fn push_to_shared_cache(&self, page_ids: &[u64]) {
-        if let Some(cache) = &self.free_page_cache {
-            let mut guard = cache.lock();
-            guard.extend(page_ids.iter().copied());
-        }
+    /// Wire the shared sink that records cache pages reused this session, so the
+    /// commit path can remove them from the durable free-list. Set alongside
+    /// [`Self::set_free_page_cache`].
+    pub fn set_free_page_consumed(&mut self, consumed: Arc<parking_lot::Mutex<Vec<u64>>>) {
+        self.free_page_consumed = Some(consumed);
     }
 
     #[must_use]
@@ -148,34 +149,31 @@ impl<V: Vfs> BTree<V> {
     }
 
     pub(super) fn allocate_page(&mut self) -> u64 {
-        // Reuse a freed page only if it is at or above the reuse threshold.
-        // Pages below the threshold may still be live in pinned reader snapshots.
+        // First, recycle a page freed earlier *in this same session*, gated by
+        // the reuse threshold: a page below it may still be live in a pinned
+        // reader's snapshot, so it can't be reused until the durable free-list
+        // clears it (it leaves via `drain_freed` at commit instead).
         if self.reuse_threshold == 0 {
-            // No readers pinned: recycle freely.
             if let Some(id) = self.freed.pop() {
                 return id;
             }
-            // Consult the cross-commit shared cache (pages handed off by
-            // earlier writer commits under the no-reader fast-free option).
-            // Only safe to draw from this when no readers are pinned — the
-            // cache contract is "always safe to immediately reuse."
-            if let Some(cache) = &self.free_page_cache {
-                if let Some(id) = cache.lock().pop() {
-                    return id;
+        } else if let Some(pos) = self
+            .freed
+            .iter()
+            .rposition(|&id| id >= self.reuse_threshold)
+        {
+            return self.freed.remove(pos);
+        }
+        // Then draw from the shared cross-commit cache. It is loaded at txn
+        // begin with *only* free-list pages below the reclamation floor — pages
+        // no live reader and no retained-history root can observe — so reusing
+        // them is safe regardless of `reuse_threshold`. Record each draw so the
+        // commit path removes it from the durable free-list.
+        if let Some(cache) = &self.free_page_cache {
+            if let Some(id) = cache.lock().pop() {
+                if let Some(consumed) = &self.free_page_consumed {
+                    consumed.lock().push(id);
                 }
-            }
-        } else {
-            // Readers pinned: only recycle pages that were allocated during
-            // this session (>= reuse_threshold) and thus cannot be in any
-            // prior snapshot. The shared cache is bypassed here because
-            // pages in it predate this session and may be visible to a
-            // pinned reader at an older commit.
-            if let Some(pos) = self
-                .freed
-                .iter()
-                .rposition(|&id| id >= self.reuse_threshold)
-            {
-                let id = self.freed.remove(pos);
                 return id;
             }
         }

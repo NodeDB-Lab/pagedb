@@ -48,6 +48,10 @@ pub(crate) struct WriterState {
     pub seq: u64,
     pub catalog_root_page_id: u64,
     pub catalog_root_txn_id: u64,
+    /// Head page id of the durable free-list chain (0 = empty). Stored in the
+    /// A/B header's `free_list_root` slot and rewritten atomically with each
+    /// commit. See [`crate::pager::freelist`].
+    pub free_list_root_page_id: u64,
     /// Root page id of the commit-history B+ tree (0 = not yet created).
     pub commit_history_root_page_id: u64,
     /// Version / `txn_id` of the commit-history tree's last write.
@@ -117,14 +121,18 @@ pub struct Db<V: Vfs + Clone> {
     /// `PinHandle` so durable-pin commit paths can also publish.
     pub(crate) snapshot: Arc<parking_lot::RwLock<ReaderSnapshot>>,
     /// Cross-commit cache of page IDs known to be safely reusable. Populated
-    /// on commit when `skip_freelist_persistence_when_no_readers` is enabled
-    /// and no readers were pinned: instead of orphaning freed pages, recycle
-    /// them in-memory so the next writer txn's `allocate_page` pops from
-    /// here before bumping `next_page_id`. Keeps the file size bounded under
-    /// the fast-free option. Shared with each session's `BTree` via the same
-    /// `Arc` so all three trees in a txn (main, catalog, history) draw from
-    /// the same pool.
+    /// after each commit with the pages it freed that no live reader and no
+    /// retained commit-history root can still observe; the next writer txn's
+    /// `allocate_page` pops from here before bumping `next_page_id`, keeping the
+    /// file size bounded under sustained writes. Shared with each session's
+    /// `BTree` via the same `Arc` so all three trees in a txn (main, catalog,
+    /// history) draw from the same pool. Cleared by `compact_now`'s full repack,
+    /// which relocates pages and invalidates every cached id.
     pub(crate) free_page_cache: Arc<parking_lot::Mutex<Vec<u64>>>,
+    /// Per-txn sink (cleared at `begin_write`) recording page ids the allocator
+    /// drew from `free_page_cache`. The commit path removes them from the
+    /// durable free-list — they now hold live committed data.
+    pub(crate) free_page_consumed: Arc<parking_lot::Mutex<Vec<u64>>>,
 }
 
 /// Reader-visible state, refreshed by the writer at commit time.
@@ -146,6 +154,23 @@ pub(super) fn encode_root_ref(page_id: u64, txn_id: u64) -> [u8; 16] {
     bytes
 }
 
+/// Encode the header's `free_list_root` slot from the free-list chain head page
+/// id (low 8 bytes, LE; remaining bytes reserved/zero).
+#[must_use]
+pub(crate) fn encode_free_list_root(head_page_id: u64) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&head_page_id.to_le_bytes());
+    bytes
+}
+
+/// Decode the free-list chain head page id from the header's `free_list_root`.
+#[must_use]
+pub(crate) fn decode_free_list_root(raw: &[u8; 16]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&raw[..8]);
+    u64::from_le_bytes(b)
+}
+
 /// Variable fields supplied per call site when assembling a
 /// [`MainDbHeaderFields`] for a writer header commit. The constant fields
 /// (`format_version`, `flags`, identity bytes, and the always-zero
@@ -163,6 +188,10 @@ pub(super) struct HeaderFieldsParams {
     pub commit_history_root_page_id: u64,
     pub commit_history_root_version: u64,
     pub next_page_id: u64,
+    /// Head page id of the durable free-list chain to record in the header.
+    /// Header writes that don't touch the free list pass the current
+    /// `state.free_list_root_page_id` so it is preserved across the swap.
+    pub free_list_root_page_id: u64,
 }
 
 impl<V: Vfs + Clone> Db<V> {
@@ -185,7 +214,7 @@ impl<V: Vfs + Clone> Db<V> {
             active_root_txn_id: params.active_root_txn_id,
             counter_anchor: params.counter_anchor,
             commit_id: CommitId(params.commit_id),
-            free_list_root: [0; 16],
+            free_list_root: encode_free_list_root(params.free_list_root_page_id),
             catalog_root: params.catalog_root,
             apply_journal_root_page_id: 0,
             apply_journal_root_version: 0,
