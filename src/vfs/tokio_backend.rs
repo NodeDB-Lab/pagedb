@@ -419,6 +419,18 @@ impl Vfs for TokioVfs {
         let dir = match std::fs::File::open(&p) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // Opening a directory as a file handle is unsupported on some
+            // platforms — notably Windows, where it fails with PermissionDenied
+            // ("Access is denied") at open, before sync_all is ever reached.
+            // Directory fsync is best-effort there, so treat it as a no-op.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(());
+            }
             Err(e) => return Err(PagedbError::Io(e)),
         };
         match dir.sync_all() {
