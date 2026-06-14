@@ -95,6 +95,19 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # nextest compiles the dev-dependency graph (incl. rocksdb →
+      # librocksdb-sys → bindgen → libclang). Windows runner images ship LLVM;
+      # Linux and macOS need it installed.
+      - name: Install LLVM/Clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - name: Install LLVM/Clang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: test-${{ matrix.os }}
@@ -224,6 +237,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # cargo bench builds the dev-dependency graph (rocksdb → librocksdb-sys →
+      # bindgen → libclang), even when only the btree/segment benches are named.
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
