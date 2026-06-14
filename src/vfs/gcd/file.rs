@@ -92,6 +92,117 @@ impl Drop for GcdFile {
     }
 }
 
+/// Submit a `dispatch_io` read and return immediately. Kept synchronous on
+/// purpose: the handler `RcBlock` and the raw block pointer derived from it are
+/// `!Send`, so they must never be live across an await point in the calling
+/// future (`VfsFile::read_at` must return a `Send` future). The handler
+/// accumulates chunks and, on completion, sends the result through `tx`.
+fn submit_read(
+    channel: &DispatchIO,
+    queue: &DispatchQueue,
+    offset: u64,
+    len: usize,
+    tx: tokio::sync::oneshot::Sender<std::io::Result<Vec<u8>>>,
+) {
+    let accum: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(len)));
+    let sender = Arc::new(Mutex::new(Some(tx)));
+
+    // block2 cannot encode `bool` or `*mut DispatchData` directly (the
+    // dispatch_object! types don't implement `RefEncode`). We declare the
+    // closure with ABI-compatible stand-ins — `u8` for bool and `*mut c_void`
+    // for DispatchData — and transmute the resulting block pointer to the
+    // dispatch_io_handler_t signature. dispatch2's own `DispatchData::to_vec`
+    // uses the same workaround (see data.rs:114).
+    let handler: RcBlock<dyn Fn(u8, *mut c_void, libc::c_int)> =
+        RcBlock::new(move |done: u8, data: *mut c_void, error: libc::c_int| {
+            if !data.is_null() {
+                let d: &DispatchData =
+                    // SAFETY: dispatch guarantees `data` (when non-null) is a
+                    // valid `DispatchData` retained for the handler's duration.
+                    unsafe { &*data.cast::<DispatchData>() };
+                let bytes = d.to_vec();
+                accum.lock().extend_from_slice(&bytes);
+            }
+            if done != 0 {
+                let result = if error != 0 {
+                    Err(std::io::Error::from_raw_os_error(error))
+                } else {
+                    Ok(std::mem::take(&mut *accum.lock()))
+                };
+                if let Some(s) = sender.lock().take() {
+                    let _ = s.send(result);
+                }
+            }
+        });
+
+    // SAFETY: transmute is from the stand-in block signature to the typedef
+    // declared by dispatch2 — the ABI is identical because `bool` and `u8`
+    // share the same one-byte ABI, and a `*mut DispatchData` is bit-identical
+    // to a `*mut c_void`.
+    let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> = unsafe {
+        std::mem::transmute::<
+            *mut Block<dyn Fn(u8, *mut c_void, libc::c_int)>,
+            *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>,
+        >(RcBlock::as_ptr(&handler))
+    };
+
+    // SAFETY: channel and queue are valid (owned by the caller's `GcdFile`);
+    // the handler block is retained by libdispatch on submission.
+    unsafe {
+        #[allow(clippy::cast_possible_wrap)]
+        channel.read(offset as libc::off_t, len, queue, handler_ptr);
+    }
+    // libdispatch has retained the block internally; we can drop our Rc.
+    drop(handler);
+}
+
+/// Submit a `dispatch_io` write and return immediately. Synchronous for the
+/// same reason as [`submit_read`]: the handler block, its raw pointer, and the
+/// `DispatchData` are all `!Send` and must not cross an await point.
+fn submit_write(
+    channel: &DispatchIO,
+    queue: &DispatchQueue,
+    offset: u64,
+    buf: &[u8],
+    tx: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+) {
+    let data = DispatchData::from_bytes(buf);
+    let sender = Arc::new(Mutex::new(Some(tx)));
+
+    // Same bool→u8 / *mut DispatchData→*mut c_void workaround as `submit_read`.
+    let handler: RcBlock<dyn Fn(u8, *mut c_void, libc::c_int)> = RcBlock::new(
+        move |done: u8, _remaining: *mut c_void, error: libc::c_int| {
+            if done != 0 {
+                let result = if error != 0 {
+                    Err(std::io::Error::from_raw_os_error(error))
+                } else {
+                    Ok(())
+                };
+                if let Some(s) = sender.lock().take() {
+                    let _ = s.send(result);
+                }
+            }
+        },
+    );
+
+    // SAFETY: ABI-compatible transmute; see `submit_read`.
+    let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> = unsafe {
+        std::mem::transmute::<
+            *mut Block<dyn Fn(u8, *mut c_void, libc::c_int)>,
+            *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>,
+        >(RcBlock::as_ptr(&handler))
+    };
+
+    // SAFETY: channel/queue/data all valid; libdispatch retains both the data
+    // object and the handler block for the operation's duration.
+    unsafe {
+        #[allow(clippy::cast_possible_wrap)]
+        channel.write(offset as libc::off_t, &data, queue, handler_ptr);
+    }
+    drop(handler);
+    drop(data);
+}
+
 impl VfsFile for GcdFile {
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if buf.is_empty() {
@@ -99,60 +210,12 @@ impl VfsFile for GcdFile {
         }
         let len = buf.len();
         let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<Vec<u8>>>();
-        let accum: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(len)));
-        let sender = Arc::new(Mutex::new(Some(tx)));
-
-        // block2 cannot encode `bool` or `*mut DispatchData` directly (the
-        // dispatch_object! types don't implement `RefEncode`). We declare the
-        // closure with ABI-compatible stand-ins — `u8` for bool and
-        // `*mut c_void` for DispatchData — and transmute the resulting block
-        // pointer to the dispatch_io_handler_t signature. dispatch2's own
-        // `DispatchData::to_vec` uses the same workaround (see data.rs:114).
-        let accum_for_block = Arc::clone(&accum);
-        let sender_for_block = Arc::clone(&sender);
-        let handler: RcBlock<dyn Fn(u8, *mut c_void, libc::c_int)> =
-            RcBlock::new(move |done: u8, data: *mut c_void, error: libc::c_int| {
-                if !data.is_null() {
-                    let d: &DispatchData =
-                        // SAFETY: dispatch guarantees `data` (when non-null)
-                        // is a valid `DispatchData` retained for the
-                        // handler's duration.
-                        unsafe { &*data.cast::<DispatchData>() };
-                    let bytes = d.to_vec();
-                    accum_for_block.lock().extend_from_slice(&bytes);
-                }
-                if done != 0 {
-                    let result = if error != 0 {
-                        Err(std::io::Error::from_raw_os_error(error))
-                    } else {
-                        Ok(std::mem::take(&mut *accum_for_block.lock()))
-                    };
-                    if let Some(s) = sender_for_block.lock().take() {
-                        let _ = s.send(result);
-                    }
-                }
-            });
-
-        // SAFETY: transmute is from the stand-in block signature to the
-        // typedef declared by dispatch2 — the ABI is identical because `bool`
-        // and `u8` share the same one-byte ABI, and a `*mut DispatchData` is
-        // bit-identical to a `*mut c_void`.
-        let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> = unsafe {
-            std::mem::transmute::<
-                *mut Block<dyn Fn(u8, *mut c_void, libc::c_int)>,
-                *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>,
-            >(RcBlock::as_ptr(&handler))
-        };
-
-        // SAFETY: the channel and queue are valid (held by `self`); the
-        // handler block is retained by libdispatch on submission.
-        unsafe {
-            #[allow(clippy::cast_possible_wrap)]
-            self.channel
-                .read(offset as libc::off_t, len, &self.queue, handler_ptr);
-        }
-        // libdispatch has retained the block internally; we can drop our Rc.
-        drop(handler);
+        // The handler block and its raw block pointer are `!Send`; submitting
+        // from a synchronous helper keeps them out of this future's state
+        // machine, so the future stays `Send` as `VfsFile` requires. Once
+        // submitted, libdispatch owns the operation and reports back through the
+        // oneshot, which is all we await here.
+        submit_read(&self.channel, &self.queue, offset, len, tx);
 
         let data = rx
             .await
@@ -184,45 +247,9 @@ impl VfsFile for GcdFile {
             return Ok(0);
         }
         let len = buf.len();
-        let data = DispatchData::from_bytes(buf);
         let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
-        let sender = Arc::new(Mutex::new(Some(tx)));
-
-        // Same bool→u8 / *mut DispatchData→*mut c_void workaround as
-        // `read_at`. See comments there.
-        let sender_for_block = Arc::clone(&sender);
-        let handler: RcBlock<dyn Fn(u8, *mut c_void, libc::c_int)> = RcBlock::new(
-            move |done: u8, _remaining: *mut c_void, error: libc::c_int| {
-                if done != 0 {
-                    let result = if error != 0 {
-                        Err(std::io::Error::from_raw_os_error(error))
-                    } else {
-                        Ok(())
-                    };
-                    if let Some(s) = sender_for_block.lock().take() {
-                        let _ = s.send(result);
-                    }
-                }
-            },
-        );
-
-        // SAFETY: ABI-compatible transmute; see `read_at`.
-        let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> = unsafe {
-            std::mem::transmute::<
-                *mut Block<dyn Fn(u8, *mut c_void, libc::c_int)>,
-                *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>,
-            >(RcBlock::as_ptr(&handler))
-        };
-
-        // SAFETY: channel/queue/data all valid; libdispatch retains both the
-        // data object and the handler block for the operation's duration.
-        unsafe {
-            #[allow(clippy::cast_possible_wrap)]
-            self.channel
-                .write(offset as libc::off_t, &data, &self.queue, handler_ptr);
-        }
-        drop(handler);
-        drop(data);
+        // `!Send` handler/data confined to a synchronous helper; see `read_at`.
+        submit_write(&self.channel, &self.queue, offset, buf, tx);
 
         rx.await
             .map_err(|_| PagedbError::Io(std::io::Error::other("dispatch_io write cancelled")))?
