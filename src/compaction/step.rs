@@ -8,7 +8,6 @@ use crate::pager::header::commit_header;
 use crate::txn::db::Db;
 use crate::vfs::{Vfs, VfsFile};
 
-use super::freelist::drain_deferred_to_freelist;
 use super::helpers::{
     collect_all_pairs, collect_catalog_split, collect_range_limited, load_compaction_state,
     load_frontier_page_id, make_header_fields, next_key_after,
@@ -35,8 +34,14 @@ pub async fn compact_step<V: Vfs + Clone>(
 
     let mut state = db.writer.lock().await;
 
-    // ── Determine reader presence ─────────────────────────────────────────────
-    let (has_readers, min_reader_commit) = {
+    // Relocation/truncation below invalidates cached reuse page ids; drop them.
+    db.free_page_cache.lock().clear();
+
+    // ── Refuse while readers are pinned ───────────────────────────────────────
+    // Relocation/truncation is unsafe under a pinned reader (in-process or
+    // cross-process durable). Runtime free-page reuse reclaims space on ordinary
+    // commits, so compaction simply waits for the readers to drop.
+    let has_readers = {
         let in_mem_min = {
             let readers = db.tracked_readers.lock();
             readers
@@ -48,89 +53,12 @@ pub async fn compact_step<V: Vfs + Clone>(
         let durable_min = db
             .min_durable_reader_commit(state.catalog_root_page_id, state.next_page_id)
             .await;
-        let min = in_mem_min.min(durable_min);
-        let has = min < u64::MAX;
-        (has, min)
+        in_mem_min.min(durable_min) < u64::MAX
     };
-
     if has_readers {
-        // With readers pinned we can only drain eligible deferred-free entries.
-        let (cat_non_housekeeping, deferred_pairs) =
-            collect_catalog_split(&db.pager, db.realm_id, &state).await?;
-        let (eligible_free, still_deferred): (Vec<_>, Vec<_>) = deferred_pairs
-            .into_iter()
-            .partition(|(commit_id, _)| *commit_id < min_reader_commit);
-
-        if eligible_free.is_empty() {
-            let wm = load_frontier_page_id(&db.pager, db.realm_id, &state).await;
-            return Ok(CompactProgress {
-                pages_relocated: 0,
-                bytes_freed: 0,
-                more_work: true,
-                watermark: wm,
-            });
-        }
-
-        let mut cat_tree = BTree::open(
-            db.pager.clone(),
-            db.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            db.page_size,
-        );
-        for (_cid, page_id) in &eligible_free {
-            let key = Catalog::free_list_key(*page_id);
-            cat_tree.put(&key, &[]).await?;
-        }
-        let dk = Catalog::deferred_free_key();
-        if still_deferred.is_empty() {
-            let _ = cat_tree.delete(&dk).await;
-        } else {
-            let encoded = Catalog::encode_deferred_free(&still_deferred);
-            cat_tree.put(&dk, &encoded).await?;
-        }
-        let _ = cat_non_housekeeping;
-        cat_tree.flush().await?;
-        let new_cat_root = cat_tree.root_page_id();
-        let new_next = cat_tree.next_page_id().max(state.next_page_id);
-
-        let new_commit_id = state.latest_commit_id + 1;
-        let new_seq = state.seq + 1;
-        let counter_anchor = db.pager.pending_anchor();
-        let fields = make_header_fields(
-            db,
-            &state,
-            new_commit_id,
-            new_seq,
-            counter_anchor,
-            state.root_page_id,
-            new_cat_root,
-            new_next,
-        );
-        let hk_clone = { db.hk.read().clone() };
-        let new_slot = commit_header(
-            &*db.vfs,
-            &db.main_db_path,
-            &hk_clone,
-            &fields,
-            state.active_slot,
-            db.page_size,
-        )
-        .await?;
-        db.pager.commit_anchor(counter_anchor)?;
-        state.catalog_root_page_id = new_cat_root;
-        state.next_page_id = new_next;
-        state.active_slot = new_slot;
-        state.seq = new_seq;
-        state.latest_commit_id = new_commit_id;
-        state.commit_history_root_page_id = 0;
-        state.commit_history_root_version = 0;
-        db.latest_commit
-            .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
-
         let wm = load_frontier_page_id(&db.pager, db.realm_id, &state).await;
         return Ok(CompactProgress {
-            pages_relocated: eligible_free.len() as u64,
+            pages_relocated: 0,
             bytes_freed: 0,
             more_work: true,
             watermark: wm,
@@ -202,14 +130,7 @@ pub async fn compact_step<V: Vfs + Clone>(
             Vec::new()
         };
 
-        let (cat_non_housekeeping, deferred_pairs) =
-            collect_catalog_split(&db.pager, db.realm_id, &state).await?;
-
-        let (eligible_free, still_deferred): (Vec<_>, Vec<_>) = deferred_pairs
-            .into_iter()
-            .partition(|(commit_id, _)| *commit_id < min_reader_commit);
-
-        let free_pages_before = eligible_free.len() as u64;
+        let cat_rows = collect_catalog_split(&db.pager, db.realm_id, &state).await?;
 
         let mut new_main = BTree::open(db.pager.clone(), db.realm_id, 0, 4, db.page_size);
         new_main.bulk_load(main_pairs).await?;
@@ -219,15 +140,10 @@ pub async fn compact_step<V: Vfs + Clone>(
 
         // Remove compaction-state row from the catalog being rebuilt.
         let cs_key_prefix = crate::catalog::codec::CatalogRowKind::CompactionState as u8;
-        let mut cat_all: Vec<(Vec<u8>, Vec<u8>)> = cat_non_housekeeping
+        let mut cat_all: Vec<(Vec<u8>, Vec<u8>)> = cat_rows
             .into_iter()
             .filter(|(k, _)| k.first() != Some(&cs_key_prefix))
             .collect();
-        if !still_deferred.is_empty() {
-            let dk = Catalog::deferred_free_key();
-            let encoded = Catalog::encode_deferred_free(&still_deferred);
-            cat_all.push((dk, encoded));
-        }
         cat_all.sort_by(|(a, _), (b, _)| a.cmp(b));
         let mut new_cat = BTree::open(db.pager.clone(), db.realm_id, 0, after_main, db.page_size);
         new_cat.bulk_load(cat_all).await?;
@@ -235,13 +151,12 @@ pub async fn compact_step<V: Vfs + Clone>(
         let new_cat_root = new_cat.root_page_id();
         let new_next = new_cat.next_page_id();
 
-        let pages_reclaimed = old_next_page_id
-            .saturating_sub(new_next)
-            .saturating_add(free_pages_before);
+        let pages_reclaimed = old_next_page_id.saturating_sub(new_next);
 
         let new_commit_id = state.latest_commit_id + 1;
         let new_seq = state.seq + 1;
         let counter_anchor = db.pager.pending_anchor();
+        // Dense repack: the relocated layout starts with an empty free-list.
         let fields = make_header_fields(
             db,
             &state,
@@ -251,6 +166,7 @@ pub async fn compact_step<V: Vfs + Clone>(
             new_root,
             new_cat_root,
             new_next,
+            0,
         );
         let hk_clone = { db.hk.read().clone() };
         let new_slot = commit_header(
@@ -272,6 +188,7 @@ pub async fn compact_step<V: Vfs + Clone>(
         state.latest_commit_id = new_commit_id;
         state.commit_history_root_page_id = 0;
         state.commit_history_root_version = 0;
+        state.free_list_root_page_id = 0;
         db.latest_commit
             .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
 
@@ -301,7 +218,6 @@ pub async fn compact_step<V: Vfs + Clone>(
         .last()
         .map_or_else(|| frontier_key.clone(), |(k, _)| k.clone());
 
-    // Build catalog tree with deferred-free drained, then update watermark.
     let mut cat_tree = BTree::open(
         db.pager.clone(),
         db.realm_id,
@@ -309,12 +225,11 @@ pub async fn compact_step<V: Vfs + Clone>(
         state.next_page_id,
         db.page_size,
     );
-    // Drain all deferred-free into free-list (no readers pinned).
-    drain_deferred_to_freelist(&mut cat_tree, u64::MAX).await?;
 
     // Re-insert the batch: delete+put forces page reallocation to low-address
-    // free slots. Pages freed by delete are added to the free-list immediately
-    // (no readers), so the subsequent put can reuse them.
+    // free slots. Pages freed by the delete are recycled within this same txn
+    // (the allocator pops the per-session freed list), so the subsequent put
+    // reuses them — densifying the layout into the low page-id range.
     let mut main_tree = BTree::open(
         db.pager.clone(),
         db.realm_id,
@@ -325,13 +240,6 @@ pub async fn compact_step<V: Vfs + Clone>(
     for (k, v) in &pairs_batch {
         main_tree.delete(k).await?;
         main_tree.put(k, v).await?;
-    }
-
-    // Freed pages from main_tree deletions: add to catalog free-list directly.
-    let freed_by_tree = main_tree.drain_freed();
-    for pid in freed_by_tree {
-        let key = Catalog::free_list_key(pid);
-        cat_tree.put(&key, &[]).await?;
     }
 
     main_tree.flush().await?;
@@ -371,6 +279,10 @@ pub async fn compact_step<V: Vfs + Clone>(
     let new_commit_id = state.latest_commit_id + 1;
     let new_seq = state.seq + 1;
     let counter_anchor = db.pager.pending_anchor();
+    // An intermediate step only relocates main-tree pages; it touches neither
+    // the durable free-list chain nor its free pages, so the free-list stays
+    // valid and is preserved across the step (the pre-existing free pages remain
+    // reusable by ordinary writes). The final dense-repack batch resets it.
     let fields = make_header_fields(
         db,
         &state,
@@ -380,6 +292,7 @@ pub async fn compact_step<V: Vfs + Clone>(
         new_main_root,
         final_cat_root,
         final_next,
+        state.free_list_root_page_id,
     );
     let hk_clone = { db.hk.read().clone() };
     let new_slot = commit_header(

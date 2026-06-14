@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod core;
 pub mod format;
+pub mod freelist;
 pub mod header;
 
 pub use cache::PageCache;

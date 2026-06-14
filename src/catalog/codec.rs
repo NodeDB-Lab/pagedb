@@ -23,16 +23,9 @@ pub enum CatalogRowKind {
     /// (singleton; no name suffix). Value is `RekeyState` encoded as 13 bytes:
     /// `target_mk_epoch[8] || main_db_done[1] || segments_remaining_idx[4]`.
     RekeyState = 0x03,
-    /// Persistent free-list entry. Key is `[0x04] || page_id_big_endian[8]`
-    /// (big-endian so lexicographic sort matches numeric order). Value is empty.
-    FreeList = 0x04,
-    /// Deferred-free queue. Singleton row; key is `[0x05]`. Value is a
-    /// length-prefixed list of `(commit_id[8] || page_id[8])` pairs, in
-    /// ascending `commit_id` order. Pages here are not yet safe to reallocate
-    /// because a reader snapshot at or before that `commit_id` may still observe
-    /// them. Pairs are promoted to the free-list once no tracked reader pins
-    /// a `commit_id` ≤ the pair's `commit_id`.
-    DeferredFree = 0x05,
+    // 0x04 and 0x05 are reserved: they were the in-catalog free-list and
+    // deferred-free queue, superseded by the durable free-list chain rooted in
+    // the A/B header (see `crate::pager::freelist`). Do not reuse these bytes.
     /// Durable reader pin. One row per active cross-process read transaction.
     /// Key: `[0x06] || pid_u32_be[4] || lease_id_u64_be[8]` (13 bytes).
     /// Value: `commit_id[8] || root_page_id[8] || catalog_root_page_id[8] ||
@@ -198,56 +191,6 @@ impl Catalog {
     #[must_use]
     pub fn rekey_state_key() -> Vec<u8> {
         vec![CatalogRowKind::RekeyState as u8]
-    }
-
-    /// Free-list entry key: `[0x04] || page_id_be[8]`.
-    /// Big-endian so lexicographic order == numeric order.
-    #[must_use]
-    pub fn free_list_key(page_id: u64) -> [u8; 9] {
-        let mut k = [0u8; 9];
-        k[0] = CatalogRowKind::FreeList as u8;
-        k[1..9].copy_from_slice(&page_id.to_be_bytes());
-        k
-    }
-
-    /// Deferred-free queue key: `[0x05]` (singleton).
-    #[must_use]
-    pub fn deferred_free_key() -> Vec<u8> {
-        vec![CatalogRowKind::DeferredFree as u8]
-    }
-
-    /// Encode a slice of `(commit_id, page_id)` pairs. Empty slice encodes to
-    /// empty bytes.
-    #[must_use]
-    pub fn encode_deferred_free(pairs: &[(u64, u64)]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(pairs.len() * 16);
-        for (commit_id, page_id) in pairs {
-            out.extend_from_slice(&commit_id.to_le_bytes());
-            out.extend_from_slice(&page_id.to_le_bytes());
-        }
-        out
-    }
-
-    /// Decode a deferred-free value. Returns `Err` if length is not a multiple
-    /// of 16.
-    pub fn decode_deferred_free(bytes: &[u8]) -> Result<Vec<(u64, u64)>> {
-        if bytes.len() % 16 != 0 {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
-        }
-        let mut out = Vec::with_capacity(bytes.len() / 16);
-        let mut i = 0;
-        while i + 16 <= bytes.len() {
-            let mut b8 = [0u8; 8];
-            b8.copy_from_slice(&bytes[i..i + 8]);
-            let commit_id = u64::from_le_bytes(b8);
-            b8.copy_from_slice(&bytes[i + 8..i + 16]);
-            let page_id = u64::from_le_bytes(b8);
-            out.push((commit_id, page_id));
-            i += 16;
-        }
-        Ok(out)
     }
 
     /// Encode a `RekeyStateRow` as 13 bytes.
