@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use crate::btree::BTree;
-use crate::catalog::codec::Catalog;
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::errors::PagedbError;
 use crate::pager::Pager;
@@ -101,10 +100,24 @@ pub(super) fn next_lease_id() -> u64 {
     ts ^ (seq.wrapping_mul(0x9e37_79b9_7f4a_7c15))
 }
 
-/// Scan the catalog for durable reader-pin rows that are either stale (written
-/// by the current PID from a previous process incarnation) or expired by wall
-/// clock. Delete all such rows in a single bulk catalog commit. Called at
-/// writer-open time to recover from reader crashes.
+/// Delete **every** durable reader-pin row in the catalog in a single bulk
+/// catalog commit. Called at writer-open time, and only for handle modes that
+/// hold the exclusive writer lock (Standalone / Follower).
+///
+/// Why deleting *all* pins is correct — not just own-PID or wall-clock-expired
+/// ones: durable pin rows are written exclusively by a Standalone writer's
+/// `begin_read` (other modes track readers in memory only). A Standalone /
+/// Follower handle holds the exclusive writer lock for its entire lifetime, and
+/// this cleanup runs while that lock is held at open, *before* any reader has
+/// been handed out on the new handle. Therefore no live reader of the current
+/// incarnation can own a pin row yet, and no other process can hold the writer
+/// lock concurrently. Every pin row present at this moment is a leftover from a
+/// prior, now-dead incarnation and is safe to remove.
+///
+/// This supersedes the earlier own-PID-or-expired heuristic, which could not
+/// remove a pin left by a *crashed* process running under a different PID until
+/// its 30 s lease expired — and which, combined with `min_durable_reader_commit`,
+/// let such a pin permanently block deferred-free drain and compaction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cleanup_stale_reader_pins<V: Vfs + Clone>(
     pager: &Arc<Pager<V>>,
@@ -122,8 +135,6 @@ pub(crate) async fn cleanup_stale_reader_pins<V: Vfs + Clone>(
     if state.catalog_root_page_id == 0 {
         return Ok(());
     }
-    let now = crate::txn::read::unix_now_seconds();
-    let own_pid = std::process::id();
     let tree = BTree::open(
         pager.clone(),
         realm_id,
@@ -135,29 +146,10 @@ pub(crate) async fn cleanup_stale_reader_pins<V: Vfs + Clone>(
     let end = crate::catalog::codec::Catalog::reader_pin_range_end();
     let rows = tree.collect_range(&start, &end).await?;
 
-    let stale_keys: Vec<Vec<u8>> = rows
-        .into_iter()
-        .filter_map(|(k, v)| {
-            // Key layout: [0x06] || pid_u32_be[4] || lease_id_u64_be[8]
-            if k.len() < 13 {
-                return Some(k);
-            }
-            let mut pid_buf = [0u8; 4];
-            pid_buf.copy_from_slice(&k[1..5]);
-            let row_pid = u32::from_be_bytes(pid_buf);
-            // Own-PID rows from prior incarnation (crash without cleanup).
-            if row_pid == own_pid {
-                return Some(k);
-            }
-            // Expired rows.
-            if let Ok(pv) = Catalog::decode_reader_pin(&v) {
-                if pv.expires_unix_seconds < now {
-                    return Some(k);
-                }
-            }
-            None
-        })
-        .collect();
+    // Every pin row present at writer open is a prior-incarnation leftover
+    // (see the function doc for the exclusive-writer-lock argument). Remove
+    // all of them.
+    let stale_keys: Vec<Vec<u8>> = rows.into_iter().map(|(k, _v)| k).collect();
 
     if stale_keys.is_empty() {
         return Ok(());
@@ -193,7 +185,7 @@ pub(crate) async fn cleanup_stale_reader_pins<V: Vfs + Clone>(
         active_root_txn_id: state.latest_commit_id,
         counter_anchor,
         commit_id: CommitId(new_commit_id),
-        free_list_root: [0u8; 16],
+        free_list_root: super::core::encode_free_list_root(state.free_list_root_page_id),
         catalog_root: catalog_root_bytes,
         apply_journal_root_page_id: 0,
         apply_journal_root_version: 0,
@@ -220,4 +212,105 @@ pub(crate) async fn cleanup_stale_reader_pins<V: Vfs + Clone>(
     state.latest_commit_id = new_commit_id;
     state.seq = new_seq;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::super::core::Db;
+    use crate::btree::BTree;
+    use crate::catalog::codec::Catalog;
+    use crate::txn::read::{insert_pin_row, make_pin_handle};
+    use crate::vfs::memory::MemVfs;
+    use crate::{OpenOptions, RealmId};
+
+    /// Count the durable reader-pin rows currently in the catalog.
+    async fn pin_row_count(db: &Db<MemVfs>) -> usize {
+        let (root, next) = {
+            let w = db.writer.lock().await;
+            (w.catalog_root_page_id, w.next_page_id)
+        };
+        if root == 0 {
+            return 0;
+        }
+        let tree = BTree::open(db.pager.clone(), db.realm_id, root, next, db.page_size);
+        let start = Catalog::reader_pin_range_start();
+        let end = Catalog::reader_pin_range_end();
+        tree.collect_range(&start, &end).await.unwrap().len()
+    }
+
+    /// A durable reader-pin row written by a *crashed* process running under a
+    /// different PID, with a lease far in the future, must be cleared the next
+    /// time a writer opens the store — otherwise it permanently pins an old
+    /// commit and blocks deferred-free drain / compaction. The old own-PID-or-
+    /// expired heuristic left such a row in place until its lease expired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_clears_foreign_pid_reader_pins() {
+        let vfs = MemVfs::new();
+        let kek = [3u8; 32];
+        let realm = RealmId::new([9u8; 16]);
+
+        // Create the store and a catalog root.
+        {
+            let db = Db::open(vfs.clone(), kek, 4096, realm, OpenOptions::default())
+                .await
+                .unwrap();
+            {
+                let mut w = db.begin_write().await.unwrap();
+                w.put(b"seed", b"v").await.unwrap();
+                w.commit().await.unwrap();
+            }
+
+            // Inject a durable pin row owned by a foreign PID with a lease
+            // ~28 hours in the future (definitely not expired).
+            {
+                let mut state = db.writer.lock().await;
+                let foreign_pid = std::process::id().wrapping_add(0x5151);
+                let pin = make_pin_handle(
+                    db.pager.clone(),
+                    db.realm_id,
+                    db.page_size,
+                    db.main_db_path.clone(),
+                    db.vfs.clone(),
+                    db.hk.read().clone(),
+                    db.mk_epoch.load(Ordering::SeqCst),
+                    db.cipher_id,
+                    db.file_id,
+                    db.kek_salt,
+                    db.latest_commit.load(Ordering::SeqCst),
+                    db.snapshot.clone(),
+                    foreign_pid,
+                    0x777,
+                    100_000,
+                );
+                let (cid, root, cat) = (
+                    state.latest_commit_id,
+                    state.root_page_id,
+                    state.catalog_root_page_id,
+                );
+                insert_pin_row(&pin, &mut state, cid, root, cat)
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(
+                pin_row_count(&db).await,
+                1,
+                "foreign-PID pin row should be present before reopen"
+            );
+            // Drop the handle (releases the writer lock) without cleaning up —
+            // simulating the foreign writer's crash.
+        }
+
+        // Reopen as a writer: open-time cleanup must remove the foreign pin.
+        let db2 = Db::open(vfs.clone(), kek, 4096, realm, OpenOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            pin_row_count(&db2).await,
+            0,
+            "open must clear every durable reader-pin row left by a prior incarnation"
+        );
+    }
 }

@@ -222,3 +222,111 @@ async fn compact_now_completes_fully() {
         );
     }
 }
+
+// ─── Test: history is consistently discarded across compact_step (no dangling
+//     commit-history root in the durable header) ────────────────────────────
+#[tokio::test(flavor = "current_thread")]
+async fn compact_step_reopen_history_consistent() {
+    let vfs = MemVfs::new();
+    {
+        // Default options retain commit history (Count(1024)). Build several
+        // commits so a history tree exists, then incrementally compact through
+        // intermediate steps and a final dense repack.
+        let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+            .await
+            .unwrap();
+        for round in 0u32..15 {
+            let mut w = db.begin_write().await.unwrap();
+            for i in 0u32..30 {
+                w.put(format!("k{round:02}_{i:04}").as_bytes(), &[round as u8; 64])
+                    .await
+                    .unwrap();
+            }
+            w.commit().await.unwrap();
+        }
+        let budget = CompactBudget::new(5, 10_000); // small → intermediate steps + final
+        let mut iters = 0;
+        loop {
+            let p = db.compact_step(budget).await.unwrap();
+            iters += 1;
+            assert!(iters < 10_000, "compaction did not converge");
+            if !p.more_work {
+                break;
+            }
+        }
+        // Db drops here.
+    }
+
+    // Reopen. Before the fix, the header still pointed at the pre-repack
+    // commit-history root (overwritten/truncated by the dense repack), so the
+    // next write — which opens the history tree at that root — corrupted or
+    // errored. It must now be a clean reset (root = 0).
+    let db = Db::open_existing(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
+    {
+        let mut w = db.begin_write().await.unwrap();
+        w.put(b"after-reopen", b"v").await.unwrap();
+        w.commit().await.unwrap();
+    }
+    let r = db.begin_read().await.unwrap();
+    assert_eq!(
+        r.get(b"after-reopen").await.unwrap().as_deref(),
+        Some(&b"v"[..])
+    );
+    // Pre-compaction data survived the repack.
+    assert!(
+        r.get(b"k00_0000").await.unwrap().is_some(),
+        "data written before compaction must survive"
+    );
+}
+
+// ─── Test: an intermediate compact_step preserves the durable free-list ──────
+#[tokio::test(flavor = "current_thread")]
+async fn compact_step_preserves_free_list() {
+    // No commit history, so freed pages are immediately reclaimable and tracked
+    // in the durable free-list with no reader/history pinning them.
+    let opts = pagedb::options::OpenOptions::default()
+        .with_commit_history_retain(pagedb::options::RetainPolicy::Disabled);
+    let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, opts)
+        .await
+        .unwrap();
+
+    // Build a working set, then delete most of it to populate the free-list.
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0u32..300 {
+            w.put(format!("k{i:05}").as_bytes(), &[1u8; 128])
+                .await
+                .unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0u32..250 {
+            w.delete(format!("k{i:05}").as_bytes()).await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+    let pending_before = db.stats().await.unwrap().free_list_pending_entries;
+    assert!(
+        pending_before > 0,
+        "setup should have populated the free-list; got {pending_before}"
+    );
+
+    // One intermediate step (small budget so it is NOT the final batch).
+    let prog = db
+        .compact_step(CompactBudget::new(5, 10_000))
+        .await
+        .unwrap();
+    assert!(prog.more_work, "small budget should leave more work");
+
+    // The pre-existing free-list must survive the intermediate step, not be
+    // wiped — those pages are still reusable by ordinary writes.
+    let pending_after = db.stats().await.unwrap().free_list_pending_entries;
+    assert!(
+        pending_after >= pending_before,
+        "intermediate compact_step wiped the durable free-list: {pending_before} -> {pending_after}"
+    );
+}

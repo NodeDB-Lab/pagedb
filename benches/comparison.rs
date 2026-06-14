@@ -84,12 +84,11 @@ fn open_pagedb_fresh() -> PagedbBench {
         // Fair-comparison: redb has no equivalent commit-history index;
         // disable pagedb's so the bench measures the same feature surface.
         // (`Disabled` is a pagedb extension; not in the architecture spec.)
+        // With history disabled and no readers, the commit path recycles freed
+        // pages through the in-memory allocator cache without persisting a
+        // deferred-free row, so per-commit work matches redb's for a fair
+        // write-latency comparison.
         .with_commit_history_retain(RetainPolicy::Disabled)
-        // Fair-comparison: redb does not persist a deferred-free queue per
-        // commit. Opt into pagedb's fast-free path so write-latency numbers
-        // measure the same per-commit work. Production embedders that turn
-        // this on must compact periodically.
-        .with_skip_freelist_persistence_when_no_readers(true)
         .with_metrics_enabled(false)
         // Large bulk loads need a generous nonce budget per txn.
         .with_anchor_budget(10_000_000);

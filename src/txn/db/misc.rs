@@ -96,15 +96,22 @@ impl<V: Vfs + Clone> Db<V> {
         use std::sync::atomic::Ordering as AtOrd;
 
         // Gather writer-guarded values.
-        let (latest_commit_id, next_page_id, catalog_root, catalog_next) = {
+        let (latest_commit_id, next_page_id, catalog_root, catalog_next, free_list_root) = {
             let w = self.writer.lock().await;
             (
                 w.latest_commit_id,
                 w.next_page_id,
                 w.catalog_root_page_id,
                 w.next_page_id,
+                w.free_list_root_page_id,
             )
         };
+
+        // Durable free-list depth (chain rooted at the header's free_list_root).
+        let free_list_pending_entries =
+            crate::pager::freelist::read_chain(&self.pager, self.realm_id, free_list_root)
+                .await
+                .map_or(0, |(entries, _)| entries.len() as u64);
 
         // Main database file size.
         let main_db_bytes = match self
@@ -137,10 +144,9 @@ impl<V: Vfs + Clone> Db<V> {
         let pending_tombstones =
             u32::try_from(self.pending_tombstones.lock().len()).unwrap_or(u32::MAX);
 
-        // Segment stats and free-list counts from catalog.
-        let (segments_live, segments_total_bytes, free_list_pending_entries) = if catalog_root == 0
-        {
-            (0u32, 0u64, 0u64)
+        // Segment stats from catalog.
+        let (segments_live, segments_total_bytes) = if catalog_root == 0 {
+            (0u32, 0u64)
         } else {
             let tree = BTree::open(
                 self.pager.clone(),
@@ -150,7 +156,6 @@ impl<V: Vfs + Clone> Db<V> {
                 self.page_size,
             );
 
-            // Segments.
             let seg_start = vec![CatalogRowKind::Segment as u8];
             let mut seg_end = seg_start.clone();
             seg_end.push(0xFF);
@@ -165,26 +170,7 @@ impl<V: Vfs + Clone> Db<V> {
                 .map(|m| m.total_bytes)
                 .sum();
 
-            // Free-list entries (persistent free-list rows).
-            let fl_start = vec![CatalogRowKind::FreeList as u8];
-            let mut fl_end = fl_start.clone();
-            fl_end.push(0xFF);
-            let fl_rows = tree
-                .collect_range(&fl_start, &fl_end)
-                .await
-                .unwrap_or_default();
-            let fl_count = fl_rows.len() as u64;
-
-            // Deferred-free entries.
-            let df_key = Catalog::deferred_free_key();
-            let df_count = match tree.get(&df_key).await {
-                Ok(Some(bytes)) => {
-                    Catalog::decode_deferred_free(&bytes).map_or(0, |v| v.len() as u64)
-                }
-                _ => 0,
-            };
-
-            (seg_count, seg_bytes, fl_count + df_count)
+            (seg_count, seg_bytes)
         };
 
         Ok(DbStats {

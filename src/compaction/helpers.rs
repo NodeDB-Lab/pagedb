@@ -21,19 +21,17 @@ pub(super) async fn collect_all_pairs<V: Vfs + Clone>(
     tree.collect_range(&[], &[0xFF; 256]).await
 }
 
-/// Collect catalog pairs split into two groups:
-/// - `non_housekeeping`: all rows that are NOT free-list or deferred-free rows.
-/// - `deferred_pairs`: the decoded deferred-free queue entries.
-///
-/// Free-list rows are intentionally excluded; they will be reconstructed
-/// during compaction by promoting eligible deferred-free entries.
+/// Collect every catalog row, for rebuilding the catalog tree during a dense
+/// repack. Free pages are tracked in the durable free-list chain (reset
+/// separately by the repack), not in the catalog, so there are no housekeeping
+/// rows to filter here.
 pub(super) async fn collect_catalog_split<V: Vfs + Clone>(
     pager: &Arc<crate::pager::Pager<V>>,
     realm_id: crate::RealmId,
     state: &WriterState,
-) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(u64, u64)>)> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     if state.catalog_root_page_id == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Vec::new());
     }
     let tree = BTree::open(
         pager.clone(),
@@ -42,28 +40,7 @@ pub(super) async fn collect_catalog_split<V: Vfs + Clone>(
         state.next_page_id,
         pager.page_size(),
     );
-    let all = collect_all_pairs(&tree).await?;
-
-    let fl_byte = CatalogRowKind::FreeList as u8;
-    let df_key = Catalog::deferred_free_key();
-
-    let mut non_housekeeping: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut deferred_pairs: Vec<(u64, u64)> = Vec::new();
-
-    for (k, v) in all {
-        if k.first() == Some(&fl_byte) {
-            // Free-list row — drop; will be rebuilt from eligible deferred entries.
-            continue;
-        }
-        if k == df_key {
-            // Deferred-free row — decode separately.
-            deferred_pairs = Catalog::decode_deferred_free(&v)?;
-            continue;
-        }
-        non_housekeeping.push((k, v));
-    }
-
-    Ok((non_housekeeping, deferred_pairs))
+    collect_all_pairs(&tree).await
 }
 
 pub(super) async fn list_all_segments_inner<V: Vfs + Clone>(
@@ -284,7 +261,15 @@ pub(super) async fn load_frontier_page_id<V: Vfs + Clone>(
     }
 }
 
-/// Build [`MainDbHeaderFields`] for a commit.
+/// Build [`MainDbHeaderFields`] for a compaction commit.
+///
+/// Compaction relocates/truncates pages, so it discards the commit-history
+/// index (`commit_history_root = 0`) — exactly as `compact_now` does. Writing
+/// the *old* history root here would leave the durable header pointing at a
+/// history tree the repack just overwrote/truncated, so a later `begin_read_at`
+/// would read garbage. `free_list_root` is supplied by the caller: an
+/// intermediate step preserves the still-valid chain; the final dense repack
+/// passes 0 (the relocated layout starts with an empty free-list).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn make_header_fields<V: Vfs + Clone>(
     db: &Db<V>,
@@ -295,7 +280,9 @@ pub(super) fn make_header_fields<V: Vfs + Clone>(
     new_root: u64,
     new_cat_root: u64,
     new_next: u64,
+    free_list_root_page_id: u64,
 ) -> MainDbHeaderFields {
+    let _ = state;
     let mut catalog_root_bytes = [0u8; 16];
     catalog_root_bytes[..8].copy_from_slice(&new_cat_root.to_le_bytes());
     catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());
@@ -312,12 +299,12 @@ pub(super) fn make_header_fields<V: Vfs + Clone>(
         active_root_txn_id: new_commit_id,
         counter_anchor,
         commit_id: CommitId(new_commit_id),
-        free_list_root: [0u8; 16],
+        free_list_root: crate::txn::db::encode_free_list_root(free_list_root_page_id),
         catalog_root: catalog_root_bytes,
         apply_journal_root_page_id: 0,
         apply_journal_root_version: 0,
-        commit_history_root_page_id: state.commit_history_root_page_id,
-        commit_history_root_version: state.commit_history_root_version,
+        commit_history_root_page_id: 0,
+        commit_history_root_version: 0,
         restore_mode: 0,
         next_page_id: new_next,
         commit_retain_policy_tag: 0,

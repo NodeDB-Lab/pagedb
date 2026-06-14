@@ -14,4 +14,6 @@ mod snapshot;
 mod util;
 
 pub use core::Db;
-pub(crate) use core::{CommitHistoryMeta, PendingTombstone, ReaderSnapshot, WriterState};
+pub(crate) use core::{
+    CommitHistoryMeta, PendingTombstone, ReaderSnapshot, WriterState, encode_free_list_root,
+};

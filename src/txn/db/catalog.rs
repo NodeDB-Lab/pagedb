@@ -15,6 +15,42 @@ use super::core::{
 };
 
 impl<V: Vfs + Clone> Db<V> {
+    /// The oldest commit id still retained in the commit-history index, or
+    /// `None` when history is disabled or the index is empty. Pages reachable
+    /// from this commit's root (or any newer one) must not be recycled, so it
+    /// is one of the two floors gating free-page reclamation (the other is the
+    /// oldest live reader pin). Reads only the leftmost spine of the history
+    /// tree — O(height), not O(retained count).
+    pub(crate) async fn oldest_retained_history_commit(
+        &self,
+        commit_history_root_page_id: u64,
+        next_page_id: u64,
+    ) -> Result<Option<u64>> {
+        if matches!(
+            self.options.commit_history_retain,
+            crate::options::RetainPolicy::Disabled
+        ) || commit_history_root_page_id == 0
+        {
+            return Ok(None);
+        }
+        let hist = BTree::open(
+            self.pager.clone(),
+            self.realm_id,
+            commit_history_root_page_id,
+            next_page_id,
+            self.page_size,
+        );
+        let Some(key) = hist.first_key().await? else {
+            return Ok(None);
+        };
+        if key.len() < 8 {
+            return Ok(None);
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&key[..8]);
+        Ok(Some(u64::from_be_bytes(b)))
+    }
+
     /// Scan catalog counter rows and bump any whose stored value is less than
     /// `anchor` up to `anchor`. Called once at open to recover monotonicity
     /// after a torn write. Errors are silently ignored (best-effort); a failure
@@ -87,6 +123,7 @@ impl<V: Vfs + Clone> Db<V> {
             catalog_root: catalog_root_bytes,
             commit_history_root_page_id: state.commit_history_root_page_id,
             commit_history_root_version: state.commit_history_root_version,
+            free_list_root_page_id: state.free_list_root_page_id,
             next_page_id: new_next,
         })?;
         let hk_clone = self.hk.read().clone();
@@ -138,6 +175,7 @@ impl<V: Vfs + Clone> Db<V> {
             catalog_root: catalog_root_bytes,
             commit_history_root_page_id: 0,
             commit_history_root_version: 0,
+            free_list_root_page_id: state.free_list_root_page_id,
             next_page_id: new_next,
         })?;
         let hk_clone = { self.hk.read().clone() };
@@ -180,16 +218,17 @@ impl<V: Vfs + Clone> Db<V> {
         }
     }
 
-    /// Insert a commit-history entry into the commit-history B+ tree, prune
-    /// according to the retention policy, and return the updated
-    /// `(root_page_id, root_version, new_next_page_id)`.
+    /// Insert the new commit-history entry and prune per the retention policy.
+    /// Returns the page ids freed by this tree's copy-on-write and pruning, so
+    /// the caller can hand them to the shared allocator cache for reuse (they
+    /// are never reader-pinned).
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn write_commit_history_entry(
         &self,
         state: &mut WriterState,
         new_commit_id: u64,
         meta: CommitHistoryMeta,
-    ) -> Result<()> {
+    ) -> Result<Vec<u64>> {
         let min_pinned = {
             let readers = self.tracked_readers.lock();
             readers.iter().map(|r| r.commit_id.0).min()
@@ -202,6 +241,14 @@ impl<V: Vfs + Clone> Db<V> {
             state.next_page_id,
             self.page_size,
         );
+        // The commit-history tree is not part of any reader's pinned snapshot
+        // (readers track the data and catalog roots, never the history root), so
+        // every page its copy-on-write/prune frees is immediately reusable.
+        // Recycle freely and feed the shared allocator cache so per-commit
+        // history churn does not leak pages over a long-lived writer's lifetime.
+        hist_tree.set_reuse_threshold(0);
+        hist_tree.set_free_page_cache(self.free_page_cache.clone());
+        hist_tree.set_free_page_consumed(self.free_page_consumed.clone());
 
         // Insert the new entry.
         let key = new_commit_id.to_be_bytes().to_vec();
@@ -322,6 +369,13 @@ impl<V: Vfs + Clone> Db<V> {
         // commit's unified `pager.flush_main` picks them up) without issuing a
         // separate fsync. The caller is responsible for flushing the pager.
         hist_tree.materialize_dirty().await?;
+        // Capture spine/prune frees after materialization (they are realized
+        // during the flush, not before it).
+        let freed: Vec<u64> = hist_tree
+            .drain_freed()
+            .into_iter()
+            .filter(|&p| p >= 4)
+            .collect();
         let new_hist_root = hist_tree.root_page_id();
         let new_next = hist_tree.next_page_id().max(state.next_page_id);
 
@@ -329,6 +383,6 @@ impl<V: Vfs + Clone> Db<V> {
         state.commit_history_root_version = new_commit_id;
         state.next_page_id = new_next;
 
-        Ok(())
+        Ok(freed)
     }
 }

@@ -411,7 +411,9 @@ fn make_header_fields<V: Vfs + Clone>(
         active_root_txn_id: state.latest_commit_id,
         counter_anchor,
         commit_id: crate::CommitId(new_commit_id),
-        free_list_root: [0u8; 16],
+        // Preserve the durable free-list head across pin-row commits, or every
+        // begin_read would wipe the free list.
+        free_list_root: crate::txn::db::encode_free_list_root(state.free_list_root_page_id),
         catalog_root: catalog_root_bytes,
         apply_journal_root_page_id: 0,
         apply_journal_root_version: 0,

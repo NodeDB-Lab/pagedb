@@ -97,6 +97,7 @@ impl<V: Vfs + Clone> Db<V> {
                 catalog_root: catalog_root_bytes,
                 commit_history_root_page_id: 0,
                 commit_history_root_version: 0,
+                free_list_root_page_id: state.free_list_root_page_id,
                 next_page_id: state.next_page_id,
             })?;
             let new_slot = commit_header(
@@ -336,6 +337,7 @@ impl<V: Vfs + Clone> Db<V> {
             catalog_root: catalog_root_bytes,
             commit_history_root_page_id: 0,
             commit_history_root_version: 0,
+            free_list_root_page_id: state.free_list_root_page_id,
             next_page_id: new_next,
         })?;
 
@@ -396,6 +398,7 @@ impl<V: Vfs + Clone> Db<V> {
             catalog_root: catalog_root_bytes,
             commit_history_root_page_id: 0,
             commit_history_root_version: 0,
+            free_list_root_page_id: state.free_list_root_page_id,
             next_page_id: new_next,
         })?;
 

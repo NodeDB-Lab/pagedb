@@ -105,32 +105,6 @@ pub struct OpenOptions {
     /// this many newly-encrypted pages — exceed it and the txn aborts. Large
     /// bulk loads need a larger budget. Default: 1024.
     pub anchor_budget: u64,
-
-    /// **Pagedb extension beyond the architecture spec.** When `true` and no
-    /// readers are pinned at commit time, skip persisting freed pages into
-    /// the deferred-free queue / persistent free-list. The pages become
-    /// **orphan pages** in `main.db` — physically allocated but unreferenced
-    /// — and can only be reclaimed by [`Db::compact`].
-    ///
-    /// Trade-off:
-    /// - **Pro**: Eliminates one catalog-tree `CoW` per commit. Big
-    ///   single-put write-latency win (~75µs on a 4 KiB page DB).
-    /// - **Con**: `main.db` grows monotonically during no-reader phases.
-    ///   Embedders MUST schedule periodic [`Db::compact`] to reclaim space,
-    ///   or accept unbounded growth.
-    ///
-    /// Default: `false` (spec-conformant; every freed page is tracked).
-    ///
-    /// Use cases that should enable this:
-    /// - Benchmarks measuring against engines without an equivalent free-list
-    /// - Ephemeral / cache-like deployments that periodically compact or
-    ///   rebuild
-    /// - Workloads where the embedder can prove the file is short-lived
-    ///
-    /// Use cases that should NOT enable this:
-    /// - Long-running write-heavy stores without compaction infrastructure
-    /// - Anything where unbounded `main.db` growth is a problem
-    pub skip_freelist_persistence_when_no_readers: bool,
 }
 
 impl Default for OpenOptions {
@@ -145,9 +119,6 @@ impl Default for OpenOptions {
             observer_retry_count: 3,
             metrics_enabled: true,
             anchor_budget: crate::crypto::nonce::DEFAULT_ANCHOR_BUDGET,
-            // Default: spec-conformant. Embedders that want the fast path
-            // explicitly opt in.
-            skip_freelist_persistence_when_no_readers: false,
         }
     }
 }
@@ -216,16 +187,6 @@ impl OpenOptions {
     #[must_use]
     pub fn with_anchor_budget(mut self, v: u64) -> Self {
         self.anchor_budget = v;
-        self
-    }
-
-    /// Opt into the no-readers fast-free path. See
-    /// [`Self::skip_freelist_persistence_when_no_readers`] for the trade-off.
-    /// Embedders that enable this **must** schedule periodic
-    /// [`Db::compact`](crate::Db::compact) to reclaim orphan pages.
-    #[must_use]
-    pub fn with_skip_freelist_persistence_when_no_readers(mut self, v: bool) -> Self {
-        self.skip_freelist_persistence_when_no_readers = v;
         self
     }
 }

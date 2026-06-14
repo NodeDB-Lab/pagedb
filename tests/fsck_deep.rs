@@ -102,3 +102,51 @@ async fn corrupt_page_detected() {
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn free_list_pages_are_accounted_not_orphans() {
+    // Disable history so deleted pages enter the durable free-list immediately
+    // (no retained snapshot pins them).
+    let opts = OpenOptions::default()
+        .with_buffer_pool_pages(64)
+        .with_commit_history_retain(pagedb::options::RetainPolicy::Disabled);
+    let db = Db::open_internal_with_options(MemVfs::new(), KEK, 4096, REALM, opts)
+        .await
+        .unwrap();
+
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0u32..300 {
+            w.put(format!("k{i:05}").as_bytes(), &[7u8; 128])
+                .await
+                .unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0u32..250 {
+            w.delete(format!("k{i:05}").as_bytes()).await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+    assert!(
+        db.stats().await.unwrap().free_list_pending_entries > 0,
+        "setup should have populated the durable free-list"
+    );
+
+    let report = run_deep_walk(&db).await.unwrap();
+    assert!(
+        report.page_issues.is_empty(),
+        "free-listed/chain pages must verify cleanly, got: {:?}",
+        report.page_issues
+    );
+    // The free-list chain pages and the pages they track are accounted for, so
+    // none should be reported as orphans.
+    assert!(
+        report.orphan_page_ids.is_empty(),
+        "free-list pages must not be reported as orphans, got: {:?}",
+        report.orphan_page_ids
+    );
+    assert!(report.is_clean(), "report should be clean");
+}

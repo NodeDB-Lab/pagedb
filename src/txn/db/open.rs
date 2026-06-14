@@ -152,6 +152,7 @@ impl<V: Vfs + Clone> Db<V> {
             seq: 1,
             catalog_root_page_id: 0,
             catalog_root_txn_id: 0,
+            free_list_root_page_id: 0,
             commit_history_root_page_id: 0,
             commit_history_root_version: 0,
             // Fresh DB: the commit-history tree is empty.
@@ -191,6 +192,7 @@ impl<V: Vfs + Clone> Db<V> {
                 catalog_root_page_id: 0,
             })),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 
@@ -202,7 +204,7 @@ impl<V: Vfs + Clone> Db<V> {
         realm: RealmId,
         options: OpenOptions,
     ) -> Result<Self> {
-        Self::open_existing_inner(vfs, kek, page_size, realm, options).await
+        Self::open_existing_inner(vfs, kek, page_size, realm, options, DbMode::Standalone).await
     }
 
     /// Open an existing database that was previously created with
@@ -214,7 +216,15 @@ impl<V: Vfs + Clone> Db<V> {
         page_size: usize,
         realm: RealmId,
     ) -> Result<Self> {
-        Self::open_existing_inner(vfs, kek, page_size, realm, OpenOptions::default()).await
+        Self::open_existing_inner(
+            vfs,
+            kek,
+            page_size,
+            realm,
+            OpenOptions::default(),
+            DbMode::Standalone,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -224,6 +234,7 @@ impl<V: Vfs + Clone> Db<V> {
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
+        mode: DbMode,
     ) -> Result<Self> {
         use crate::vfs::VfsFile;
         use crate::vfs::types::OpenMode;
@@ -327,6 +338,7 @@ impl<V: Vfs + Clone> Db<V> {
             seq: fields.seq,
             catalog_root_page_id,
             catalog_root_txn_id,
+            free_list_root_page_id: super::core::decode_free_list_root(&fields.free_list_root),
             commit_history_root_page_id: fields.commit_history_root_page_id,
             commit_history_root_version: fields.commit_history_root_version,
             // Lazily populated on first `write_commit_history_entry` call.
@@ -384,7 +396,7 @@ impl<V: Vfs + Clone> Db<V> {
             mmap_bytes_in_use: std::sync::Arc::new(AtomicU64::new(0)),
             spill_bytes_in_use: AtomicU64::new(0),
             txn_seq: AtomicU64::new(0),
-            mode: DbMode::Standalone,
+            mode,
             aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
             sentinel_locks: Vec::new(),
             snapshot: Arc::new(parking_lot::RwLock::new(ReaderSnapshot {
@@ -394,6 +406,7 @@ impl<V: Vfs + Clone> Db<V> {
                 catalog_root_page_id,
             })),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
         };
 
         // If an online rekey was interrupted (crash or abort), resume and
@@ -407,29 +420,34 @@ impl<V: Vfs + Clone> Db<V> {
             }
         }
 
-        // Remove stale and expired reader-pin rows: own-PID rows from a prior
-        // process incarnation (crash without cleanup) and rows whose
-        // expires_unix_seconds is in the past.
-        {
-            let mut state = db.writer.lock().await;
-            let hk_clone = db.hk.read().clone();
-            let _ = cleanup_stale_reader_pins(
-                &db.pager,
-                &db.vfs,
-                &db.main_db_path,
-                &hk_clone,
-                db.realm_id,
-                db.page_size,
-                db.cipher_id,
-                db.file_id,
-                db.kek_salt,
-                db.mk_epoch.load(Ordering::SeqCst),
-                &mut state,
-            )
-            .await;
-            // Snapshot may have advanced by the bulk-pin-cleanup commit
-            // performed inside cleanup_stale_reader_pins.
-            db.publish_snapshot(&state);
+        // Recovery work that mutates the catalog/header is only valid for
+        // handle modes that hold the exclusive writer lock. ReadOnly / Observer
+        // must never write, so they skip pin cleanup and backlog draining.
+        if matches!(mode, DbMode::Standalone | DbMode::Follower) {
+            // Remove every durable reader-pin row left behind by a prior
+            // (now-dead) incarnation. Safe to clear all of them while holding
+            // the exclusive writer lock — see `cleanup_stale_reader_pins`.
+            {
+                let mut state = db.writer.lock().await;
+                let hk_clone = db.hk.read().clone();
+                let _ = cleanup_stale_reader_pins(
+                    &db.pager,
+                    &db.vfs,
+                    &db.main_db_path,
+                    &hk_clone,
+                    db.realm_id,
+                    db.page_size,
+                    db.cipher_id,
+                    db.file_id,
+                    db.kek_salt,
+                    db.mk_epoch.load(Ordering::SeqCst),
+                    &mut state,
+                )
+                .await;
+                // Snapshot may have advanced by the bulk-pin-cleanup commit
+                // performed inside cleanup_stale_reader_pins.
+                db.publish_snapshot(&state);
+            }
         }
 
         // Durable monotonicity recovery for named counters.
@@ -564,9 +582,11 @@ impl<V: Vfs + Clone> Db<V> {
             }
         }
 
-        // Delegate to the appropriate lower-level constructor.
+        // Delegate to the appropriate lower-level constructor. Pass `mode`
+        // through to the existing-DB path so open-time recovery (pin cleanup,
+        // backlog drain) runs only for writer-lock-holding modes.
         let mut db = if main_db_exists {
-            Self::open_existing_with_options(vfs, kek, page_size, realm, options).await?
+            Self::open_existing_inner(vfs, kek, page_size, realm, options, mode).await?
         } else {
             Self::open_internal_with_options(vfs, kek, page_size, realm, options).await?
         };
