@@ -124,6 +124,104 @@ async fn abort_oldest_aborts_old_reader() {
     drop(r2);
 }
 
+/// After an unclean shutdown that leaves a *drainable* deferred-free backlog
+/// behind, reopening the store must self-heal: the inherited backlog is not
+/// corruption and must not brick the store. The deferred entries were tagged
+/// with commit ids older than anything a freshly-opened reader pins, so the
+/// first post-open commit drains them — the stall policy is evaluated against
+/// the post-drain depth, so a reader opened against the reopened store is
+/// neither rejected nor aborted.
+///
+/// Repro of the reported failure: a daemon under write load is killed with a
+/// deferred-free backlog past the stall threshold; on restart the consumer
+/// holds a read txn across its schema-ensure write, and that first commit trips
+/// `AbortOldest` against the backlog inherited from the dead writer — surfacing
+/// as a permanent `Aborted` on every reopen.
+#[tokio::test(flavor = "current_thread")]
+async fn reopen_with_drainable_backlog_does_not_brick_readers() {
+    const THRESHOLD: u64 = 50;
+    let opts = || {
+        let mut o = OpenOptions::default()
+            .with_buffer_pool_pages(256)
+            // Disable commit history so the backlog is governed purely by the
+            // reader-pin floor: once the dead writer's reader is gone, every
+            // inherited entry is drainable. (Reclamation under a *bounded*
+            // history window is covered by `deferred_free_reclaim`.)
+            .with_commit_history_retain(pagedb::options::RetainPolicy::Disabled);
+        o.reader_stall_threshold_pages = THRESHOLD;
+        o
+    };
+    let vfs = MemVfs::new();
+
+    // Phase 1: build a large *durable* deferred-free backlog. Holding a reader
+    // pins an old commit, forcing every subsequent commit's freed pages into
+    // the deferred-free queue (none are eligible to drain while that reader
+    // pins). Then drop everything without draining — simulating a writer killed
+    // mid-workload. The backlog persists on disk in the catalog.
+    {
+        let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts())
+            .await
+            .unwrap();
+        {
+            let mut w = db.begin_write().await.unwrap();
+            w.put(b"seed", b"v").await.unwrap();
+            w.commit().await.unwrap();
+        }
+        // Pin an old snapshot for the duration of the build. AbortOldest may
+        // flag it, but it keeps pinning until dropped, so the backlog grows.
+        let pin = db.begin_read().await.unwrap();
+        for round in 0u32..40 {
+            let mut w = db.begin_write().await.unwrap();
+            for i in 0u32..8 {
+                w.put(format!("k{round:03}_{i}").as_bytes(), &[0u8; 128])
+                    .await
+                    .unwrap();
+            }
+            w.commit().await.unwrap();
+            let mut w2 = db.begin_write().await.unwrap();
+            for i in 0u32..8 {
+                w2.put(format!("k{round:03}_{i}").as_bytes(), b"x")
+                    .await
+                    .unwrap();
+            }
+            w2.commit().await.unwrap();
+        }
+        let pending = db.stats().await.unwrap().free_list_pending_entries;
+        assert!(
+            pending > THRESHOLD,
+            "test setup should have built a backlog past the threshold; got {pending}"
+        );
+        drop(pin);
+        // Handle drops here — backlog is durably on disk, undrained.
+    }
+
+    // Phase 2: reopen (process restart) and run the consumer open pattern: a
+    // read txn held across a single write commit (schema ensure). The inherited
+    // backlog's entries are all older than the reopened reader's pin, so the
+    // commit drains them and the stall policy sees a depth below the threshold.
+    let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts())
+        .await
+        .unwrap();
+    let reader = db.begin_read().await.unwrap();
+    let mut w = db.begin_write().await.unwrap();
+    w.put(b"schema", b"v1").await.unwrap();
+    let res = w.commit().await;
+    assert!(
+        res.is_ok(),
+        "post-reopen commit must not be rejected by the stall policy on an \
+         inherited drainable backlog: {res:?}"
+    );
+
+    let got = reader.get(b"seed").await;
+    assert!(
+        !matches!(got, Err(PagedbError::Aborted)),
+        "reopening a store with a drainable backlog bricked a live reader with \
+         Aborted — a non-corrupt, recoverable backlog must self-heal"
+    );
+    assert!(got.is_ok(), "reader read failed after reopen: {got:?}");
+    drop(reader);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn non_abortable_reader_survives_abort_oldest() {
     let vfs = MemVfs::new();
