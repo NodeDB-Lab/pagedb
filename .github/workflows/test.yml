@@ -46,6 +46,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # The comparison benchmark links rocksdb (librocksdb-sys), whose build
+      # runs bindgen and needs libclang. clippy --all-targets compiles it.
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: lint
@@ -197,6 +202,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # --benches compiles the comparison bench, which links rocksdb
+      # (librocksdb-sys) — its build runs bindgen and needs libclang.
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
