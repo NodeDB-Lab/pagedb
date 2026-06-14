@@ -26,9 +26,21 @@ use super::helpers::{
 use super::types::CompactStats;
 
 /// Full online compaction. See module-level docs for the staged flow.
-#[allow(clippy::too_many_lines)]
+///
+/// The body is instrumented via [`tracing::Instrument`] rather than an
+/// `EnteredSpan` guard: an entered span guard is `!Send` and would be held
+/// across the many `.await` points below, making the returned future `!Send`
+/// and thus uncallable from `Send` async contexts (e.g. the nodedb-lite
+/// `#[async_trait]` StorageEngine impl, which requires `Send` futures).
 pub async fn compact_now<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
-    let _span = tracing::debug_span!("compaction.run").entered();
+    use tracing::Instrument;
+    compact_now_inner(db)
+        .instrument(tracing::debug_span!("compaction.run"))
+        .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
     if !matches!(db.mode, crate::txn::mode::DbMode::Standalone) {
         return Err(PagedbError::Unsupported);
     }
