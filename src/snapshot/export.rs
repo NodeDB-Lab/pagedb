@@ -47,6 +47,13 @@ pub struct SnapshotManifest {
     /// reserved section of the manifest so `restore_from` can reopen with the
     /// correct AAD.
     pub realm_id: [u8; 16],
+    /// Data B+ tree root page id at `target_commit`. The receiver installs this
+    /// as its `active_root` — without it an incremental apply cannot advance
+    /// the tree past the base snapshot's root.
+    pub target_active_root_page_id: u64,
+    /// Catalog B+ tree root page id at `target_commit`. The receiver installs
+    /// this so incrementally-applied segments are reachable from the catalog.
+    pub target_catalog_root_page_id: u64,
 }
 
 /// Encode and HK-MAC a manifest into the 240-byte on-disk format.
@@ -79,7 +86,11 @@ pub fn encode_manifest(m: &SnapshotManifest, hk_key: &[u8; 32]) -> [u8; MANIFEST
     buf[82..86].copy_from_slice(&m.segments_count.to_le_bytes());
     // realm_id [16] [86..102]
     buf[86..102].copy_from_slice(&m.realm_id);
-    // reserved zeros [102..224]
+    // target_active_root_page_id u64 LE [102..110]
+    buf[102..110].copy_from_slice(&m.target_active_root_page_id.to_le_bytes());
+    // target_catalog_root_page_id u64 LE [110..118]
+    buf[110..118].copy_from_slice(&m.target_catalog_root_page_id.to_le_bytes());
+    // reserved zeros [118..224]
     // HK-MAC[16] [224..240]
     let mac = compute_manifest_mac(&buf[..224], hk_key);
     buf[224..240].copy_from_slice(&mac);
@@ -118,6 +129,9 @@ pub fn decode_manifest(
     let segments_count = u32::from_le_bytes(buf[82..86].try_into().unwrap_or([0; 4]));
     let mut realm_id = [0u8; 16];
     realm_id.copy_from_slice(&buf[86..102]);
+    let target_active_root_page_id = u64::from_le_bytes(buf[102..110].try_into().unwrap_or([0; 8]));
+    let target_catalog_root_page_id =
+        u64::from_le_bytes(buf[110..118].try_into().unwrap_or([0; 8]));
     Ok(SnapshotManifest {
         version,
         kind,
@@ -131,6 +145,8 @@ pub fn decode_manifest(
         next_page_id_at_target,
         segments_count,
         realm_id,
+        target_active_root_page_id,
+        target_catalog_root_page_id,
     })
 }
 

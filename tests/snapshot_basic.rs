@@ -224,6 +224,21 @@ async fn apply_incremental_advances_commit() {
     let follower_commit = follower.latest_commit();
     assert_eq!(follower_commit, c2, "follower commit should match c2");
 
+    // The applied delta must advance the data tree: the key written after the
+    // base snapshot is now readable, and the base key still resolves.
+    let rtxn = follower.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"new_key").await.unwrap().as_deref(),
+        Some(b"new_val".as_slice()),
+        "incrementally-applied key must be readable on the follower"
+    );
+    assert_eq!(
+        rtxn.get(b"base").await.unwrap().as_deref(),
+        Some(b"data".as_slice()),
+        "base key must survive the incremental apply"
+    );
+    drop(rtxn);
+
     std::fs::remove_dir_all(&src_dir).ok();
     std::fs::remove_dir_all(&snap_dir).ok();
     std::fs::remove_dir_all(&delta_dir).ok();
@@ -324,5 +339,113 @@ async fn manifest_corruption_detected() {
 
     std::fs::remove_dir_all(&src_dir).ok();
     std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// An incremental delta may carry an arbitrary number of new segments. Applying
+// it must promote every staged segment, regardless of how many there are — the
+// apply journal that records the promotions must represent a promotion set that
+// does not fit in a single page. A live set larger than one journal page's
+// worth of actions is ordinary for any segment-heavy engine (HNSW shards,
+// columnar blocks, FTS postings), so this is common usage, not a corner case.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_promotes_segment_set_larger_than_one_journal_page() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    // Link more segments than fit in a single journal page's worth of promote
+    // actions, so the promotion set must span multiple journal pages.
+    const SEGMENTS: u32 = 300;
+    for i in 0..SEGMENTS {
+        let meta = {
+            let mut s = db
+                .create_segment(REALM, SegmentKind::Unspecified)
+                .await
+                .unwrap();
+            s.append_page(SegmentPageKind::Data, &[0xAA; 256])
+                .await
+                .unwrap();
+            s.seal().await.unwrap()
+        };
+        let mut w = db.begin_write().await.unwrap();
+        w.link_segment(&format!("seg-{i:05}"), &meta).await.unwrap();
+        w.commit().await.unwrap();
+    }
+
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let stats: ApplyStats = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect("apply_incremental must promote a multi-page promotion set");
+    assert_eq!(
+        stats.segments_promoted, SEGMENTS,
+        "every staged segment must be promoted"
+    );
+
+    // Every staged segment must have been promoted from `seg/.staging/` to its
+    // live `seg/<hex(id)>` path — the journal must carry the whole promotion
+    // set, not just the fraction that fit one page. Verify at the filesystem level
+    // (the live `seg/` dir holds exactly the promoted files), and that nothing
+    // is left behind in staging. A single-page journal could only carry a
+    // fraction of the set, so this fails unless the journal spans pages.
+    let live_count = std::fs::read_dir(dst_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.path().is_file())
+        .count();
+    assert_eq!(
+        live_count as u32, SEGMENTS,
+        "all {SEGMENTS} staged segments must be promoted to live paths"
+    );
+    let staging = dst_dir.join("seg").join(".staging");
+    let staging_left = std::fs::read_dir(&staging)
+        .map(|rd| {
+            rd.filter_map(std::result::Result::ok)
+                .filter(|e| e.path().is_file())
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(staging_left, 0, "no staged segment may be left unpromoted");
+
+    // The applied delta must advance the catalog: every promoted segment is
+    // reachable by name and readable through the follower's catalog, not just
+    // present on disk.
+    let rtxn = follower.begin_read().await.unwrap();
+    for i in (0..SEGMENTS).step_by(73) {
+        let name = format!("seg-{i:05}");
+        let reader = rtxn
+            .open_segment(&name)
+            .await
+            .unwrap_or_else(|e| panic!("segment {name} unreachable via catalog: {e:?}"));
+        let page = reader.read_page(1).await.unwrap();
+        assert!(
+            page.starts_with(&[0xAA; 256]),
+            "segment {name} content wrong"
+        );
+    }
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
     std::fs::remove_dir_all(&dst_dir).ok();
 }

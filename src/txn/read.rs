@@ -112,6 +112,12 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
         self.catalog_root_page_id
     }
 
+    /// The data B+ tree root page id at this snapshot.
+    #[must_use]
+    pub fn root_page_id(&self) -> u64 {
+        self.root_page_id
+    }
+
     fn tree(&self) -> BTree<V> {
         BTree::open(
             self.db.pager.clone(),

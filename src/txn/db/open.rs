@@ -338,7 +338,7 @@ impl<V: Vfs + Clone> Db<V> {
         };
 
         let latest_commit = fields.commit_id.0;
-        let writer = WriterState {
+        let mut writer = WriterState {
             root_page_id: fields.active_root_page_id,
             next_page_id: fields.next_page_id,
             active_slot,
@@ -355,17 +355,46 @@ impl<V: Vfs + Clone> Db<V> {
 
         let pager_arc = Arc::new(pager);
 
-        // Replay any pending apply journal before catalog reconciliation.
-        // Per architecture §6: the journal must run first so that catalog
-        // reconciliation sees the post-replay disk state. In this slice no
-        // producer sets a non-zero page id, so this is a no-op for all
-        // existing code paths.
-        crate::recovery::journal::replay_apply_journal(
-            &*vfs_arc,
+        // Replay any pending apply journal before catalog reconciliation, so
+        // reconciliation sees the post-replay disk state. A non-zero
+        // `apply_journal_root` means a crash interrupted an `apply_incremental`
+        // after the header swap but before the renames completed; replay
+        // re-executes them idempotently, then we clear the header pointer and
+        // remove the now-drained sidecar.
+        let pending_journal_id = crate::recovery::journal::decode_journal_id(
             fields.apply_journal_root_page_id,
             fields.apply_journal_root_version,
-        )
-        .await?;
+        );
+        if crate::recovery::journal::replay_apply_journal(&pager_arc, realm, pending_journal_id)
+            .await?
+            .is_some()
+        {
+            let mut cleared = fields.clone();
+            cleared.seq = fields.seq + 1;
+            cleared.apply_journal_root_page_id = 0;
+            cleared.apply_journal_root_version = 0;
+            let new_slot = crate::pager::header::commit_header(
+                &*vfs_arc,
+                &main_db_path,
+                &hk,
+                &cleared,
+                active_slot,
+                page_size,
+            )
+            .await?;
+            pager_arc.remove_journal(pending_journal_id).await?;
+            writer.active_slot = new_slot;
+            writer.seq = cleared.seq;
+        }
+
+        // Sweep orphaned journal sidecars. The header now references no pending
+        // journal, so any file left under `applyjournal/` is debris from a crash
+        // between the journal-clear commit and sidecar removal; reclaim it.
+        if let Ok(entries) = vfs_arc.list_dir("applyjournal").await {
+            for name in entries {
+                let _ = vfs_arc.remove(&format!("applyjournal/{name}")).await;
+            }
+        }
 
         // Walk the catalog and reconcile each segment file against its expected path.
         crate::recovery::reconcile_catalog(

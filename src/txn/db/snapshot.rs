@@ -37,6 +37,8 @@ impl<V: Vfs + Clone> Db<V> {
         };
 
         let (target_commit, next_page_id) = { (txn.commit_id().0, txn.next_page_id()) };
+        let target_active_root_page_id = txn.root_page_id();
+        let target_catalog_root_page_id = txn.catalog_root_page_id();
 
         // Collect live segment ids from the pinned catalog snapshot.
         let segments = txn.list_segments("").await?;
@@ -62,6 +64,8 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id_at_target: next_page_id,
             segments_count,
             realm_id: self.realm_id.0,
+            target_active_root_page_id,
+            target_catalog_root_page_id,
         };
 
         let src_root = get_vfs_root(&*self.vfs)?;
@@ -168,6 +172,8 @@ impl<V: Vfs + Clone> Db<V> {
 
         let target_commit = txn.commit_id().0;
         let target_next_page_id = txn.next_page_id();
+        let target_active_root_page_id = txn.root_page_id();
+        let target_catalog_root_page_id = txn.catalog_root_page_id();
 
         // Get base snapshot's next_page_id by reading the commit history.
         let base_txn_result = self.begin_read_at(base_commit).await;
@@ -225,6 +231,8 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id_at_target: target_next_page_id,
             segments_count,
             realm_id: self.realm_id.0,
+            target_active_root_page_id,
+            target_catalog_root_page_id,
         };
 
         let src_root = get_vfs_root(&*self.vfs)?;
@@ -253,11 +261,10 @@ impl<V: Vfs + Clone> Db<V> {
         &self,
         src_path: &std::path::Path,
     ) -> crate::Result<crate::snapshot::ApplyStats> {
-        use crate::pager::format::data_page::ENVELOPE_OVERHEAD;
-        use crate::pager::format::page_kind::PageKind;
         use crate::pager::header::commit_header;
         use crate::recovery::journal::{
-            ApplyJournalRecord, JournalAction, encode_apply_journal, execute_journal_actions,
+            ApplyJournalRecord, JournalAction, encode_journal_id, encode_journal_pages,
+            execute_journal_actions,
         };
         use crate::snapshot::apply::{apply_delta_pages, stage_snapshot_segments};
         use crate::txn::mode::DbMode;
@@ -315,31 +322,32 @@ impl<V: Vfs + Clone> Db<V> {
 
         let mut state = self.writer.lock().await;
 
-        // Select the journal slot by parity of the current version counter.
-        // Even version → slot page 2; odd version → slot page 3.
-        let journal_version = state.seq;
-        let journal_page_id: u64 = if journal_version % 2 == 0 { 2 } else { 3 };
-
-        // Write the journal record to the selected slot page via the Pager's
-        // AEAD path. This ensures the journal is authenticated under the same
-        // keys as all other pages.
-        if !actions.is_empty() {
-            let body_len = page_size - ENVELOPE_OVERHEAD;
+        // Write the journal record to a fresh apply-journal sidecar via the
+        // Pager AEAD path. A fresh, never-reused `journal_id` guarantees the
+        // sidecar's nonce space never collides with another file's under one
+        // key. The sidecar may span any number of pages, so the promotion set
+        // is unbounded — no single-page ceiling. The 16-byte id is carried in
+        // the header's `apply_journal_root` fields after the swap.
+        let journal_id = if actions.is_empty() {
+            [0u8; 16]
+        } else {
+            let id = self.next_segment_id();
             let record = ApplyJournalRecord {
                 target_commit_id: new_commit_id,
                 actions: actions.clone(),
             };
-            let body = encode_apply_journal(&record, body_len)?;
-            self.pager
-                .write_main_page(
-                    journal_page_id,
-                    self.realm_id,
-                    PageKind::ApplyJournal,
-                    &body,
-                )
-                .await?;
-            self.pager.flush_main(self.realm_id).await?;
-        }
+            let pages = encode_journal_pages(&record, page_size)?;
+            self.vfs.mkdir_all("applyjournal").await?;
+            for (page_id, body) in pages.iter().enumerate() {
+                self.pager
+                    .stage_journal_page(id, page_id as u64, self.realm_id, body)
+                    .await?;
+            }
+            self.pager.flush_journal(id, self.realm_id).await?;
+            self.vfs.sync_dir("applyjournal").await.ok();
+            id
+        };
+        let (journal_root_page_id, journal_root_version) = encode_journal_id(&journal_id);
 
         // Commit the A/B header with the journal root pointing at the slot we
         // just wrote. After this commit, a crash-recovery replay can re-execute
@@ -348,15 +356,17 @@ impl<V: Vfs + Clone> Db<V> {
         let new_seq = state.seq + 1;
         let counter_anchor = self.pager.pending_anchor();
 
-        let mut catalog_root_bytes = [0u8; 16];
-        catalog_root_bytes[..8].copy_from_slice(&state.catalog_root_page_id.to_le_bytes());
-        catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());
+        // Install the target trees the producer shipped in the manifest. The
+        // delta pages just written to main.db contain these root pages; pointing
+        // the header at them is what advances the data and catalog trees past the
+        // base snapshot (without this, incrementally-applied rows and segments
+        // are unreachable from the follower's catalog).
+        let new_root_page_id = manifest.target_active_root_page_id;
+        let new_catalog_root_page_id = manifest.target_catalog_root_page_id;
 
-        let journal_root_page_id_for_header = if actions.is_empty() {
-            0
-        } else {
-            journal_page_id
-        };
+        let mut catalog_root_bytes = [0u8; 16];
+        catalog_root_bytes[..8].copy_from_slice(&new_catalog_root_page_id.to_le_bytes());
+        catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());
 
         let fields_with_journal = MainDbHeaderFields {
             format_version: 1,
@@ -367,14 +377,14 @@ impl<V: Vfs + Clone> Db<V> {
             kek_salt: self.kek_salt,
             mk_epoch: self.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
             seq: new_seq,
-            active_root_page_id: manifest.next_page_id_at_target,
+            active_root_page_id: new_root_page_id,
             active_root_txn_id: new_commit_id,
             counter_anchor,
             commit_id: crate::CommitId(new_commit_id),
             free_list_root: [0; 16],
             catalog_root: catalog_root_bytes,
-            apply_journal_root_page_id: journal_root_page_id_for_header,
-            apply_journal_root_version: journal_version,
+            apply_journal_root_page_id: journal_root_page_id,
+            apply_journal_root_version: journal_root_version,
             commit_history_root_page_id: 0,
             commit_history_root_version: 0,
             restore_mode: 0,
@@ -417,7 +427,7 @@ impl<V: Vfs + Clone> Db<V> {
                 kek_salt: self.kek_salt,
                 mk_epoch: self.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
                 seq: new_seq2,
-                active_root_page_id: new_next_page_id,
+                active_root_page_id: new_root_page_id,
                 active_root_txn_id: new_commit_id,
                 counter_anchor: counter_anchor2,
                 commit_id: crate::CommitId(new_commit_id),
@@ -444,10 +454,17 @@ impl<V: Vfs + Clone> Db<V> {
             self.pager.commit_anchor(counter_anchor2)?;
             state.active_slot = new_slot2;
             state.seq = new_seq2;
+
+            // The journal root is cleared and durable; the sidecar is no longer
+            // needed. Remove it (a crash before this point leaves the sidecar,
+            // which the next open's replay re-runs idempotently then removes).
+            self.pager.remove_journal(journal_id).await?;
         }
 
         state.latest_commit_id = new_commit_id;
         state.next_page_id = new_next_page_id;
+        state.root_page_id = new_root_page_id;
+        state.catalog_root_page_id = new_catalog_root_page_id;
         self.latest_commit
             .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
         self.publish_snapshot(&state);
