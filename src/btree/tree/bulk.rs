@@ -1,11 +1,14 @@
 //! Bulk-load: build a dense tree from sorted pairs without `CoW` overhead.
 
+use std::sync::Arc;
+
 use crate::Result;
 use crate::errors::PagedbError;
 use crate::vfs::Vfs;
 
 use crate::btree::leaf::{Leaf, LeafValue};
 use crate::btree::node;
+use crate::btree::overflow;
 
 use super::core::BTree;
 
@@ -13,14 +16,11 @@ impl<V: Vfs> BTree<V> {
     /// Bulk-load sorted `(key, value)` pairs into a freshly-created tree
     /// without any `CoW` overhead. The tree must be empty (`root_page_id == 0`).
     ///
-    /// All records are first placed into as few leaves as needed, then internal
-    /// nodes are built bottom-up. Each page is written exactly once; no freed
-    /// pages are generated. The resulting layout is dense and compact.
-    ///
-    /// Overflow values are NOT supported in bulk-load; callers must ensure all
-    /// values fit inline (`value.len()` ≤ `page_size` / 4). For compaction use-
-    /// cases, the pairs come from `collect_range` which already resolves
-    /// overflow chains into inline bytes.
+    /// Values larger than the inline threshold (`page_size / 4`) are spilled to
+    /// overflow chains, exactly as the `put` path does, so a dense repack
+    /// reproduces the original storage shape. Records are then packed into as few
+    /// leaves as needed and internal nodes are built bottom-up. Each leaf/internal
+    /// page is written exactly once; the layout is dense and compact.
     ///
     /// Returns `Err` if the tree is not empty.
     #[allow(clippy::too_many_lines)]
@@ -34,82 +34,70 @@ impl<V: Vfs> BTree<V> {
             return Ok(());
         }
 
-        // Build leaves greedily: pack as many records as fit into each leaf.
-        // No sibling pointers yet — we'll wire them up at the end.
-        let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new(); // (page_id, first_key)
-
-        let body_cap = node::body_capacity(self.page_size);
-        let mut current_leaf = Leaf::new();
-
-        let flush_leaf = |leaf: &Leaf, page_id: u64, next_id: u64| {
-            let _ = (leaf, page_id, next_id); // will write below
-        };
-        let _ = flush_leaf; // suppress unused-variable lint (closure is a placeholder)
-
-        // First pass: group records into leaves.
-        let mut leaf_groups: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
-        for (k, v) in &pairs {
-            let entry_size = {
-                let suffix_len = k.len(); // conservative: no prefix compression yet
-                2 + suffix_len + 2 + v.len() // slot entry (inline value)
+        // Resolve each value to its stored form, spilling values past the inline
+        // threshold to overflow chains (same threshold as `put`). Inlining an
+        // oversized value would exceed leaf capacity and fail the encode.
+        let realm = self.realm_id;
+        let ps = self.page_size;
+        let pager = Arc::clone(&self.pager);
+        let inline_threshold = overflow::inline_value_threshold(ps);
+        let mut records: Vec<(Vec<u8>, LeafValue)> = Vec::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            let value = if v.len() > inline_threshold {
+                let total_len = v.len() as u64;
+                let root_page_id =
+                    overflow::write_chain(&pager, realm, &v, ps, &mut || self.allocate_page())
+                        .await?;
+                LeafValue::Overflow {
+                    total_len,
+                    root_page_id,
+                }
+            } else {
+                LeafValue::Inline(v)
             };
-            // Rough check: header + slot_dir entry + record body
+            records.push((k, value));
+        }
+
+        let body_cap = node::body_capacity(ps);
+
+        // First pass: group records into leaves, sized by encoded record width.
+        let mut leaf_groups: Vec<Vec<(Vec<u8>, LeafValue)>> = Vec::new();
+        let mut current: Vec<(Vec<u8>, LeafValue)> = Vec::new();
+        for (k, value) in records {
+            // New record's body contribution: suffix-len field + key + value.
+            // (No prefix compression at build time, so suffix == full key.)
+            let entry_size = 2 + k.len() + value.encoded_size();
             let projected = node::HEADER_LEN
-                + (current_leaf.records.len() + 1) * 2
-                + current_leaf
-                    .records
+                + (current.len() + 1) * 2
+                + current
                     .iter()
                     .map(|(ck, cv)| 2 + ck.len() + cv.encoded_size())
                     .sum::<usize>()
                 + entry_size;
-            if projected > body_cap && !current_leaf.records.is_empty() {
-                leaf_groups.push(
-                    std::mem::take(&mut current_leaf.records)
-                        .into_iter()
-                        .map(|(lk, lv)| {
-                            let vbytes = match lv {
-                                LeafValue::Inline(b) => b,
-                                LeafValue::Overflow { .. } => Vec::new(),
-                            };
-                            (lk, vbytes)
-                        })
-                        .collect(),
-                );
-                current_leaf = Leaf::new();
+            if projected > body_cap && !current.is_empty() {
+                leaf_groups.push(std::mem::take(&mut current));
             }
-            current_leaf.upsert(k, LeafValue::Inline(v.clone()));
+            current.push((k, value));
         }
-        if !current_leaf.records.is_empty() {
-            leaf_groups.push(
-                std::mem::take(&mut current_leaf.records)
-                    .into_iter()
-                    .map(|(lk, lv)| {
-                        let vbytes = match lv {
-                            LeafValue::Inline(b) => b,
-                            LeafValue::Overflow { .. } => Vec::new(),
-                        };
-                        (lk, vbytes)
-                    })
-                    .collect(),
-            );
+        if !current.is_empty() {
+            leaf_groups.push(current);
         }
 
-        // Second pass: allocate page_ids and write leaves with correct sibling pointers.
+        // Second pass: allocate page ids and write leaves with sibling links.
+        // Input is sorted and grouping preserves order, so each leaf's records
+        // are already in key order.
+        let mut leaves: Vec<(u64, Vec<u8>)> = Vec::new(); // (page_id, first_key)
         let n_leaves = leaf_groups.len();
         let page_ids: Vec<u64> = (0..n_leaves).map(|_| self.allocate_page()).collect();
 
-        for (i, group) in leaf_groups.iter().enumerate() {
-            let mut leaf = Leaf {
+        for (i, group) in leaf_groups.into_iter().enumerate() {
+            let first_key = group.first().map(|(k, _)| k.clone()).unwrap_or_default();
+            let leaf = Leaf {
                 left_sibling: if i == 0 { 0 } else { page_ids[i - 1] },
                 right_sibling: if i + 1 < n_leaves { page_ids[i + 1] } else { 0 },
-                records: group
-                    .iter()
-                    .map(|(k, v)| (k.clone(), LeafValue::Inline(v.clone())))
-                    .collect(),
+                records: group,
             };
-            leaf.records.sort_by(|(a, _), (b, _)| a.cmp(b)); // already sorted
             self.write_leaf(page_ids[i], &leaf).await?;
-            let first_key = group.first().map(|(k, _)| k.clone()).unwrap_or_default();
             leaves.push((page_ids[i], first_key));
         }
 
