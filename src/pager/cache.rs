@@ -14,6 +14,10 @@ use std::sync::Arc;
 pub enum FileKey {
     Main,
     Segment([u8; 16]),
+    /// Apply-journal sidecar at `applyjournal/<hex(id)>`. A receiver-local,
+    /// AEAD-authenticated file written before an `apply_incremental` header
+    /// swap; it is neither a `main.db` page nor a catalog-tracked segment.
+    ApplyJournal([u8; 16]),
 }
 
 /// Bytes plus pin count. `bytes` holds the decrypted full-page buffer

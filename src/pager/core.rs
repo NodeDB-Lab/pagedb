@@ -132,7 +132,7 @@ impl PagerInner {
     pub(crate) fn cache_for_key(&self, file: FileKey) -> &parking_lot::Mutex<PageCache> {
         match file {
             FileKey::Main => &self.buffer_pool,
-            FileKey::Segment(_) => &self.segment_cache,
+            FileKey::Segment(_) | FileKey::ApplyJournal(_) => &self.segment_cache,
         }
     }
 
@@ -166,6 +166,10 @@ pub struct Pager<V: Vfs> {
     dek_lru: parking_lot::Mutex<DekLru>,
     main_nonce: parking_lot::Mutex<MainDbNonceGen>,
     segment_nonces: parking_lot::Mutex<BTreeMap<[u8; 16], SegmentNonceGen>>,
+    /// Per-journal-sidecar nonce generators. Each apply allocates a fresh,
+    /// never-reused `journal_id`, so a generator seeded from that id never
+    /// collides with another journal's nonces under one key.
+    journal_nonces: parking_lot::Mutex<BTreeMap<[u8; 16], SegmentNonceGen>>,
     pub(crate) inner: Arc<PagerInner>,
     /// Retries on AEAD failure before surfacing `ChecksumFailure`. Non-zero
     /// only in Observer mode to absorb torn reads from a concurrent writer.
@@ -228,6 +232,7 @@ impl<V: Vfs> Pager<V> {
             dek_lru: parking_lot::Mutex::new(DekLru::with_capacity(cfg.dek_lru_capacity)),
             main_nonce: parking_lot::Mutex::new(main_nonce),
             segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
+            journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             files: AsyncMutex::new(BTreeMap::new()),
             inner,
             active_epoch: AtomicU64::new(initial_epoch),
@@ -353,6 +358,75 @@ impl<V: Vfs> Pager<V> {
             let _ = nonce_gen.next_nonce()?;
         }
         Ok(page_id)
+    }
+
+    /// Stage an apply-journal sidecar page into the cache as dirty. `page_id`
+    /// is the 0-based page index within `applyjournal/<hex(journal_id)>`.
+    #[allow(clippy::unused_async)]
+    pub async fn stage_journal_page(
+        &self,
+        journal_id: [u8; 16],
+        page_id: u64,
+        realm_id: RealmId,
+        body_plain: &[u8],
+    ) -> Result<()> {
+        self.write_page(
+            FileKey::ApplyJournal(journal_id),
+            page_id,
+            realm_id,
+            PageKind::ApplyJournal,
+            body_plain,
+            journal_id,
+        )
+    }
+
+    /// Flush all dirty pages of an apply-journal sidecar to disk and fsync.
+    pub async fn flush_journal(&self, journal_id: [u8; 16], realm_id: RealmId) -> Result<()> {
+        self.flush_file(
+            FileKey::ApplyJournal(journal_id),
+            realm_id,
+            journal_id,
+            None,
+        )
+        .await
+    }
+
+    /// Read an apply-journal sidecar page, AEAD-verified under `realm_id`.
+    pub async fn read_journal_page(
+        &self,
+        journal_id: [u8; 16],
+        page_id: u64,
+        realm_id: RealmId,
+    ) -> Result<PageGuard> {
+        self.read_page(
+            FileKey::ApplyJournal(journal_id),
+            page_id,
+            realm_id,
+            PageKind::ApplyJournal,
+            journal_id,
+        )
+        .await
+    }
+
+    /// Remove an apply-journal sidecar file and drop all its in-memory state
+    /// (cache pages, file handle, nonce generator). Called after the journal
+    /// has been fully replayed and the header pointer cleared.
+    pub async fn remove_journal(&self, journal_id: [u8; 16]) -> Result<()> {
+        let key = FileKey::ApplyJournal(journal_id);
+        self.files.lock().await.remove(&key);
+        self.inner.cache_for_key(key).lock().clear_file(key);
+        self.journal_nonces.lock().remove(&journal_id);
+        let path = format!("applyjournal/{}", crate::hex::to_hex_lower(&journal_id));
+        self.vfs.remove(&path).await.ok();
+        Ok(())
+    }
+
+    /// Drop an apply-journal sidecar's cached pages without removing the file,
+    /// forcing subsequent reads to AEAD-decrypt from disk.
+    #[cfg(test)]
+    pub(crate) fn drop_journal_cache(&self, journal_id: [u8; 16]) {
+        let key = FileKey::ApplyJournal(journal_id);
+        self.inner.cache_for_key(key).lock().clear_file(key);
     }
 
     /// Flush all dirty main.db pages to the VFS in physical-id order.
@@ -734,6 +808,9 @@ impl<V: Vfs> Pager<V> {
         let path = match file {
             FileKey::Main => self.cfg.main_db_path.clone(),
             FileKey::Segment(id) => format!("seg/{}", crate::hex::to_hex_lower(&id)),
+            FileKey::ApplyJournal(id) => {
+                format!("applyjournal/{}", crate::hex::to_hex_lower(&id))
+            }
         };
         let f = self.vfs.open(&path, OpenMode::CreateOrOpen).await?;
         let arc = Arc::new(AsyncMutex::new(f));
@@ -752,6 +829,11 @@ impl<V: Vfs> Pager<V> {
                 let nonce_gen = gens.entry(id).or_insert_with(|| SegmentNonceGen::new(&id));
                 nonce_gen.next_nonce()
             }
+            FileKey::ApplyJournal(id) => {
+                let mut gens = self.journal_nonces.lock();
+                let nonce_gen = gens.entry(id).or_insert_with(|| SegmentNonceGen::new(&id));
+                nonce_gen.next_nonce()
+            }
         }
     }
 }
@@ -765,6 +847,7 @@ fn derive_kind_for_flush(file: FileKey) -> PageKind {
     match file {
         FileKey::Main => PageKind::BTreeLeaf,
         FileKey::Segment(_) => PageKind::SegmentData,
+        FileKey::ApplyJournal(_) => PageKind::ApplyJournal,
     }
 }
 
