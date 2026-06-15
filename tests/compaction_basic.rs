@@ -120,6 +120,130 @@ async fn compact_truncates_main_db() {
     }
 }
 
+// ─── Large (overflow-backed) values survive a full repack ─────────────────────
+
+/// Values larger than the inline threshold (`PAGE / 4`) are stored as overflow
+/// chains. A full `compact_now` repack must reconstruct those chains, not try to
+/// inline the resolved bytes into a single leaf (which exceeds leaf capacity),
+/// and must leave the store readable.
+#[tokio::test(flavor = "current_thread")]
+async fn compact_now_preserves_large_overflow_values() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
+
+    let big = vec![0xCDu8; 4096]; // > PAGE/4 (1024) → overflow chain
+    let small = vec![0x07u8; 48];
+    let n = 120u32;
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0..n {
+            let key = format!("k-{i:05}");
+            let val = if i % 2 == 0 {
+                big.as_slice()
+            } else {
+                small.as_slice()
+            };
+            w.put(key.as_bytes(), val).await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+
+    db.compact_now().await.unwrap();
+
+    // All values intact and correct immediately after compaction.
+    {
+        let r = db.begin_read().await.unwrap();
+        for i in 0..n {
+            let key = format!("k-{i:05}");
+            let want = if i % 2 == 0 { &big } else { &small };
+            assert_eq!(
+                r.get(key.as_bytes()).await.unwrap().as_deref(),
+                Some(want.as_slice()),
+                "value mismatch at {key} after compaction"
+            );
+        }
+    }
+
+    // And the store reopens cleanly — a partial/non-atomic repack would brick it
+    // with an AEAD tag failure here.
+    drop(db);
+    let db2 = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let r = db2.begin_read().await.unwrap();
+    let k0 = format!("k-{:05}", 0);
+    assert_eq!(
+        r.get(k0.as_bytes()).await.unwrap().as_deref(),
+        Some(big.as_slice()),
+        "large value lost after reopen"
+    );
+}
+
+/// A compaction that cannot complete must leave the store fully readable: it has
+/// to roll back, never persist a half-built tree. Guards against the failure
+/// mode where a partial repack leaves orphaned dirty pages that a later ordinary
+/// commit flushes over the live tree, corrupting it on the next open.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_then_commit_keeps_large_values_readable_on_reopen() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
+
+    let big = vec![0x5Au8; 4096];
+    let small = vec![0x11u8; 48];
+    // Small values sort first ("a-*") and fill several leaves that a repack
+    // writes successfully; the big values ("z-*") come later and trip the
+    // failure mid-write, leaving partially-written pages behind.
+    let n_small = 300u32;
+    let n_big = 5u32;
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0..n_small {
+            w.put(format!("a-{i:05}").as_bytes(), &small).await.unwrap();
+        }
+        for i in 0..n_big {
+            w.put(format!("z-{i:05}").as_bytes(), &big).await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+
+    // Attempt compaction; whatever its outcome, the store must stay consistent.
+    let _ = db.compact_now().await;
+
+    // A subsequent ordinary commit must not flush a half-built repack over the
+    // live tree.
+    {
+        let mut w = db.begin_write().await.unwrap();
+        w.put(b"sentinel", b"ok").await.unwrap();
+        w.commit().await.unwrap();
+    }
+
+    drop(db);
+    let db2 = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let r = db2.begin_read().await.unwrap();
+    for i in 0..n_small {
+        let key = format!("a-{i:05}");
+        assert_eq!(
+            r.get(key.as_bytes()).await.unwrap().as_deref(),
+            Some(small.as_slice()),
+            "small value {key} lost/corrupted after compaction + commit + reopen"
+        );
+    }
+    for i in 0..n_big {
+        let key = format!("z-{i:05}");
+        assert_eq!(
+            r.get(key.as_bytes()).await.unwrap().as_deref(),
+            Some(big.as_slice()),
+            "large value {key} lost/corrupted after compaction + commit + reopen"
+        );
+    }
+    assert_eq!(
+        r.get(b"sentinel").await.unwrap().as_deref(),
+        Some(b"ok".as_slice())
+    );
+}
+
 // ─── Test 3: compact_now repacks segments ─────────────────────────────────────
 
 #[tokio::test(flavor = "current_thread")]

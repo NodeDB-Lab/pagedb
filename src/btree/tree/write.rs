@@ -17,7 +17,7 @@ impl<V: Vfs> BTree<V> {
     /// Insert or overwrite a key-value pair.
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         // Build the leaf value — inline if small enough, overflow chain otherwise.
-        let leaf_value = if value.len() > self.page_size / 4 {
+        let leaf_value = if value.len() > overflow::inline_value_threshold(self.page_size) {
             let realm = self.realm_id;
             let ps = self.page_size;
             let pager = Arc::clone(&self.pager);

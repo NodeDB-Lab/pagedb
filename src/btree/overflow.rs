@@ -26,6 +26,14 @@ use crate::{RealmId, Result};
 /// Header length for chain pages (non-root): `next[8] || data_len[4]`.
 pub const OVERFLOW_HEADER_LEN: usize = 12;
 
+/// Values longer than this are stored as an overflow chain rather than inline in
+/// a leaf. Shared by the `put` path and `bulk_load` so a repack reproduces the
+/// same inline/overflow split the original writes produced.
+#[must_use]
+pub fn inline_value_threshold(page_size: usize) -> usize {
+    page_size / 4
+}
+
 /// Extra bytes at the start of a v2 root body before the standard header:
 /// `refcount[4]`.
 const OVERFLOW_ROOT_V2_PREFIX: usize = 4;

@@ -9,6 +9,7 @@
 
 mod full;
 mod helpers;
+mod repack;
 mod step;
 mod types;
 

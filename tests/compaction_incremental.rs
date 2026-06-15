@@ -47,18 +47,18 @@ async fn compact_now_no_free_pages() {
     let _ = stats; // stats are informational; just verify it completes
 }
 
-// ─── Test 3: compact_step advances watermark in each call ────────────────────
+// ─── Test 3: compact_step reclaims freed space and reports completion ─────────
 
 #[tokio::test(flavor = "current_thread")]
-async fn compact_step_watermark_advances() {
+async fn compact_step_reclaims_after_deletes() {
     let db = fresh_db().await;
 
-    // Write 100 keys and delete half to create free pages.
+    // Write 100 keys and delete half to free pages.
     {
         let mut txn = db.begin_write().await.unwrap();
         for i in 0u32..100 {
             let key = format!("wm-{i:04}");
-            txn.put(key.as_bytes(), b"watermark-test-value")
+            txn.put(key.as_bytes(), b"reclaim-test-value")
                 .await
                 .unwrap();
         }
@@ -73,35 +73,29 @@ async fn compact_step_watermark_advances() {
         txn.commit().await.unwrap();
     }
 
-    // Run compaction in tiny batches of 5 and verify watermark is monotonically
-    // non-decreasing until completion.
-    let budget = CompactBudget::new(5, 10_000);
+    // Compaction runs to completion in one call (a full rewrite cannot be safely
+    // chunked across lock releases) and reclaims the freed pages.
+    let prog = db.compact_step(CompactBudget::default()).await.unwrap();
+    assert!(!prog.more_work, "compaction completes in a single call");
+    assert!(
+        prog.pages_relocated > 0,
+        "expected reclaimed pages after deleting half the keys"
+    );
 
-    let mut prev_watermark: Option<u64> = None;
-    let mut iterations = 0usize;
-    loop {
-        let prog = db.compact_step(budget).await.unwrap();
-        iterations += 1;
+    // A second call has nothing to reclaim.
+    let prog2 = db.compact_step(CompactBudget::default()).await.unwrap();
+    assert!(!prog2.more_work);
+    assert_eq!(prog2.pages_relocated, 0, "already compact: nothing to do");
 
-        if let Some(wm) = prog.watermark {
-            if let Some(prev) = prev_watermark {
-                assert!(
-                    wm >= prev,
-                    "watermark must not decrease: prev={prev} current={wm}"
-                );
-            }
-            prev_watermark = Some(wm);
-        } else {
-            // Watermark cleared = session complete.
-            assert!(!prog.more_work);
-            break;
-        }
-
-        if !prog.more_work {
-            break;
-        }
-
-        assert!(iterations < 10_000, "compaction did not converge");
+    // Surviving keys remain readable.
+    let r = db.begin_read().await.unwrap();
+    for i in (1u32..100).step_by(2) {
+        let key = format!("wm-{i:04}");
+        assert_eq!(
+            r.get(key.as_bytes()).await.unwrap().as_deref(),
+            Some(b"reclaim-test-value".as_slice()),
+            "{key} must survive compaction"
+        );
     }
 }
 
@@ -281,52 +275,35 @@ async fn compact_step_reopen_history_consistent() {
     );
 }
 
-// ─── Test: an intermediate compact_step preserves the durable free-list ──────
+/// `compact_step` runs the same atomic repack as `compact_now`, so it must
+/// preserve overflow (large) values rather than failing or corrupting the store.
 #[tokio::test(flavor = "current_thread")]
-async fn compact_step_preserves_free_list() {
-    // No commit history, so freed pages are immediately reclaimable and tracked
-    // in the durable free-list with no reader/history pinning them.
-    let opts = pagedb::options::OpenOptions::default()
-        .with_commit_history_retain(pagedb::options::RetainPolicy::Disabled);
-    let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, opts)
+async fn compact_step_preserves_large_overflow_values() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
         .await
         .unwrap();
 
-    // Build a working set, then delete most of it to populate the free-list.
+    let big = vec![0x3Cu8; 4096]; // > PAGE/4 → overflow chain
+    let n = 60u32;
     {
         let mut w = db.begin_write().await.unwrap();
-        for i in 0u32..300 {
-            w.put(format!("k{i:05}").as_bytes(), &[1u8; 128])
-                .await
-                .unwrap();
+        for i in 0..n {
+            w.put(format!("k-{i:05}").as_bytes(), &big).await.unwrap();
         }
         w.commit().await.unwrap();
     }
-    {
-        let mut w = db.begin_write().await.unwrap();
-        for i in 0u32..250 {
-            w.delete(format!("k{i:05}").as_bytes()).await.unwrap();
-        }
-        w.commit().await.unwrap();
+
+    let prog = db.compact_step(CompactBudget::default()).await.unwrap();
+    assert!(!prog.more_work, "compaction completes in a single call");
+
+    let r = db.begin_read().await.unwrap();
+    for i in 0..n {
+        let key = format!("k-{i:05}");
+        assert_eq!(
+            r.get(key.as_bytes()).await.unwrap().as_deref(),
+            Some(big.as_slice()),
+            "large value {key} lost after compact_step repack"
+        );
     }
-    let pending_before = db.stats().await.unwrap().free_list_pending_entries;
-    assert!(
-        pending_before > 0,
-        "setup should have populated the free-list; got {pending_before}"
-    );
-
-    // One intermediate step (small budget so it is NOT the final batch).
-    let prog = db
-        .compact_step(CompactBudget::new(5, 10_000))
-        .await
-        .unwrap();
-    assert!(prog.more_work, "small budget should leave more work");
-
-    // The pre-existing free-list must survive the intermediate step, not be
-    // wiped — those pages are still reusable by ordinary writes.
-    let pending_after = db.stats().await.unwrap().free_list_pending_entries;
-    assert!(
-        pending_after >= pending_before,
-        "intermediate compact_step wiped the durable free-list: {pending_before} -> {pending_after}"
-    );
 }

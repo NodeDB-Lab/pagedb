@@ -241,6 +241,14 @@ impl<V: Vfs + Clone> Db<V> {
 
         let main_db_path = "/main.db".to_string();
 
+        // An interrupted compaction may leave a scratch copy behind; its rename
+        // never happened, so main.db is authoritative and the scratch is stale.
+        // Only a handle that holds the exclusive writer lock may remove it — an
+        // Observer could otherwise delete a live writer's in-progress compaction.
+        if matches!(mode, DbMode::Standalone | DbMode::Follower) {
+            vfs.remove(&format!("{main_db_path}.compact")).await.ok();
+        }
+
         // Read both raw header pages to extract kek_salt and mk_epoch without
         // yet knowing HK. We try each header page's own kek_salt to derive HK
         // and verify, then pick the winner by seq.

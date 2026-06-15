@@ -27,7 +27,6 @@ pub mod snapshot;
 pub mod txn;
 pub mod vfs;
 
-pub use catalog::codec::CompactionStateRow;
 pub use catalog::codec::{RealmQuotas, SegmentKind, SegmentMeta};
 pub use compaction::{CompactBudget, CompactProgress, CompactStats};
 pub use crypto::CipherId;

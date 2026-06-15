@@ -358,13 +358,39 @@ impl<V: Vfs> Pager<V> {
     /// Flush all dirty main.db pages to the VFS in physical-id order.
     pub async fn flush_main(&self, realm_id: RealmId) -> Result<()> {
         tracing::debug!(name = "pager.flush", "flushing dirty main db pages");
-        self.flush_file(FileKey::Main, realm_id, MAIN_DB_SEGMENT_ID)
+        self.flush_file(FileKey::Main, realm_id, MAIN_DB_SEGMENT_ID, None)
             .await
+    }
+
+    /// Flush all dirty main.db pages to an alternate file `dest_path` (rather
+    /// than the live main.db), clearing their dirty flags. Pages are sealed with
+    /// the same AAD as a normal main flush, so the destination is a bit-identical
+    /// main.db. Used by compaction to build a compacted copy that is then
+    /// atomically renamed into place.
+    pub async fn flush_main_to(&self, realm_id: RealmId, dest_path: &str) -> Result<()> {
+        self.flush_file(FileKey::Main, realm_id, MAIN_DB_SEGMENT_ID, Some(dest_path))
+            .await
+    }
+
+    /// Drop all cached main.db pages so subsequent reads re-fetch from disk.
+    /// Used after compaction replaces main.db (the cached pages no longer match
+    /// the on-disk file) and on a failed compaction (to discard the partially
+    /// built, never-persisted compacted pages).
+    pub fn reset_main_pages(&self) {
+        self.inner.buffer_pool.lock().clear_file(FileKey::Main);
+    }
+
+    /// Close the cached main.db file handle. The next access reopens the file.
+    /// Required around an atomic rename over main.db: closing first lets the
+    /// rename replace the file on platforms that reject replacing an open file
+    /// (Windows), and reopening afterwards picks up the new inode (Unix).
+    pub async fn close_main_handle(&self) {
+        self.files.lock().await.remove(&FileKey::Main);
     }
 
     /// Flush all dirty pages for one segment to the VFS in physical-id order.
     pub async fn flush_segment(&self, segment_id: [u8; 16], realm_id: RealmId) -> Result<()> {
-        self.flush_file(FileKey::Segment(segment_id), realm_id, segment_id)
+        self.flush_file(FileKey::Segment(segment_id), realm_id, segment_id, None)
             .await
     }
 
@@ -588,6 +614,7 @@ impl<V: Vfs> Pager<V> {
         file: FileKey,
         realm_id: RealmId,
         segment_id: [u8; 16],
+        dest_path: Option<&str>,
     ) -> Result<()> {
         let dirty_ids = self.inner.cache_for_key(file).lock().dirty_for_file(file);
         if dirty_ids.is_empty() {
@@ -678,8 +705,14 @@ impl<V: Vfs> Pager<V> {
                 buf: wire,
             });
         }
-        let file_handle = self.open_file_handle(file).await?;
-        {
+        if let Some(path) = dest_path {
+            // Alternate destination (compaction's compacted copy): open it
+            // directly, never via the cached main handle.
+            let mut f = self.vfs.open(path, OpenMode::CreateOrOpen).await?;
+            f.write_at_vectored(&reqs).await?;
+            f.sync().await?;
+        } else {
+            let file_handle = self.open_file_handle(file).await?;
             let mut f = file_handle.lock().await;
             f.write_at_vectored(&reqs).await?;
             f.sync().await?;
