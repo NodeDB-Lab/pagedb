@@ -1,28 +1,20 @@
 //! Full one-shot compaction (entry point: [`compact_now`]):
 //!
-//! 1. Collects all live data from main and catalog trees into memory.
-//! 2. Drains eligible deferred-free pages (now eligible since no pinned reader
-//!    can observe them).
-//! 3. Writes fresh compacted trees starting at page 4, producing a dense layout.
-//! 4. Commits a new header with the updated roots and reduced `next_page_id`.
-//! 5. Truncates main.db if no reader pins the old high-water-mark range.
-//! 6. Repacks segment files whose garbage ratio exceeds 5%.
+//! 1. Refuses while any reader pins the page range (relocation/truncation is
+//!    unsafe under a pinned reader).
+//! 2. Crash-atomically repacks the main + catalog trees into a dense low-address
+//!    layout and truncates the reclaimed tail (see [`super::repack`]).
+//! 3. Repacks segment files whose garbage ratio exceeds 5%.
 
-use crate::btree::BTree;
+use crate::Result;
 use crate::errors::PagedbError;
-use crate::pager::header::commit_header;
-use crate::pager::structural_header::MainDbHeaderFields;
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentPageKind;
 use crate::segment::writer::SegmentWriter;
 use crate::txn::db::Db;
 use crate::vfs::{Vfs, VfsFile};
-use crate::{CommitId, Result};
 
-use super::helpers::{
-    collect_all_pairs, collect_catalog_split, find_segment_name_inner, list_all_segments_inner,
-    page_size_log2, replace_segment_compact,
-};
+use super::helpers::{find_segment_name_inner, list_all_segments_inner, replace_segment_compact};
 use super::types::CompactStats;
 
 /// Full online compaction. See module-level docs for the staged flow.
@@ -31,7 +23,7 @@ use super::types::CompactStats;
 /// `EnteredSpan` guard: an entered span guard is `!Send` and would be held
 /// across the many `.await` points below, making the returned future `!Send`
 /// and thus uncallable from `Send` async contexts (e.g. the nodedb-lite
-/// `#[async_trait]` StorageEngine impl, which requires `Send` futures).
+/// `#[async_trait]` `StorageEngine` impl, which requires `Send` futures).
 pub async fn compact_now<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
     use tracing::Instrument;
     compact_now_inner(db)
@@ -54,8 +46,6 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
     // cached for runtime reuse. Drop those reuse hints so a post-compaction
     // commit can't recycle a page the repack now uses for live data.
     db.free_page_cache.lock().clear();
-
-    let old_next_page_id = state.next_page_id;
 
     // ── 1. Refuse while readers are pinned ───────────────────────────────────
     // A dense repack relocates the current tree and truncates the file; pinned
@@ -81,124 +71,19 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
         return Ok(result);
     }
 
-    // ── 2. Full repack (no readers pinned) ───────────────────────────────────
-
-    // Collect all live data in memory BEFORE any writes.
-    let main_pairs = if state.root_page_id != 0 {
-        let old_tree = BTree::open(
-            db.pager.clone(),
-            db.realm_id,
-            state.root_page_id,
-            old_next_page_id,
-            db.page_size,
-        );
-        collect_all_pairs(&old_tree).await?
-    } else {
-        Vec::new()
-    };
-
-    // Collect catalog rows (housekeeping free-list rows dropped).
-    let cat_rows = collect_catalog_split(&db.pager, db.realm_id, &state).await?;
-
-    // ── 3. Write fresh compacted trees starting at page 4 ────────────────────
-    // Pages 0–3 are reserved (header slots A/B + two spares); never allocated.
-    let mut new_main = BTree::open(
-        db.pager.clone(),
-        db.realm_id,
-        0,
-        4, // first data page (pages 0-3 are reserved header slots)
-        db.page_size,
-    );
-    new_main.bulk_load(main_pairs).await?;
-    new_main.flush().await?;
-    let new_root = new_main.root_page_id();
-    let after_main = new_main.next_page_id();
-
-    let mut new_cat = BTree::open(db.pager.clone(), db.realm_id, 0, after_main, db.page_size);
-    new_cat.bulk_load(cat_rows).await?;
-    new_cat.flush().await?;
-    let new_cat_root = new_cat.root_page_id();
-    let new_next = new_cat.next_page_id();
-
-    // Pages reclaimed = reduction in next_page_id (the dense layout is contiguous,
-    // and the durable free-list is reset to empty below).
-    result.main_db_pages_reclaimed = old_next_page_id.saturating_sub(new_next);
-
-    // ── 4. Commit new header ─────────────────────────────────────────────────
-    let new_commit_id = state.latest_commit_id + 1;
-    let new_seq = state.seq + 1;
-    let counter_anchor = db.pager.pending_anchor();
-
-    let mut catalog_root_bytes = [0u8; 16];
-    catalog_root_bytes[..8].copy_from_slice(&new_cat_root.to_le_bytes());
-    catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());
-
-    let fields = MainDbHeaderFields {
-        format_version: 1,
-        cipher_id: db.cipher_id.as_byte(),
-        page_size_log2: page_size_log2(db.page_size)?,
-        flags: 0,
-        file_id: db.file_id,
-        kek_salt: db.kek_salt,
-        mk_epoch: db.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
-        seq: new_seq,
-        active_root_page_id: new_root,
-        active_root_txn_id: new_commit_id,
-        counter_anchor,
-        commit_id: CommitId(new_commit_id),
-        free_list_root: [0u8; 16],
-        catalog_root: catalog_root_bytes,
-        apply_journal_root_page_id: 0,
-        apply_journal_root_version: 0,
-        commit_history_root_page_id: 0,
-        commit_history_root_version: 0,
-        restore_mode: 0,
-        next_page_id: new_next,
-        commit_retain_policy_tag: 0,
-        commit_retain_policy_value: 0,
-    };
-
-    let hk_clone = { db.hk.read().clone() };
-    let new_slot = commit_header(
-        &*db.vfs,
-        &db.main_db_path,
-        &hk_clone,
-        &fields,
-        state.active_slot,
-        db.page_size,
-    )
-    .await?;
-    db.pager.commit_anchor(counter_anchor)?;
-
-    state.root_page_id = new_root;
-    state.catalog_root_page_id = new_cat_root;
-    state.next_page_id = new_next;
-    state.active_slot = new_slot;
-    state.seq = new_seq;
-    state.latest_commit_id = new_commit_id;
-    state.commit_history_root_page_id = 0;
-    state.commit_history_root_version = 0;
-    // The dense repack relocates/truncates every page, so the old free-list is
-    // gone; the new layout starts with an empty free-list.
-    state.free_list_root_page_id = 0;
-    db.latest_commit
-        .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
-
-    // ── 5. Truncate if no readers pin the old high-water range ───────────────
-    // (No readers are pinned at this point — checked above — so truncation is safe.)
-    if new_next < old_next_page_id {
-        let new_size = new_next.saturating_mul(db.page_size as u64);
-        let old_size = old_next_page_id.saturating_mul(db.page_size as u64);
-        let mut f = db
-            .vfs
-            .open(&db.main_db_path, crate::vfs::types::OpenMode::ReadWrite)
-            .await?;
-        f.set_len(new_size).await?;
-        f.sync().await?;
-        result.bytes_truncated = old_size.saturating_sub(new_size);
+    // ── 2. Crash-atomic dense repack of the main + catalog trees ─────────────
+    // An empty free-list means every page below the high-water mark is live —
+    // the store is already dense, so there is nothing to reclaim and we skip the
+    // repack entirely (no wasted rewrite). Otherwise repack via a scratch file +
+    // atomic rename; main.db is never modified until the rename (see
+    // `super::repack`).
+    if state.free_list_root_page_id != 0 {
+        let repack = super::repack::atomic_dense_repack(db, &mut state).await?;
+        result.main_db_pages_reclaimed = repack.pages_reclaimed;
+        result.bytes_truncated = repack.bytes_truncated;
     }
 
-    // ── 6. Repack segments ────────────────────────────────────────────────────
+    // ── 3. Repack segments ────────────────────────────────────────────────────
     let all_segments = list_all_segments_inner(&db.pager, db.realm_id, &state).await?;
     for meta in all_segments {
         let live = crate::segment::writer::live_path(&meta.segment_id);

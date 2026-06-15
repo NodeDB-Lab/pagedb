@@ -42,45 +42,12 @@ pub enum CatalogRowKind {
     /// catalog, reader pins are maintained in-memory only and the writer process
     /// must be trusted to honor the catalog pins.
     ReaderPin = 0x06,
-    /// Incremental compaction watermark. Singleton row; key is `[0x07]`.
-    /// Value: `target_root[8] || frontier_page_id[8] || started_at_commit_id[8] ||
-    ///          total_pages_estimate[8]` = 32 bytes.
-    ///
-    /// Present only while an incremental compaction is in progress. Cleared
-    /// atomically with the final compaction commit. On `Db::open`, a present
-    /// row means a prior compaction was interrupted; the embedder must call
-    /// `compact_step` again to resume — `Db::open` does NOT auto-resume.
+    /// Reserved (`0x07`). Older builds wrote an incremental-compaction watermark
+    /// here; compaction is now a single atomic operation and never writes it.
+    /// Retained as a row-kind boundary and so any legacy row is recognised and
+    /// dropped during compaction.
     CompactionState = 0x07,
 }
-
-/// Incremental compaction watermark persisted in the catalog.
-///
-/// Present while a `compact_step` session is in progress. The embedder must
-/// call `compact_step` again to resume after a crash; `Db::open` does not
-/// auto-resume.
-///
-/// Encoding: `target_root[8] || frontier_page_id[8] || started_at_commit_id[8] ||
-///             total_pages_estimate[8] || frontier_key_len[4] || frontier_key[frontier_key_len]`
-/// (minimum 32 bytes; variable total).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompactionStateRow {
-    /// Root page id of the main B+ tree at the time compaction started.
-    /// Used as the source snapshot to read from during each step.
-    pub target_root: u64,
-    /// The `next_page_id` of the partially-built compacted tree after the last
-    /// committed batch. Used to estimate progress and as the initial `next_page_id`
-    /// when no free-list pages are available.
-    pub frontier_page_id: u64,
-    /// The `commit_id` at which the compaction session began.
-    pub started_at_commit_id: u64,
-    /// Estimated total pages in the source tree (for progress reporting).
-    pub total_pages_estimate: u64,
-    /// The key (exclusive lower bound) from which the next step should begin
-    /// reading pairs. Empty means start from the beginning.
-    pub frontier_key: Vec<u8>,
-}
-
-pub const COMPACTION_STATE_FIXED_LEN: usize = 36; // 4 × u64 + 1 × u32 length prefix
 
 /// Rekey watermark persisted in the catalog during an online rekey operation.
 /// A present row means a rekey is in flight or was interrupted by a crash.
@@ -244,61 +211,6 @@ impl Catalog {
     #[must_use]
     pub fn reader_pin_range_end() -> [u8; 1] {
         [CatalogRowKind::CompactionState as u8]
-    }
-
-    /// Compaction-state row key: `[0x07]` (singleton).
-    #[must_use]
-    pub fn compaction_state_key() -> [u8; 1] {
-        [CatalogRowKind::CompactionState as u8]
-    }
-
-    /// Encode a `CompactionStateRow`. Returns a variable-length `Vec<u8>`.
-    pub fn encode_compaction_state(r: &CompactionStateRow) -> Result<Vec<u8>> {
-        let key_len = r.frontier_key.len();
-        let klen32 = u32::try_from(key_len).map_err(|_| PagedbError::ManifestTooLarge)?;
-        let mut o = Vec::with_capacity(COMPACTION_STATE_FIXED_LEN + key_len);
-        o.extend_from_slice(&r.target_root.to_le_bytes());
-        o.extend_from_slice(&r.frontier_page_id.to_le_bytes());
-        o.extend_from_slice(&r.started_at_commit_id.to_le_bytes());
-        o.extend_from_slice(&r.total_pages_estimate.to_le_bytes());
-        o.extend_from_slice(&klen32.to_le_bytes());
-        o.extend_from_slice(&r.frontier_key);
-        Ok(o)
-    }
-
-    /// Decode a `CompactionStateRow` from bytes.
-    pub fn decode_compaction_state(bytes: &[u8]) -> Result<CompactionStateRow> {
-        if bytes.len() < COMPACTION_STATE_FIXED_LEN {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
-        }
-        let read_u64 = |off: usize| {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&bytes[off..off + 8]);
-            u64::from_le_bytes(b)
-        };
-        let target_root = read_u64(0);
-        let frontier_page_id = read_u64(8);
-        let started_at_commit_id = read_u64(16);
-        let total_pages_estimate = read_u64(24);
-        let mut klen_buf = [0u8; 4];
-        klen_buf.copy_from_slice(&bytes[32..36]);
-        let key_len = u32::from_le_bytes(klen_buf) as usize;
-        if bytes.len() < COMPACTION_STATE_FIXED_LEN + key_len {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
-        }
-        let frontier_key =
-            bytes[COMPACTION_STATE_FIXED_LEN..COMPACTION_STATE_FIXED_LEN + key_len].to_vec();
-        Ok(CompactionStateRow {
-            target_root,
-            frontier_page_id,
-            started_at_commit_id,
-            total_pages_estimate,
-            frontier_key,
-        })
     }
 
     /// Encode a `ReaderPinValue` as 41 bytes.

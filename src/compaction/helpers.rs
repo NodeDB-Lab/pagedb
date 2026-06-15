@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::btree::BTree;
-use crate::catalog::codec::{Catalog, CatalogRowKind, CompactionStateRow, SegmentMeta};
+use crate::catalog::codec::{Catalog, CatalogRowKind, SegmentMeta};
 use crate::errors::PagedbError;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
@@ -193,72 +193,6 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
         .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
 
     Ok(())
-}
-
-/// Return the "next key strictly greater than `key`" for range scanning.
-/// Appends a 0x00 byte, which gives the lexicographically smallest key
-/// greater than `key`. If `key` is empty, returns empty (scan from start).
-pub(super) fn next_key_after(key: &[u8]) -> Vec<u8> {
-    if key.is_empty() {
-        Vec::new()
-    } else {
-        let mut v = key.to_vec();
-        v.push(0x00);
-        v
-    }
-}
-
-/// Collect at most `limit` key-value pairs from `[start..end)` in `tree`.
-pub(super) async fn collect_range_limited<V: Vfs + Clone>(
-    tree: &BTree<V>,
-    start: &[u8],
-    end: &[u8],
-    limit: u64,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut pairs = tree.collect_range(start, end).await?;
-    #[allow(clippy::cast_possible_truncation)]
-    if pairs.len() as u64 > limit {
-        pairs.truncate(limit as usize);
-    }
-    Ok(pairs)
-}
-
-/// Load the compaction watermark from the catalog, if present.
-pub(super) async fn load_compaction_state<V: Vfs + Clone>(
-    pager: &Arc<crate::pager::Pager<V>>,
-    realm_id: crate::RealmId,
-    state: &WriterState,
-) -> Result<Option<CompactionStateRow>> {
-    if state.catalog_root_page_id == 0 {
-        return Ok(None);
-    }
-    let tree = BTree::open(
-        pager.clone(),
-        realm_id,
-        state.catalog_root_page_id,
-        state.next_page_id,
-        pager.page_size(),
-    );
-    let key = Catalog::compaction_state_key();
-    match tree.get(&key).await? {
-        Some(bytes) => {
-            let cs = Catalog::decode_compaction_state(&bytes)?;
-            Ok(Some(cs))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Load just the `frontier_page_id` from the watermark (for progress reporting).
-pub(super) async fn load_frontier_page_id<V: Vfs + Clone>(
-    pager: &Arc<crate::pager::Pager<V>>,
-    realm_id: crate::RealmId,
-    state: &WriterState,
-) -> Option<u64> {
-    match load_compaction_state(pager, realm_id, state).await {
-        Ok(Some(cs)) => Some(cs.frontier_page_id),
-        _ => None,
-    }
 }
 
 /// Build [`MainDbHeaderFields`] for a compaction commit.

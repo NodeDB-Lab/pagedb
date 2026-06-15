@@ -4,4 +4,4 @@
 
 pub mod codec;
 
-pub use codec::{Catalog, CatalogRowKind, CompactionStateRow, ReaderPinValue, RekeyStateRow};
+pub use codec::{Catalog, CatalogRowKind, ReaderPinValue, RekeyStateRow};

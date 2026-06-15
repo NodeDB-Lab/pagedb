@@ -273,6 +273,36 @@ impl PageCache {
             .filter_map(|(f, p)| if *f == file { Some(*p) } else { None })
             .collect()
     }
+
+    /// Drop every (unpinned) entry for `file`, including dirty ones, so that the
+    /// cached plaintext is discarded and later reads re-fetch from disk. Used
+    /// when compaction replaces the backing file (the cached pages no longer
+    /// match what is on disk). Pinned entries are left untouched.
+    pub fn clear_file(&mut self, file: FileKey) {
+        let keys: Vec<(FileKey, u64)> = self
+            .map
+            .keys()
+            .filter(|(f, _)| *f == file)
+            .copied()
+            .collect();
+        for key in keys {
+            if self.pins.get(&key).copied().unwrap_or(0) > 0 {
+                continue;
+            }
+            if let Some(idx) = self.map.remove(&key) {
+                let (prev, next) = {
+                    let node = self.slab[idx].as_ref().expect("indexed node alive");
+                    (node.prev, node.next)
+                };
+                if self.hand == Some(idx) {
+                    self.hand = next;
+                }
+                self.unlink_node(idx, prev, next);
+                self.free_node(idx);
+            }
+            self.dirty.remove(&key);
+        }
+    }
 }
 
 #[cfg(test)]
