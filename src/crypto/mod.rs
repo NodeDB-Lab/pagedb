@@ -6,6 +6,7 @@ pub mod kdf;
 pub mod key_manager;
 pub mod keys;
 pub mod nonce;
+pub(crate) mod random;
 
 pub use aad::{Aad, AadFields};
 pub use cipher::{Cipher, CipherId};

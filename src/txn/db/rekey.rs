@@ -152,7 +152,7 @@ impl<V: Vfs + Clone> Db<V> {
             // Create a new segment writer under the new epoch.
             // The pager is already using the new epoch at this point.
             self.vfs.mkdir_all("seg/.staging").await?;
-            let new_segment_id = self.next_segment_id();
+            let new_segment_id = crate::crypto::random::segment_id()?;
             let mut writer = SegmentWriter::create_internal(
                 self.pager.clone(),
                 meta.realm_id,

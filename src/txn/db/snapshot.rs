@@ -331,7 +331,7 @@ impl<V: Vfs + Clone> Db<V> {
         let journal_id = if actions.is_empty() {
             [0u8; 16]
         } else {
-            let id = self.next_segment_id();
+            let id = crate::crypto::random::journal_id()?;
             let record = ApplyJournalRecord {
                 target_commit_id: new_commit_id,
                 actions: actions.clone(),

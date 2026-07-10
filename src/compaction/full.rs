@@ -106,7 +106,7 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
         )
         .await?;
         db.vfs.mkdir_all("seg/.staging").await?;
-        let new_segment_id = db.next_segment_id();
+        let new_segment_id = crate::crypto::random::segment_id()?;
         let mut writer = SegmentWriter::create_internal(
             db.pager.clone(),
             meta.realm_id,

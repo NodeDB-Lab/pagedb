@@ -1,13 +1,9 @@
 /// Verify apply-journal encode/decode round-trips and idempotent action replay.
 /// These tests exercise the journal machinery at the level of the public
 /// encode/decode API and the VFS rename layer without requiring a full crash.
-use pagedb::recovery::journal::{
-    ApplyJournalRecord, JournalAction, decode_apply_journal, encode_apply_journal,
-};
-use pagedb::vfs::memory::MemVfs;
+use pagedb::recovery::journal::{ApplyJournalRecord, JournalAction, decode_record, encode_record};
 use pagedb::vfs::Vfs;
-
-const BODY_LEN: usize = 4096 - 40; // page_size - ENVELOPE_OVERHEAD
+use pagedb::vfs::memory::MemVfs;
 
 #[test]
 fn encode_promote_then_decode() {
@@ -16,11 +12,13 @@ fn encode_promote_then_decode() {
         target_commit_id: 7,
         actions: vec![JournalAction::Promote { segment_id: seg_id }],
     };
-    let buf = encode_apply_journal(&record, BODY_LEN).unwrap();
-    let decoded = decode_apply_journal(&buf).unwrap();
+    let buf = encode_record(&record);
+    let decoded = decode_record(&buf).unwrap();
     assert_eq!(decoded.target_commit_id, 7);
     assert_eq!(decoded.actions.len(), 1);
-    assert!(matches!(decoded.actions[0], JournalAction::Promote { segment_id } if segment_id == seg_id));
+    assert!(
+        matches!(decoded.actions[0], JournalAction::Promote { segment_id } if segment_id == seg_id)
+    );
 }
 
 #[test]
@@ -33,8 +31,8 @@ fn encode_tombstone_then_decode() {
             tombstone_commit_id: 41,
         }],
     };
-    let buf = encode_apply_journal(&record, BODY_LEN).unwrap();
-    let decoded = decode_apply_journal(&buf).unwrap();
+    let buf = encode_record(&record);
+    let decoded = decode_record(&buf).unwrap();
     assert_eq!(decoded.target_commit_id, 42);
     assert!(
         matches!(decoded.actions[0], JournalAction::Tombstone { segment_id, tombstone_commit_id } if segment_id == seg_id && tombstone_commit_id == 41)
@@ -55,8 +53,8 @@ fn encode_mixed_actions_then_decode() {
             },
         ],
     };
-    let buf = encode_apply_journal(&record, BODY_LEN).unwrap();
-    let decoded = decode_apply_journal(&buf).unwrap();
+    let buf = encode_record(&record);
+    let decoded = decode_record(&buf).unwrap();
     assert_eq!(decoded.actions.len(), 2);
     assert_eq!(decoded, record);
 }
@@ -77,8 +75,8 @@ async fn promote_action_is_idempotent_when_staging_absent() {
 #[tokio::test(flavor = "current_thread")]
 async fn promote_action_renames_staging_to_live() {
     use pagedb::recovery::journal::execute_journal_actions;
-    use pagedb::vfs::types::OpenMode;
     use pagedb::vfs::VfsFile;
+    use pagedb::vfs::types::OpenMode;
 
     let vfs = MemVfs::new();
     let seg_id: [u8; 16] = [0xDD; 16];
@@ -87,12 +85,15 @@ async fn promote_action_renames_staging_to_live() {
     vfs.mkdir_all("seg/.staging").await.unwrap();
     let staging_name = format!(
         "seg/.staging/{}",
-        seg_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        seg_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
     {
-        let f = vfs.open(&staging_name, OpenMode::CreateNew).await.unwrap();
+        let mut f = vfs.open(&staging_name, OpenMode::CreateNew).await.unwrap();
         f.write_at(0, b"segment_content").await.unwrap();
-        f.sync_all().await.unwrap();
+        f.sync().await.unwrap();
     }
 
     // Execute promote; staging should move to live.
@@ -101,7 +102,10 @@ async fn promote_action_renames_staging_to_live() {
 
     let live_name = format!(
         "seg/{}",
-        seg_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        seg_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
     // Live file should now exist.
     let f = vfs.open(&live_name, OpenMode::Read).await.unwrap();

@@ -18,3 +18,4 @@ pub enum DbMode {
 pub const WRITER_LOCK_PATH: &str = ".writer.lock";
 pub const FROZEN_READERS_LOCK_PATH: &str = ".frozen_readers.lock";
 pub const OBSERVERS_LOCK_PATH: &str = ".observers.lock";
+pub const ACQUISITION_LOCK_PATH: &str = ".acquisition.lock";

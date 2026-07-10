@@ -26,6 +26,9 @@ pub enum PagedbError {
     #[error("nonce counter exhausted (per-file 2^48 limit reached); rekey required")]
     NonceCounterExhausted,
 
+    #[error("arithmetic overflow while computing {operation}")]
+    ArithmeticOverflow { operation: &'static str },
+
     #[error("read-only handle")]
     ReadOnly,
 
@@ -117,6 +120,9 @@ pub enum PagedbError {
     #[error("unsupported by backend")]
     Unsupported,
 
+    #[error("cryptographically secure randomness unavailable: {0}")]
+    Randomness(#[from] getrandom::Error),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -194,6 +200,12 @@ impl PagedbError {
     #[must_use]
     pub fn corruption(detail: CorruptionDetail) -> Self {
         Self::Corruption(detail)
+    }
+
+    /// Canonical constructor for arithmetic-overflow errors.
+    #[must_use]
+    pub const fn arithmetic_overflow(operation: &'static str) -> Self {
+        Self::ArithmeticOverflow { operation }
     }
 
     /// Canonical constructor for deferred-free backlog errors.

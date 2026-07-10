@@ -31,6 +31,7 @@ bytes = "1"
 tracing = "0.1"
 parking_lot = "0.12"
 rayon = "1"
+getrandom = { version = "0.2", features = ["js"] }
 
 # tokio's `rt-multi-thread` and `fs` features are not supported on
 # `wasm32-unknown-unknown`. Split per target so OPFS builds compile.
@@ -67,7 +68,6 @@ lz4_flex = { version = "0.13", optional = true, default-features = false, featur
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }

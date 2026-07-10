@@ -10,4 +10,4 @@ pub use deep_walk::{DeepWalkReport, run_deep_walk};
 pub use journal::{
     ApplyJournalRecord, JournalAction, execute_journal_actions, replay_apply_journal,
 };
-pub use reconcile::reconcile_catalog;
+pub use reconcile::{repair_catalog, verify_catalog};

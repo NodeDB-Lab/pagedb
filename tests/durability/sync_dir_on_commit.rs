@@ -36,8 +36,13 @@ async fn segment_promote_calls_sync_dir_without_error() {
         .await
         .unwrap();
 
-    let mut sw = db.create_segment(realm, SegmentKind::Unspecified).await.unwrap();
-    sw.append_page(SegmentPageKind::Data, b"payload").await.unwrap();
+    let mut sw = db
+        .create_segment(realm, SegmentKind::Unspecified)
+        .await
+        .unwrap();
+    sw.append_page(SegmentPageKind::Data, b"payload")
+        .await
+        .unwrap();
     let meta = sw.seal().await.unwrap();
 
     let mut w = db.begin_write().await.unwrap();

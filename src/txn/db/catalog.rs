@@ -1,10 +1,11 @@
-//! Catalog-backed operations: realm-quota persistence, counter-monotonicity
-//! recovery, and commit-history maintenance.
+//! Catalog-backed operations: realm-quota persistence and commit-history
+//! maintenance.
 
 use std::sync::atomic::Ordering;
 
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, RealmQuotas};
+use crate::errors::PagedbError;
 use crate::pager::header::commit_header;
 use crate::vfs::Vfs;
 use crate::{RealmId, Result};
@@ -51,95 +52,6 @@ impl<V: Vfs + Clone> Db<V> {
         Ok(Some(u64::from_be_bytes(b)))
     }
 
-    /// Scan catalog counter rows and bump any whose stored value is less than
-    /// `anchor` up to `anchor`. Called once at open to recover monotonicity
-    /// after a torn write. Errors are silently ignored (best-effort); a failure
-    /// here does not prevent the database from opening.
-    pub(super) async fn recover_counter_monotonicity(&self, anchor: u64) -> Result<()> {
-        let (cat_root, next) = {
-            let state = self.writer.lock().await;
-            (state.catalog_root_page_id, state.next_page_id)
-        };
-        if cat_root == 0 {
-            return Ok(());
-        }
-        let counter_prefix = vec![crate::catalog::codec::CatalogRowKind::Counter as u8];
-        let mut end_prefix = counter_prefix.clone();
-        end_prefix.push(0xFF);
-
-        let cat_tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            cat_root,
-            next,
-            self.page_size,
-        );
-        let rows = cat_tree.collect_range(&counter_prefix, &end_prefix).await?;
-        let mut rows_to_bump: Vec<(Vec<u8>, u64)> = Vec::new();
-        for (k, v) in &rows {
-            if let Ok(val) = Catalog::decode_counter(v) {
-                if val < anchor {
-                    rows_to_bump.push((k.clone(), anchor));
-                    tracing::debug!(
-                        name = "counter.monotonicity_recover",
-                        old_value = val,
-                        anchor,
-                        "bumping counter to anchor"
-                    );
-                }
-            }
-        }
-        if rows_to_bump.is_empty() {
-            return Ok(());
-        }
-
-        // Perform a mini write-txn to persist the bumped values.
-        let state = self.writer.lock().await;
-        let mut cat_tree_w = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        for (k, v) in &rows_to_bump {
-            let encoded = Catalog::encode_counter(*v);
-            cat_tree_w.put(k, &encoded).await?;
-        }
-        cat_tree_w.flush().await?;
-        let new_cat_root = cat_tree_w.root_page_id();
-        let new_next = cat_tree_w.next_page_id().max(state.next_page_id);
-        let new_commit_id = state.latest_commit_id + 1;
-        let new_seq = state.seq + 1;
-        let counter_anchor = self.pager.pending_anchor();
-        let catalog_root_bytes = encode_root_ref(new_cat_root, new_commit_id);
-        let fields = self.header_fields(HeaderFieldsParams {
-            mk_epoch: self.mk_epoch.load(Ordering::SeqCst),
-            seq: new_seq,
-            active_root_page_id: state.root_page_id,
-            active_root_txn_id: state.latest_commit_id,
-            counter_anchor,
-            commit_id: new_commit_id,
-            catalog_root: catalog_root_bytes,
-            commit_history_root_page_id: state.commit_history_root_page_id,
-            commit_history_root_version: state.commit_history_root_version,
-            free_list_root_page_id: state.free_list_root_page_id,
-            next_page_id: new_next,
-        })?;
-        let hk_clone = self.hk.read().clone();
-        let _new_slot = commit_header(
-            &*self.vfs,
-            &self.main_db_path,
-            &hk_clone,
-            &fields,
-            state.active_slot,
-            self.page_size,
-        )
-        .await?;
-        self.pager.commit_anchor(counter_anchor)?;
-        Ok(())
-    }
-
     /// Write per-realm quota caps into the catalog B+ tree and persist the
     /// updated catalog root to the A/B header.
     pub async fn set_realm_quotas(&self, realm: RealmId, quotas: RealmQuotas) -> Result<()> {
@@ -159,9 +71,15 @@ impl<V: Vfs + Clone> Db<V> {
 
         let new_catalog_root = cat_tree.root_page_id();
         let new_next = cat_tree.next_page_id();
-        let new_catalog_txn_id = state.latest_commit_id + 1;
+        let new_catalog_txn_id = state
+            .latest_commit_id
+            .checked_add(1)
+            .ok_or_else(|| PagedbError::arithmetic_overflow("catalog transaction id"))?;
 
-        let new_seq = state.seq + 1;
+        let new_seq = state
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| PagedbError::arithmetic_overflow("catalog header sequence"))?;
         let counter_anchor = self.pager.pending_anchor();
         let catalog_root_bytes = encode_root_ref(new_catalog_root, new_catalog_txn_id);
 

@@ -90,7 +90,6 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) mk_epoch: AtomicU64,
     pub(crate) file_id: [u8; 16],
     pub(crate) kek_salt: [u8; 16],
-    pub(crate) segment_id_counter: std::sync::atomic::AtomicU64,
     pub(crate) pending_tombstones: parking_lot::Mutex<Vec<PendingTombstone>>,
     /// Reader-pin rows that need to be deleted from the catalog at the next
     /// catalog commit opportunity. Populated by `ReadTxn::drop`; drained by

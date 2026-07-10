@@ -23,8 +23,11 @@ impl<V: Vfs + Clone> Db<V> {
         realm: RealmId,
         kind: SegmentKind,
     ) -> Result<SegmentWriter<V>> {
+        if !self.mode.open_capabilities().allows_user_writes() {
+            return Err(PagedbError::ReadOnly);
+        }
         self.vfs.mkdir_all("seg/.staging").await?;
-        let segment_id = self.next_segment_id();
+        let segment_id = crate::crypto::random::segment_id()?;
         SegmentWriter::create_internal(self.pager.clone(), realm, segment_id, self.file_id, kind)
             .await
     }
@@ -122,34 +125,6 @@ impl<V: Vfs + Clone> Db<V> {
         let key = Catalog::segment_key(realm, name.as_bytes())?;
         let value = tree.get(&key).await?.ok_or(PagedbError::NotFound)?;
         Catalog::decode_segment_meta(&value)
-    }
-
-    pub(crate) fn next_segment_id(&self) -> [u8; 16] {
-        let counter = self.segment_id_counter.fetch_add(1, Ordering::Relaxed);
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-        let mut seed = u64::from_le_bytes([
-            self.file_id[0],
-            self.file_id[1],
-            self.file_id[2],
-            self.file_id[3],
-            self.file_id[4],
-            self.file_id[5],
-            self.file_id[6],
-            self.file_id[7],
-        ]) ^ counter
-            ^ wall;
-        let mut out = [0u8; 16];
-        for chunk in out.chunks_mut(8) {
-            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = seed;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            chunk.copy_from_slice(&z.to_le_bytes());
-        }
-        out
     }
 
     /// List all segment entries in the catalog.

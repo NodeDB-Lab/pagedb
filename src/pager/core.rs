@@ -4,11 +4,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomOrd};
 
 use bytes::Bytes;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing;
 
 use crate::crypto::aad::{AadFields, MAIN_DB_SEGMENT_ID};
 use crate::crypto::key_manager::DekLru;
@@ -41,7 +40,7 @@ pub struct PagerConfig {
     pub anchor_budget: u64,
     pub dek_lru_capacity: usize,
     /// Number of AEAD-verification retries on a cache miss before surfacing
-    /// a `ChecksumFailure`. Set to > 0 only in Observer mode to absorb torn
+    /// a `ChecksumFailure`. Set to > 0 only in `Observer` mode to absorb torn
     /// reads; all other modes keep this at 0 so that AEAD failures remain
     /// hard corruption signals.
     pub observer_retry_count: u32,
@@ -162,6 +161,7 @@ pub struct Pager<V: Vfs> {
     /// in the cache. Reads use per-page epoch routing; writes always use this
     /// atomic to pick the DEK.
     active_epoch: AtomicU64,
+    read_only: AtomicBool,
     files: AsyncMutex<BTreeMap<FileKey, Arc<AsyncMutex<V::File>>>>,
     dek_lru: parking_lot::Mutex<DekLru>,
     main_nonce: parking_lot::Mutex<MainDbNonceGen>,
@@ -172,7 +172,7 @@ pub struct Pager<V: Vfs> {
     journal_nonces: parking_lot::Mutex<BTreeMap<[u8; 16], SegmentNonceGen>>,
     pub(crate) inner: Arc<PagerInner>,
     /// Retries on AEAD failure before surfacing `ChecksumFailure`. Non-zero
-    /// only in Observer mode to absorb torn reads from a concurrent writer.
+    /// only in `Observer` mode to absorb torn reads from a concurrent writer.
     observer_retry_count: u32,
 }
 
@@ -236,11 +236,26 @@ impl<V: Vfs> Pager<V> {
             files: AsyncMutex::new(BTreeMap::new()),
             inner,
             active_epoch: AtomicU64::new(initial_epoch),
+            read_only: AtomicBool::new(false),
             mk: parking_lot::RwLock::new(mk),
             observer_retry_count,
             vfs,
             cfg,
         })
+    }
+
+    /// Restrict all lazily-opened persistent files to read access and reject
+    /// pager flushes. This only changes in-memory state.
+    pub(crate) fn set_read_only(&self) {
+        self.read_only.store(true, AtomOrd::SeqCst);
+    }
+
+    /// Enable persistent writes after a frozen read-only handle transitions
+    /// to Follower mode. Cached read-only file handles are discarded so later
+    /// pager operations reopen them with read/write access.
+    pub(crate) async fn enable_write_access(&self) {
+        self.read_only.store(false, AtomOrd::SeqCst);
+        self.files.lock().await.clear();
     }
 
     /// Atomically advance the active epoch used for flush (write) operations.
@@ -602,6 +617,11 @@ impl<V: Vfs> Pager<V> {
         // mk_epoch before constructing AAD and selecting the DEK.
         self.inner.record_miss(file);
         let page_size = self.cfg.page_size;
+        let page_size_u64 =
+            u64::try_from(page_size).map_err(|_| PagedbError::arithmetic_overflow("page size"))?;
+        let page_offset = page_id
+            .checked_mul(page_size_u64)
+            .ok_or_else(|| PagedbError::arithmetic_overflow("page read offset"))?;
         let file_handle = self.open_file_handle(file).await?;
 
         // Observer-mode retry loop: on AEAD failure retry up to
@@ -609,7 +629,10 @@ impl<V: Vfs> Pager<V> {
         // from a concurrent writer. In non-observer mode (retry_count == 0)
         // the loop body executes exactly once and any AEAD failure is a hard
         // corruption signal.
-        let max_attempts = self.observer_retry_count + 1;
+        let max_attempts = self
+            .observer_retry_count
+            .checked_add(1)
+            .ok_or_else(|| PagedbError::arithmetic_overflow("observer retry attempts"))?;
         let mut last_err: Option<PagedbError> = None;
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -618,7 +641,7 @@ impl<V: Vfs> Pager<V> {
             let mut buf = vec![0u8; page_size];
             {
                 let f = file_handle.lock().await;
-                let n = f.read_at(page_id * page_size as u64, &mut buf).await?;
+                let n = f.read_at(page_offset, &mut buf).await?;
                 if n < page_size {
                     for b in &mut buf[n..] {
                         *b = 0;
@@ -690,12 +713,17 @@ impl<V: Vfs> Pager<V> {
         segment_id: [u8; 16],
         dest_path: Option<&str>,
     ) -> Result<()> {
+        if self.read_only.load(AtomOrd::SeqCst) {
+            return Err(PagedbError::ReadOnly);
+        }
         let dirty_ids = self.inner.cache_for_key(file).lock().dirty_for_file(file);
         if dirty_ids.is_empty() {
             return Ok(());
         }
 
         let page_size = self.cfg.page_size;
+        let page_size_u64 =
+            u64::try_from(page_size).map_err(|_| PagedbError::arithmetic_overflow("page size"))?;
         let flush_epoch = self.active_epoch.load(AtomOrd::SeqCst);
 
         // Serial gather: snapshot each dirty page's plaintext + kind under the
@@ -722,6 +750,15 @@ impl<V: Vfs> Pager<V> {
             wire[HEADER_LEN..HEADER_LEN + plain.len()].copy_from_slice(plain);
             prepared.push((*pid, kind, wire));
         }
+
+        // Validate every physical offset before consuming any nonce.
+        let offsets: Vec<u64> = prepared
+            .iter()
+            .map(|(pid, _, _)| {
+                pid.checked_mul(page_size_u64)
+                    .ok_or_else(|| PagedbError::arithmetic_overflow("page write offset"))
+            })
+            .collect::<Result<_>>()?;
 
         // Pre-allocate a nonce per page (counter increments — single-threaded
         // by design; cheap).
@@ -773,11 +810,8 @@ impl<V: Vfs> Pager<V> {
 
         // Issue physical-id-order vectored writes.
         let mut reqs: Vec<WriteReq<'_>> = Vec::with_capacity(prepared.len());
-        for (pid, _kind, wire) in &prepared {
-            reqs.push(WriteReq {
-                offset: *pid * page_size as u64,
-                buf: wire,
-            });
+        for ((_, _kind, wire), offset) in prepared.iter().zip(offsets) {
+            reqs.push(WriteReq { offset, buf: wire });
         }
         if let Some(path) = dest_path {
             // Alternate destination (compaction's compacted copy): open it
@@ -801,10 +835,14 @@ impl<V: Vfs> Pager<V> {
     }
 
     async fn open_file_handle(&self, file: FileKey) -> Result<Arc<AsyncMutex<V::File>>> {
-        let mut files = self.files.lock().await;
-        if let Some(h) = files.get(&file) {
-            return Ok(h.clone());
+        let cached = {
+            let files = self.files.lock().await;
+            files.get(&file).cloned()
+        };
+        if let Some(handle) = cached {
+            return Ok(handle);
         }
+
         let path = match file {
             FileKey::Main => self.cfg.main_db_path.clone(),
             FileKey::Segment(id) => format!("seg/{}", crate::hex::to_hex_lower(&id)),
@@ -812,10 +850,18 @@ impl<V: Vfs> Pager<V> {
                 format!("applyjournal/{}", crate::hex::to_hex_lower(&id))
             }
         };
-        let f = self.vfs.open(&path, OpenMode::CreateOrOpen).await?;
-        let arc = Arc::new(AsyncMutex::new(f));
-        files.insert(file, arc.clone());
-        Ok(arc)
+        let mode = if self.read_only.load(AtomOrd::SeqCst) {
+            OpenMode::Read
+        } else {
+            OpenMode::CreateOrOpen
+        };
+        let opened = Arc::new(AsyncMutex::new(self.vfs.open(&path, mode).await?));
+        let mut files = self.files.lock().await;
+        if let Some(handle) = files.get(&file) {
+            return Ok(handle.clone());
+        }
+        files.insert(file, opened.clone());
+        Ok(opened)
     }
 
     fn next_nonce_for_flush(&self, file: FileKey) -> Result<Nonce> {

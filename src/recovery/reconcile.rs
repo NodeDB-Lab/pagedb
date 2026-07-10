@@ -1,11 +1,12 @@
-//! Open-flow catalog reconciliation. Walks the catalog and matches expected
-//! segment files against the live `seg/` and `seg/.staging/` directories.
+//! Catalog reconciliation at open. Verification authenticates the catalog's
+//! segment files without mutation; repair additionally converges interrupted
+//! segment publication and removes orphaned files.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::btree::BTree;
-use crate::catalog::codec::SegmentMeta;
-use crate::catalog::codec::{Catalog, CatalogRowKind};
+use crate::catalog::codec::{Catalog, CatalogRowKind, SegmentMeta};
 use crate::crypto::keys::DerivedKey;
 use crate::errors::{CorruptionDetail, PagedbError};
 use crate::pager::Pager;
@@ -15,17 +16,43 @@ use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
 use crate::{RealmId, Result};
 
-/// Run open-flow reconciliation. For each catalog entry, probe the expected
-/// `seg/<hex(segment_id)>` file. Promote staged files where the live path is
-/// missing. Raise corruption on foreign/unverifiable footers or missing files
-/// with no recoverable staging. Sweep orphan files into the tombstone
-/// directory.
-///
-/// `db_realm_id` is the Db-level realm used to authenticate the catalog tree
-/// pages themselves (not the per-segment realm, which is stored inside each
-/// `SegmentMeta`).
+/// Authenticate and validate catalog-referenced segment files without
+/// modifying persistent state. Returns `Unsupported` when completing an
+/// interrupted publication or orphan cleanup would be required.
 #[allow(clippy::too_many_arguments)]
-pub async fn reconcile_catalog<V: Vfs + Clone>(
+pub async fn verify_catalog<V: Vfs + Clone>(
+    vfs: &V,
+    pager: Arc<Pager<V>>,
+    hk: &DerivedKey,
+    db_realm_id: RealmId,
+    catalog_root_page_id: u64,
+    next_page_id: u64,
+    page_size: usize,
+    parent_file_id: [u8; 16],
+    _recovery_commit: u64,
+) -> Result<Vec<[u8; 16]>> {
+    let expected = verify_catalog_entries(
+        vfs,
+        pager,
+        hk,
+        db_realm_id,
+        catalog_root_page_id,
+        next_page_id,
+        page_size,
+        parent_file_id,
+        false,
+    )
+    .await?;
+    if has_orphans(vfs, &expected).await? {
+        return Err(PagedbError::Unsupported);
+    }
+    Ok(expected)
+}
+
+/// Authenticate and validate catalog-referenced segment files, complete an
+/// interrupted staged publication, and sweep orphaned segment files.
+#[allow(clippy::too_many_arguments)]
+pub async fn repair_catalog<V: Vfs + Clone>(
     vfs: &V,
     pager: Arc<Pager<V>>,
     hk: &DerivedKey,
@@ -36,9 +63,36 @@ pub async fn reconcile_catalog<V: Vfs + Clone>(
     parent_file_id: [u8; 16],
     recovery_commit: u64,
 ) -> Result<Vec<[u8; 16]>> {
-    let mut expected: Vec<[u8; 16]> = Vec::new();
+    let expected = verify_catalog_entries(
+        vfs,
+        pager,
+        hk,
+        db_realm_id,
+        catalog_root_page_id,
+        next_page_id,
+        page_size,
+        parent_file_id,
+        true,
+    )
+    .await?;
+    sweep_orphans(vfs, &expected, recovery_commit).await?;
+    Ok(expected)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_catalog_entries<V: Vfs + Clone>(
+    vfs: &V,
+    pager: Arc<Pager<V>>,
+    hk: &DerivedKey,
+    db_realm_id: RealmId,
+    catalog_root_page_id: u64,
+    next_page_id: u64,
+    page_size: usize,
+    parent_file_id: [u8; 16],
+    repair: bool,
+) -> Result<Vec<[u8; 16]>> {
+    let mut expected = Vec::new();
     if catalog_root_page_id == 0 {
-        sweep_orphans(vfs, &expected, recovery_commit).await?;
         return Ok(expected);
     }
     let tree = BTree::open(
@@ -48,7 +102,6 @@ pub async fn reconcile_catalog<V: Vfs + Clone>(
         next_page_id,
         page_size,
     );
-    // Bracket all segment rows: prefix 0x01..0x02.
     let start = vec![CatalogRowKind::Segment as u8];
     let mut end = vec![CatalogRowKind::Segment as u8];
     end[0] += 1;
@@ -66,37 +119,29 @@ pub async fn reconcile_catalog<V: Vfs + Clone>(
                 verify_segment_file::<V>(&file, &meta, hk, &pager, page_size, parent_file_id, &key)
                     .await?;
             }
-            Err(PagedbError::Io(_)) => {
-                // Missing at live path: look for staging.
-                match vfs.open(&staging, OpenMode::Read).await {
-                    Ok(file) => {
-                        verify_segment_file::<V>(
-                            &file,
-                            &meta,
-                            hk,
-                            &pager,
-                            page_size,
-                            parent_file_id,
-                            &key,
-                        )
-                        .await?;
-                        drop(file);
-                        vfs.rename(&staging, &live).await?;
-                    }
-                    Err(_) => {
+            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let file = match vfs.open(&staging, OpenMode::Read).await {
+                    Ok(file) => file,
+                    Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                         return Err(PagedbError::corruption(CorruptionDetail::SegmentMissing {
                             realm_id: meta.realm_id,
                             name: String::from_utf8_lossy(&key[17..]).into_owned(),
                             segment_id: meta.segment_id,
                         }));
                     }
+                    Err(error) => return Err(error),
+                };
+                verify_segment_file::<V>(&file, &meta, hk, &pager, page_size, parent_file_id, &key)
+                    .await?;
+                drop(file);
+                if !repair {
+                    return Err(PagedbError::Unsupported);
                 }
+                vfs.rename(&staging, &live).await?;
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         }
     }
-    vfs.sync_dir("seg").await.ok();
-    sweep_orphans(vfs, &expected, recovery_commit).await?;
     Ok(expected)
 }
 
@@ -157,15 +202,9 @@ async fn verify_segment_file<V: Vfs + Clone>(
     Ok(())
 }
 
-async fn sweep_orphans<V: Vfs + Clone>(
-    vfs: &V,
-    expected: &[[u8; 16]],
-    recovery_commit: u64,
-) -> Result<()> {
-    let _ = vfs.mkdir_all("seg/.tombstone").await;
-    let Ok(live_entries) = vfs.list_dir("seg").await else {
-        return Ok(());
-    };
+async fn has_orphans<V: Vfs>(vfs: &V, expected: &[[u8; 16]]) -> Result<bool> {
+    let expected_ids: BTreeSet<[u8; 16]> = expected.iter().copied().collect();
+    let live_entries = vfs.list_dir("seg").await?;
     for name in live_entries {
         if name.starts_with('.') {
             continue;
@@ -173,23 +212,50 @@ async fn sweep_orphans<V: Vfs + Clone>(
         let Some(id) = crate::hex::parse_hex::<16>(&name) else {
             continue;
         };
-        if !expected.contains(&id) {
-            let from = format!("seg/{name}");
-            let to = format!("seg/.tombstone/{name}.{recovery_commit}");
-            vfs.rename(&from, &to).await.ok();
+        if !expected_ids.contains(&id) {
+            return Ok(true);
         }
     }
-    let Ok(staging_entries) = vfs.list_dir("seg/.staging").await else {
-        return Ok(());
-    };
+    let staging_entries = vfs.list_dir("seg/.staging").await?;
     for name in staging_entries {
         let Some(id) = crate::hex::parse_hex::<16>(&name) else {
             continue;
         };
-        if !expected.contains(&id) {
-            let path = format!("seg/.staging/{name}");
-            vfs.remove(&path).await.ok();
+        if !expected_ids.contains(&id) {
+            return Ok(true);
         }
     }
+    Ok(false)
+}
+
+async fn sweep_orphans<V: Vfs>(vfs: &V, expected: &[[u8; 16]], recovery_commit: u64) -> Result<()> {
+    let expected_ids: BTreeSet<[u8; 16]> = expected.iter().copied().collect();
+    vfs.mkdir_all("seg/.tombstone").await?;
+    let live_entries = vfs.list_dir("seg").await?;
+    for name in live_entries {
+        if name.starts_with('.') {
+            continue;
+        }
+        let Some(id) = crate::hex::parse_hex::<16>(&name) else {
+            continue;
+        };
+        if !expected_ids.contains(&id) {
+            let from = format!("seg/{name}");
+            let to = format!("seg/.tombstone/{name}.{recovery_commit}");
+            vfs.rename(&from, &to).await?;
+        }
+    }
+    let staging_entries = vfs.list_dir("seg/.staging").await?;
+    for name in staging_entries {
+        let Some(id) = crate::hex::parse_hex::<16>(&name) else {
+            continue;
+        };
+        if !expected_ids.contains(&id) {
+            let path = format!("seg/.staging/{name}");
+            vfs.remove(&path).await?;
+        }
+    }
+    vfs.sync_dir("seg").await?;
+    vfs.sync_dir("seg/.tombstone").await?;
     Ok(())
 }
