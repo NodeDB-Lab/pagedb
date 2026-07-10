@@ -33,6 +33,7 @@ pub async fn compact_now<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
 
 #[allow(clippy::too_many_lines)]
 async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
+    db.ensure_usable()?;
     if !matches!(db.mode, crate::txn::mode::DbMode::Standalone) {
         return Err(PagedbError::Unsupported);
     }
@@ -41,6 +42,12 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
 
     // Acquire exclusive writer lock for the entire compact operation.
     let mut state = db.writer.lock().await;
+    db.ensure_usable()?;
+    #[cfg(test)]
+    db.notify_writer_waiting();
+    // Keep reader admission closed from the pin scan through the main-file
+    // swap, directory sync, and published replacement snapshot.
+    let visibility_guard = db.visibility_gate.write().await;
 
     // Compaction relocates and/or truncates pages, invalidating every page id
     // cached for runtime reuse. Drop those reuse hints so a post-compaction
@@ -49,23 +56,13 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
 
     // ── 1. Refuse while readers are pinned ───────────────────────────────────
     // A dense repack relocates the current tree and truncates the file; pinned
-    // readers (in-process or cross-process durable) still reference the old
-    // pages, so neither is safe under them. Runtime free-page reuse already
+    // in-process readers still reference the old pages, so neither is safe
+    // under them. Runtime free-page reuse already
     // reclaims space on ordinary commits, so there is nothing for compaction to
     // do here until the readers drop.
     let has_readers = {
-        let in_mem_min = {
-            let readers = db.tracked_readers.lock();
-            readers
-                .iter()
-                .map(|r| r.commit_id.0)
-                .min()
-                .unwrap_or(u64::MAX)
-        };
-        let durable_min = db
-            .min_durable_reader_commit(state.catalog_root_page_id, state.next_page_id)
-            .await;
-        in_mem_min.min(durable_min) < u64::MAX
+        let readers = db.tracked_readers.lock();
+        !readers.is_empty()
     };
     if has_readers {
         return Ok(result);
@@ -78,7 +75,7 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
     // atomic rename; main.db is never modified until the rename (see
     // `super::repack`).
     if state.free_list_root_page_id != 0 {
-        let repack = super::repack::atomic_dense_repack(db, &mut state).await?;
+        let repack = super::repack::atomic_dense_repack(db, &mut state, &visibility_guard).await?;
         result.main_db_pages_reclaimed = repack.pages_reclaimed;
         result.bytes_truncated = repack.bytes_truncated;
     }
@@ -131,7 +128,15 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
         let new_meta = writer.seal().await?;
         let seg_name =
             find_segment_name_inner(&db.pager, db.realm_id, &state, &meta.segment_id).await?;
-        replace_segment_compact(db, &mut state, &seg_name, &meta.segment_id, &new_meta).await?;
+        replace_segment_compact(
+            db,
+            &mut state,
+            &visibility_guard,
+            &seg_name,
+            &meta.segment_id,
+            &new_meta,
+        )
+        .await?;
         result.segments_repacked += 1;
     }
 

@@ -9,6 +9,7 @@ use crate::errors::PagedbError;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::txn::db::{Db, WriterState};
+use crate::txn::write::SegmentSideEffect;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 
@@ -102,6 +103,7 @@ pub(super) async fn find_segment_name_inner<V: Vfs + Clone>(
 pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     db: &Db<V>,
     state: &mut WriterState,
+    visibility: &tokio::sync::RwLockWriteGuard<'_, ()>,
     name: &str,
     old_segment_id: &[u8; 16],
     new_meta: &SegmentMeta,
@@ -164,34 +166,33 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
         db.page_size,
     )
     .await?;
-    db.pager.commit_anchor(counter_anchor)?;
-
-    // Promote staging file to live.
-    db.vfs.mkdir_all("seg").await?;
-    let staging = crate::segment::writer::staging_path(&new_meta.segment_id);
-    let live = crate::segment::writer::live_path(&new_meta.segment_id);
-    db.vfs.rename(&staging, &live).await?;
-    db.vfs.sync_dir("seg").await.ok();
-
-    // Tombstone old segment.
-    let old_live = crate::segment::writer::live_path(old_segment_id);
-    let tomb = format!(
-        "seg/.tombstone/{}.{}",
-        crate::hex::to_hex_lower(old_segment_id),
-        new_commit_id,
-    );
-    db.vfs.mkdir_all("seg/.tombstone").await?;
-    db.vfs.rename(&old_live, &tomb).await.ok();
-    db.vfs.sync_dir("seg/.tombstone").await.ok();
-
+    // The catalog is durable at this point. Preserve its state internally but
+    // retain the prior reader snapshot until segment replacement is reconciled.
     state.catalog_root_page_id = new_cat_root;
+    state.catalog_root_txn_id = new_commit_id;
     state.next_page_id = new_next;
     state.active_slot = new_slot;
     state.seq = new_seq;
     state.latest_commit_id = new_commit_id;
-    db.latest_commit
-        .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
 
+    let effects = [
+        SegmentSideEffect::Tombstone {
+            segment_id: *old_segment_id,
+            tombstone_commit_id: None,
+        },
+        SegmentSideEffect::Promote {
+            segment_id: new_meta.segment_id,
+        },
+    ];
+    let _ = db
+        .finish_durable_commit_visible(
+            visibility,
+            state,
+            CommitId(new_commit_id),
+            counter_anchor,
+            &effects,
+        )
+        .await?;
     Ok(())
 }
 

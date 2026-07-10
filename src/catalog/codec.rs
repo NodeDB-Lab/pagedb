@@ -26,22 +26,7 @@ pub enum CatalogRowKind {
     // 0x04 and 0x05 are reserved: they were the in-catalog free-list and
     // deferred-free queue, superseded by the durable free-list chain rooted in
     // the A/B header (see `crate::pager::freelist`). Do not reuse these bytes.
-    /// Durable reader pin. One row per active cross-process read transaction.
-    /// Key: `[0x06] || pid_u32_be[4] || lease_id_u64_be[8]` (13 bytes).
-    /// Value: `commit_id[8] || root_page_id[8] || catalog_root_page_id[8] ||
-    ///          free_list_root_page_id[8] || expires_unix_seconds[8] || flags[1]`
-    /// (41 bytes).
-    ///
-    /// On `begin_read` the writer inserts a row; on `ReadTxn::drop` the row is
-    /// deleted. If a reader crashes, its row is cleaned up at the next
-    /// `Db::open` of a writer handle. A row whose `expires_unix_seconds` is
-    /// older than the current wall-clock time is treated as expired by GC and
-    /// does not block page reclamation.
-    ///
-    /// On a `ReadOnly` or `Follower` handle that cannot write to its own
-    /// catalog, reader pins are maintained in-memory only and the writer process
-    /// must be trusted to honor the catalog pins.
-    ReaderPin = 0x06,
+    // 0x06 is reserved, deliberately uninterpreted, and must never be reused.
     /// Reserved (`0x07`). Older builds wrote an incremental-compaction watermark
     /// here; compaction is now a single atomic operation and never writes it.
     /// Retained as a row-kind boundary and so any legacy row is recognised and
@@ -112,20 +97,6 @@ pub struct RealmQuotas {
     pub max_segment_bytes: Option<u64>,
 }
 
-/// Value for a durable reader-pin row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReaderPinValue {
-    pub commit_id: u64,
-    pub root_page_id: u64,
-    pub catalog_root_page_id: u64,
-    pub free_list_root_page_id: u64,
-    pub expires_unix_seconds: u64,
-    pub flags: u8,
-}
-
-pub const READER_PIN_VALUE_LEN: usize = 41;
-pub const READER_PIN_KEY_LEN: usize = 13;
-
 pub const SEGMENT_META_LEN: usize = 94;
 pub const REALM_QUOTAS_LEN: usize = 33;
 
@@ -188,63 +159,6 @@ impl Catalog {
             target_mk_epoch,
             main_db_done,
             segments_remaining_idx,
-        })
-    }
-
-    /// Reader-pin row key: `[0x06] || pid_u32_be[4] || lease_id_u64_be[8]`.
-    #[must_use]
-    pub fn reader_pin_key(pid: u32, lease_id: u64) -> [u8; READER_PIN_KEY_LEN] {
-        let mut k = [0u8; READER_PIN_KEY_LEN];
-        k[0] = CatalogRowKind::ReaderPin as u8;
-        k[1..5].copy_from_slice(&pid.to_be_bytes());
-        k[5..13].copy_from_slice(&lease_id.to_be_bytes());
-        k
-    }
-
-    /// Range start key for all reader-pin rows: `[0x06]`.
-    #[must_use]
-    pub fn reader_pin_range_start() -> [u8; 1] {
-        [CatalogRowKind::ReaderPin as u8]
-    }
-
-    /// Range end key (exclusive) for all reader-pin rows: `[0x07]`.
-    #[must_use]
-    pub fn reader_pin_range_end() -> [u8; 1] {
-        [CatalogRowKind::CompactionState as u8]
-    }
-
-    /// Encode a `ReaderPinValue` as 41 bytes.
-    #[must_use]
-    pub fn encode_reader_pin(v: &ReaderPinValue) -> [u8; READER_PIN_VALUE_LEN] {
-        let mut o = [0u8; READER_PIN_VALUE_LEN];
-        o[0..8].copy_from_slice(&v.commit_id.to_le_bytes());
-        o[8..16].copy_from_slice(&v.root_page_id.to_le_bytes());
-        o[16..24].copy_from_slice(&v.catalog_root_page_id.to_le_bytes());
-        o[24..32].copy_from_slice(&v.free_list_root_page_id.to_le_bytes());
-        o[32..40].copy_from_slice(&v.expires_unix_seconds.to_le_bytes());
-        o[40] = v.flags;
-        o
-    }
-
-    /// Decode a `ReaderPinValue` from a 41-byte slice.
-    pub fn decode_reader_pin(bytes: &[u8]) -> Result<ReaderPinValue> {
-        if bytes.len() != READER_PIN_VALUE_LEN {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
-        }
-        let read_u64 = |off: usize| {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&bytes[off..off + 8]);
-            u64::from_le_bytes(b)
-        };
-        Ok(ReaderPinValue {
-            commit_id: read_u64(0),
-            root_page_id: read_u64(8),
-            catalog_root_page_id: read_u64(16),
-            free_list_root_page_id: read_u64(24),
-            expires_unix_seconds: read_u64(32),
-            flags: bytes[40],
         })
     }
 

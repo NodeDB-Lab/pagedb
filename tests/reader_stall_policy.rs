@@ -109,8 +109,9 @@ async fn abort_oldest_aborts_old_reader() {
     // Build backlog until AbortOldest fires and marks R1 as aborted.
     fill_until_stall(&db).await;
 
-    // R1 should now return Aborted on its next read.
-    let r1_result = r1.get(b"hello").await;
+    // Every data-bearing reader API, including catalog listing, observes the
+    // one-shot abort before touching its pinned pages.
+    let r1_result = r1.list_segments("").await;
     assert!(
         matches!(r1_result, Err(PagedbError::Aborted)),
         "R1 should be aborted, got: {r1_result:?}"

@@ -242,11 +242,10 @@ pub fn decode_journal_id(page_id: u64, version: u64) -> [u8; 16] {
     id
 }
 
-/// Replay a pending apply-journal sidecar. Returns `Ok(None)` when no journal
-/// is in flight (`journal_id == 0`). When a journal is present, reads its pages
-/// through the Pager (AEAD-verified under `realm_id`), decodes the record, and
-/// re-executes every action idempotently, returning the decoded record so the
-/// caller can clear the header pointer and remove the sidecar.
+/// Read a pending apply-journal sidecar. Returns `Ok(None)` when no journal
+/// is in flight (`journal_id == 0`). Action execution is intentionally kept
+/// separate so the live `Db` can apply reader-pin policy before deciding
+/// whether a tombstone is complete or deferred.
 pub async fn replay_apply_journal<V: Vfs + Clone>(
     pager: &crate::pager::Pager<V>,
     realm_id: crate::RealmId,
@@ -282,22 +281,25 @@ pub async fn replay_apply_journal<V: Vfs + Clone>(
     }
     debug_assert_eq!(stream.len(), page_count * cap);
 
-    let record = decode_journal_stream(&stream)?;
-    execute_journal_actions(pager.vfs(), &record.actions).await;
-    Ok(Some(record))
+    Ok(Some(decode_journal_stream(&stream)?))
 }
 
-/// Execute journal actions idempotently. All errors are silently ignored
-/// since each action is a rename that is either complete (source missing)
-/// or can be retried safely.
-pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction]) {
+/// Execute journal actions idempotently when no live reader-pins need to be
+/// considered (for example, standalone recovery). Required directory creation,
+/// renames, and directory syncs are all fallible. The live `Db` uses its
+/// pin-aware reconciliation path instead.
+pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction]) -> Result<()> {
+    vfs.mkdir_all("seg").await?;
+    vfs.mkdir_all("seg/.staging").await?;
+    vfs.mkdir_all("seg/.tombstone").await?;
     for action in actions {
         match action {
             JournalAction::Promote { segment_id } => {
                 let src = crate::segment::writer::staging_path(segment_id);
                 let dst = crate::segment::writer::live_path(segment_id);
-                let _ = vfs.mkdir_all("seg").await;
-                let _ = vfs.rename(&src, &dst).await;
+                if !path_exists(vfs, &dst).await? {
+                    vfs.rename(&src, &dst).await?;
+                }
             }
             JournalAction::Tombstone {
                 segment_id,
@@ -309,10 +311,22 @@ pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction])
                     crate::hex::to_hex_lower(segment_id),
                     tombstone_commit_id,
                 );
-                let _ = vfs.mkdir_all("seg/.tombstone").await;
-                let _ = vfs.rename(&src, &dst).await;
+                if !path_exists(vfs, &dst).await? && path_exists(vfs, &src).await? {
+                    vfs.rename(&src, &dst).await?;
+                }
             }
         }
+    }
+    vfs.sync_dir("seg").await?;
+    vfs.sync_dir("seg/.staging").await?;
+    vfs.sync_dir("seg/.tombstone").await
+}
+
+async fn path_exists<V: Vfs>(vfs: &V, path: &str) -> Result<bool> {
+    match vfs.open(path, crate::vfs::types::OpenMode::Read).await {
+        Ok(_) => Ok(true),
+        Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -470,6 +484,9 @@ mod tests {
             .unwrap()
             .expect("a pending journal must replay");
         assert_eq!(replayed.actions.len(), n);
+        execute_journal_actions(pager.vfs(), &replayed.actions)
+            .await
+            .unwrap();
 
         // Every staging file is now promoted to its live path.
         for id in &ids {

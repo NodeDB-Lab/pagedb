@@ -29,6 +29,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// Returns `Unsupported` if this handle is not in Standalone mode.
     #[allow(clippy::too_many_lines)]
     pub async fn rekey_db(&self, kek: [u8; 32], new_mk_epoch: u64) -> Result<()> {
+        self.ensure_usable()?;
         let _span = tracing::debug_span!("rekey.run", new_mk_epoch);
         if !matches!(self.mode, crate::txn::mode::DbMode::Standalone) {
             return Err(PagedbError::Unsupported);
@@ -36,11 +37,10 @@ impl<V: Vfs + Clone> Db<V> {
 
         let new_mk = derive_mk(&kek, &self.kek_salt, new_mk_epoch)?;
         let derived_hk = derive_hk(&new_mk)?;
-        let old_epoch = self.mk_epoch.load(Ordering::SeqCst);
-        let old_mk = derive_mk(&kek, &self.kek_salt, old_epoch)?;
 
         // Acquire writer lock for the entire rekey operation.
         let mut state = self.writer.lock().await;
+        self.ensure_usable()?;
 
         // Check for an in-flight rekey from a prior crash and compute start
         // position. A rekey watermark row under key [0x03] indicates a prior
@@ -109,9 +109,16 @@ impl<V: Vfs + Clone> Db<V> {
                 self.page_size,
             )
             .await?;
-            self.pager.commit_anchor(counter_anchor)?;
             state.active_slot = new_slot;
             state.seq = new_seq;
+            let _ = self
+                .finish_durable_commit(
+                    &state,
+                    crate::CommitId(state.latest_commit_id),
+                    counter_anchor,
+                    &[],
+                )
+                .await?;
 
             // Update Db's mk_epoch atomically and switch the HK so subsequent
             // WriteTxn::commit() calls sign headers with the new key material.
@@ -136,14 +143,16 @@ impl<V: Vfs + Clone> Db<V> {
                 continue;
             }
 
-            // Open segment reader using old epoch MK so the header HMAC and
-            // page DEK derivation use the correct key material.
+            // Each segment carries its source epoch. Re-derive that epoch's
+            // key rather than assuming the active header still names it: an
+            // interrupted rekey may already have durably advanced main.db.
+            let source_mk = derive_mk(&kek, &self.kek_salt, meta.mk_epoch)?;
             let mmap_limit =
                 u64::try_from(self.options.mmap_view_scratch_bytes).unwrap_or(u64::MAX);
             let reader = SegmentReader::open_internal_with_mk(
                 self.pager.clone(),
                 meta.clone(),
-                &old_mk,
+                &source_mk,
                 self.mmap_bytes_in_use.clone(),
                 mmap_limit,
             )
@@ -267,6 +276,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// rewritten yet. Exposed for integration tests that need to simulate an
     /// interrupted rekey without accessing private fields.
     pub async fn inject_incomplete_rekey_watermark(&self, target_epoch: u64) -> Result<()> {
+        self.ensure_usable()?;
         if !matches!(self.mode, crate::txn::mode::DbMode::Standalone) {
             return Err(PagedbError::Unsupported);
         }
@@ -350,12 +360,19 @@ impl<V: Vfs + Clone> Db<V> {
             self.page_size,
         )
         .await?;
-        self.pager.commit_anchor(counter_anchor)?;
 
         state.catalog_root_page_id = new_catalog_root;
         state.next_page_id = new_next;
         state.active_slot = new_slot;
         state.seq = new_seq;
+        let _ = self
+            .finish_durable_commit(
+                state,
+                crate::CommitId(state.latest_commit_id),
+                counter_anchor,
+                &[],
+            )
+            .await?;
 
         Ok(())
     }
@@ -411,12 +428,19 @@ impl<V: Vfs + Clone> Db<V> {
             self.page_size,
         )
         .await?;
-        self.pager.commit_anchor(counter_anchor)?;
 
         state.catalog_root_page_id = new_catalog_root;
         state.next_page_id = new_next;
         state.active_slot = new_slot;
         state.seq = new_seq;
+        let _ = self
+            .finish_durable_commit(
+                state,
+                crate::CommitId(state.latest_commit_id),
+                counter_anchor,
+                &[],
+            )
+            .await?;
 
         Ok(())
     }

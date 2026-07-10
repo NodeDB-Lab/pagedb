@@ -26,18 +26,16 @@
 //! crash before the header swap, the old `free_list_root` and everything it
 //! references are intact.
 
-use std::collections::HashSet;
-use std::sync::atomic::Ordering;
-
 use crate::errors::PagedbError;
 use crate::pager::freelist;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
+use std::collections::HashSet;
 
-use super::super::db::{CommitHistoryMeta, PendingTombstone, encode_free_list_root};
-use super::txn::{SegmentSideEffect, WriteTxn};
+use super::super::db::{CommitHistoryMeta, encode_free_list_root};
+use super::txn::WriteTxn;
 
 impl<V: Vfs + Clone> WriteTxn<'_, V> {
     /// Flush dirty pages, write the A/B header, apply pending segment side
@@ -203,43 +201,10 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             self.db.page_size,
         )
         .await?;
-        self.db.pager.commit_anchor(counter_anchor)?;
-
-        // Apply pending segment side effects after the header is durable.
-        if !self.pending_segments.is_empty() {
-            self.db.vfs.mkdir_all("seg").await?;
-            self.db.vfs.sync_dir("seg").await?;
-            self.db.vfs.mkdir_all("seg/.tombstone").await?;
-            self.db.vfs.sync_dir("seg/.tombstone").await?;
-            for effect in &self.pending_segments {
-                match effect {
-                    SegmentSideEffect::Promote { segment_id } => {
-                        let staging = crate::segment::writer::staging_path(segment_id);
-                        let live = crate::segment::writer::live_path(segment_id);
-                        self.db.vfs.rename(&staging, &live).await?;
-                    }
-                    SegmentSideEffect::Tombstone { segment_id } => {
-                        if self.db.segment_id_is_reader_pinned(*segment_id).await? {
-                            self.db.pending_tombstones.lock().push(PendingTombstone {
-                                segment_id: *segment_id,
-                                commit_id: new_commit_id,
-                            });
-                        } else {
-                            let live = crate::segment::writer::live_path(segment_id);
-                            let tomb = format!(
-                                "seg/.tombstone/{}.{}",
-                                crate::hex::to_hex_lower(segment_id),
-                                new_commit_id,
-                            );
-                            self.db.vfs.rename(&live, &tomb).await?;
-                        }
-                    }
-                }
-            }
-            self.db.vfs.sync_dir("seg").await?;
-            self.db.vfs.sync_dir("seg/.tombstone").await?;
-        }
-
+        // From this point the header is durable. Advance writer state before
+        // any fallible post-header work so a failed reconciliation can never
+        // regress the next durable write. Keep the prior reader snapshot until
+        // segment effects have completed and their directories are synced.
         self.guard.root_page_id = new_root;
         self.guard.next_page_id = new_next;
         self.guard.active_slot = new_slot;
@@ -250,8 +215,31 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         self.guard.free_list_root_page_id = new_free_list_root;
         // commit_history_root_page_id and commit_history_root_version are
         // already updated inside write_commit_history_entry.
-        self.db.latest_commit.store(new_commit_id, Ordering::SeqCst);
         self.committed_or_aborted = true;
+
+        // `visibility_guard` was acquired before the reclamation-floor scan
+        // in `WriteTxn::begin` and remains held through this publication.
+        let _visibility = &self.visibility_guard;
+        if self
+            .db
+            .finish_durable_commit_visible(
+                &self.visibility_guard,
+                &self.guard,
+                CommitId(new_commit_id),
+                counter_anchor,
+                &self.pending_segments,
+            )
+            .await
+            .is_err()
+        {
+            self.cleanup_spill_async().await;
+            self.db
+                .spill_bytes_in_use
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            return Err(PagedbError::durably_committed_but_unpublished(CommitId(
+                new_commit_id,
+            )));
+        }
 
         // The allocator cache is rebuilt from the durable free-list at the next
         // `begin_write`, so nothing is handed off here.

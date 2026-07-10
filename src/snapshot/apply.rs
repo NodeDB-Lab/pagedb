@@ -70,6 +70,19 @@ pub async fn apply_delta_pages(
     Ok(pages_applied)
 }
 
+/// Verify that the snapshot's segment directory has exactly the count claimed
+/// by its already-authenticated manifest. This runs before apply writes pages
+/// or creates any staging files.
+pub(crate) async fn validate_snapshot_segment_count(src_path: &Path, expected: u32) -> Result<()> {
+    let entries = snapshot_segment_entries(src_path).await?;
+    let actual = u32::try_from(entries.len())
+        .map_err(|_| PagedbError::snapshot_incompatible("segments_count"))?;
+    if actual != expected {
+        return Err(PagedbError::snapshot_incompatible("segments_count"));
+    }
+    Ok(())
+}
+
 /// Copy new segment files from the incremental snapshot `src_path/seg/` to the
 /// Follower's staging area at `dst_seg_root/.staging/<hex>`. Returns the list
 /// of segment IDs that were staged; callers must promote them from staging to
@@ -78,21 +91,8 @@ pub async fn stage_snapshot_segments(
     src_path: &Path,
     dst_seg_root: &Path,
 ) -> Result<Vec<[u8; 16]>> {
+    let entries = snapshot_segment_entries(src_path).await?;
     let seg_src = src_path.join("seg");
-    let entries: Vec<String> = match fs::read_dir(&seg_src).await {
-        Ok(rd) => {
-            let mut v = Vec::new();
-            let mut rd = rd;
-            while let Some(e) = rd.next_entry().await.map_err(PagedbError::Io)? {
-                if let Some(n) = e.file_name().to_str() {
-                    v.push(n.to_string());
-                }
-            }
-            v
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(PagedbError::Io(e)),
-    };
 
     let staging_dir = dst_seg_root.join(".staging");
     fs::create_dir_all(&staging_dir)
@@ -126,4 +126,24 @@ pub async fn stage_snapshot_segments(
     }
 
     Ok(staged)
+}
+
+async fn snapshot_segment_entries(src_path: &Path) -> Result<Vec<String>> {
+    let seg_src = src_path.join("seg");
+    let mut directory = match fs::read_dir(&seg_src).await {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(PagedbError::Io(error)),
+    };
+    let mut entries = Vec::new();
+    while let Some(entry) = directory.next_entry().await.map_err(PagedbError::Io)? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(PagedbError::snapshot_incompatible("segments"));
+        };
+        crate::hex::parse_hex::<16>(name)
+            .ok_or_else(|| PagedbError::snapshot_incompatible("segments"))?;
+        entries.push(name.to_owned());
+    }
+    Ok(entries)
 }

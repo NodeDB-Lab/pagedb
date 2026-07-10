@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::crypto::CipherId;
 use crate::errors::PagedbError;
@@ -17,6 +17,8 @@ use crate::{CommitId, RealmId, Result};
 
 use super::super::mode::DbMode;
 use super::super::policy::ReaderStallPolicy;
+use super::segment::SegmentReconciliation;
+use crate::txn::write::SegmentSideEffect;
 
 /// A segment tombstone that was deferred because a reader was pinning it at
 /// commit time.
@@ -40,6 +42,16 @@ pub(crate) struct TrackedReader {
 
 /// Writer state, guarded by the writer mutex. Holds the current root and
 /// allocation cursor; on commit the new values get persisted to the header.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct VisibilityTestHook {
+    pub(crate) reader_selected: tokio::sync::Notify,
+    pub(crate) allow_reader_registration: tokio::sync::Notify,
+    pub(crate) reader_registered: tokio::sync::Notify,
+    pub(crate) reader_may_read: tokio::sync::Notify,
+    pub(crate) writer_waiting: tokio::sync::Notify,
+}
+
 pub(crate) struct WriterState {
     pub root_page_id: u64,
     pub next_page_id: u64,
@@ -62,6 +74,14 @@ pub(crate) struct WriterState {
     /// limit. `None` means "not yet populated; refresh from disk on first
     /// use". Re-populated lazily after a reopen.
     pub commit_history_count: Option<u64>,
+    /// Identity of the apply journal named by the durable header. A zero id
+    /// means no apply sidecar is pending reconciliation.
+    pub pending_apply_journal_id: [u8; 16],
+    /// Header mode preserved by every recovery header rewrite.
+    pub restore_mode: u8,
+    /// Header commit-history retention fields preserved by recovery rewrites.
+    pub commit_retain_policy_tag: u8,
+    pub commit_retain_policy_value: u64,
 }
 
 /// Top-level handle to an open database.
@@ -82,19 +102,23 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) main_db_path: String,
     pub(crate) vfs: Arc<V>,
     pub(crate) writer: Arc<AsyncMutex<WriterState>>,
+    /// Serializes the complete incremental-apply protocol, including manifest
+    /// validation, journal recovery, raw page writes, and segment staging.
+    pub(crate) apply_gate: AsyncMutex<()>,
+    /// Serializes reader admission against destructive visibility changes.
+    ///
+    /// Lock ordering is fixed: writer and apply locks are acquired before this
+    /// write lock; reader admission acquires only this read lock. Tokio guards
+    /// may cross awaits, while no guard from `parking_lot` may do so.
+    pub(crate) visibility_gate: AsyncRwLock<()>,
     pub(crate) tracked_readers: parking_lot::Mutex<Vec<TrackedReader>>,
     pub(crate) reader_seq: AtomicU64,
-    pub(crate) latest_commit: AtomicU64,
     pub(crate) stall_policy: parking_lot::Mutex<ReaderStallPolicy>,
     pub(crate) cipher_id: CipherId,
     pub(crate) mk_epoch: AtomicU64,
     pub(crate) file_id: [u8; 16],
     pub(crate) kek_salt: [u8; 16],
     pub(crate) pending_tombstones: parking_lot::Mutex<Vec<PendingTombstone>>,
-    /// Reader-pin rows that need to be deleted from the catalog at the next
-    /// catalog commit opportunity. Populated by `ReadTxn::drop`; drained by
-    /// the next writer commit or explicit `gc_now` call.
-    pub(crate) pending_pin_deletes: parking_lot::Mutex<Vec<(u32, u64)>>,
     pub(crate) options: OpenOptions,
     /// Running total of bytes currently charged to `mmap_view_scratch_bytes`.
     /// Shared with live `MmapView` handles via `Arc` so they can decrement on drop.
@@ -114,11 +138,15 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) aborted_readers: parking_lot::Mutex<std::collections::HashSet<u64>>,
     /// Sentinel-lock handles acquired at open. Released (dropped) when the `Db` drops.
     pub(crate) sentinel_locks: Vec<<V as Vfs>::LockHandle>,
-    /// Snapshot of the four reader-visible fields, published atomically at
-    /// each writer commit. Read-only path for `begin_read*`: avoids contending
-    /// the async writer mutex just to copy four `u64`s. Shared via `Arc` with
-    /// `PinHandle` so durable-pin commit paths can also publish.
+    /// Snapshot of the reader-visible roots, published atomically at each
+    /// writer commit. Read-only paths use this as their sole current-state
+    /// publication channel, so readers see either the prior complete commit or
+    /// the next complete commit.
     pub(crate) snapshot: Arc<parking_lot::RwLock<ReaderSnapshot>>,
+    /// The durable commit that could not be reconciled into `snapshot`.
+    /// Existing readers retain their pinned snapshots; all new state-dependent
+    /// operations fail until the database is reopened.
+    pub(crate) poisoned_commit: parking_lot::Mutex<Option<CommitId>>,
     /// Cross-commit cache of page IDs known to be safely reusable. Populated
     /// after each commit with the pages it freed that no live reader and no
     /// retained commit-history root can still observe; the next writer txn's
@@ -132,6 +160,8 @@ pub struct Db<V: Vfs + Clone> {
     /// drew from `free_page_cache`. The commit path removes them from the
     /// durable free-list — they now hold live committed data.
     pub(crate) free_page_consumed: Arc<parking_lot::Mutex<Vec<u64>>>,
+    #[cfg(test)]
+    pub(crate) visibility_test_hook: parking_lot::Mutex<Option<Arc<VisibilityTestHook>>>,
 }
 
 /// Reader-visible state, refreshed by the writer at commit time.
@@ -142,6 +172,11 @@ pub(crate) struct ReaderSnapshot {
     pub root_page_id: u64,
     pub next_page_id: u64,
     pub catalog_root_page_id: u64,
+    pub free_list_root_page_id: u64,
+    /// Commit-history root accompanying this published snapshot. Historical
+    /// reader admission resolves from this immutable root without taking the
+    /// writer lock.
+    pub commit_history_root_page_id: u64,
 }
 
 /// Encode a 16-byte catalog/free-list root reference: `page_id` (LE u64) in the
@@ -172,9 +207,8 @@ pub(crate) fn decode_free_list_root(raw: &[u8; 16]) -> u64 {
 
 /// Variable fields supplied per call site when assembling a
 /// [`MainDbHeaderFields`] for a writer header commit. The constant fields
-/// (`format_version`, `flags`, identity bytes, and the always-zero
-/// apply-journal / restore / retain-policy fields) are filled in by
-/// [`Db::header_fields`].
+/// (`format_version`, `flags`, identity bytes, and the no-pending-journal
+/// default) are filled in by [`Db::header_fields`].
 #[derive(Clone, Copy)]
 pub(super) struct HeaderFieldsParams {
     pub mk_epoch: u64,
@@ -194,6 +228,101 @@ pub(super) struct HeaderFieldsParams {
 }
 
 impl<V: Vfs + Clone> Db<V> {
+    pub(crate) fn ensure_usable(&self) -> Result<()> {
+        match *self.poisoned_commit.lock() {
+            Some(commit) => Err(PagedbError::durably_committed_but_unpublished(commit)),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn poison(&self, commit: CommitId) {
+        let mut poisoned = self.poisoned_commit.lock();
+        if poisoned.is_none() {
+            *poisoned = Some(commit);
+        }
+    }
+
+    /// Finish a commit whose header is already durable and whose writer state
+    /// already names that durable snapshot. The prior reader snapshot remains
+    /// visible until the nonce anchor and all required segment effects succeed.
+    /// A failed post-header operation leaves the handle poisoned: advancing it
+    /// again could expose a catalog whose filesystem side effects are unknown.
+    pub(crate) async fn finish_durable_commit(
+        &self,
+        state: &WriterState,
+        commit: CommitId,
+        counter_anchor: u64,
+        effects: &[SegmentSideEffect],
+    ) -> Result<SegmentReconciliation> {
+        #[cfg(test)]
+        self.notify_writer_waiting();
+        let visibility = self.visibility_gate.write().await;
+        self.finish_durable_commit_visible(&visibility, state, commit, counter_anchor, effects)
+            .await
+    }
+
+    /// Complete a durable commit while the caller holds `visibility_gate`'s
+    /// write guard. `WriteTxn` uses this after taking the guard before its
+    /// reclamation-floor scan, preserving the gate through publication.
+    pub(crate) async fn finish_durable_commit_visible(
+        &self,
+        _visibility: &tokio::sync::RwLockWriteGuard<'_, ()>,
+        state: &WriterState,
+        commit: CommitId,
+        counter_anchor: u64,
+        effects: &[SegmentSideEffect],
+    ) -> Result<SegmentReconciliation> {
+        if self.pager.commit_anchor(counter_anchor).is_err() {
+            self.poison(commit);
+            return Err(PagedbError::durably_committed_but_unpublished(commit));
+        }
+        if let Ok(outcome) = self.reconcile_segment_effects(effects, commit.0).await {
+            self.publish_snapshot(state);
+            Ok(outcome)
+        } else {
+            self.poison(commit);
+            Err(PagedbError::durably_committed_but_unpublished(commit))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_visibility_test_hook(&self, hook: Arc<VisibilityTestHook>) {
+        *self.visibility_test_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_snapshot_selection(&self) {
+        let hook = self.visibility_test_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook.reader_selected.notify_one();
+            hook.allow_reader_registration.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_reader_registered(&self) {
+        if let Some(hook) = self.visibility_test_hook.lock().clone() {
+            hook.reader_registered.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_writer_waiting(&self) {
+        if let Some(hook) = self.visibility_test_hook.lock().clone() {
+            hook.writer_waiting.notify_one();
+        }
+    }
+
+    /// Parent directory whose metadata contains `main.db` and its compaction
+    /// scratch replacement.
+    #[must_use]
+    pub(crate) fn main_db_parent_dir(&self) -> &str {
+        match self.main_db_path.rsplit_once('/') {
+            Some(("", _)) | None => "/",
+            Some((parent, _)) => parent,
+        }
+    }
+
     /// Assemble a [`MainDbHeaderFields`] for a writer header commit, filling in
     /// the fields that are constant across every writer commit path (identity,
     /// format version, and the apply-journal / restore-mode / retain-policy

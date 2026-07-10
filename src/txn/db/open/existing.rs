@@ -159,6 +159,13 @@ impl<V: Vfs + Clone> Db<V> {
             commit_history_root_page_id: fields.commit_history_root_page_id,
             commit_history_root_version: fields.commit_history_root_version,
             commit_history_count: None,
+            pending_apply_journal_id: crate::recovery::journal::decode_journal_id(
+                fields.apply_journal_root_page_id,
+                fields.apply_journal_root_version,
+            ),
+            restore_mode: fields.restore_mode,
+            commit_retain_policy_tag: fields.commit_retain_policy_tag,
+            commit_retain_policy_value: fields.commit_retain_policy_value,
         };
 
         let db = Self {
@@ -169,16 +176,16 @@ impl<V: Vfs + Clone> Db<V> {
             main_db_path,
             vfs: vfs_arc,
             writer: Arc::new(AsyncMutex::new(writer)),
+            apply_gate: AsyncMutex::new(()),
+            visibility_gate: tokio::sync::RwLock::new(()),
             tracked_readers: parking_lot::Mutex::new(Vec::new()),
             reader_seq: AtomicU64::new(0),
-            latest_commit: AtomicU64::new(latest_commit),
             stall_policy: parking_lot::Mutex::new(ReaderStallPolicy::default()),
             cipher_id,
             mk_epoch: AtomicU64::new(mk_epoch),
             file_id,
             kek_salt,
             pending_tombstones: parking_lot::Mutex::new(Vec::new()),
-            pending_pin_deletes: parking_lot::Mutex::new(Vec::new()),
             options,
             mmap_bytes_in_use: Arc::new(AtomicU64::new(0)),
             spill_bytes_in_use: AtomicU64::new(0),
@@ -191,9 +198,16 @@ impl<V: Vfs + Clone> Db<V> {
                 root_page_id: fields.active_root_page_id,
                 next_page_id: fields.next_page_id,
                 catalog_root_page_id,
+                free_list_root_page_id: super::super::core::decode_free_list_root(
+                    &fields.free_list_root,
+                ),
+                commit_history_root_page_id: fields.commit_history_root_page_id,
             })),
+            poisoned_commit: parking_lot::Mutex::new(None),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),
             free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            visibility_test_hook: parking_lot::Mutex::new(None),
         };
 
         recover_open_state(&db, kek, &fields).await?;

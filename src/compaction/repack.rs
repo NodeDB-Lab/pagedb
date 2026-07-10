@@ -46,13 +46,14 @@ fn scratch_path(db: &Db<impl Vfs + Clone>) -> String {
 pub(super) async fn atomic_dense_repack<V: Vfs + Clone>(
     db: &Db<V>,
     state: &mut WriterState,
+    visibility: &tokio::sync::RwLockWriteGuard<'_, ()>,
 ) -> Result<RepackOutcome> {
     let scratch = scratch_path(db);
     // Remove any leftover scratch from an earlier interrupted compaction.
     db.vfs.remove(&scratch).await.ok();
 
     match build_scratch(db, state, &scratch).await {
-        Ok(pending) => commit_swap(db, state, &scratch, pending).await,
+        Ok(pending) => commit_swap(db, state, visibility, &scratch, pending).await,
         Err(e) => {
             // Nothing was written to main.db; drop the never-persisted compacted
             // pages from the cache so the old tree is read back from disk, and
@@ -166,23 +167,29 @@ pub(super) async fn build_scratch<V: Vfs + Clone>(
 async fn commit_swap<V: Vfs + Clone>(
     db: &Db<V>,
     state: &mut WriterState,
+    visibility: &tokio::sync::RwLockWriteGuard<'_, ()>,
     scratch: &str,
     pending: PendingSwap,
 ) -> Result<RepackOutcome> {
     // Close the cached main.db handle so the rename can replace the file
     // (Windows) and the next access reopens the new inode (Unix).
     db.pager.close_main_handle().await;
-    db.vfs.rename(scratch, &db.main_db_path).await?;
-    db.vfs.sync_dir("/").await.ok();
-
-    db.pager.commit_anchor(pending.counter_anchor)?;
-    // The cached pages were sealed for the scratch file (now main.db); drop them
-    // so reads re-fetch from the renamed file rather than serving stale entries.
-    db.pager.reset_main_pages();
-
     let new_commit_id = state.latest_commit_id + 1;
+    if db.vfs.rename(scratch, &db.main_db_path).await.is_err() {
+        // After closing the old handle, a backend may have performed an
+        // ambiguous replacement even when it reports an error. Reopen is the
+        // only safe way to establish the durable image.
+        let commit = crate::CommitId(new_commit_id);
+        db.poison(commit);
+        return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
+    }
+
+    // Rename is the durable-image boundary. Advance internal state and drop
+    // cache pages immediately, but do not publish until the parent directory
+    // sync and nonce-anchor commit both succeed.
     state.root_page_id = pending.new_root;
     state.catalog_root_page_id = pending.new_cat_root;
+    state.catalog_root_txn_id = new_commit_id;
     state.next_page_id = pending.new_next;
     state.active_slot = ActiveSlot::A;
     state.seq += 1;
@@ -190,8 +197,22 @@ async fn commit_swap<V: Vfs + Clone>(
     state.commit_history_root_page_id = 0;
     state.commit_history_root_version = 0;
     state.free_list_root_page_id = 0;
-    db.latest_commit
-        .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
+    db.pager.reset_main_pages();
+
+    if db.vfs.sync_dir(db.main_db_parent_dir()).await.is_err() {
+        let commit = crate::CommitId(new_commit_id);
+        db.poison(commit);
+        return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
+    }
+    let _ = db
+        .finish_durable_commit_visible(
+            visibility,
+            state,
+            crate::CommitId(new_commit_id),
+            pending.counter_anchor,
+            &[],
+        )
+        .await?;
 
     let pages_reclaimed = pending.old_next.saturating_sub(pending.new_next);
     Ok(RepackOutcome {

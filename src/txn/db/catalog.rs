@@ -55,7 +55,9 @@ impl<V: Vfs + Clone> Db<V> {
     /// Write per-realm quota caps into the catalog B+ tree and persist the
     /// updated catalog root to the A/B header.
     pub async fn set_realm_quotas(&self, realm: RealmId, quotas: RealmQuotas) -> Result<()> {
+        self.ensure_usable()?;
         let mut state = self.writer.lock().await;
+        self.ensure_usable()?;
         let key = Catalog::quota_key(realm);
         let value = Catalog::encode_realm_quotas(&quotas);
 
@@ -106,13 +108,20 @@ impl<V: Vfs + Clone> Db<V> {
             self.page_size,
         )
         .await?;
-        self.pager.commit_anchor(counter_anchor)?;
 
         state.catalog_root_page_id = new_catalog_root;
         state.catalog_root_txn_id = new_catalog_txn_id;
         state.next_page_id = new_next;
         state.active_slot = new_slot;
         state.seq = new_seq;
+        let _ = self
+            .finish_durable_commit(
+                &state,
+                crate::CommitId(state.latest_commit_id),
+                counter_anchor,
+                &[],
+            )
+            .await?;
 
         Ok(())
     }
@@ -120,16 +129,16 @@ impl<V: Vfs + Clone> Db<V> {
     /// Read per-realm quota caps from the catalog B+ tree. Returns
     /// `RealmQuotas::default()` if no entry has been written for this realm.
     pub async fn realm_quotas(&self, realm: RealmId) -> Result<RealmQuotas> {
-        let state = self.writer.lock().await;
+        self.ensure_usable()?;
+        let snapshot = *self.snapshot.read();
         let key = Catalog::quota_key(realm);
         let cat_tree = BTree::open(
             self.pager.clone(),
             self.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
+            snapshot.catalog_root_page_id,
+            snapshot.next_page_id,
             self.page_size,
         );
-        drop(state);
         match cat_tree.get(&key).await? {
             Some(bytes) => Catalog::decode_realm_quotas(&bytes),
             None => Ok(RealmQuotas::default()),

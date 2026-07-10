@@ -19,7 +19,95 @@ use super::super::super::policy::ReaderStallPolicy;
 use super::super::core::{Db, ReaderSnapshot, WriterState};
 use super::super::util::page_size_log2;
 
+struct FreshDbState<V: Vfs + Clone> {
+    pager: Pager<V>,
+    realm_id: RealmId,
+    page_size: usize,
+    hk: crate::crypto::keys::DerivedKey,
+    main_db_path: String,
+    vfs: Arc<V>,
+    options: OpenOptions,
+    cipher_id: CipherId,
+    mk_epoch: u64,
+    file_id: [u8; 16],
+    kek_salt: [u8; 16],
+    initial: MainDbHeaderFields,
+}
+
 impl<V: Vfs + Clone> Db<V> {
+    fn assemble_fresh(state: FreshDbState<V>) -> Self {
+        let FreshDbState {
+            pager,
+            realm_id,
+            page_size,
+            hk,
+            main_db_path,
+            vfs,
+            options,
+            cipher_id,
+            mk_epoch,
+            file_id,
+            kek_salt,
+            initial,
+        } = state;
+        let writer = WriterState {
+            root_page_id: 0,
+            next_page_id: 4,
+            active_slot: ActiveSlot::A,
+            latest_commit_id: 0,
+            seq: 1,
+            catalog_root_page_id: 0,
+            catalog_root_txn_id: 0,
+            free_list_root_page_id: 0,
+            commit_history_root_page_id: 0,
+            commit_history_root_version: 0,
+            commit_history_count: Some(0),
+            pending_apply_journal_id: [0; 16],
+            restore_mode: initial.restore_mode,
+            commit_retain_policy_tag: initial.commit_retain_policy_tag,
+            commit_retain_policy_value: initial.commit_retain_policy_value,
+        };
+        Self {
+            pager: Arc::new(pager),
+            realm_id,
+            page_size,
+            hk: parking_lot::RwLock::new(hk),
+            main_db_path,
+            vfs,
+            writer: Arc::new(AsyncMutex::new(writer)),
+            apply_gate: AsyncMutex::new(()),
+            visibility_gate: tokio::sync::RwLock::new(()),
+            tracked_readers: parking_lot::Mutex::new(Vec::new()),
+            reader_seq: AtomicU64::new(0),
+            stall_policy: parking_lot::Mutex::new(ReaderStallPolicy::default()),
+            cipher_id,
+            mk_epoch: AtomicU64::new(mk_epoch),
+            file_id,
+            kek_salt,
+            pending_tombstones: parking_lot::Mutex::new(Vec::new()),
+            options,
+            mmap_bytes_in_use: Arc::new(AtomicU64::new(0)),
+            spill_bytes_in_use: AtomicU64::new(0),
+            txn_seq: AtomicU64::new(0),
+            mode: DbMode::Standalone,
+            aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            sentinel_locks: Vec::new(),
+            snapshot: Arc::new(parking_lot::RwLock::new(ReaderSnapshot {
+                commit_id: 0,
+                root_page_id: 0,
+                next_page_id: 4,
+                catalog_root_page_id: 0,
+                free_list_root_page_id: 0,
+                commit_history_root_page_id: 0,
+            })),
+            poisoned_commit: parking_lot::Mutex::new(None),
+            free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            visibility_test_hook: parking_lot::Mutex::new(None),
+        }
+    }
+
     /// Bootstrap a fresh database. Creates `main.db`, writes an initial A/B
     /// header in slot A with `seq=1`.
     pub async fn open_internal(
@@ -136,53 +224,19 @@ impl<V: Vfs + Clone> Db<V> {
         let vfs_for_pager = V::clone(&*vfs_arc);
         let pager = Pager::open(vfs_for_pager, mk, cfg).await?;
 
-        let writer = WriterState {
-            root_page_id: 0,
-            next_page_id: 4,
-            active_slot: ActiveSlot::A,
-            latest_commit_id: 0,
-            seq: 1,
-            catalog_root_page_id: 0,
-            catalog_root_txn_id: 0,
-            free_list_root_page_id: 0,
-            commit_history_root_page_id: 0,
-            commit_history_root_version: 0,
-            commit_history_count: Some(0),
-        };
-
-        Ok(Self {
-            pager: Arc::new(pager),
+        Ok(Self::assemble_fresh(FreshDbState {
+            pager,
             realm_id: realm,
             page_size,
-            hk: parking_lot::RwLock::new(hk),
+            hk,
             main_db_path,
             vfs: vfs_arc,
-            writer: Arc::new(AsyncMutex::new(writer)),
-            tracked_readers: parking_lot::Mutex::new(Vec::new()),
-            reader_seq: AtomicU64::new(0),
-            latest_commit: AtomicU64::new(0),
-            stall_policy: parking_lot::Mutex::new(ReaderStallPolicy::default()),
+            options,
             cipher_id,
-            mk_epoch: AtomicU64::new(mk_epoch),
+            mk_epoch,
             file_id,
             kek_salt,
-            pending_tombstones: parking_lot::Mutex::new(Vec::new()),
-            pending_pin_deletes: parking_lot::Mutex::new(Vec::new()),
-            options,
-            mmap_bytes_in_use: Arc::new(AtomicU64::new(0)),
-            spill_bytes_in_use: AtomicU64::new(0),
-            txn_seq: AtomicU64::new(0),
-            mode: DbMode::Standalone,
-            aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
-            sentinel_locks: Vec::new(),
-            snapshot: Arc::new(parking_lot::RwLock::new(ReaderSnapshot {
-                commit_id: 0,
-                root_page_id: 0,
-                next_page_id: 4,
-                catalog_root_page_id: 0,
-            })),
-            free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
-        })
+            initial,
+        }))
     }
 }

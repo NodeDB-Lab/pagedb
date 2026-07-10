@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use tokio::sync::MutexGuard;
+use tokio::sync::{MutexGuard, RwLockWriteGuard};
 
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, RealmQuotas, SegmentMeta};
@@ -19,8 +19,15 @@ use super::spill::SpillSegmentMeta;
 
 /// Deferred filesystem operation applied after the A/B header is durable.
 pub(crate) enum SegmentSideEffect {
-    Promote { segment_id: [u8; 16] },
-    Tombstone { segment_id: [u8; 16] },
+    Promote {
+        segment_id: [u8; 16],
+    },
+    Tombstone {
+        segment_id: [u8; 16],
+        /// `None` uses the enclosing durable commit. Apply-journal entries
+        /// carry their recorded tombstone commit explicitly.
+        tombstone_commit_id: Option<u64>,
+    },
 }
 
 /// An exclusive write transaction. At most one `WriteTxn` exists per `Db` at
@@ -30,6 +37,8 @@ pub(crate) enum SegmentSideEffect {
 pub struct WriteTxn<'db, V: Vfs + Clone> {
     pub(super) db: &'db Db<V>,
     pub(super) guard: MutexGuard<'db, WriterState>,
+    /// Held from the reclamation-floor scan through commit publication.
+    pub(super) visibility_guard: RwLockWriteGuard<'db, ()>,
     pub(super) btree: BTree<V>,
     pub(super) catalog_tree: BTree<V>,
     pub(super) pending_segments: Vec<SegmentSideEffect>,
@@ -63,7 +72,12 @@ pub struct WriteTxn<'db, V: Vfs + Clone> {
 
 impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     pub(crate) async fn begin(db: &'db Db<V>) -> Result<WriteTxn<'db, V>> {
+        db.ensure_usable()?;
         let guard = db.writer.lock().await;
+        db.ensure_usable()?;
+        #[cfg(test)]
+        db.notify_writer_waiting();
+        let visibility_guard = db.visibility_gate.write().await;
 
         // Pages freed *within this txn* must not be recycled within it while a
         // reader is pinned (they may still be live in a prior snapshot). The
@@ -132,6 +146,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         Ok(Self {
             db,
             guard,
+            visibility_guard,
             btree,
             catalog_tree,
             pending_segments: Vec::new(),
@@ -241,6 +256,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         }
         self.pending_segments.push(SegmentSideEffect::Tombstone {
             segment_id: meta.segment_id,
+            tombstone_commit_id: None,
         });
         Ok(())
     }
@@ -267,6 +283,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         self.sync_allocator_from_catalog();
         self.pending_segments.push(SegmentSideEffect::Tombstone {
             segment_id: old_meta.segment_id,
+            tombstone_commit_id: None,
         });
         self.pending_segments.push(SegmentSideEffect::Promote {
             segment_id: new_meta.segment_id,

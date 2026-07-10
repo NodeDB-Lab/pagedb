@@ -8,4 +8,5 @@ mod txn;
 
 pub use counter::CounterRef;
 pub use spill::{ScratchOffset, SpillScope};
+pub(crate) use txn::SegmentSideEffect;
 pub use txn::WriteTxn;

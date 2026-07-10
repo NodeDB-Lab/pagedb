@@ -5,7 +5,9 @@ use crate::Result;
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, CatalogRowKind};
 use crate::observability::DbStats;
-use crate::vfs::Vfs;
+use crate::vfs::types::OpenMode;
+use crate::vfs::{Vfs, VfsFile};
+use std::sync::atomic::Ordering as AtOrd;
 
 use super::super::mode::DbMode;
 use super::core::Db;
@@ -36,14 +38,16 @@ impl<V: Vfs + Clone> Db<V> {
     /// Stub: rekey a restored `Db` (`ReadOnly` or Follower) into a Standalone writer.
     /// Full implementation is out of scope for this slice.
     pub fn rekey_into_writer(self, _new_kek: [u8; 32]) -> Result<Self> {
+        self.ensure_usable()?;
         Err(crate::errors::PagedbError::Unsupported)
     }
 
     /// Return the `next_page_id` from the current writer state.
     ///
     /// Intended for integration tests that need to know how many pages exist.
+    #[allow(clippy::unused_async)] // async signature preserved for API stability
     pub async fn next_page_id(&self) -> u64 {
-        self.writer.lock().await.next_page_id
+        self.snapshot.read().next_page_id
     }
 
     /// Evict all clean and dirty pages for the main realm from the buffer
@@ -56,8 +60,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// Return the current size of `main.db` in bytes. Useful for tests that
     /// verify compaction shrinks the file.
     pub async fn main_db_byte_size(&self) -> Result<u64> {
-        use crate::vfs::VfsFile;
-        use crate::vfs::types::OpenMode;
+        self.ensure_usable()?;
         let f = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
         f.len().await
     }
@@ -71,6 +74,7 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Returns a [`CompactStats`] summary of what was reclaimed.
     pub async fn compact_now(&self) -> Result<crate::compaction::CompactStats> {
+        self.ensure_usable()?;
         crate::compaction::compact_now(self).await
     }
 
@@ -87,25 +91,23 @@ impl<V: Vfs + Clone> Db<V> {
         &self,
         budget: crate::compaction::CompactBudget,
     ) -> Result<crate::compaction::CompactProgress> {
+        self.ensure_usable()?;
         crate::compaction::compact_step(self, budget).await
     }
 
     /// Collect a point-in-time snapshot of database runtime metrics.
     pub async fn stats(&self) -> Result<DbStats> {
-        use crate::vfs::VfsFile;
-        use std::sync::atomic::Ordering as AtOrd;
-
-        // Gather writer-guarded values.
-        let (latest_commit_id, next_page_id, catalog_root, catalog_next, free_list_root) = {
-            let w = self.writer.lock().await;
-            (
-                w.latest_commit_id,
-                w.next_page_id,
-                w.catalog_root_page_id,
-                w.next_page_id,
-                w.free_list_root_page_id,
-            )
-        };
+        // Stats that describe reader-visible state must use the publication
+        // snapshot, which remains at the prior commit while a handle is
+        // poisoned after a post-header reconciliation failure.
+        let snapshot = *self.snapshot.read();
+        let (next_page_id, catalog_root, catalog_next, free_list_root) = (
+            snapshot.next_page_id,
+            snapshot.catalog_root_page_id,
+            snapshot.next_page_id,
+            snapshot.free_list_root_page_id,
+        );
+        let latest_commit_id = snapshot.commit_id;
 
         // Durable free-list depth (chain rooted at the header's free_list_root).
         let free_list_pending_entries =

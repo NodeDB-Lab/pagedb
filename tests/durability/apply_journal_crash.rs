@@ -60,16 +60,34 @@ fn encode_mixed_actions_then_decode() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn promote_action_is_idempotent_when_staging_absent() {
-    // If the staging file is absent, the promote rename is a no-op.
-    // execute_journal_actions must not return an error.
+async fn promote_action_is_idempotent_when_live_exists() {
     use pagedb::recovery::journal::execute_journal_actions;
+    use pagedb::vfs::types::OpenMode;
+
+    let vfs = MemVfs::new();
+    let segment_id = [0xCC; 16];
+    let live = format!(
+        "seg/{}",
+        segment_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    vfs.open(&live, OpenMode::CreateNew).await.unwrap();
+
+    let actions = vec![JournalAction::Promote { segment_id }];
+    execute_journal_actions(&vfs, &actions).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn promote_action_propagates_missing_staging() {
+    use pagedb::recovery::journal::execute_journal_actions;
+
     let vfs = MemVfs::new();
     let actions = vec![JournalAction::Promote {
-        segment_id: [0xCC; 16],
+        segment_id: [0xCE; 16],
     }];
-    // No staging file exists; execute must succeed silently.
-    execute_journal_actions(&vfs, &actions).await;
+    assert!(execute_journal_actions(&vfs, &actions).await.is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -98,7 +116,7 @@ async fn promote_action_renames_staging_to_live() {
 
     // Execute promote; staging should move to live.
     let actions = vec![JournalAction::Promote { segment_id: seg_id }];
-    execute_journal_actions(&vfs, &actions).await;
+    execute_journal_actions(&vfs, &actions).await.unwrap();
 
     let live_name = format!(
         "seg/{}",
@@ -124,5 +142,5 @@ async fn tombstone_action_is_idempotent_when_live_absent() {
         segment_id: [0xEE; 16],
         tombstone_commit_id: 5,
     }];
-    execute_journal_actions(&vfs, &actions).await;
+    execute_journal_actions(&vfs, &actions).await.unwrap();
 }

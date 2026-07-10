@@ -75,6 +75,13 @@ async fn latest_commit_advances_on_commit() {
         w.put(b"a", b"1").await.unwrap();
         w.commit().await.unwrap();
     }
+    let reader = db.begin_read_non_abortable().await.unwrap();
+    assert_eq!(reader.commit_id(), CommitId::new(1));
+    assert_eq!(
+        reader.get(b"a").await.unwrap().as_deref(),
+        Some(b"1".as_ref())
+    );
+    drop(reader);
     assert_eq!(db.latest_commit(), CommitId::new(1));
     {
         let mut w = db.begin_write().await.unwrap();

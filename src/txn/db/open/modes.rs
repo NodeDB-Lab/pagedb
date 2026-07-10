@@ -217,6 +217,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// Promote a frozen read-only handle to Follower mode after excluding all
     /// other frozen readers and acquiring the writer sentinel.
     pub async fn promote_to_follower(mut self) -> Result<Self> {
+        self.ensure_usable()?;
         if self.mode != DbMode::ReadOnly {
             return Err(PagedbError::Unsupported);
         }

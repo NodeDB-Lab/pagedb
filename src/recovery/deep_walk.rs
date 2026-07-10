@@ -144,6 +144,7 @@ impl DeepWalkReport {
 /// page including free, spill, and unreferenced pages.
 #[allow(clippy::too_many_lines)]
 pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport> {
+    db.ensure_usable()?;
     let mut report = DeepWalkReport::default();
 
     let (next_page_id, catalog_root, catalog_next, free_list_root) = {

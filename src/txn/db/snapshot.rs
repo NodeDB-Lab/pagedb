@@ -23,18 +23,11 @@ impl<V: Vfs + Clone> Db<V> {
     ) -> crate::Result<crate::snapshot::SnapshotStats> {
         use crate::snapshot::export::{SnapshotManifest, snapshot_full};
 
+        self.ensure_usable()?;
         let _span = tracing::debug_span!("snapshot.export");
 
-        // Pin the current state via a non-abortable read txn.
-        let txn = {
-            let w = self.writer.lock().await;
-            let cid = crate::CommitId(w.latest_commit_id);
-            let root = w.root_page_id;
-            let next = w.next_page_id;
-            let cat = w.catalog_root_page_id;
-            drop(w);
-            self.register_read(cid, root, next, cat, true)
-        };
+        // Pin the current published state with a non-abortable read txn.
+        let txn = self.begin_read_non_abortable().await?;
 
         let (target_commit, next_page_id) = { (txn.commit_id().0, txn.next_page_id()) };
         let target_active_root_page_id = txn.root_page_id();
@@ -159,16 +152,9 @@ impl<V: Vfs + Clone> Db<V> {
     ) -> crate::Result<crate::snapshot::SnapshotStats> {
         use crate::snapshot::export::{SnapshotManifest, snapshot_incremental};
 
-        // Pin current state.
-        let txn = {
-            let w = self.writer.lock().await;
-            let cid = crate::CommitId(w.latest_commit_id);
-            let root = w.root_page_id;
-            let next = w.next_page_id;
-            let cat = w.catalog_root_page_id;
-            drop(w);
-            self.register_read(cid, root, next, cat, true)
-        };
+        self.ensure_usable()?;
+        // Pin the current published state.
+        let txn = self.begin_read_non_abortable().await?;
 
         let target_commit = txn.commit_id().0;
         let target_next_page_id = txn.next_page_id();
@@ -177,14 +163,12 @@ impl<V: Vfs + Clone> Db<V> {
 
         // Get base snapshot's next_page_id by reading the commit history.
         let base_txn_result = self.begin_read_at(base_commit).await;
-        let base_next_page_id = match &base_txn_result {
-            Ok(bt) => bt.next_page_id(),
-            Err(_) => 0u64,
-        };
-        let base_catalog_root = match &base_txn_result {
-            Ok(bt) => bt.catalog_root_page_id(),
-            Err(_) => 0u64,
-        };
+        let base_next_page_id = base_txn_result
+            .as_ref()
+            .map_or(0u64, crate::txn::ReadTxn::next_page_id);
+        let base_catalog_root = base_txn_result
+            .as_ref()
+            .map_or(0u64, crate::txn::ReadTxn::catalog_root_page_id);
 
         // Pages changed = all pages with page_id >= base_next_page_id (allocated after base).
         // Also include all pages reachable from current root that have id >= base_next_page_id.
@@ -264,16 +248,27 @@ impl<V: Vfs + Clone> Db<V> {
         use crate::pager::header::commit_header;
         use crate::recovery::journal::{
             ApplyJournalRecord, JournalAction, encode_journal_id, encode_journal_pages,
-            execute_journal_actions,
         };
-        use crate::snapshot::apply::{apply_delta_pages, stage_snapshot_segments};
+        use crate::snapshot::apply::{
+            apply_delta_pages, stage_snapshot_segments, validate_snapshot_segment_count,
+        };
         use crate::txn::mode::DbMode;
 
+        self.ensure_usable()?;
         let _span = tracing::debug_span!("snapshot.apply");
 
         if !matches!(self.mode, DbMode::Follower) {
             return Err(crate::errors::PagedbError::IdentityForked);
         }
+        // An apply owns the complete protocol, including recovery, validation,
+        // raw page writes, staging, and post-header reconciliation. A waiting
+        // caller re-checks poison state after it acquires the gate.
+        let _apply_guard = self.apply_gate.lock().await;
+        self.ensure_usable()?;
+
+        // A durable target with an uncleared journal must converge before a
+        // later apply can overwrite its retry pointer or staging set.
+        self.retry_pending_apply_journal().await?;
 
         let manifest_path = src_path.join("manifest");
         // We need kek to verify the manifest, but Db doesn't hold it. Use the
@@ -299,8 +294,12 @@ impl<V: Vfs + Clone> Db<V> {
             buf
         };
         let manifest = crate::snapshot::export::decode_manifest(&manifest_bytes, &hk_raw)?;
+        self.validate_incremental_manifest(&manifest, &manifest_bytes[118..224])?;
 
-        let page_size = manifest.page_size as usize;
+        let page_size = usize::try_from(manifest.page_size)
+            .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("page_size"))?;
+        validate_snapshot_segment_count(src_path, manifest.segments_count).await?;
+
         let vfs_root = get_vfs_root(&*self.vfs)?;
         let dst_main_db = vfs_root.join("main.db");
 
@@ -310,17 +309,71 @@ impl<V: Vfs + Clone> Db<V> {
         // Stage new segment files in `.staging/` so they can be promoted
         // atomically after the header swap via the apply journal.
         let dst_seg_root = vfs_root.join("seg");
+        let staging_dir = dst_seg_root.join(".staging");
+        let staging_existed = match tokio::fs::metadata(&staging_dir).await {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(crate::errors::PagedbError::Io(error)),
+        };
         let staged_ids = stage_snapshot_segments(src_path, &dst_seg_root).await?;
-        let segments_promoted = u32::try_from(staged_ids.len()).unwrap_or(u32::MAX);
+        let segments_promoted = u32::try_from(staged_ids.len())
+            .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("segments_count"))?;
+        if segments_promoted != manifest.segments_count {
+            for segment_id in &staged_ids {
+                let path = staging_dir.join(crate::hex::to_hex_lower(segment_id));
+                tokio::fs::remove_file(path)
+                    .await
+                    .map_err(crate::errors::PagedbError::Io)?;
+            }
+            if !staging_existed {
+                tokio::fs::remove_dir(&staging_dir)
+                    .await
+                    .map_err(crate::errors::PagedbError::Io)?;
+            }
+            return Err(crate::errors::PagedbError::snapshot_incompatible(
+                "segments_count",
+            ));
+        }
 
-        // Build journal actions: one Promote per staged segment.
         let new_commit_id = manifest.target_commit;
-        let actions: Vec<JournalAction> = staged_ids
+        let mut state = self.writer.lock().await;
+        self.ensure_usable()?;
+
+        // Reconcile the target catalog against the currently published one.
+        // The target pages are already present on disk, so this comparison can
+        // record both staged promotions and old live segments that must be
+        // tombstoned after the header becomes durable.
+        let old_segments = self.list_all_segments(&state).await?;
+        let target_catalog_root = manifest.target_catalog_root_page_id;
+        let target_segments = if target_catalog_root == 0 {
+            Vec::new()
+        } else {
+            let tree = crate::btree::BTree::open(
+                self.pager.clone(),
+                self.realm_id,
+                target_catalog_root,
+                manifest.next_page_id_at_target,
+                self.page_size,
+            );
+            let rows = tree.collect_range(&[0x01], &[0x02]).await?;
+            let mut entries = Vec::with_capacity(rows.len());
+            for (_, value) in rows {
+                entries.push(crate::catalog::codec::Catalog::decode_segment_meta(&value)?);
+            }
+            entries
+        };
+        let target_ids: std::collections::HashSet<[u8; 16]> =
+            target_segments.iter().map(|meta| meta.segment_id).collect();
+        let mut actions: Vec<JournalAction> = staged_ids
             .iter()
             .map(|&segment_id| JournalAction::Promote { segment_id })
             .collect();
-
-        let mut state = self.writer.lock().await;
+        actions.extend(old_segments.into_iter().filter_map(|meta| {
+            (!target_ids.contains(&meta.segment_id)).then_some(JournalAction::Tombstone {
+                segment_id: meta.segment_id,
+                tombstone_commit_id: new_commit_id,
+            })
+        }));
 
         // Write the journal record to a fresh apply-journal sidecar via the
         // Pager AEAD path. A fresh, never-reused `journal_id` guarantees the
@@ -344,7 +397,7 @@ impl<V: Vfs + Clone> Db<V> {
                     .await?;
             }
             self.pager.flush_journal(id, self.realm_id).await?;
-            self.vfs.sync_dir("applyjournal").await.ok();
+            self.vfs.sync_dir("applyjournal").await?;
             id
         };
         let (journal_root_page_id, journal_root_version) = encode_journal_id(&journal_id);
@@ -353,7 +406,10 @@ impl<V: Vfs + Clone> Db<V> {
         // just wrote. After this commit, a crash-recovery replay can re-execute
         // the promote renames idempotently.
         let new_next_page_id = manifest.next_page_id_at_target;
-        let new_seq = state.seq + 1;
+        let new_seq = state
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| crate::errors::PagedbError::arithmetic_overflow("apply sequence"))?;
         let counter_anchor = self.pager.pending_anchor();
 
         // Install the target trees the producer shipped in the manifest. The
@@ -381,16 +437,16 @@ impl<V: Vfs + Clone> Db<V> {
             active_root_txn_id: new_commit_id,
             counter_anchor,
             commit_id: crate::CommitId(new_commit_id),
-            free_list_root: [0; 16],
+            free_list_root: crate::txn::db::encode_free_list_root(state.free_list_root_page_id),
             catalog_root: catalog_root_bytes,
             apply_journal_root_page_id: journal_root_page_id,
             apply_journal_root_version: journal_root_version,
-            commit_history_root_page_id: 0,
-            commit_history_root_version: 0,
-            restore_mode: 0,
+            commit_history_root_page_id: state.commit_history_root_page_id,
+            commit_history_root_version: state.commit_history_root_version,
+            restore_mode: state.restore_mode,
             next_page_id: new_next_page_id,
-            commit_retain_policy_tag: 0,
-            commit_retain_policy_value: 0,
+            commit_retain_policy_tag: state.commit_retain_policy_tag,
+            commit_retain_policy_value: state.commit_retain_policy_value,
         };
 
         let hk_clone = { self.hk.read().clone() };
@@ -403,73 +459,34 @@ impl<V: Vfs + Clone> Db<V> {
             self.page_size,
         )
         .await?;
-        self.pager.commit_anchor(counter_anchor)?;
-
-        // The header swap is durable. Execute the journal actions (staging →
-        // live renames). Each rename is idempotent; a crash here is safe
-        // because replay_apply_journal will re-execute on the next open.
-        if actions.is_empty() {
-            state.active_slot = new_slot;
-            state.seq = new_seq;
-        } else {
-            execute_journal_actions(&*self.vfs, &actions).await;
-
-            // Clear the journal root by writing a second header commit with
-            // apply_journal_root_page_id = 0. This marks the journal as complete.
-            let new_seq2 = new_seq + 1;
-            let counter_anchor2 = self.pager.pending_anchor();
-            let fields_clear = MainDbHeaderFields {
-                format_version: 1,
-                cipher_id: self.cipher_id.as_byte(),
-                page_size_log2: page_size_log2(self.page_size)?,
-                flags: 0,
-                file_id: self.file_id,
-                kek_salt: self.kek_salt,
-                mk_epoch: self.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
-                seq: new_seq2,
-                active_root_page_id: new_root_page_id,
-                active_root_txn_id: new_commit_id,
-                counter_anchor: counter_anchor2,
-                commit_id: crate::CommitId(new_commit_id),
-                free_list_root: [0; 16],
-                catalog_root: catalog_root_bytes,
-                apply_journal_root_page_id: 0,
-                apply_journal_root_version: 0,
-                commit_history_root_page_id: 0,
-                commit_history_root_version: 0,
-                restore_mode: 0,
-                next_page_id: new_next_page_id,
-                commit_retain_policy_tag: 0,
-                commit_retain_policy_value: 0,
-            };
-            let new_slot2 = commit_header(
-                &*self.vfs,
-                &self.main_db_path,
-                &hk_clone,
-                &fields_clear,
-                new_slot,
-                self.page_size,
-            )
-            .await?;
-            self.pager.commit_anchor(counter_anchor2)?;
-            state.active_slot = new_slot2;
-            state.seq = new_seq2;
-
-            // The journal root is cleared and durable; the sidecar is no longer
-            // needed. Remove it (a crash before this point leaves the sidecar,
-            // which the next open's replay re-runs idempotently then removes).
-            self.pager.remove_journal(journal_id).await?;
-        }
-
+        // The target header is durable. Advance only internal writer state;
+        // prior readers remain on the old snapshot until the nonce anchor and
+        // journal actions establish a safe target directory.
+        state.active_slot = new_slot;
+        state.seq = new_seq;
         state.latest_commit_id = new_commit_id;
         state.next_page_id = new_next_page_id;
         state.root_page_id = new_root_page_id;
         state.catalog_root_page_id = new_catalog_root_page_id;
-        self.latest_commit
-            .store(new_commit_id, std::sync::atomic::Ordering::SeqCst);
-        self.publish_snapshot(&state);
+        state.catalog_root_txn_id = new_commit_id;
+        // The header is the source of truth for a pending apply. Mirror it in
+        // live writer state immediately so every subsequent operation sees the
+        // same retry obligation.
+        state.pending_apply_journal_id = journal_id;
 
-        drop(state);
+        if self.pager.commit_anchor(counter_anchor).is_err() {
+            let commit = crate::CommitId(new_commit_id);
+            self.poison(commit);
+            return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
+        }
+
+        if actions.is_empty() {
+            self.publish_snapshot(&state);
+            drop(state);
+        } else {
+            drop(state);
+            self.retry_pending_apply_journal().await?;
+        }
 
         Ok(crate::snapshot::ApplyStats {
             pages_applied,

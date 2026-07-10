@@ -4,7 +4,6 @@
 use std::sync::atomic::Ordering;
 
 use crate::btree::BTree;
-use crate::catalog::codec::Catalog;
 use crate::errors::PagedbError;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
@@ -14,77 +13,24 @@ use super::super::policy::ReaderStallPolicy;
 use super::super::read::ReadTxn;
 use super::super::write::WriteTxn;
 use super::core::{Db, ReaderSnapshot, TrackedReader, WriterState, decode_commit_meta};
-use super::util::next_lease_id;
 
 impl<V: Vfs + Clone> Db<V> {
-    /// Open a read transaction pinned to the current committed root. Inserts a
-    /// durable reader-pin row in the catalog so cross-process GC can see the pin
-    /// even after a crash. The pin is deleted (best-effort) when the `ReadTxn`
-    /// drops via the `pending_pin_deletes` queue, which is drained by the next
-    /// writer commit or `gc_now`. If the process crashes before cleanup, the next
-    /// writer open scans and removes stale pin rows.
+    /// Open a read transaction pinned to the current published root. Reader
+    /// tracking is local to this `Db` handle and never mutates durable state.
+    #[allow(clippy::unused_async)] // async signature preserved for API stability
     pub async fn begin_read(&self) -> Result<ReadTxn<'_, V>> {
-        // Only insert a durable pin on Standalone handles; ReadOnly / Follower
-        // handles that cannot write to their own catalog use the in-memory path.
-        let can_write_catalog = matches!(self.mode, crate::txn::mode::DbMode::Standalone);
-
-        let (commit_id, root_page_id, next_page_id, catalog_root_page_id) = {
-            let w = self.writer.lock().await;
-            (
-                CommitId(w.latest_commit_id),
-                w.root_page_id,
-                w.next_page_id,
-                w.catalog_root_page_id,
-            )
-        };
-        let txn = self.register_read(
-            commit_id,
-            root_page_id,
-            next_page_id,
-            catalog_root_page_id,
+        self.ensure_usable()?;
+        let _admission = self.visibility_gate.read().await;
+        let snap = *self.snapshot.read();
+        #[cfg(test)]
+        self.pause_after_snapshot_selection().await;
+        Ok(self.register_read(
+            CommitId(snap.commit_id),
+            snap.root_page_id,
+            snap.next_page_id,
+            snap.catalog_root_page_id,
             false,
-        );
-
-        if can_write_catalog {
-            let lease_seconds = 30u64;
-            let lease_id = next_lease_id();
-            let own_pid = std::process::id();
-            let pin_handle = crate::txn::read::make_pin_handle(
-                self.pager.clone(),
-                self.realm_id,
-                self.page_size,
-                self.main_db_path.clone(),
-                self.vfs.clone(),
-                self.hk.read().clone(),
-                self.mk_epoch.load(Ordering::SeqCst),
-                self.cipher_id,
-                self.file_id,
-                self.kek_salt,
-                self.latest_commit.load(Ordering::SeqCst),
-                self.snapshot.clone(),
-                own_pid,
-                lease_id,
-                lease_seconds,
-            );
-            // Insert the pin row. On failure (e.g., no catalog yet or during
-            // bootstrap), fall through to in-memory-only tracking.
-            {
-                let mut state = self.writer.lock().await;
-                if state.catalog_root_page_id != 0 {
-                    let _ = crate::txn::read::insert_pin_row(
-                        &pin_handle,
-                        &mut state,
-                        commit_id.0,
-                        root_page_id,
-                        catalog_root_page_id,
-                    )
-                    .await;
-                    return Ok(txn.with_durable_pin(own_pid, lease_id));
-                }
-            }
-        }
-
-        Ok(txn)
+        ))
     }
 
     /// Like [`begin_read`] but marks the reader as non-abortable. The
@@ -96,12 +42,13 @@ impl<V: Vfs + Clone> Db<V> {
     /// not be interrupted mid-stream.
     #[allow(clippy::unused_async)] // async signature preserved for API stability
     pub async fn begin_read_non_abortable(&self) -> Result<ReadTxn<'_, V>> {
-        // Lock-free fast path: read the published snapshot without touching
-        // the async writer mutex. The snapshot is updated by the writer at
-        // each commit (see `publish_snapshot`), and is always internally
-        // consistent — a reader either sees the previous commit fully or the
-        // new commit fully, never a torn mix.
+        self.ensure_usable()?;
+        let _admission = self.visibility_gate.read().await;
+        // The snapshot and registration remain under the admission gate, so a
+        // destructive writer cannot decide reader-pin eligibility between them.
         let snap = *self.snapshot.read();
+        #[cfg(test)]
+        self.pause_after_snapshot_selection().await;
         Ok(self.register_read(
             CommitId(snap.commit_id),
             snap.root_page_id,
@@ -120,6 +67,8 @@ impl<V: Vfs + Clone> Db<V> {
             root_page_id: state.root_page_id,
             next_page_id: state.next_page_id,
             catalog_root_page_id: state.catalog_root_page_id,
+            free_list_root_page_id: state.free_list_root_page_id,
+            commit_history_root_page_id: state.commit_history_root_page_id,
         };
     }
 
@@ -145,6 +94,8 @@ impl<V: Vfs + Clone> Db<V> {
             non_abortable,
         });
         drop(readers);
+        #[cfg(test)]
+        self.notify_reader_registered();
         ReadTxn::new(
             self,
             commit_id,
@@ -168,6 +119,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// Open a write transaction. Acquires the exclusive writer slot.
     /// Returns `PagedbError::ReadOnly` if the handle is not in Standalone mode.
     pub async fn begin_write(&self) -> Result<WriteTxn<'_, V>> {
+        self.ensure_usable()?;
         if !matches!(self.mode, DbMode::Standalone) {
             return Err(PagedbError::ReadOnly);
         }
@@ -177,7 +129,7 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Return the most recently published `CommitId`.
     pub fn latest_commit(&self) -> CommitId {
-        CommitId(self.latest_commit.load(Ordering::SeqCst))
+        CommitId(self.snapshot.read().commit_id)
     }
 
     /// Replace the reader stall policy. Takes effect on the next stall
@@ -252,69 +204,26 @@ impl<V: Vfs + Clone> Db<V> {
         }
     }
 
-    /// Scan the catalog for durable reader-pin rows. Returns the minimum
-    /// `commit_id` among non-expired pins, or `u64::MAX` if there are none.
-    /// This supplements the in-memory `tracked_readers` check with cross-process
-    /// readers whose pins are only visible via the catalog.
-    pub(crate) async fn min_durable_reader_commit(&self, catalog_root: u64, next: u64) -> u64 {
-        if catalog_root == 0 {
-            return u64::MAX;
-        }
-        let now = crate::txn::read::unix_now_seconds();
-        let tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            catalog_root,
-            next,
-            self.page_size,
-        );
-        let start = Catalog::reader_pin_range_start();
-        let end = Catalog::reader_pin_range_end();
-        let Ok(rows) = tree.collect_range(&start, &end).await else {
-            return u64::MAX;
-        };
-        let own_pid = std::process::id();
-        let mut min_commit = u64::MAX;
-        for (k, v) in &rows {
-            // Skip own-PID pins (they're accounted for in-memory).
-            if k.len() >= 5 {
-                let mut pid_buf = [0u8; 4];
-                pid_buf.copy_from_slice(&k[1..5]);
-                if u32::from_be_bytes(pid_buf) == own_pid {
-                    continue;
-                }
-            }
-            if let Ok(pv) = Catalog::decode_reader_pin(v) {
-                if pv.expires_unix_seconds >= now {
-                    min_commit = min_commit.min(pv.commit_id);
-                }
-            }
-        }
-        min_commit
-    }
-
     /// Look up `commit` in the commit-history B+ tree and, if found, return a
     /// `ReadTxn` pinned to that historical snapshot.
     pub async fn begin_read_at(&self, commit: CommitId) -> Result<ReadTxn<'_, V>> {
-        let (history_root, history_next, latest_commit_id) = {
-            let w = self.writer.lock().await;
-            (
-                w.commit_history_root_page_id,
-                w.next_page_id,
-                w.latest_commit_id,
-            )
-        };
-
-        // Fast path: current commit.
-        if commit.0 == latest_commit_id {
-            let w = self.writer.lock().await;
-            let cid = CommitId(w.latest_commit_id);
-            let root = w.root_page_id;
-            let next = w.next_page_id;
-            let cat = w.catalog_root_page_id;
-            drop(w);
-            return Ok(self.register_read(cid, root, next, cat, false));
+        self.ensure_usable()?;
+        let _admission = self.visibility_gate.read().await;
+        let snap = *self.snapshot.read();
+        if commit.0 == snap.commit_id {
+            #[cfg(test)]
+            self.pause_after_snapshot_selection().await;
+            return Ok(self.register_read(
+                CommitId(snap.commit_id),
+                snap.root_page_id,
+                snap.next_page_id,
+                snap.catalog_root_page_id,
+                false,
+            ));
         }
+        let history_root = snap.commit_history_root_page_id;
+        let history_next = snap.next_page_id;
+        let latest_commit_id = snap.commit_id;
 
         if history_root == 0 {
             // History tree not yet written; all historical commits are gone.
@@ -335,6 +244,8 @@ impl<V: Vfs + Clone> Db<V> {
         let key = commit.0.to_be_bytes().to_vec();
         if let Some(value) = tree.get(&key).await? {
             let meta = decode_commit_meta(&value)?;
+            #[cfg(test)]
+            self.pause_after_snapshot_selection().await;
             Ok(self.register_read(
                 commit,
                 meta.active_root_page_id,
@@ -361,5 +272,139 @@ impl<V: Vfs + Clone> Db<V> {
                 oldest_available: oldest,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::catalog::codec::SegmentKind;
+    use crate::segment::types::SegmentPageKind;
+    use crate::vfs::memory::MemVfs;
+    use crate::{Db, RealmId};
+
+    use super::super::core::VisibilityTestHook;
+
+    const PAGE: usize = 4096;
+    const KEK: [u8; 32] = [0xD1; 32];
+    const REALM: RealmId = RealmId::new([0xD2; 16]);
+
+    async fn linked_segment(db: &Db<MemVfs>, name: &str, bytes: &[u8]) {
+        let mut writer = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        writer
+            .append_page(SegmentPageKind::Data, bytes)
+            .await
+            .unwrap();
+        let meta = writer.seal().await.unwrap();
+        let mut txn = db.begin_write().await.unwrap();
+        txn.link_segment(name, &meta).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_before_tombstone_registration_preserves_old_segment() {
+        let db = Arc::new(
+            Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+                .await
+                .unwrap(),
+        );
+        linked_segment(&db, "old", b"old-page").await;
+
+        let hook = Arc::new(VisibilityTestHook::default());
+        db.install_visibility_test_hook(hook.clone());
+
+        let reader_db = db.clone();
+        let reader_hook = hook.clone();
+        let reader_task = tokio::spawn(async move {
+            let reader = reader_db.begin_read().await.unwrap();
+            reader_hook.reader_may_read.notified().await;
+            reader
+                .open_segment("old")
+                .await
+                .unwrap()
+                .read_page(1)
+                .await
+                .unwrap()
+        });
+        hook.reader_selected.notified().await;
+
+        let writer_db = db.clone();
+        let writer_task = tokio::spawn(async move {
+            let mut txn = writer_db.begin_write().await.unwrap();
+            txn.unlink_segment("old").await.unwrap();
+            txn.commit().await.unwrap()
+        });
+        hook.writer_waiting.notified().await;
+
+        hook.allow_reader_registration.notify_one();
+        hook.reader_registered.notified().await;
+        writer_task.await.unwrap();
+
+        hook.reader_may_read.notify_one();
+        let page = reader_task.await.unwrap();
+        assert!(page.starts_with(b"old-page"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_before_compaction_check_blocks_reclamation() {
+        let db = Arc::new(
+            Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+                .await
+                .unwrap(),
+        );
+        {
+            let mut txn = db.begin_write().await.unwrap();
+            for index in 0..80_u32 {
+                txn.put(
+                    format!("key-{index:03}").as_bytes(),
+                    &[u8::try_from(index).unwrap(); 64],
+                )
+                .await
+                .unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+        {
+            let mut txn = db.begin_write().await.unwrap();
+            for index in 0..70_u32 {
+                txn.delete(format!("key-{index:03}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+
+        let hook = Arc::new(VisibilityTestHook::default());
+        db.install_visibility_test_hook(hook.clone());
+
+        let reader_db = db.clone();
+        let reader_hook = hook.clone();
+        let reader_task = tokio::spawn(async move {
+            let reader = reader_db.begin_read().await.unwrap();
+            reader_hook.reader_may_read.notified().await;
+            reader.get(b"key-079").await.unwrap()
+        });
+        hook.reader_selected.notified().await;
+
+        let compact_db = db.clone();
+        let compact_task =
+            tokio::spawn(async move { crate::compaction::compact_now(&compact_db).await });
+        hook.writer_waiting.notified().await;
+
+        hook.allow_reader_registration.notify_one();
+        hook.reader_registered.notified().await;
+        let stats = compact_task.await.unwrap().unwrap();
+        assert_eq!(stats.bytes_truncated, 0);
+
+        hook.reader_may_read.notify_one();
+        let expected = [79_u8; 64];
+        assert_eq!(
+            reader_task.await.unwrap().as_deref(),
+            Some(expected.as_slice())
+        );
     }
 }

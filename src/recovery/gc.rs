@@ -12,23 +12,18 @@ use crate::vfs::{Vfs, VfsFile};
 pub async fn delete_tombstone_files<V: Vfs + Clone>(vfs: &V) -> Result<(u64, u64)> {
     let mut count: u64 = 0;
     let mut bytes: u64 = 0;
-    let Ok(entries) = vfs.list_dir("seg/.tombstone").await else {
-        return Ok((0, 0));
-    };
+    let entries = vfs.list_dir("seg/.tombstone").await?;
     for name in entries {
         let path = format!("seg/.tombstone/{name}");
-        if let Ok(file) = vfs.open(&path, OpenMode::Read).await {
-            if let Ok(len) = file.len().await {
-                bytes = bytes.saturating_add(len);
-            }
-        }
-        vfs.remove(&path).await.ok();
+        let file = vfs.open(&path, OpenMode::Read).await?;
+        bytes = bytes.saturating_add(file.len().await?);
+        vfs.remove(&path).await?;
         count += 1;
     }
     if count > 0 {
         // Make the directory-entry removals durable so that a subsequent open
         // does not re-count deleted tombstones as live segment bytes.
-        vfs.sync_dir("seg/.tombstone").await.ok();
+        vfs.sync_dir("seg/.tombstone").await?;
     }
     Ok((count, bytes))
 }

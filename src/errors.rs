@@ -50,6 +50,12 @@ pub enum PagedbError {
     #[error("identity forked; apply_incremental refused")]
     IdentityForked,
 
+    #[error("incremental snapshot is incompatible: {field}")]
+    SnapshotIncompatible { field: &'static str },
+
+    #[error("commit {commit:?} is durable but unpublished; reopen required")]
+    DurablyCommittedButUnpublished { commit: CommitId },
+
     #[error("commit {commit:?} gone; oldest_available={oldest_available:?}")]
     CommitGone {
         commit: CommitId,
@@ -200,6 +206,20 @@ impl PagedbError {
     #[must_use]
     pub fn corruption(detail: CorruptionDetail) -> Self {
         Self::Corruption(detail)
+    }
+
+    /// Canonical constructor for an incremental snapshot that cannot be
+    /// applied to this handle's current identity or reader-visible state.
+    #[must_use]
+    pub const fn snapshot_incompatible(field: &'static str) -> Self {
+        Self::SnapshotIncompatible { field }
+    }
+
+    /// Canonical constructor for a handle whose newest durable commit could
+    /// not be reconciled into its reader-visible state.
+    #[must_use]
+    pub const fn durably_committed_but_unpublished(commit: CommitId) -> Self {
+        Self::DurablyCommittedButUnpublished { commit }
     }
 
     /// Canonical constructor for arithmetic-overflow errors.

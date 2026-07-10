@@ -432,8 +432,8 @@ impl<V: Vfs> Pager<V> {
         self.inner.cache_for_key(key).lock().clear_file(key);
         self.journal_nonces.lock().remove(&journal_id);
         let path = format!("applyjournal/{}", crate::hex::to_hex_lower(&journal_id));
-        self.vfs.remove(&path).await.ok();
-        Ok(())
+        self.vfs.remove(&path).await?;
+        self.vfs.sync_dir("applyjournal").await
     }
 
     /// Drop an apply-journal sidecar's cached pages without removing the file,
