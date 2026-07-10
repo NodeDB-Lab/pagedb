@@ -285,7 +285,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
                     realm_id,
                     segment_id: MAIN_DB_SEGMENT_ID,
                 });
-                let mk_snapshot = db.pager.mk();
+                let mk_snapshot = db.pager.mk()?;
                 let mut lru = db.pager.dek_lru().lock();
                 let cipher_res =
                     lru.get_or_derive(realm_id, on_disk_epoch, on_disk_cipher_id, &mk_snapshot);
@@ -343,7 +343,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
         }
     };
 
-    let mk = db.pager.mk();
+    let mk = db.pager.mk()?;
     let hk = derive_hk(&mk)?;
 
     for (_k, v) in &catalog_rows {

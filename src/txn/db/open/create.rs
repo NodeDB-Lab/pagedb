@@ -5,8 +5,8 @@ use std::sync::atomic::AtomicU64;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::crypto::CipherId;
 use crate::crypto::kdf::{derive_hk, derive_mk};
+use crate::crypto::{CipherId, SecretKey};
 use crate::options::OpenOptions;
 use crate::pager::header::{ActiveSlot, bootstrap_header};
 use crate::pager::structural_header::MainDbHeaderFields;
@@ -81,10 +81,13 @@ impl<V: Vfs + Clone> Db<V> {
             reader_seq: AtomicU64::new(0),
             stall_policy: parking_lot::Mutex::new(ReaderStallPolicy::default()),
             cipher_id,
+            format_version: initial.format_version,
+            header_flags: initial.flags,
             mk_epoch: AtomicU64::new(mk_epoch),
             file_id,
             kek_salt,
             pending_tombstones: parking_lot::Mutex::new(Vec::new()),
+            pending_key_retirements: parking_lot::Mutex::new(Vec::new()),
             options,
             mmap_bytes_in_use: Arc::new(AtomicU64::new(0)),
             spill_bytes_in_use: AtomicU64::new(0),
@@ -105,6 +108,8 @@ impl<V: Vfs + Clone> Db<V> {
             free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(test)]
             visibility_test_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            rekey_test_fault: parking_lot::Mutex::new(None),
         }
     }
 
@@ -112,10 +117,11 @@ impl<V: Vfs + Clone> Db<V> {
     /// header in slot A with `seq=1`.
     pub async fn open_internal(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_internal_with_options_and_cipher(
             vfs,
             kek,
@@ -130,11 +136,12 @@ impl<V: Vfs + Clone> Db<V> {
     /// Like `open_internal` but with explicit cipher selection.
     pub async fn open_internal_with_cipher(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
         cipher_id: CipherId,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_internal_with_options_and_cipher(
             vfs,
             kek,
@@ -149,11 +156,12 @@ impl<V: Vfs + Clone> Db<V> {
     /// Like `open_internal` but with explicit memory budgets.
     pub async fn open_internal_with_options(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_internal_with_options_and_cipher(
             vfs,
             kek,
@@ -168,17 +176,18 @@ impl<V: Vfs + Clone> Db<V> {
     /// Full constructor: explicit cipher and explicit memory budgets.
     pub async fn open_internal_with_options_and_cipher(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
         cipher_id: CipherId,
     ) -> Result<Self> {
+        let kek = kek.into();
         let main_db_path = "/main.db".to_string();
         let (file_id, kek_salt) = crate::crypto::random::database_identity()?;
         let mk_epoch = 0u64;
 
-        let mk = derive_mk(&kek, &kek_salt, mk_epoch)?;
+        let mk = derive_mk(kek.as_bytes(), &kek_salt, mk_epoch)?;
         let hk = derive_hk(&mk)?;
 
         let initial = MainDbHeaderFields {

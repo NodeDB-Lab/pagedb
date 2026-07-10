@@ -46,6 +46,11 @@ pub struct SegmentWriter<V: Vfs + Clone> {
     /// page id, count, and total logical bytes. Written as the index block
     /// in v2 segments before the footer page.
     extents: Vec<ExtentIndexEntry>,
+    format_version: u16,
+    evictable: Evictable,
+    /// Exact footer layout copied during rekey. Its index pages have already
+    /// been authenticated and appended as logical segment pages.
+    rekey_footer_layout: Option<(u64, u32)>,
 }
 
 impl<V: Vfs + Clone> SegmentWriter<V> {
@@ -59,7 +64,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let page_size = pager.page_size();
         let cipher_id = pager.cipher_id().as_byte();
         let mk_epoch = pager.mk_epoch();
-        let pager_mk = pager.mk();
+        let pager_mk = pager.mk()?;
         let hk = derive_hk(&pager_mk)?;
         let page_size_log2 = page_size_to_log2(page_size)?;
 
@@ -104,7 +109,46 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             manifest: Vec::new(),
             total_bytes,
             extents: Vec::new(),
+            format_version: FORMAT_VERSION,
+            evictable: Evictable::Authoritative,
+            rekey_footer_layout: None,
         })
+    }
+
+    /// Construct a replacement writer that preserves the source segment's
+    /// logical footer version, extent-index layout, kind, and evictability.
+    pub(crate) async fn create_rekey_internal(
+        pager: Arc<Pager<V>>,
+        source: &SegmentMeta,
+        segment_id: [u8; 16],
+        index_start_page: u64,
+        index_page_count: u32,
+    ) -> Result<Self> {
+        let mut writer = Self::create_internal(
+            pager,
+            source.realm_id,
+            segment_id,
+            source.parent_file_id,
+            source.segment_kind,
+        )
+        .await?;
+        writer.format_version = source.format_version;
+        writer.evictable = source.evictable;
+        writer.rekey_footer_layout = Some((index_start_page, index_page_count));
+        Ok(writer)
+    }
+
+    pub(crate) async fn append_rekey_page(
+        &mut self,
+        kind: SegmentPageKind,
+        payload: &[u8],
+    ) -> Result<PageId> {
+        self.append_page(kind, payload).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_format_version_for_rekey_test(&mut self, format_version: u16) {
+        self.format_version = format_version;
     }
 
     pub async fn append_page(&mut self, kind: SegmentPageKind, payload: &[u8]) -> Result<PageId> {
@@ -127,12 +171,12 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let mut buf = vec![0u8; self.page_size];
         body_mut(&mut buf)[..payload.len()].copy_from_slice(payload);
         {
-            let pager_mk_append = self.pager.mk();
+            let pager_mk_append = self.pager.mk()?;
             let mut lru = self.pager.dek_lru().lock();
             let cipher = lru.get_or_derive(
                 self.realm_id,
                 self.mk_epoch,
-                self.pager.cipher_id(),
+                crate::crypto::CipherId::from_byte(self.cipher_id)?,
                 &pager_mk_append,
             )?;
             seal_data_page(&mut buf, page_kind, 0, self.mk_epoch, &nonce, &aad, cipher)?;
@@ -168,8 +212,12 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
     }
 
     pub fn set_manifest(&mut self, manifest: &[u8]) -> Result<()> {
-        // Use the v2 limit (slightly smaller than v1 due to extra cleartext fields).
-        if manifest.len() > max_manifest_len_v2(self.page_size) {
+        let max_len = if self.format_version == 1 {
+            crate::pager::format::segment_footer::max_manifest_len(self.page_size)
+        } else {
+            max_manifest_len_v2(self.page_size)
+        };
+        if manifest.len() > max_len {
             return Err(PagedbError::ManifestTooLarge);
         }
         self.manifest = manifest.to_vec();
@@ -189,7 +237,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
     #[allow(clippy::too_many_lines)]
     pub async fn seal(mut self) -> Result<SegmentMeta> {
         tracing::debug!(name = "segment.seal", "sealing segment file");
-        let pager_mk_seal = self.pager.mk();
+        let pager_mk_seal = self.pager.mk()?;
         let hk = derive_hk(&pager_mk_seal)?;
 
         // ── Write extent index block (v2) ─────────────────────────────────────
@@ -199,7 +247,25 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let index_start_page: u64;
         let index_page_count: u32;
 
-        if self.extents.is_empty() {
+        if let Some((source_index_start, source_index_count)) = self.rekey_footer_layout {
+            let footer_page_id = self.next_page_id;
+            let invalid_layout = if self.format_version == 1 {
+                source_index_start != 0 || source_index_count != 0
+            } else if source_index_count == 0 {
+                source_index_start != 0
+            } else {
+                source_index_start == 0
+                    || source_index_start.checked_add(u64::from(source_index_count))
+                        != Some(footer_page_id)
+            };
+            if invalid_layout {
+                return Err(PagedbError::corruption(
+                    crate::errors::CorruptionDetail::HeaderUnverifiable,
+                ));
+            }
+            index_start_page = source_index_start;
+            index_page_count = source_index_count;
+        } else if self.extents.is_empty() {
             index_start_page = 0;
             index_page_count = 0;
         } else {
@@ -238,12 +304,12 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
                 crate::pager::format::data_page::body_mut(&mut buf)[..body_cap]
                     .copy_from_slice(&body);
                 {
-                    let pager_mk_idx = self.pager.mk();
+                    let pager_mk_idx = self.pager.mk()?;
                     let mut lru = self.pager.dek_lru().lock();
                     let cipher = lru.get_or_derive(
                         self.realm_id,
                         self.mk_epoch,
-                        self.pager.cipher_id(),
+                        crate::crypto::CipherId::from_byte(self.cipher_id)?,
                         &pager_mk_idx,
                     )?;
                     crate::pager::format::data_page::seal_data_page(
@@ -269,7 +335,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         // ── Write footer ──────────────────────────────────────────────────────
         let footer_page_id = self.next_page_id;
         let footer_fields = SegmentFooterFields {
-            format_version: FORMAT_VERSION,
+            format_version: self.format_version,
             cipher_id: self.cipher_id,
             segment_id: self.segment_id,
             parent_file_id: self.parent_file_id,
@@ -282,12 +348,12 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             index_page_count,
         };
         let footer_bytes = {
-            let pager_mk_footer = self.pager.mk();
+            let pager_mk_footer = self.pager.mk()?;
             let mut lru = self.pager.dek_lru().lock();
             let cipher = lru.get_or_derive(
                 self.realm_id,
                 self.mk_epoch,
-                self.pager.cipher_id(),
+                crate::crypto::CipherId::from_byte(self.cipher_id)?,
                 &pager_mk_footer,
             )?;
             encode_segment_footer(&footer_fields, &self.manifest, &hk, cipher, self.page_size)?
@@ -310,8 +376,8 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             final_counter: footer_fields.final_counter,
             mk_epoch: self.mk_epoch,
             cipher_id: self.cipher_id,
-            format_version: FORMAT_VERSION,
-            evictable: Evictable::Authoritative,
+            format_version: self.format_version,
+            evictable: self.evictable,
         })
     }
 

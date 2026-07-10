@@ -10,5 +10,5 @@ pub(crate) mod random;
 
 pub use aad::{Aad, AadFields};
 pub use cipher::{Cipher, CipherId};
-pub use keys::{DerivedKey, MasterKey};
+pub use keys::{DerivedKey, MasterKey, SecretKey};
 pub use nonce::{MainDbNonceGen, Nonce, SegmentNonceGen};

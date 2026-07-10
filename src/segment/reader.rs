@@ -6,7 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::Result;
-use crate::catalog::codec::SegmentMeta;
+use crate::catalog::codec::{SegmentKind, SegmentMeta};
+use crate::crypto::CipherId;
 use crate::crypto::aad::{Aad, AadFields};
 use crate::crypto::kdf::derive_hk;
 use crate::errors::PagedbError;
@@ -18,17 +19,29 @@ use crate::pager::format::structural_header::decode_segment_header;
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
 
-use super::types::{EXTENT_INDEX_ENTRY_LEN, ExtentIndexEntry, ExtentRef, MmapView};
-use super::writer::live_path;
+use super::types::{
+    EXTENT_INDEX_ENTRY_LEN, ExtentIndexEntry, ExtentRef, MmapView, SegmentPageKind,
+};
+use super::writer::{live_path, staging_path};
+
+/// Authenticated footer material retained for internal segment rewrites.
+pub(crate) struct AuthenticatedSegmentFooter {
+    pub(crate) fields: crate::pager::format::segment_footer::SegmentFooterFields,
+    pub(crate) manifest: Vec<u8>,
+}
+
+struct MmapBudget {
+    used: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    limit: u64,
+}
 
 pub struct SegmentReader<V: Vfs + Clone> {
     pager: Arc<Pager<V>>,
     meta: SegmentMeta,
     page_size: usize,
     file: V::File,
-    /// When set, used instead of `pager.mk()` for DEK derivation. Needed
-    /// during online rekey when the pager has already advanced to a new epoch
-    /// but this reader is reading a segment sealed under an older epoch.
+    /// Owned master-key lease for this reader. It keeps authenticated reads
+    /// valid after an online rekey removes an obsolete keyring entry.
     mk_override: Option<crate::crypto::keys::MasterKey>,
     /// Shared budget counter for `mmap_view` scratch bytes. Cloned from `Db`.
     /// Only read by the native `mmap_view` path; unused on `wasm32`.
@@ -45,6 +58,119 @@ pub struct SegmentReader<V: Vfs + Clone> {
     /// v2 index block location from the footer (0/0 for v1 segments).
     index_start_page: u64,
     index_page_count: u32,
+    footer: AuthenticatedSegmentFooter,
+}
+
+fn footer_unverifiable(meta: &SegmentMeta) -> PagedbError {
+    PagedbError::corruption(crate::errors::CorruptionDetail::FooterUnverifiable {
+        realm_id: meta.realm_id,
+        name: String::new(),
+        segment_id: meta.segment_id,
+    })
+}
+
+fn validate_segment_header(
+    header: &crate::pager::format::structural_header::SegmentHeaderFields,
+    meta: &SegmentMeta,
+) -> Result<()> {
+    if header.segment_id != meta.segment_id
+        || SegmentKind::from_byte(header.segment_kind)? != meta.segment_kind
+        || header.realm_id != meta.realm_id
+        || header.mk_epoch != meta.mk_epoch
+        || header.cipher_id != meta.cipher_id
+    {
+        return Err(footer_unverifiable(meta));
+    }
+    if header.parent_file_id != meta.parent_file_id {
+        return Err(PagedbError::corruption(
+            crate::errors::CorruptionDetail::ForeignSegment {
+                realm_id: meta.realm_id,
+                name: String::new(),
+                segment_id: meta.segment_id,
+                footer_parent_file_id: header.parent_file_id,
+                expected_parent_file_id: meta.parent_file_id,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_footer_index(
+    format_version: u16,
+    index_start_page: u64,
+    index_page_count: u32,
+    footer_page_id: u64,
+) -> bool {
+    match format_version {
+        1 => index_start_page != 0 || index_page_count != 0,
+        2 if index_page_count == 0 => index_start_page != 0,
+        2 => {
+            index_start_page == 0
+                || index_start_page.checked_add(u64::from(index_page_count)) != Some(footer_page_id)
+        }
+        _ => true,
+    }
+}
+
+async fn read_authenticated_footer<V: Vfs + Clone>(
+    pager: &Arc<Pager<V>>,
+    file: &V::File,
+    meta: &SegmentMeta,
+    hk: &crate::crypto::keys::DerivedKey,
+    mk_override: Option<&crate::crypto::keys::MasterKey>,
+    page_size: usize,
+) -> Result<(u64, u32, AuthenticatedSegmentFooter)> {
+    if meta.page_count < 2 {
+        return Err(footer_unverifiable(meta));
+    }
+    let footer_page_id = meta.page_count - 1;
+    let footer_offset = footer_page_id
+        .checked_mul(page_size as u64)
+        .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
+    let mut footer_buf = vec![0u8; page_size];
+    file.read_at(footer_offset, &mut footer_buf).await?;
+
+    let effective_master_key;
+    let effective_master_key_ref = if let Some(master_key) = mk_override {
+        master_key
+    } else {
+        effective_master_key = pager.mk_for(meta.mk_epoch, CipherId::from_byte(meta.cipher_id)?)?;
+        &effective_master_key
+    };
+    let mut lru = pager.dek_lru().lock();
+    let cipher = lru.get_or_derive(
+        meta.realm_id,
+        meta.mk_epoch,
+        CipherId::from_byte(meta.cipher_id)?,
+        effective_master_key_ref,
+    )?;
+    let (footer_fields, manifest) = decode_segment_footer(&footer_buf, hk, cipher, page_size)?;
+    let invalid_index = invalid_footer_index(
+        footer_fields.format_version,
+        footer_fields.index_start_page,
+        footer_fields.index_page_count,
+        footer_page_id,
+    );
+    if footer_fields.segment_id != meta.segment_id
+        || footer_fields.parent_file_id != meta.parent_file_id
+        || footer_fields.realm_id != meta.realm_id
+        || footer_fields.mk_epoch != meta.mk_epoch
+        || footer_fields.cipher_id != meta.cipher_id
+        || footer_fields.format_version != meta.format_version
+        || footer_fields.page_count != meta.page_count
+        || footer_fields.total_bytes != meta.total_bytes
+        || invalid_index
+    {
+        return Err(footer_unverifiable(meta));
+    }
+    Ok((
+        footer_fields.index_start_page,
+        footer_fields.index_page_count,
+        AuthenticatedSegmentFooter {
+            fields: footer_fields,
+            manifest,
+        },
+    ))
 }
 
 impl<V: Vfs + Clone> SegmentReader<V> {
@@ -55,7 +181,10 @@ impl<V: Vfs + Clone> SegmentReader<V> {
         mmap_budget_limit: u64,
     ) -> Result<Self> {
         let page_size = pager.page_size();
-        let pager_mk = pager.mk();
+        let pager_mk = pager.mk_for(
+            catalog_meta.mk_epoch,
+            CipherId::from_byte(catalog_meta.cipher_id)?,
+        )?;
         let hk = derive_hk(&pager_mk)?;
         let live = live_path(&catalog_meta.segment_id);
         let file = pager
@@ -67,123 +196,113 @@ impl<V: Vfs + Clone> SegmentReader<V> {
             pager,
             catalog_meta,
             hk,
-            None,
+            Some(pager_mk),
             page_size,
             file,
-            mmap_budget_used,
-            mmap_budget_limit,
+            MmapBudget {
+                used: mmap_budget_used,
+                limit: mmap_budget_limit,
+            },
         )
         .await
     }
 
-    /// Like `open_internal` but uses an explicit `MasterKey` rather than the
-    /// pager's current active key. Used during online rekey when the pager has
-    /// already advanced to the new epoch but old segments still need to be read
-    /// under the old epoch's HK.
-    pub(crate) async fn open_internal_with_mk(
+    /// Open a sealed replacement from either publication location. The
+    /// replacement identity is durable progress, so a missing or malformed
+    /// file must fail closed rather than being regenerated.
+    pub(crate) async fn open_rekey_replacement(
         pager: Arc<Pager<V>>,
-        catalog_meta: SegmentMeta,
-        mk: &crate::crypto::keys::MasterKey,
+        source: &SegmentMeta,
+        replacement_segment_id: [u8; 16],
+        target_mk_epoch: u64,
+        target_cipher_id: u8,
         mmap_budget_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
         mmap_budget_limit: u64,
     ) -> Result<Self> {
         let page_size = pager.page_size();
-        let hk = derive_hk(mk)?;
-        let live = live_path(&catalog_meta.segment_id);
-        let file = pager
+        let file = match pager
             .vfs()
-            .open(&live, OpenMode::Read)
+            .open(&live_path(&replacement_segment_id), OpenMode::Read)
             .await
-            .map_err(|_| PagedbError::NotFound)?;
-        Self::finish_open(
+        {
+            Ok(file) => file,
+            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => pager
+                .vfs()
+                .open(&staging_path(&replacement_segment_id), OpenMode::Read)
+                .await
+                .map_err(|_| PagedbError::RekeyReplacementMissing {
+                    replacement_segment_id,
+                })?,
+            Err(_) => {
+                return Err(PagedbError::RekeyReplacementMissing {
+                    replacement_segment_id,
+                });
+            }
+        };
+        let total_bytes = file
+            .len()
+            .await
+            .map_err(|_| PagedbError::RekeyReplacementMissing {
+                replacement_segment_id,
+            })?;
+        let page_size_u64 = u64::try_from(page_size).map_err(|_| PagedbError::Unsupported)?;
+        if total_bytes < page_size_u64 * 2 || total_bytes % page_size_u64 != 0 {
+            return Err(PagedbError::RekeyReplacementMissing {
+                replacement_segment_id,
+            });
+        }
+        let target_cipher = CipherId::from_byte(target_cipher_id)?;
+        let mk = pager.mk_for(target_mk_epoch, target_cipher)?;
+        let mut expected = source.clone();
+        expected.segment_id = replacement_segment_id;
+        expected.page_count = total_bytes / page_size_u64;
+        expected.total_bytes = total_bytes;
+        expected.final_counter = 0;
+        expected.mk_epoch = target_mk_epoch;
+        expected.cipher_id = target_cipher_id;
+        let reader = Self::finish_open(
             pager,
-            catalog_meta,
-            hk,
-            Some(mk.clone()),
+            expected,
+            derive_hk(&mk)?,
+            Some(mk),
             page_size,
             file,
-            mmap_budget_used,
-            mmap_budget_limit,
+            MmapBudget {
+                used: mmap_budget_used,
+                limit: mmap_budget_limit,
+            },
         )
-        .await
+        .await;
+        reader.map_err(|_| PagedbError::RekeyReplacementMissing {
+            replacement_segment_id,
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn finish_open(
         pager: Arc<Pager<V>>,
-        catalog_meta: SegmentMeta,
+        mut catalog_meta: SegmentMeta,
         hk: crate::crypto::keys::DerivedKey,
         mk_override: Option<crate::crypto::keys::MasterKey>,
         page_size: usize,
         file: V::File,
-        mmap_budget_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        mmap_budget_limit: u64,
+        mmap_budget: MmapBudget,
     ) -> Result<Self> {
-        // Validate header.
         let mut header_buf = vec![0u8; page_size];
         file.read_at(0, &mut header_buf).await?;
-        let header_fields = decode_segment_header(&header_buf, &hk, page_size)?;
-
-        if header_fields.segment_id != catalog_meta.segment_id {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::FooterUnverifiable {
-                    realm_id: catalog_meta.realm_id,
-                    name: String::new(),
-                    segment_id: catalog_meta.segment_id,
-                },
-            ));
-        }
-        if header_fields.parent_file_id != catalog_meta.parent_file_id {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::ForeignSegment {
-                    realm_id: catalog_meta.realm_id,
-                    name: String::new(),
-                    segment_id: catalog_meta.segment_id,
-                    footer_parent_file_id: header_fields.parent_file_id,
-                    expected_parent_file_id: catalog_meta.parent_file_id,
-                },
-            ));
-        }
-
-        // Validate footer. Use `mk_override` if present so the DEK is derived
-        // from the correct epoch's master key even if the pager has advanced.
-        let footer_page_id = catalog_meta.page_count - 1;
-        let footer_offset = footer_page_id
-            .checked_mul(page_size as u64)
-            .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
-        let mut footer_buf = vec![0u8; page_size];
-        file.read_at(footer_offset, &mut footer_buf).await?;
-        let (index_start_page, index_page_count) = {
-            let effective_mk;
-            let effective_mk_ref = if let Some(m) = &mk_override {
-                m
-            } else {
-                effective_mk = pager.mk();
-                &effective_mk
-            };
-            let mut lru = pager.dek_lru().lock();
-            let cipher = lru.get_or_derive(
-                catalog_meta.realm_id,
-                catalog_meta.mk_epoch,
-                pager.cipher_id(),
-                effective_mk_ref,
-            )?;
-            let (footer_fields, _manifest) =
-                decode_segment_footer(&footer_buf, &hk, cipher, page_size)?;
-            if footer_fields.segment_id != catalog_meta.segment_id {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::FooterUnverifiable {
-                        realm_id: catalog_meta.realm_id,
-                        name: String::new(),
-                        segment_id: catalog_meta.segment_id,
-                    },
-                ));
-            }
-            (
-                footer_fields.index_start_page,
-                footer_fields.index_page_count,
-            )
-        };
+        validate_segment_header(
+            &decode_segment_header(&header_buf, &hk, page_size)?,
+            &catalog_meta,
+        )?;
+        let (index_start_page, index_page_count, footer) = read_authenticated_footer(
+            &pager,
+            &file,
+            &catalog_meta,
+            &hk,
+            mk_override.as_ref(),
+            page_size,
+        )
+        .await?;
+        catalog_meta.final_counter = footer.fields.final_counter;
 
         Ok(Self {
             pager,
@@ -191,15 +310,19 @@ impl<V: Vfs + Clone> SegmentReader<V> {
             page_size,
             file,
             mk_override,
-            mmap_budget_used,
-            mmap_budget_limit,
+            mmap_budget_used: mmap_budget.used,
+            mmap_budget_limit: mmap_budget.limit,
             extent_index: tokio::sync::OnceCell::new(),
             index_start_page,
             index_page_count,
+            footer,
         })
     }
 
-    pub async fn read_page(&self, id: u64) -> Result<Bytes> {
+    pub(crate) async fn read_authenticated_page(
+        &self,
+        id: u64,
+    ) -> Result<(SegmentPageKind, Bytes)> {
         // page 0 = header, page page_count-1 = footer; data pages are 1..page_count-2.
         if id == 0 || id >= self.meta.page_count - 1 {
             return Err(PagedbError::NotFound);
@@ -225,14 +348,17 @@ impl<V: Vfs + Clone> SegmentReader<V> {
         let effective_mk_read_ref = if let Some(m) = &self.mk_override {
             m
         } else {
-            effective_mk_read = self.pager.mk();
+            effective_mk_read = self.pager.mk_for(
+                self.meta.mk_epoch,
+                CipherId::from_byte(self.meta.cipher_id)?,
+            )?;
             &effective_mk_read
         };
         let mut lru = self.pager.dek_lru().lock();
         let cipher = lru.get_or_derive(
             self.meta.realm_id,
             self.meta.mk_epoch,
-            self.pager.cipher_id(),
+            CipherId::from_byte(self.meta.cipher_id)?,
             effective_mk_read_ref,
         )?;
         let mut last_err: Option<PagedbError> = None;
@@ -249,12 +375,26 @@ impl<V: Vfs + Clone> SegmentReader<V> {
             match open_data_page(&mut buf_try, &aad_try, cipher) {
                 Ok(_) => {
                     let body_bytes = body(&buf_try).to_vec();
-                    return Ok(Bytes::from(body_bytes));
+                    let segment_kind = match kind {
+                        PageKind::SegmentData => SegmentPageKind::Data,
+                        PageKind::SegmentIndex => SegmentPageKind::Index,
+                        PageKind::SegmentOverflow => SegmentPageKind::Overflow,
+                        _ => return Err(PagedbError::IllegalPageKind),
+                    };
+                    return Ok((segment_kind, Bytes::from(body_bytes)));
                 }
                 Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.unwrap_or(PagedbError::ChecksumFailure))
+    }
+
+    pub async fn read_page(&self, id: u64) -> Result<Bytes> {
+        self.read_authenticated_page(id).await.map(|(_, body)| body)
+    }
+
+    pub(crate) fn authenticated_footer(&self) -> &AuthenticatedSegmentFooter {
+        &self.footer
     }
 
     pub async fn read_extent(&self, r: ExtentRef) -> Result<Vec<Bytes>> {
@@ -362,7 +502,10 @@ impl<V: Vfs + Clone> SegmentReader<V> {
             let effective_mk_read_ref = if let Some(m) = &self.mk_override {
                 m
             } else {
-                effective_mk_read = self.pager.mk();
+                effective_mk_read = self.pager.mk_for(
+                    self.meta.mk_epoch,
+                    CipherId::from_byte(self.meta.cipher_id)?,
+                )?;
                 &effective_mk_read
             };
             let aad = crate::crypto::aad::Aad::from_fields(crate::crypto::aad::AadFields {
@@ -378,7 +521,7 @@ impl<V: Vfs + Clone> SegmentReader<V> {
                 let cipher = lru.get_or_derive(
                     self.meta.realm_id,
                     self.meta.mk_epoch,
-                    self.pager.cipher_id(),
+                    CipherId::from_byte(self.meta.cipher_id)?,
                     effective_mk_read_ref,
                 )?;
                 let _ = crate::pager::format::data_page::open_data_page(&mut buf, &aad, cipher)?;

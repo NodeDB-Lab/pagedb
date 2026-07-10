@@ -56,6 +56,13 @@ pub enum PagedbError {
     #[error("commit {commit:?} is durable but unpublished; reopen required")]
     DurablyCommittedButUnpublished { commit: CommitId },
 
+    #[error("rekey activated a target epoch at commit {commit:?}; reopen required: {source}")]
+    RekeyTargetEpochActivated {
+        commit: CommitId,
+        #[source]
+        source: Box<PagedbError>,
+    },
+
     #[error("commit {commit:?} gone; oldest_available={oldest_available:?}")]
     CommitGone {
         commit: CommitId,
@@ -122,6 +129,28 @@ pub enum PagedbError {
 
     #[error("readers pinning truncated range")]
     ReadersPinningTruncatedRange,
+
+    #[error(
+        "rekey resume requires counterpart key for source epoch {source_epoch} and target epoch {target_epoch}"
+    )]
+    RekeyResumeKeyRequired {
+        source_epoch: u64,
+        target_epoch: u64,
+    },
+
+    #[error(
+        "rekey counterpart key does not prove source epoch {source_epoch} for target epoch {target_epoch}"
+    )]
+    RekeyCounterpartKeyInvalid {
+        source_epoch: u64,
+        target_epoch: u64,
+    },
+
+    #[error("recorded rekey state is invalid: {field}")]
+    RekeyStateInvalid { field: &'static str },
+
+    #[error("recorded rekey replacement segment {replacement_segment_id:?} is missing or invalid")]
+    RekeyReplacementMissing { replacement_segment_id: [u8; 16] },
 
     #[error("unsupported by backend")]
     Unsupported,
@@ -222,10 +251,44 @@ impl PagedbError {
         Self::DurablyCommittedButUnpublished { commit }
     }
 
+    /// Canonical constructor for a rekey that cannot safely continue after
+    /// activating target-key routing before recovery completes.
+    #[must_use]
+    pub fn rekey_target_epoch_activated(commit: CommitId, source: PagedbError) -> Self {
+        Self::RekeyTargetEpochActivated {
+            commit,
+            source: Box::new(source),
+        }
+    }
+
     /// Canonical constructor for arithmetic-overflow errors.
     #[must_use]
     pub const fn arithmetic_overflow(operation: &'static str) -> Self {
         Self::ArithmeticOverflow { operation }
+    }
+
+    /// Canonical constructor for a rekey admission that needs both KEKs.
+    #[must_use]
+    pub const fn rekey_resume_key_required(source_epoch: u64, target_epoch: u64) -> Self {
+        Self::RekeyResumeKeyRequired {
+            source_epoch,
+            target_epoch,
+        }
+    }
+
+    /// Canonical constructor for counterpart material that fails the durable proof.
+    #[must_use]
+    pub const fn rekey_counterpart_key_invalid(source_epoch: u64, target_epoch: u64) -> Self {
+        Self::RekeyCounterpartKeyInvalid {
+            source_epoch,
+            target_epoch,
+        }
+    }
+
+    /// Canonical constructor for a durable rekey intent that cannot be admitted.
+    #[must_use]
+    pub const fn rekey_state_invalid(field: &'static str) -> Self {
+        Self::RekeyStateInvalid { field }
     }
 
     /// Canonical constructor for deferred-free backlog errors.

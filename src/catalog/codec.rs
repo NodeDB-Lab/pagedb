@@ -19,9 +19,9 @@ pub enum CatalogRowKind {
     /// under this row kind. The page-kind reservation remains available for
     /// that later optimisation.
     Counter = 0x02,
-    /// Durable rekey watermark. Cleared on rekey completion. Key is `[0x03]`
-    /// (singleton; no name suffix). Value is `RekeyState` encoded as 13 bytes:
-    /// `target_mk_epoch[8] || main_db_done[1] || segments_remaining_idx[4]`.
+    /// Durable versioned rekey intent. Key is `[0x03]` (singleton; no name
+    /// suffix). Its fixed-size value records both cryptographic epochs and
+    /// keys' non-secret proofs; it is never a segment-list index.
     RekeyState = 0x03,
     // 0x04 and 0x05 are reserved: they were the in-catalog free-list and
     // deferred-free queue, superseded by the durable free-list chain rooted in
@@ -32,22 +32,98 @@ pub enum CatalogRowKind {
     /// Retained as a row-kind boundary and so any legacy row is recognised and
     /// dropped during compaction.
     CompactionState = 0x07,
+    /// Fixed-size progress for one immutable source segment. The key suffix is
+    /// its old `segment_id`, never a catalog-order index.
+    RekeySegmentProgress = 0x08,
 }
 
-/// Rekey watermark persisted in the catalog during an online rekey operation.
-/// A present row means a rekey is in flight or was interrupted by a crash.
+/// Explicit durable rekey transition points. They are ordered so recovery can
+/// reject an A/B header that is newer than the intent's durable transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RekeyStage {
+    Intent = 1,
+    MainPagesTargetReadable = 2,
+    HeaderTargetPublished = 3,
+    MainDone = 4,
+    SegmentsPending = 5,
+}
+
+impl RekeyStage {
+    fn from_byte(byte: u8) -> Result<Self> {
+        match byte {
+            1 => Ok(Self::Intent),
+            2 => Ok(Self::MainPagesTargetReadable),
+            3 => Ok(Self::HeaderTargetPublished),
+            4 => Ok(Self::MainDone),
+            5 => Ok(Self::SegmentsPending),
+            _ => Err(PagedbError::corruption(
+                crate::errors::CorruptionDetail::HeaderUnverifiable,
+            )),
+        }
+    }
+}
+
+/// Version-one durable rekey intent. HK proofs are one-way identifiers used to
+/// validate caller-provided key material; neither KEKs nor master keys are
+/// ever persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RekeyStateRow {
-    /// The `mk_epoch` the rekey is converging toward.
+pub struct RekeyIntent {
+    pub source_mk_epoch: u64,
     pub target_mk_epoch: u64,
-    /// True once every main.db B+ tree page has been rewritten.
-    pub main_db_done: bool,
-    /// Index into the segment list at which resume should start.
-    /// Segments at indices `< segments_remaining_idx` have been rekeyed.
-    pub segments_remaining_idx: u32,
+    pub source_cipher_id: u8,
+    pub target_cipher_id: u8,
+    pub same_kek: bool,
+    pub stage: RekeyStage,
+    pub source_hk_proof: [u8; 16],
+    pub target_hk_proof: [u8; 16],
 }
 
-pub const REKEY_STATE_LEN: usize = 13;
+/// Old, insufficient rekey state. It is decoded only to admit a conservative
+/// same-KEK upgrade; its positional segment index is never correctness state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRekeyState {
+    pub target_mk_epoch: u64,
+    pub main_db_done: bool,
+    pub discarded_segments_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RekeyStateRow {
+    V1(RekeyIntent),
+    Legacy(LegacyRekeyState),
+}
+
+pub const LEGACY_REKEY_STATE_LEN: usize = 13;
+pub const REKEY_INTENT_V1_LEN: usize = 64;
+pub const REKEY_SEGMENT_PROGRESS_LEN: usize = 20;
+
+/// Durable state of a replacement segment recorded under its source identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RekeySegmentProgressState {
+    /// The replacement file was sealed and synced, but its catalog swap may not
+    /// yet have been made durable.
+    Sealed = 1,
+}
+
+impl RekeySegmentProgressState {
+    fn from_byte(byte: u8) -> Result<Self> {
+        match byte {
+            1 => Ok(Self::Sealed),
+            _ => Err(PagedbError::corruption(
+                crate::errors::CorruptionDetail::HeaderUnverifiable,
+            )),
+        }
+    }
+}
+
+/// Fixed-width replacement identity for a source segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RekeySegmentProgress {
+    pub replacement_segment_id: [u8; 16],
+    pub state: RekeySegmentProgressState,
+}
 
 /// Engine-defined segment type tag. This slice ships only `Unspecified`;
 /// engine adapters add concrete variants later.
@@ -131,34 +207,139 @@ impl Catalog {
         vec![CatalogRowKind::RekeyState as u8]
     }
 
-    /// Encode a `RekeyStateRow` as 13 bytes.
+    /// Per-source-segment progress key: `[0x08] || old_segment_id[16]`.
     #[must_use]
-    pub fn encode_rekey_state(r: &RekeyStateRow) -> [u8; REKEY_STATE_LEN] {
-        let mut o = [0u8; REKEY_STATE_LEN];
-        o[0..8].copy_from_slice(&r.target_mk_epoch.to_le_bytes());
-        o[8] = u8::from(r.main_db_done);
-        o[9..13].copy_from_slice(&r.segments_remaining_idx.to_le_bytes());
-        o
+    pub fn rekey_segment_progress_key(old_segment_id: [u8; 16]) -> [u8; 17] {
+        let mut key = [0u8; 17];
+        key[0] = CatalogRowKind::RekeySegmentProgress as u8;
+        key[1..].copy_from_slice(&old_segment_id);
+        key
     }
 
-    /// Decode a `RekeyStateRow` from a 13-byte slice.
+    /// Encode a V1 rekey intent. All reserved bytes are emitted as zero.
+    #[must_use]
+    pub fn encode_rekey_intent(intent: &RekeyIntent) -> [u8; REKEY_INTENT_V1_LEN] {
+        let mut out = [0u8; REKEY_INTENT_V1_LEN];
+        out[0] = 1;
+        out[1] = intent.stage as u8;
+        out[2] = u8::from(intent.same_kek);
+        out[4..12].copy_from_slice(&intent.source_mk_epoch.to_le_bytes());
+        out[12..20].copy_from_slice(&intent.target_mk_epoch.to_le_bytes());
+        out[20] = intent.source_cipher_id;
+        out[21] = intent.target_cipher_id;
+        out[24..40].copy_from_slice(&intent.source_hk_proof);
+        out[40..56].copy_from_slice(&intent.target_hk_proof);
+        out
+    }
+
+    /// Decode either a fixed V1 intent or the legacy 13-byte row. Legacy
+    /// positional progress is deliberately preserved only for diagnostics.
     pub fn decode_rekey_state(bytes: &[u8]) -> Result<RekeyStateRow> {
-        if bytes.len() != REKEY_STATE_LEN {
+        if bytes.len() == LEGACY_REKEY_STATE_LEN {
+            let target_mk_epoch = u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| {
+                PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
+            })?);
+            if target_mk_epoch == 0 {
+                return Err(PagedbError::corruption(
+                    crate::errors::CorruptionDetail::HeaderUnverifiable,
+                ));
+            }
+            return Ok(RekeyStateRow::Legacy(LegacyRekeyState {
+                target_mk_epoch,
+                main_db_done: match bytes[8] {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(PagedbError::corruption(
+                            crate::errors::CorruptionDetail::HeaderUnverifiable,
+                        ));
+                    }
+                },
+                discarded_segments_index: u32::from_le_bytes(bytes[9..13].try_into().map_err(
+                    |_| {
+                        PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
+                    },
+                )?),
+            }));
+        }
+        if bytes.len() != REKEY_INTENT_V1_LEN
+            || bytes[0] != 1
+            || bytes[3] != 0
+            || bytes[22..24].iter().any(|byte| *byte != 0)
+            || bytes[56..].iter().any(|byte| *byte != 0)
+        {
             return Err(PagedbError::corruption(
                 crate::errors::CorruptionDetail::HeaderUnverifiable,
             ));
         }
-        let mut ep = [0u8; 8];
-        ep.copy_from_slice(&bytes[0..8]);
-        let target_mk_epoch = u64::from_le_bytes(ep);
-        let main_db_done = bytes[8] != 0;
-        let mut idx = [0u8; 4];
-        idx.copy_from_slice(&bytes[9..13]);
-        let segments_remaining_idx = u32::from_le_bytes(idx);
-        Ok(RekeyStateRow {
+        let source_mk_epoch = u64::from_le_bytes(bytes[4..12].try_into().map_err(|_| {
+            PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
+        })?);
+        let target_mk_epoch = u64::from_le_bytes(bytes[12..20].try_into().map_err(|_| {
+            PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
+        })?);
+        if target_mk_epoch == 0 || target_mk_epoch <= source_mk_epoch {
+            return Err(PagedbError::corruption(
+                crate::errors::CorruptionDetail::HeaderUnverifiable,
+            ));
+        }
+        let same_kek = match bytes[2] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(PagedbError::corruption(
+                    crate::errors::CorruptionDetail::HeaderUnverifiable,
+                ));
+            }
+        };
+        crate::crypto::CipherId::from_byte(bytes[20])?;
+        crate::crypto::CipherId::from_byte(bytes[21])?;
+        if bytes[20] != bytes[21] {
+            return Err(PagedbError::rekey_state_invalid("target_cipher_id"));
+        }
+        let mut source_hk_proof = [0u8; 16];
+        source_hk_proof.copy_from_slice(&bytes[24..40]);
+        let mut target_hk_proof = [0u8; 16];
+        target_hk_proof.copy_from_slice(&bytes[40..56]);
+        Ok(RekeyStateRow::V1(RekeyIntent {
+            source_mk_epoch,
             target_mk_epoch,
-            main_db_done,
-            segments_remaining_idx,
+            source_cipher_id: bytes[20],
+            target_cipher_id: bytes[21],
+            same_kek,
+            stage: RekeyStage::from_byte(bytes[1])?,
+            source_hk_proof,
+            target_hk_proof,
+        }))
+    }
+
+    /// Encode fixed rekey replacement progress:
+    /// `version[1] || state[1] || reserved[2] || replacement_segment_id[16]`.
+    #[must_use]
+    pub fn encode_rekey_segment_progress(
+        progress: RekeySegmentProgress,
+    ) -> [u8; REKEY_SEGMENT_PROGRESS_LEN] {
+        let mut out = [0u8; REKEY_SEGMENT_PROGRESS_LEN];
+        out[0] = 1;
+        out[1] = progress.state as u8;
+        out[4..20].copy_from_slice(&progress.replacement_segment_id);
+        out
+    }
+
+    pub fn decode_rekey_segment_progress(bytes: &[u8]) -> Result<RekeySegmentProgress> {
+        if bytes.len() != REKEY_SEGMENT_PROGRESS_LEN
+            || bytes[0] != 1
+            || bytes[2..4].iter().any(|byte| *byte != 0)
+        {
+            return Err(PagedbError::corruption(
+                crate::errors::CorruptionDetail::HeaderUnverifiable,
+            ));
+        }
+        let mut replacement_segment_id = [0u8; 16];
+        replacement_segment_id.copy_from_slice(&bytes[4..20]);
+        Ok(RekeySegmentProgress {
+            replacement_segment_id,
+            state: RekeySegmentProgressState::from_byte(bytes[1])?,
         })
     }
 
@@ -450,6 +631,83 @@ mod tests {
             let dec = Catalog::decode_counter(&enc).unwrap();
             assert_eq!(dec, v);
         }
+    }
+
+    #[test]
+    fn rekey_intent_v1_round_trip() {
+        let intent = RekeyIntent {
+            source_mk_epoch: 0,
+            target_mk_epoch: 27,
+            source_cipher_id: 2,
+            target_cipher_id: 2,
+            same_kek: false,
+            stage: RekeyStage::HeaderTargetPublished,
+            source_hk_proof: [7; 16],
+            target_hk_proof: [8; 16],
+        };
+        let encoded = Catalog::encode_rekey_intent(&intent);
+        assert_eq!(
+            Catalog::decode_rekey_state(&encoded).unwrap(),
+            RekeyStateRow::V1(intent)
+        );
+    }
+
+    #[test]
+    fn legacy_rekey_state_discards_positional_progress() {
+        let mut bytes = [0u8; LEGACY_REKEY_STATE_LEN];
+        bytes[..8].copy_from_slice(&4u64.to_le_bytes());
+        bytes[8] = 1;
+        bytes[9..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            Catalog::decode_rekey_state(&bytes).unwrap(),
+            RekeyStateRow::Legacy(LegacyRekeyState {
+                target_mk_epoch: 4,
+                main_db_done: true,
+                discarded_segments_index: u32::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn rekey_intent_rejects_invalid_boolean_epoch_and_progress_reserved_bytes() {
+        let mut intent = RekeyIntent {
+            source_mk_epoch: 1,
+            target_mk_epoch: 2,
+            source_cipher_id: 1,
+            target_cipher_id: 1,
+            same_kek: true,
+            stage: RekeyStage::Intent,
+            source_hk_proof: [0; 16],
+            target_hk_proof: [0; 16],
+        };
+        let mut encoded = Catalog::encode_rekey_intent(&intent);
+        encoded[2] = 2;
+        assert!(Catalog::decode_rekey_state(&encoded).is_err());
+        intent.target_mk_epoch = 0;
+        assert!(Catalog::decode_rekey_state(&Catalog::encode_rekey_intent(&intent)).is_err());
+        let progress = RekeySegmentProgress {
+            replacement_segment_id: [5; 16],
+            state: RekeySegmentProgressState::Sealed,
+        };
+        let mut encoded_progress = Catalog::encode_rekey_segment_progress(progress);
+        assert_eq!(
+            Catalog::decode_rekey_segment_progress(&encoded_progress).unwrap(),
+            progress
+        );
+        encoded_progress[2] = 1;
+        assert!(Catalog::decode_rekey_segment_progress(&encoded_progress).is_err());
+        intent.target_mk_epoch = 2;
+        let mut encoded_intent = Catalog::encode_rekey_intent(&intent);
+        encoded_intent[21] = u8::MAX;
+        assert!(Catalog::decode_rekey_state(&encoded_intent).is_err());
+        let mut mixed_cipher_intent = Catalog::encode_rekey_intent(&intent);
+        mixed_cipher_intent[21] = 2;
+        assert!(matches!(
+            Catalog::decode_rekey_state(&mixed_cipher_intent),
+            Err(PagedbError::RekeyStateInvalid {
+                field: "target_cipher_id"
+            })
+        ));
     }
 
     #[test]

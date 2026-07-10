@@ -4,4 +4,7 @@
 
 pub mod codec;
 
-pub use codec::{Catalog, CatalogRowKind, RekeyStateRow};
+pub use codec::{
+    Catalog, CatalogRowKind, LegacyRekeyState, RekeyIntent, RekeySegmentProgress,
+    RekeySegmentProgressState, RekeyStage, RekeyStateRow,
+};

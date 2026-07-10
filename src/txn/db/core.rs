@@ -28,6 +28,14 @@ pub(crate) struct PendingTombstone {
     pub commit_id: u64,
 }
 
+/// A source epoch that remains leased until all tracked pre-cutover readers
+/// have released their snapshot pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingKeyRetirement {
+    pub epoch: u64,
+    pub cipher_id: CipherId,
+}
+
 /// One registered reader's pin record. Held in the `Db`'s tracked-reader `Vec`.
 #[derive(Debug)]
 pub(crate) struct TrackedReader {
@@ -50,6 +58,18 @@ pub(crate) struct VisibilityTestHook {
     pub(crate) reader_registered: tokio::sync::Notify,
     pub(crate) reader_may_read: tokio::sync::Notify,
     pub(crate) writer_waiting: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RekeyTestFault {
+    Intent,
+    MainPagesTargetReadable,
+    HeaderTargetPublished,
+    SegmentSeal,
+    ProgressRowCommit,
+    CatalogSwapEffects,
+    ProgressDeletion,
 }
 
 pub(crate) struct WriterState {
@@ -115,10 +135,15 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) reader_seq: AtomicU64,
     pub(crate) stall_policy: parking_lot::Mutex<ReaderStallPolicy>,
     pub(crate) cipher_id: CipherId,
+    /// Authenticated structural fields copied from the selected A/B header so
+    /// non-ordinary writers (including rekey) can preserve them verbatim.
+    pub(crate) format_version: u16,
+    pub(crate) header_flags: u32,
     pub(crate) mk_epoch: AtomicU64,
     pub(crate) file_id: [u8; 16],
     pub(crate) kek_salt: [u8; 16],
     pub(crate) pending_tombstones: parking_lot::Mutex<Vec<PendingTombstone>>,
+    pub(crate) pending_key_retirements: parking_lot::Mutex<Vec<PendingKeyRetirement>>,
     pub(crate) options: OpenOptions,
     /// Running total of bytes currently charged to `mmap_view_scratch_bytes`.
     /// Shared with live `MmapView` handles via `Arc` so they can decrement on drop.
@@ -162,6 +187,8 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) free_page_consumed: Arc<parking_lot::Mutex<Vec<u64>>>,
     #[cfg(test)]
     pub(crate) visibility_test_hook: parking_lot::Mutex<Option<Arc<VisibilityTestHook>>>,
+    #[cfg(test)]
+    pub(crate) rekey_test_fault: parking_lot::Mutex<Option<RekeyTestFault>>,
 }
 
 /// Reader-visible state, refreshed by the writer at commit time.
@@ -228,6 +255,38 @@ pub(super) struct HeaderFieldsParams {
 }
 
 impl<V: Vfs + Clone> Db<V> {
+    /// Retire an obsolete source epoch immediately when no reader can still
+    /// resolve a pre-cutover snapshot; otherwise defer retirement until the
+    /// tracked reader set drains.
+    pub(crate) fn retire_rekey_source_when_safe(
+        &self,
+        epoch: u64,
+        cipher_id: CipherId,
+    ) -> Result<()> {
+        if self.tracked_readers.lock().is_empty() {
+            return self.pager.retire_mk_epoch(epoch, cipher_id);
+        }
+        let pending = PendingKeyRetirement { epoch, cipher_id };
+        let mut retirements = self.pending_key_retirements.lock();
+        if !retirements.contains(&pending) {
+            retirements.push(pending);
+        }
+        Ok(())
+    }
+
+    /// Drain deferred source-epoch retirements once no tracked reader remains.
+    pub(crate) fn drain_pending_key_retirements(&self) -> Result<()> {
+        if !self.tracked_readers.lock().is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut *self.pending_key_retirements.lock());
+        for retirement in pending {
+            self.pager
+                .retire_mk_epoch(retirement.epoch, retirement.cipher_id)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_usable(&self) -> Result<()> {
         match *self.poisoned_commit.lock() {
             Some(commit) => Err(PagedbError::durably_committed_but_unpublished(commit)),
@@ -272,22 +331,44 @@ impl<V: Vfs + Clone> Db<V> {
         counter_anchor: u64,
         effects: &[SegmentSideEffect],
     ) -> Result<SegmentReconciliation> {
-        if self.pager.commit_anchor(counter_anchor).is_err() {
+        if let Err(error) = self.pager.commit_anchor(counter_anchor) {
+            tracing::error!(commit = commit.0, error = %error, "durable commit anchor failed");
             self.poison(commit);
             return Err(PagedbError::durably_committed_but_unpublished(commit));
         }
-        if let Ok(outcome) = self.reconcile_segment_effects(effects, commit.0).await {
-            self.publish_snapshot(state);
-            Ok(outcome)
-        } else {
-            self.poison(commit);
-            Err(PagedbError::durably_committed_but_unpublished(commit))
+        match self.reconcile_segment_effects(effects, commit.0).await {
+            Ok(outcome) => {
+                self.publish_snapshot(state);
+                Ok(outcome)
+            }
+            Err(error) => {
+                tracing::error!(commit = commit.0, error = %error, "durable commit reconciliation failed");
+                self.poison(commit);
+                Err(PagedbError::durably_committed_but_unpublished(commit))
+            }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn install_visibility_test_hook(&self, hook: Arc<VisibilityTestHook>) {
         *self.visibility_test_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_rekey_after(&self, point: RekeyTestFault) {
+        *self.rekey_test_fault.lock() = Some(point);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_rekey_if_requested(&self, point: RekeyTestFault) -> Result<()> {
+        let mut fault = self.rekey_test_fault.lock();
+        if *fault == Some(point) {
+            *fault = None;
+            return Err(PagedbError::Io(std::io::Error::other(
+                "rekey test interruption",
+            )));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -330,10 +411,10 @@ impl<V: Vfs + Clone> Db<V> {
     /// per-commit variable fields from `params`.
     pub(super) fn header_fields(&self, params: HeaderFieldsParams) -> Result<MainDbHeaderFields> {
         Ok(MainDbHeaderFields {
-            format_version: 1,
+            format_version: self.format_version,
             cipher_id: self.cipher_id.as_byte(),
             page_size_log2: super::util::page_size_log2(self.page_size)?,
-            flags: 0,
+            flags: self.header_flags,
             file_id: self.file_id,
             kek_salt: self.kek_salt,
             mk_epoch: params.mk_epoch,

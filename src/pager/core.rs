@@ -20,6 +20,7 @@ use crate::pager::format::data_page::{
     ENVELOPE_OVERHEAD, HEADER_LEN, body, extract_page_header_ids, open_data_page, seal_data_page,
 };
 use crate::pager::format::page_kind::PageKind;
+use crate::txn::db::rekey::EpochKeyring;
 use crate::vfs::types::{OpenMode, WriteReq};
 use crate::vfs::{Vfs, VfsFile};
 use crate::{RealmId, Result};
@@ -155,7 +156,10 @@ impl PagerInner {
 pub struct Pager<V: Vfs> {
     cfg: PagerConfig,
     vfs: V,
-    mk: parking_lot::RwLock<MasterKey>,
+    /// Memory-only master-key leases, selected by the epoch and cipher carried
+    /// by every encrypted page. The keyring is the sole decryption authority
+    /// during mixed-epoch rekey state.
+    keyring: EpochKeyring,
     /// Active `mk_epoch` for flush (write) operations. May differ from
     /// `cfg.mk_epoch` during an online rekey while old-epoch pages still live
     /// in the cache. Reads use per-page epoch routing; writes always use this
@@ -194,10 +198,15 @@ impl<V: Vfs> Pager<V> {
         self.cfg.main_db_file_id
     }
 
-    /// Clone the current active master key. Callers that need a short-lived
-    /// reference use this rather than holding a lock guard across await points.
-    pub(crate) fn mk(&self) -> MasterKey {
-        self.mk.read().clone()
+    /// Lease the master key selected by an on-wire epoch/cipher pair.
+    pub(crate) fn mk_for(&self, epoch: u64, cipher_id: CipherId) -> Result<MasterKey> {
+        self.keyring.lease(epoch, cipher_id)
+    }
+
+    /// Clone the active writer key. Read paths must call [`Self::mk_for`] with
+    /// the epoch and cipher recovered from their wire format instead.
+    pub(crate) fn mk(&self) -> Result<MasterKey> {
+        self.mk_for(self.active_mk_epoch(), self.cfg.cipher_id)
     }
 
     /// Return the active `mk_epoch` used for flush (write) operations.
@@ -237,7 +246,7 @@ impl<V: Vfs> Pager<V> {
             inner,
             active_epoch: AtomicU64::new(initial_epoch),
             read_only: AtomicBool::new(false),
-            mk: parking_lot::RwLock::new(mk),
+            keyring: EpochKeyring::new(initial_epoch, cfg.cipher_id, mk),
             observer_retry_count,
             vfs,
             cfg,
@@ -258,12 +267,25 @@ impl<V: Vfs> Pager<V> {
         self.files.lock().await.clear();
     }
 
-    /// Atomically advance the active epoch used for flush (write) operations.
-    /// Also installs a new master key. Called by `Db::rekey_db` immediately
-    /// before the final page flush so all dirty pages are re-sealed under the
-    /// new key material.
+    /// Install a leased epoch key without changing which epoch flushes use.
+    pub(crate) fn install_mk_epoch(&self, mk: MasterKey, epoch: u64, cipher_id: CipherId) {
+        self.keyring.install(epoch, cipher_id, mk);
+    }
+
+    /// Retire an inactive epoch and all cached derived cipher state for it.
+    pub(crate) fn retire_mk_epoch(&self, epoch: u64, cipher_id: CipherId) -> Result<()> {
+        if epoch == self.active_mk_epoch() && cipher_id == self.cfg.cipher_id {
+            return Err(PagedbError::rekey_state_invalid("active_epoch_retirement"));
+        }
+        self.keyring.remove(epoch, cipher_id);
+        self.dek_lru.lock().invalidate_epoch(epoch, cipher_id);
+        Ok(())
+    }
+
+    /// Atomically advance the active epoch used for flush operations after its
+    /// key has been installed. Existing readers continue to lease old keys.
     pub fn set_active_mk_epoch(&self, new_mk: MasterKey, new_epoch: u64) {
-        *self.mk.write() = new_mk;
+        self.install_mk_epoch(new_mk, new_epoch, self.cfg.cipher_id);
         self.active_epoch.store(new_epoch, AtomOrd::SeqCst);
     }
 
@@ -531,12 +553,6 @@ impl<V: Vfs> Pager<V> {
         Ok(())
     }
 
-    /// Evict all DEK LRU entries for a specific epoch, freeing cache slots for
-    /// new-epoch entries.
-    pub(crate) fn evict_dek_for_epoch(&self, epoch: u64) {
-        self.dek_lru.lock().evict_by_epoch(epoch);
-    }
-
     /// Discard all dirty main.db pages from the cache without flushing them.
     /// Used by `WriteTxn::abort` to undo in-flight `CoW` writes. Pages are
     /// removed from the dirty set; their cached plaintext remains in the
@@ -671,10 +687,11 @@ impl<V: Vfs> Pager<V> {
                 segment_id,
             });
             let decrypt_result = {
-                let mk_snapshot = self.mk.read().clone();
+                let mk_snapshot = self.mk_for(on_disk_epoch, on_disk_cipher_id);
                 let mut lru = self.dek_lru.lock();
-                let cipher_res =
-                    lru.get_or_derive(realm_id, on_disk_epoch, on_disk_cipher_id, &mk_snapshot);
+                let cipher_res = mk_snapshot.and_then(|mk| {
+                    lru.get_or_derive(realm_id, on_disk_epoch, on_disk_cipher_id, &mk)
+                });
                 match cipher_res {
                     Ok(cipher) => open_data_page(&mut buf, &aad, cipher),
                     Err(e) => Err(e),
@@ -774,7 +791,7 @@ impl<V: Vfs> Pager<V> {
         // workers.
         let cipher_id = self.cfg.cipher_id;
         let cipher: crate::crypto::Cipher = {
-            let mk_snapshot = self.mk.read().clone();
+            let mk_snapshot = self.mk_for(flush_epoch, cipher_id)?;
             let mut lru = self.dek_lru.lock();
             let derived = lru.get_or_derive(realm_id, flush_epoch, cipher_id, &mk_snapshot)?;
             // Clone the cipher (cheap; carries a derived key) so we drop the

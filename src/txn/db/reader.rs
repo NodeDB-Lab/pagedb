@@ -110,9 +110,17 @@ impl<V: Vfs + Clone> Db<V> {
     /// Uses `swap_remove` for O(1) amortised removal; order in the Vec is
     /// not semantically significant.
     pub(crate) fn unregister_read(&self, entry_id: u64) {
-        let mut readers = self.tracked_readers.lock();
-        if let Some(pos) = readers.iter().position(|r| r.entry_id == entry_id) {
-            readers.swap_remove(pos);
+        let readers_drained = {
+            let mut readers = self.tracked_readers.lock();
+            if let Some(pos) = readers.iter().position(|r| r.entry_id == entry_id) {
+                readers.swap_remove(pos);
+            }
+            readers.is_empty()
+        };
+        if readers_drained {
+            if let Err(error) = self.drain_pending_key_retirements() {
+                tracing::error!(error = %error, "deferred rekey source retirement failed");
+            }
         }
     }
 

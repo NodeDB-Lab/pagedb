@@ -5,8 +5,8 @@ use std::sync::atomic::AtomicU64;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::crypto::CipherId;
 use crate::crypto::kdf::{derive_hk, derive_mk};
+use crate::crypto::{CipherId, SecretKey};
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
 use crate::pager::header::ActiveSlot;
@@ -24,11 +24,12 @@ impl<V: Vfs + Clone> Db<V> {
     /// Like `open_existing` but with explicit memory budgets.
     pub async fn open_existing_with_options(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_existing_inner(vfs, kek, page_size, realm, options, DbMode::Standalone).await
     }
 
@@ -37,10 +38,11 @@ impl<V: Vfs + Clone> Db<V> {
     /// active one, recovers the nonce generator, and restores catalog state.
     pub async fn open_existing(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_existing_inner(
             vfs,
             kek,
@@ -52,10 +54,47 @@ impl<V: Vfs + Clone> Db<V> {
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Explicitly resume an interrupted KEK-changing rekey. `primary_kek` is
+    /// the normal caller key; `counterpart_kek` proves the other durable epoch.
+    pub async fn open_existing_with_counterpart_kek(
+        vfs: V,
+        primary_kek: impl Into<SecretKey>,
+        counterpart_kek: impl Into<SecretKey>,
+        page_size: usize,
+        realm: RealmId,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let primary_kek = primary_kek.into();
+        let counterpart_kek = counterpart_kek.into();
+        Self::open_existing_inner_with_counterpart(
+            vfs,
+            primary_kek,
+            Some(counterpart_kek),
+            page_size,
+            realm,
+            options,
+            DbMode::Standalone,
+        )
+        .await
+    }
+
     pub(super) async fn open_existing_inner(
         vfs: V,
-        kek: [u8; 32],
+        kek: SecretKey,
+        page_size: usize,
+        realm: RealmId,
+        options: OpenOptions,
+        mode: DbMode,
+    ) -> Result<Self> {
+        Self::open_existing_inner_with_counterpart(vfs, kek, None, page_size, realm, options, mode)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn open_existing_inner_with_counterpart(
+        vfs: V,
+        kek: SecretKey,
+        counterpart_kek: Option<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
@@ -74,7 +113,7 @@ impl<V: Vfs + Clone> Db<V> {
         let _ = f.read_at(page_size_u64, &mut buf_b).await?;
         drop(f);
 
-        let try_decode = |buf: &[u8]| -> Option<MainDbHeaderFields> {
+        let try_decode = |buf: &[u8]| -> Option<(MainDbHeaderFields, bool)> {
             if buf.len() < 56 {
                 return None;
             }
@@ -83,23 +122,37 @@ impl<V: Vfs + Clone> Db<V> {
             let mut epoch_bytes = [0u8; 8];
             epoch_bytes.copy_from_slice(&buf[48..56]);
             let epoch = u64::from_le_bytes(epoch_bytes);
-            let mk = derive_mk(&kek, &salt, epoch).ok()?;
-            let hk = derive_hk(&mk).ok()?;
-            crate::pager::format::structural_header::decode_main_db_header(buf, &hk, page_size).ok()
+            for (candidate, primary) in [(Some(&kek), true), (counterpart_kek.as_ref(), false)] {
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                let Ok(mk) = derive_mk(candidate.as_bytes(), &salt, epoch) else {
+                    continue;
+                };
+                let Ok(hk) = derive_hk(&mk) else {
+                    continue;
+                };
+                if let Ok(fields) = crate::pager::format::structural_header::decode_main_db_header(
+                    buf, &hk, page_size,
+                ) {
+                    return Some((fields, primary));
+                }
+            }
+            None
         };
 
         let a = try_decode(&buf_a);
         let b = try_decode(&buf_b);
-        let (fields, active_slot) = match (a, b) {
+        let (fields, active_slot, header_uses_primary) = match (a, b) {
             (Some(a), Some(b)) => {
-                if a.seq >= b.seq {
-                    (a, ActiveSlot::A)
+                if a.0.seq >= b.0.seq {
+                    (a.0, ActiveSlot::A, a.1)
                 } else {
-                    (b, ActiveSlot::B)
+                    (b.0, ActiveSlot::B, b.1)
                 }
             }
-            (Some(a), None) => (a, ActiveSlot::A),
-            (None, Some(b)) => (b, ActiveSlot::B),
+            (Some(a), None) => (a.0, ActiveSlot::A, a.1),
+            (None, Some(b)) => (b.0, ActiveSlot::B, b.1),
             (None, None) => {
                 return Err(PagedbError::corruption(
                     crate::errors::CorruptionDetail::HeaderUnverifiable,
@@ -111,7 +164,14 @@ impl<V: Vfs + Clone> Db<V> {
         let mk_epoch = fields.mk_epoch;
         let file_id = fields.file_id;
         let kek_salt = fields.kek_salt;
-        let mk = derive_mk(&kek, &kek_salt, mk_epoch)?;
+        let header_kek = if header_uses_primary {
+            &kek
+        } else {
+            counterpart_kek.as_ref().ok_or_else(|| {
+                PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
+            })?
+        };
+        let mk = derive_mk(header_kek.as_bytes(), &kek_salt, mk_epoch)?;
         let hk = derive_hk(&mk)?;
 
         let cfg = PagerConfig {
@@ -182,10 +242,13 @@ impl<V: Vfs + Clone> Db<V> {
             reader_seq: AtomicU64::new(0),
             stall_policy: parking_lot::Mutex::new(ReaderStallPolicy::default()),
             cipher_id,
+            format_version: fields.format_version,
+            header_flags: fields.flags,
             mk_epoch: AtomicU64::new(mk_epoch),
             file_id,
             kek_salt,
             pending_tombstones: parking_lot::Mutex::new(Vec::new()),
+            pending_key_retirements: parking_lot::Mutex::new(Vec::new()),
             options,
             mmap_bytes_in_use: Arc::new(AtomicU64::new(0)),
             spill_bytes_in_use: AtomicU64::new(0),
@@ -208,9 +271,11 @@ impl<V: Vfs + Clone> Db<V> {
             free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
             #[cfg(test)]
             visibility_test_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            rekey_test_fault: parking_lot::Mutex::new(None),
         };
 
-        recover_open_state(&db, kek, &fields).await?;
+        recover_open_state(&db, &kek, counterpart_kek.as_ref(), &fields).await?;
         Ok(db)
     }
 }

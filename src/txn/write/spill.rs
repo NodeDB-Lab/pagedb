@@ -199,11 +199,11 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// with a spill-specific HKDF derivation from the master key).
     pub(crate) fn ensure_spill_cipher(&mut self) -> Result<&Cipher> {
         if self.spill_cipher.is_none() {
-            let pager_mk = self.db.pager.mk();
+            let pager_mk = self.db.pager.mk()?;
             let key = derive_spill_key(&pager_mk, &self.db.file_id, self.txn_seq)?;
             self.spill_cipher = Some(Cipher::new_aes_gcm(&key));
         }
-        Ok(self.spill_cipher.as_ref().expect("just set"))
+        self.spill_cipher.as_ref().ok_or(PagedbError::NotFound)
     }
 
     /// Return a reference to the cached spill cipher for read paths (does NOT

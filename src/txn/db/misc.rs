@@ -4,6 +4,7 @@
 use crate::Result;
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, CatalogRowKind};
+use crate::crypto::SecretKey;
 use crate::observability::DbStats;
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
@@ -37,7 +38,8 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Stub: rekey a restored `Db` (`ReadOnly` or Follower) into a Standalone writer.
     /// Full implementation is out of scope for this slice.
-    pub fn rekey_into_writer(self, _new_kek: [u8; 32]) -> Result<Self> {
+    pub fn rekey_into_writer(self, new_kek: impl Into<SecretKey>) -> Result<Self> {
+        let _new_kek = new_kek.into();
         self.ensure_usable()?;
         Err(crate::errors::PagedbError::Unsupported)
     }

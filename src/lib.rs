@@ -29,7 +29,7 @@ pub mod vfs;
 
 pub use catalog::codec::{RealmQuotas, SegmentKind, SegmentMeta};
 pub use compaction::{CompactBudget, CompactProgress, CompactStats};
-pub use crypto::CipherId;
+pub use crypto::{CipherId, SecretKey};
 pub use errors::{CorruptionDetail, Evictable, PagedbError, QuotaKind};
 pub use observability::DbStats;
 pub use options::OpenOptions;

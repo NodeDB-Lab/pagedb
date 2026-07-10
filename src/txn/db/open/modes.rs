@@ -1,5 +1,6 @@
 //! Mode policy, sentinel acquisition, and public mode constructors.
 
+use crate::crypto::SecretKey;
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
 use crate::vfs::Vfs;
@@ -131,39 +132,42 @@ impl<V: Vfs + Clone> Db<V> {
     /// Open a database in Standalone mode.
     pub async fn open(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Standalone).await
     }
 
     /// Open a frozen-snapshot database without write access.
     pub async fn open_read_only(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::ReadOnly).await
     }
 
     /// Open a best-effort read-only view of a database that may have a writer.
     pub async fn open_observer(
         vfs: V,
-        kek: [u8; 32],
+        kek: impl Into<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
     ) -> Result<Self> {
+        let kek = kek.into();
         Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Observer).await
     }
 
     async fn open_with_mode(
         vfs: V,
-        kek: [u8; 32],
+        kek: SecretKey,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
@@ -195,7 +199,7 @@ impl<V: Vfs + Clone> Db<V> {
             }
             if exists
                 && capabilities.rejects_unpromoted_restore()
-                && peek_restore_mode(&vfs, &kek, page_size).await? == 2
+                && peek_restore_mode(&vfs, kek.as_bytes(), page_size).await? == 2
             {
                 return Err(PagedbError::RestoredNotPromoted);
             }

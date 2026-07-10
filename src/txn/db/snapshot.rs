@@ -3,8 +3,22 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
+use crate::recovery::journal::{
+    ApplyJournalRecord, JournalAction, encode_journal_id, encode_journal_pages,
+};
+use crate::snapshot::apply::{
+    apply_delta_pages, stage_snapshot_segments, validate_snapshot_segment_count,
+};
+use crate::snapshot::export::{
+    SnapshotManifest, decode_manifest, open_manifest, snapshot_full, snapshot_incremental,
+};
+use crate::txn::mode::DbMode;
 use crate::vfs::Vfs;
+use crate::vfs::tokio_backend::TokioVfs;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::core::Db;
 use super::util::{get_vfs_root, page_size_log2};
@@ -21,8 +35,6 @@ impl<V: Vfs + Clone> Db<V> {
         &self,
         dst_path: &std::path::Path,
     ) -> crate::Result<crate::snapshot::SnapshotStats> {
-        use crate::snapshot::export::{SnapshotManifest, snapshot_full};
-
         self.ensure_usable()?;
         let _span = tracing::debug_span!("snapshot.export");
 
@@ -77,18 +89,14 @@ impl<V: Vfs + Clone> Db<V> {
         src_path: &std::path::Path,
         dst_path: &std::path::Path,
         options: crate::options::OpenOptions,
-        kek: [u8; 32],
+        kek: impl Into<crate::crypto::SecretKey>,
     ) -> crate::Result<crate::txn::db::Db<crate::vfs::tokio_backend::TokioVfs>> {
-        use crate::snapshot::export::open_manifest;
-        use crate::vfs::tokio_backend::TokioVfs;
-        use tokio::fs;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+        let kek = kek.into();
         let _span = tracing::debug_span!("snapshot.apply");
 
         // Verify and parse manifest.
         let manifest_src = src_path.join("manifest");
-        let manifest = open_manifest(&manifest_src, &kek).await?;
+        let manifest = open_manifest(&manifest_src, kek.as_bytes()).await?;
 
         // Create destination directory.
         fs::create_dir_all(dst_path)
@@ -150,8 +158,6 @@ impl<V: Vfs + Clone> Db<V> {
         base_commit: crate::CommitId,
         dst_path: &std::path::Path,
     ) -> crate::Result<crate::snapshot::SnapshotStats> {
-        use crate::snapshot::export::{SnapshotManifest, snapshot_incremental};
-
         self.ensure_usable()?;
         // Pin the current published state.
         let txn = self.begin_read_non_abortable().await?;
@@ -245,15 +251,6 @@ impl<V: Vfs + Clone> Db<V> {
         &self,
         src_path: &std::path::Path,
     ) -> crate::Result<crate::snapshot::ApplyStats> {
-        use crate::pager::header::commit_header;
-        use crate::recovery::journal::{
-            ApplyJournalRecord, JournalAction, encode_journal_id, encode_journal_pages,
-        };
-        use crate::snapshot::apply::{
-            apply_delta_pages, stage_snapshot_segments, validate_snapshot_segment_count,
-        };
-        use crate::txn::mode::DbMode;
-
         self.ensure_usable()?;
         let _span = tracing::debug_span!("snapshot.apply");
 
@@ -281,8 +278,6 @@ impl<V: Vfs + Clone> Db<V> {
         };
         // Decode manifest using hk_raw as the key directly.
         let manifest_bytes = {
-            use tokio::fs;
-            use tokio::io::AsyncReadExt;
             let mut f = fs::File::open(&manifest_path)
                 .await
                 .map_err(crate::errors::PagedbError::Io)?;
@@ -293,7 +288,7 @@ impl<V: Vfs + Clone> Db<V> {
                 .map_err(crate::errors::PagedbError::Io)?;
             buf
         };
-        let manifest = crate::snapshot::export::decode_manifest(&manifest_bytes, &hk_raw)?;
+        let manifest = decode_manifest(&manifest_bytes, &hk_raw)?;
         self.validate_incremental_manifest(&manifest, &manifest_bytes[118..224])?;
 
         let page_size = usize::try_from(manifest.page_size)

@@ -9,7 +9,7 @@ mod manifest_validation;
 mod misc;
 mod open;
 mod reader;
-mod rekey;
+pub(crate) mod rekey;
 mod segment;
 #[cfg(not(target_arch = "wasm32"))]
 mod snapshot;

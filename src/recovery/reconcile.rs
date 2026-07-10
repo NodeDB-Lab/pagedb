@@ -180,7 +180,7 @@ async fn verify_segment_file<V: Vfs + Clone>(
     let mut footer_buf = vec![0u8; page_size];
     file.read_at(footer_offset, &mut footer_buf).await?;
     let result = {
-        let pager_mk_reconcile = pager.mk();
+        let pager_mk_reconcile = pager.mk()?;
         let mut lru = pager.dek_lru().lock();
         let cipher = lru.get_or_derive(
             catalog_meta.realm_id,

@@ -3,6 +3,24 @@
 
 use zeroize::Zeroizing;
 
+/// 256-bit key-encryption key supplied by the embedder.
+///
+/// The bytes are zeroized on drop and intentionally never exposed outside this
+/// crate. Construct it from a `[u8; 32]` at an API boundary.
+pub struct SecretKey(Zeroizing<[u8; 32]>);
+
+impl SecretKey {
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for SecretKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+}
+
 /// 256-bit master key derived from the embedder-supplied KEK and the per-DB
 /// `kek_salt` / `mk_epoch`. Held in memory only; zeroized on drop.
 pub struct MasterKey(pub(crate) Zeroizing<[u8; 32]>);

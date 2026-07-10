@@ -61,6 +61,15 @@ impl DekLru {
         self.map.is_empty()
     }
 
+    /// Remove every cached cipher state derived from one retired epoch/cipher.
+    pub fn invalidate_epoch(&mut self, mk_epoch: u64, cipher_id: CipherId) {
+        let cipher_id_byte = cipher_id.as_byte();
+        self.map
+            .retain(|key, _| key.mk_epoch != mk_epoch || key.cipher_id_byte != cipher_id_byte);
+        self.order
+            .retain(|key| key.mk_epoch != mk_epoch || key.cipher_id_byte != cipher_id_byte);
+    }
+
     /// Look up or derive the cipher for `(realm, mk_epoch, cipher_id)`. The
     /// caller supplies the master key relevant to `mk_epoch`.
     pub fn get_or_derive(
@@ -115,25 +124,6 @@ impl DekLru {
             .get_mut(&key)
             .ok_or_else(|| PagedbError::Io(std::io::Error::other("dek lru insert")))
     }
-
-    /// Remove all cache entries whose `mk_epoch` matches `epoch`. This is
-    /// called during rekey cleanup to evict stale entries for the old epoch,
-    /// allowing subsequent reads of remaining old-epoch pages to re-derive the
-    /// correct DEK from the still-valid MK.
-    pub fn evict_by_epoch(&mut self, epoch: u64) {
-        let victims: Vec<DekKey> = self
-            .order
-            .iter()
-            .filter(|k| k.mk_epoch == epoch)
-            .copied()
-            .collect();
-        for v in &victims {
-            self.map.remove(v);
-            if let Some(pos) = self.order.iter().position(|k| k == v) {
-                self.order.remove(pos);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -153,6 +143,25 @@ mod tests {
             .get_or_derive(RealmId([1; 16]), 0, CipherId::Aes256Gcm, &mk)
             .unwrap();
         assert_eq!(lru.len(), 1);
+    }
+
+    #[test]
+    fn retirement_invalidates_only_matching_epoch_and_cipher() {
+        let mk = derive_mk(&[7; 32], &[0; 16], 0).unwrap();
+        let mut lru = DekLru::with_capacity(4);
+        let _ = lru
+            .get_or_derive(RealmId([1; 16]), 0, CipherId::Aes256Gcm, &mk)
+            .unwrap();
+        let _ = lru
+            .get_or_derive(RealmId([1; 16]), 0, CipherId::ChaCha20Poly1305, &mk)
+            .unwrap();
+        let _ = lru
+            .get_or_derive(RealmId([1; 16]), 1, CipherId::Aes256Gcm, &mk)
+            .unwrap();
+
+        lru.invalidate_epoch(0, CipherId::Aes256Gcm);
+
+        assert_eq!(lru.len(), 2);
     }
 
     #[test]

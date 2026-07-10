@@ -1183,6 +1183,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",

@@ -1,7 +1,7 @@
-//! Rekey integration tests: online re-encryption of main.db and segments.
+//! Rekey integration tests: main-db and immutable-segment transitions.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, PagedbError, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, Evictable, PagedbError, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 const KEK0: [u8; 32] = [0xAA; 32];
@@ -59,26 +59,37 @@ async fn rekey_main_db_only() {
 
 // ── Test 2 ─────────────────────────────────────────────────────────────────
 
-/// Segments created at epoch 0 are rekeyed to epoch 1 and remain readable
-/// afterwards. Footer mk_epoch reflects the new epoch.
+/// Linked immutable segments are replaced under the target epoch while
+/// preserving their logical payloads.
 #[tokio::test(flavor = "current_thread")]
 async fn rekey_with_segments() {
-    let (vfs, db) = fresh_db().await;
+    let (_vfs, db) = fresh_db().await;
 
     // Create and seal two segments at epoch 0.
-    let meta1 = {
+    let (meta1, extent) = {
         let mut w = db
             .create_segment(REALM, SegmentKind::Unspecified)
             .await
             .unwrap();
-        w.append_page(SegmentPageKind::Data, b"segment-1-page")
+        w.append_page(SegmentPageKind::Data, b"segment-1-data")
             .await
             .unwrap();
+        w.append_page(SegmentPageKind::Index, b"segment-1-index")
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Overflow, b"segment-1-overflow")
+            .await
+            .unwrap();
+        let extent = w
+            .append_extent(&[b"segment-1-extent-a", b"segment-1-extent-b"])
+            .await
+            .unwrap();
+        w.set_manifest(b"segment-1-manifest").unwrap();
         let m = w.seal().await.unwrap();
         let mut tx = db.begin_write().await.unwrap();
-        tx.link_segment("seg1", &m).await.unwrap();
+        tx.link_segment("z-seg", &m).await.unwrap();
         tx.commit().await.unwrap();
-        m
+        (m, extent)
     };
     let meta2 = {
         let mut w = db
@@ -88,9 +99,10 @@ async fn rekey_with_segments() {
         w.append_page(SegmentPageKind::Data, b"segment-2-page")
             .await
             .unwrap();
-        let m = w.seal().await.unwrap();
+        let mut m = w.seal().await.unwrap();
+        m.evictable = Evictable::Replaceable;
         let mut tx = db.begin_write().await.unwrap();
-        tx.link_segment("seg2", &m).await.unwrap();
+        tx.link_segment("a-seg", &m).await.unwrap();
         tx.commit().await.unwrap();
         m
     };
@@ -98,72 +110,57 @@ async fn rekey_with_segments() {
     assert_eq!(meta1.mk_epoch, 0);
     assert_eq!(meta2.mk_epoch, 0);
 
-    // Rekey to epoch 1.
+    let old_txn = db.begin_read().await.unwrap();
+    let old_reader = old_txn.open_segment("z-seg").await.unwrap();
     db.rekey_db(KEK0, 1).await.unwrap();
 
-    // Reopen.
-    drop(db);
-    let db2 = Db::open_existing(vfs, KEK0, PAGE, REALM).await.unwrap();
-
-    // Both segments must be readable.
-    let r1 = db2.open_segment(REALM, "seg1").await.unwrap();
-    let page = r1.read_page(1).await.unwrap();
-    assert!(page.starts_with(b"segment-1-page"));
-    // Footer mk_epoch should now be 1.
-    assert_eq!(
-        r1.meta().mk_epoch,
-        1,
-        "segment 1 should be epoch 1 after rekey"
+    assert!(
+        old_reader
+            .read_page(1)
+            .await
+            .unwrap()
+            .starts_with(b"segment-1-data")
     );
-
-    let r2 = db2.open_segment(REALM, "seg2").await.unwrap();
-    let page = r2.read_page(1).await.unwrap();
-    assert!(page.starts_with(b"segment-2-page"));
-    assert_eq!(
-        r2.meta().mk_epoch,
-        1,
-        "segment 2 should be epoch 1 after rekey"
+    let r1 = db.open_segment(REALM, "z-seg").await.unwrap();
+    assert!(
+        r1.read_page(1)
+            .await
+            .unwrap()
+            .starts_with(b"segment-1-data")
     );
+    assert_eq!(r1.meta().mk_epoch, 1);
+    assert!(
+        r1.read_page(2)
+            .await
+            .unwrap()
+            .starts_with(b"segment-1-index")
+    );
+    assert!(
+        r1.read_page(3)
+            .await
+            .unwrap()
+            .starts_with(b"segment-1-overflow")
+    );
+    let migrated_extent = r1.find_extent(extent.start_page_id).await.unwrap();
+    assert!(migrated_extent[0].starts_with(b"segment-1-extent-a"));
+    assert!(migrated_extent[1].starts_with(b"segment-1-extent-b"));
+    let r2 = db.open_segment(REALM, "a-seg").await.unwrap();
+    assert!(
+        r2.read_page(1)
+            .await
+            .unwrap()
+            .starts_with(b"segment-2-page")
+    );
+    assert_eq!(r2.meta().mk_epoch, 1);
+    assert_eq!(r2.meta().evictable, Evictable::Replaceable);
+    drop(r2);
+    drop(r1);
+    drop(old_reader);
+    drop(old_txn);
+
+    let gc = db.gc_now().await.unwrap();
+    assert!(gc.reclaimed_segments >= 1);
 }
-
-// ── Test 3 ─────────────────────────────────────────────────────────────────
-
-/// If rekey is interrupted after writing the watermark but before completing
-/// the main-db rewrite, reopening must resume and complete the rekey.
-#[tokio::test(flavor = "current_thread")]
-async fn rekey_crash_mid_main_db() {
-    let (vfs, db) = fresh_db().await;
-
-    // Write data at epoch 0.
-    {
-        let mut tx = db.begin_write().await.unwrap();
-        tx.put(b"key1", b"v1").await.unwrap();
-        tx.put(b"key2", b"v2").await.unwrap();
-        tx.commit().await.unwrap();
-    }
-
-    // Simulate a crash by writing a rekey watermark (main_db_done=false)
-    // without actually rekeying any pages.
-    db.inject_incomplete_rekey_watermark(1).await.unwrap();
-
-    // Drop the Db and reopen — should auto-resume rekey to epoch 1.
-    drop(db);
-    let db2 = Db::open_existing(vfs, KEK0, PAGE, REALM).await.unwrap();
-
-    // Data must still be readable after resume.
-    let rx = db2.begin_read().await.unwrap();
-    assert_eq!(
-        rx.get(b"key1").await.unwrap().as_deref(),
-        Some(b"v1".as_slice())
-    );
-    assert_eq!(
-        rx.get(b"key2").await.unwrap().as_deref(),
-        Some(b"v2".as_slice())
-    );
-    drop(rx);
-}
-
-// ── Test 4 ─────────────────────────────────────────────────────────────────
 
 /// A page sealed under epoch 0 must NOT be decryptable when its AAD claims
 /// epoch 1. This validates that per-page epoch routing is actually enforced

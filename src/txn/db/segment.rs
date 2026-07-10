@@ -12,7 +12,7 @@ use crate::vfs::Vfs;
 use crate::vfs::types::OpenMode;
 use crate::{RealmId, Result};
 
-use super::core::{Db, HeaderFieldsParams, PendingTombstone, WriterState, encode_root_ref};
+use super::core::{Db, PendingTombstone, WriterState};
 
 /// Result of reconciling post-header segment effects. A deferred tombstone is
 /// safe to publish because the old live file is extra data not referenced by
@@ -305,123 +305,5 @@ impl<V: Vfs + Clone> Db<V> {
             out.push(meta);
         }
         Ok(out)
-    }
-
-    /// Find the catalog name for a segment by its `segment_id`.
-    pub(super) async fn find_segment_name(
-        &self,
-        state: &WriterState,
-        segment_id: &[u8; 16],
-    ) -> Result<String> {
-        if state.catalog_root_page_id == 0 {
-            return Err(PagedbError::NotFound);
-        }
-        let tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        let start = vec![CatalogRowKind::Segment as u8];
-        let mut end = start.clone();
-        end.push(0xFF);
-        let rows = tree.collect_range(&start, &end).await?;
-        for (k, v) in rows {
-            let meta = Catalog::decode_segment_meta(&v)?;
-            if meta.segment_id == *segment_id {
-                // Key layout: [0x01] || realm_id[16] || name_bytes
-                if k.len() > 17 {
-                    let name = String::from_utf8_lossy(&k[17..]).into_owned();
-                    return Ok(name);
-                }
-            }
-        }
-        Err(PagedbError::NotFound)
-    }
-
-    /// Replace a segment in the catalog with a new one and commit the header.
-    pub(super) async fn replace_segment_in_catalog(
-        &self,
-        state: &mut WriterState,
-        name: &str,
-        old_segment_id: &[u8; 16],
-        new_meta: &SegmentMeta,
-        hk: &crate::crypto::keys::DerivedKey,
-        new_mk_epoch: u64,
-    ) -> Result<()> {
-        let key = Catalog::segment_key(self.realm_id, name.as_bytes())?;
-        let value = Catalog::encode_segment_meta(new_meta);
-
-        let mut cat_tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        cat_tree.put(&key, &value).await?;
-        cat_tree.flush().await?;
-
-        let new_catalog_root = cat_tree.root_page_id();
-        let new_next = cat_tree.next_page_id().max(state.next_page_id);
-        let new_commit_id = state.latest_commit_id + 1;
-        let new_seq = state.seq + 1;
-        let counter_anchor = self.pager.pending_anchor();
-
-        let catalog_root_bytes = encode_root_ref(new_catalog_root, new_commit_id);
-
-        let fields = self.header_fields(HeaderFieldsParams {
-            mk_epoch: new_mk_epoch,
-            seq: new_seq,
-            active_root_page_id: state.root_page_id,
-            active_root_txn_id: state.latest_commit_id,
-            counter_anchor,
-            commit_id: new_commit_id,
-            catalog_root: catalog_root_bytes,
-            commit_history_root_page_id: 0,
-            commit_history_root_version: 0,
-            free_list_root_page_id: state.free_list_root_page_id,
-            next_page_id: new_next,
-        })?;
-
-        let new_slot = crate::pager::header::commit_header(
-            &*self.vfs,
-            &self.main_db_path,
-            hk,
-            &fields,
-            state.active_slot,
-            self.page_size,
-        )
-        .await?;
-        // The header is durable. Advance the internal writer state before
-        // the shared post-durability protocol, while retaining the old reader
-        // snapshot until segment reconciliation succeeds.
-        state.catalog_root_page_id = new_catalog_root;
-        state.catalog_root_txn_id = new_commit_id;
-        state.next_page_id = new_next;
-        state.active_slot = new_slot;
-        state.seq = new_seq;
-        state.latest_commit_id = new_commit_id;
-
-        let effects = [
-            SegmentSideEffect::Tombstone {
-                segment_id: *old_segment_id,
-                tombstone_commit_id: None,
-            },
-            SegmentSideEffect::Promote {
-                segment_id: new_meta.segment_id,
-            },
-        ];
-        let _ = self
-            .finish_durable_commit(
-                state,
-                crate::CommitId(new_commit_id),
-                counter_anchor,
-                &effects,
-            )
-            .await?;
-
-        Ok(())
     }
 }

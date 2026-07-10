@@ -212,13 +212,21 @@ async fn rekey_segment_reconciliation_failure_poisoned_handle_reopens_with_reada
     txn.commit().await.unwrap();
 
     vfs.fail_renames(true);
-    assert!(matches!(
-        db.rekey_db(KEK, 1).await,
-        Err(PagedbError::DurablyCommittedButUnpublished { .. })
-    ));
+    let durable_commit = match db.rekey_db(KEK, 1).await {
+        Err(PagedbError::RekeyTargetEpochActivated { commit, source }) => {
+            assert!(matches!(
+                *source,
+                PagedbError::DurablyCommittedButUnpublished { commit: source_commit }
+                    if source_commit == commit
+            ));
+            commit
+        }
+        other => panic!("expected poisoned-handle error, got {other:?}"),
+    };
     assert!(matches!(
         db.list_segments(REALM, "").await,
-        Err(PagedbError::DurablyCommittedButUnpublished { .. })
+        Err(PagedbError::DurablyCommittedButUnpublished { commit })
+            if commit == durable_commit
     ));
 
     vfs.fail_renames(false);
