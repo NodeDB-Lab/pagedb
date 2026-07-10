@@ -201,6 +201,27 @@ impl Catalog {
         Ok(k)
     }
 
+    /// Validate and return the name suffix of a segment-row key. This is used
+    /// before recovery derives a diagnostic name from authenticated catalog
+    /// bytes, so malformed rows cannot cause a slice panic or a repair action.
+    pub fn validate_segment_key<'a>(key: &'a [u8], meta: &SegmentMeta) -> Result<&'a [u8]> {
+        const SEGMENT_KEY_PREFIX_LEN: usize = 1 + 16;
+        if key.first().copied() != Some(CatalogRowKind::Segment as u8) {
+            return Err(PagedbError::catalog_row_invalid("segment.key.kind"));
+        }
+        if key.len() < SEGMENT_KEY_PREFIX_LEN {
+            return Err(PagedbError::catalog_row_invalid("segment.key.length"));
+        }
+        let name = &key[SEGMENT_KEY_PREFIX_LEN..];
+        if name.len() > MAX_SEGMENT_NAME_LEN {
+            return Err(PagedbError::catalog_row_invalid("segment.key.name_length"));
+        }
+        if key[1..SEGMENT_KEY_PREFIX_LEN] != meta.realm_id.0[..] {
+            return Err(PagedbError::catalog_row_invalid("segment.key.realm_id"));
+        }
+        Ok(name)
+    }
+
     /// Rekey-state row key: `[0x03]` (singleton, no suffix).
     #[must_use]
     pub fn rekey_state_key() -> Vec<u8> {
@@ -489,12 +510,25 @@ impl Catalog {
             b.copy_from_slice(&bytes[33..49]);
             b
         };
-        let linked_commit = if bytes[49] == 1 {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&bytes[50..58]);
-            Some(CommitId(u64::from_le_bytes(b)))
-        } else {
-            None
+        let linked_commit = match bytes[49] {
+            0 => {
+                if bytes[50..58].iter().any(|byte| *byte != 0) {
+                    return Err(PagedbError::catalog_row_invalid(
+                        "segment_meta.linked_commit",
+                    ));
+                }
+                None
+            }
+            1 => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&bytes[50..58]);
+                Some(CommitId(u64::from_le_bytes(b)))
+            }
+            _ => {
+                return Err(PagedbError::catalog_row_invalid(
+                    "segment_meta.linked_commit",
+                ));
+            }
         };
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes[58..66]);
@@ -716,6 +750,74 @@ mod tests {
         assert!(matches!(err, PagedbError::Corruption { .. }));
         let err = Catalog::decode_counter(&[]).err().unwrap();
         assert!(matches!(err, PagedbError::Corruption { .. }));
+    }
+
+    #[test]
+    fn segment_meta_rejects_invalid_linked_commit_discriminator_and_unused_bytes() {
+        let meta = SegmentMeta {
+            segment_id: [9; 16],
+            segment_kind: SegmentKind::Unspecified,
+            realm_id: RealmId([0; 16]),
+            parent_file_id: [0; 16],
+            linked_commit: None,
+            page_count: 2,
+            total_bytes: 8192,
+            final_counter: 0,
+            mk_epoch: 0,
+            cipher_id: 1,
+            format_version: 1,
+            evictable: Evictable::Authoritative,
+        };
+        let mut encoded = Catalog::encode_segment_meta(&meta);
+        encoded[49] = 2;
+        assert!(matches!(
+            Catalog::decode_segment_meta(&encoded),
+            Err(PagedbError::Corruption(
+                crate::errors::CorruptionDetail::CatalogRowInvalid {
+                    field: "segment_meta.linked_commit"
+                }
+            ))
+        ));
+
+        let mut encoded = Catalog::encode_segment_meta(&meta);
+        encoded[50] = 1;
+        assert!(matches!(
+            Catalog::decode_segment_meta(&encoded),
+            Err(PagedbError::Corruption(
+                crate::errors::CorruptionDetail::CatalogRowInvalid {
+                    field: "segment_meta.linked_commit"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn segment_key_validation_rejects_malformed_routing_bytes() {
+        let meta = SegmentMeta {
+            segment_id: [1; 16],
+            segment_kind: SegmentKind::Unspecified,
+            realm_id: RealmId([2; 16]),
+            parent_file_id: [3; 16],
+            linked_commit: None,
+            page_count: 2,
+            total_bytes: 8192,
+            final_counter: 0,
+            mk_epoch: 0,
+            cipher_id: 1,
+            format_version: 1,
+            evictable: Evictable::Authoritative,
+        };
+        assert!(Catalog::validate_segment_key(&[], &meta).is_err());
+        assert!(Catalog::validate_segment_key(&[CatalogRowKind::Quota as u8; 17], &meta).is_err());
+        assert!(
+            Catalog::validate_segment_key(&[CatalogRowKind::Segment as u8; 16], &meta).is_err()
+        );
+        let wrong_realm = Catalog::segment_key(RealmId([4; 16]), b"name").unwrap();
+        assert!(Catalog::validate_segment_key(&wrong_realm, &meta).is_err());
+        let mut long_name = vec![CatalogRowKind::Segment as u8];
+        long_name.extend_from_slice(&meta.realm_id.0);
+        long_name.extend_from_slice(&vec![b'n'; MAX_SEGMENT_NAME_LEN + 1]);
+        assert!(Catalog::validate_segment_key(&long_name, &meta).is_err());
     }
 
     #[test]

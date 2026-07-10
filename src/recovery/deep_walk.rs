@@ -11,10 +11,10 @@ use crate::Result;
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, SegmentMeta};
 use crate::crypto::aad::{Aad, AadFields, MAIN_DB_SEGMENT_ID};
-use crate::crypto::kdf::derive_hk;
 use crate::pager::Pager;
 use crate::pager::format::data_page::extract_page_header_ids;
 use crate::pager::format::page_kind::PageKind;
+use crate::segment::authenticated_metadata::authenticate_segment_metadata;
 use crate::txn::db::Db;
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
@@ -344,7 +344,6 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     };
 
     let mk = db.pager.mk()?;
-    let hk = derive_hk(&mk)?;
 
     for (_k, v) in &catalog_rows {
         let meta = match Catalog::decode_segment_meta(v) {
@@ -358,7 +357,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
             }
         };
 
-        check_segment(vfs, &meta, &hk, &mk, db.pager.clone(), &mut report).await;
+        check_segment(vfs, &meta, &mk, db.pager.clone(), &mut report).await;
         report.segments_examined += 1;
     }
 
@@ -370,7 +369,6 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
 async fn check_segment<V: Vfs + Clone>(
     vfs: &V,
     meta: &SegmentMeta,
-    hk: &crate::crypto::keys::DerivedKey,
     mk: &crate::crypto::keys::MasterKey,
     pager: std::sync::Arc<Pager<V>>,
     report: &mut DeepWalkReport,
@@ -387,57 +385,22 @@ async fn check_segment<V: Vfs + Clone>(
         return;
     };
 
-    // Validate header page (page 0).
-    let mut header_buf = vec![0u8; page_size];
-    if let Err(e) = file.read_at(0, &mut header_buf).await {
-        report.segment_issues.push(SegmentIssue {
-            segment_id: meta.segment_id,
-            description: format!("cannot read header page: {e}"),
-        });
-        return;
-    }
     if let Err(e) =
-        crate::pager::format::structural_header::decode_segment_header(&header_buf, hk, page_size)
+        authenticate_segment_metadata(&pager, &file, meta, pager.main_db_file_id(), page_size).await
     {
         report.segment_issues.push(SegmentIssue {
             segment_id: meta.segment_id,
-            description: format!("header HK-MAC failed: {e}"),
+            description: format!("authenticated segment metadata invalid: {e}"),
         });
         return;
     }
-
-    // Verify footer page (last page).
-    let footer_page_id = meta.page_count.saturating_sub(1);
-    let footer_offset = footer_page_id * page_size as u64;
-    let mut footer_buf = vec![0u8; page_size];
-    if let Err(e) = file.read_at(footer_offset, &mut footer_buf).await {
+    let Some(footer_page_id) = meta.page_count.checked_sub(1) else {
         report.segment_issues.push(SegmentIssue {
             segment_id: meta.segment_id,
-            description: format!("cannot read footer page: {e}"),
+            description: "segment page count cannot locate footer".to_string(),
         });
         return;
-    }
-    let footer_ok = {
-        let mut lru = pager.dek_lru().lock();
-        let cipher_res = lru.get_or_derive(meta.realm_id, meta.mk_epoch, pager.cipher_id(), mk);
-        match cipher_res {
-            Ok(cipher) => crate::pager::format::segment_footer::decode_segment_footer(
-                &footer_buf,
-                hk,
-                cipher,
-                page_size,
-            )
-            .is_ok(),
-            Err(_) => false,
-        }
     };
-    if !footer_ok {
-        report.segment_issues.push(SegmentIssue {
-            segment_id: meta.segment_id,
-            description: "footer AEAD / MAC verification failed".to_string(),
-        });
-        return;
-    }
 
     // Catalog-disk drift: compare page count with actual file size.
     // We don't have a metadata API, but we can check via read: try reading one

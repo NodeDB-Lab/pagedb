@@ -1,4 +1,6 @@
 use pagedb::vfs::memory::MemVfs;
+use pagedb::vfs::types::OpenMode;
+use pagedb::vfs::{Vfs, VfsFile};
 use pagedb::{Db, PagedbError, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
@@ -42,6 +44,46 @@ async fn create_append_seal_link_read_round_trip() {
     let page2 = reader.read_page(2).await.unwrap();
     assert!(page2.starts_with(b"page-two"));
     assert_eq!(reader.meta().page_count, 4);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_referenced_corruption_is_not_reclaimed_during_recovery() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
+        .await
+        .unwrap();
+    let realm = RealmId::new([1; 16]);
+    let mut writer = db
+        .create_segment(realm, SegmentKind::Unspecified)
+        .await
+        .unwrap();
+    writer
+        .append_page(SegmentPageKind::Data, b"persisted")
+        .await
+        .unwrap();
+    let meta = writer.seal().await.unwrap();
+    let mut txn = db.begin_write().await.unwrap();
+    txn.link_segment("referenced", &meta).await.unwrap();
+    txn.commit().await.unwrap();
+
+    let path = format!("seg/{}", pagedb::hex::to_hex_lower(&meta.segment_id));
+    let mut file = vfs.open(&path, OpenMode::ReadWrite).await.unwrap();
+    let header_tag_offset = u64::try_from(PAGE - 1).unwrap();
+    let mut tag_byte = [0u8; 1];
+    file.read_at(header_tag_offset, &mut tag_byte)
+        .await
+        .unwrap();
+    tag_byte[0] ^= 1;
+    file.write_at(header_tag_offset, &tag_byte).await.unwrap();
+    drop(file);
+    drop(db);
+
+    let error = Db::open_existing(vfs.clone(), [9u8; 32], PAGE, realm)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, PagedbError::Corruption(_)));
+    assert!(vfs.open(&path, OpenMode::Read).await.is_ok());
 }
 
 #[tokio::test(flavor = "current_thread")]

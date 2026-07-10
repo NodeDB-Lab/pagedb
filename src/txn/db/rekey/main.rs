@@ -593,7 +593,7 @@ mod tests {
 
         assert!(matches!(
             db.pager.mk_for(0, db.cipher_id),
-            Err(PagedbError::ChecksumFailure)
+            Err(PagedbError::MissingPersistedKey { mk_epoch: 0, .. })
         ));
         assert!(db.pager.mk_for(1, db.cipher_id).is_ok());
     }
@@ -632,7 +632,7 @@ mod tests {
 
         assert!(matches!(
             db.pager.mk_for(0, db.cipher_id),
-            Err(PagedbError::ChecksumFailure)
+            Err(PagedbError::MissingPersistedKey { mk_epoch: 0, .. })
         ));
         assert!(
             old_reader
@@ -665,7 +665,7 @@ mod tests {
         db.rekey_db(TARGET_KEK, 1).await.unwrap();
         assert!(matches!(
             db.pager.mk_for(0, db.cipher_id),
-            Err(PagedbError::ChecksumFailure)
+            Err(PagedbError::MissingPersistedKey { mk_epoch: 0, .. })
         ));
         assert!(
             reader

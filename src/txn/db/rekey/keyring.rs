@@ -31,7 +31,10 @@ impl EpochKeyring {
             .read()
             .get(&(epoch, cipher_id.as_byte()))
             .cloned()
-            .ok_or(PagedbError::ChecksumFailure)
+            .ok_or(PagedbError::MissingPersistedKey {
+                mk_epoch: epoch,
+                cipher_id: cipher_id.as_byte(),
+            })
     }
 
     pub(crate) fn remove(&self, epoch: u64, cipher_id: CipherId) {

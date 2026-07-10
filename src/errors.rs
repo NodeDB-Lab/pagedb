@@ -9,6 +9,9 @@ pub enum PagedbError {
     #[error("checksum / AEAD tag verification failed")]
     ChecksumFailure,
 
+    #[error("required persisted key is unavailable: mk_epoch={mk_epoch} cipher_id={cipher_id}")]
+    MissingPersistedKey { mk_epoch: u64, cipher_id: u8 },
+
     #[error("corruption: {0:?}")]
     Corruption(CorruptionDetail),
 
@@ -86,6 +89,9 @@ pub enum PagedbError {
 
     #[error("payload too large")]
     PayloadTooLarge,
+
+    #[error("extent must contain at least one page")]
+    EmptyExtent,
 
     #[error("manifest too large")]
     ManifestTooLarge,
@@ -183,6 +189,12 @@ pub enum CorruptionDetail {
         name: String,
         segment_id: [u8; 16],
     },
+    /// Authenticated segment metadata differs from its trusted catalog routing entry.
+    SegmentMetadataMismatch { field: &'static str },
+    /// Segment file geometry cannot safely locate its authenticated footer.
+    SegmentGeometryInvalid { field: &'static str },
+    /// Authenticated catalog row bytes do not form a valid segment key/value pair.
+    CatalogRowInvalid { field: &'static str },
     /// Catalog references a segment whose file is absent from both `seg/` and `seg/.staging/`.
     SegmentMissing {
         realm_id: RealmId,
@@ -235,6 +247,24 @@ impl PagedbError {
     #[must_use]
     pub fn corruption(detail: CorruptionDetail) -> Self {
         Self::Corruption(detail)
+    }
+
+    /// Canonical constructor for authenticated catalog/file metadata disagreement.
+    #[must_use]
+    pub const fn segment_metadata_mismatch(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::SegmentMetadataMismatch { field })
+    }
+
+    /// Canonical constructor for malformed segment-file geometry.
+    #[must_use]
+    pub const fn segment_geometry_invalid(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::SegmentGeometryInvalid { field })
+    }
+
+    /// Canonical constructor for malformed authenticated catalog rows.
+    #[must_use]
+    pub const fn catalog_row_invalid(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::CatalogRowInvalid { field })
     }
 
     /// Canonical constructor for an incremental snapshot that cannot be

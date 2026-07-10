@@ -192,6 +192,9 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
     }
 
     pub async fn append_extent(&mut self, pages: &[&[u8]]) -> Result<ExtentRef> {
+        if pages.is_empty() {
+            return Err(PagedbError::EmptyExtent);
+        }
         let start = self.next_page_id;
         let mut logical_bytes = 0u64;
         for payload in pages {

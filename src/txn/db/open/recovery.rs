@@ -46,12 +46,10 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         (state.catalog_root_page_id, state.next_page_id)
     };
     let recovery_commit = db.latest_commit().0;
-    let hk = db.hk.read().clone();
     if capabilities.runs_standalone_recovery() {
         crate::recovery::repair_catalog(
             &*db.vfs,
             db.pager.clone(),
-            &hk,
             db.realm_id,
             catalog_root_page_id,
             next_page_id,
@@ -64,7 +62,6 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         crate::recovery::verify_catalog(
             &*db.vfs,
             db.pager.clone(),
-            &hk,
             db.realm_id,
             catalog_root_page_id,
             next_page_id,
