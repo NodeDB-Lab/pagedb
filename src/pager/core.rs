@@ -616,7 +616,7 @@ impl<V: Vfs> Pager<V> {
         {
             let mut cache = self.inner.cache_for_key(file).lock();
             if let Some(page) = cache.get((file, page_id)) {
-                if page.realm_id_bytes != [0u8; 16] && page.realm_id_bytes != realm_id.0 {
+                if page.realm_id_bytes != Some(realm_id.0) {
                     return Err(PagedbError::ChecksumFailure);
                 }
                 self.inner.record_hit(file);
@@ -1028,6 +1028,57 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, PagedbError::ChecksumFailure));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cached_pages_require_an_exact_realm_match() {
+        let pager = mk_pager().await;
+        let zero_realm = RealmId([0; 16]);
+        let nonzero_realm = RealmId([1; 16]);
+        let body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
+
+        pager
+            .write_main_page(1, zero_realm, PageKind::BTreeLeaf, &body)
+            .await
+            .unwrap();
+        pager
+            .write_main_page(2, nonzero_realm, PageKind::BTreeLeaf, &body)
+            .await
+            .unwrap();
+
+        {
+            let mut cache = pager.inner.buffer_pool.lock();
+            assert_eq!(
+                cache
+                    .get((FileKey::Main, 1))
+                    .map(|page| page.realm_id_bytes),
+                Some(Some(zero_realm.0))
+            );
+            assert_eq!(
+                cache
+                    .get((FileKey::Main, 2))
+                    .map(|page| page.realm_id_bytes),
+                Some(Some(nonzero_realm.0))
+            );
+        }
+
+        for (page_id, requested_realm) in [(1, nonzero_realm), (2, zero_realm)] {
+            let misses_before = pager.inner.buffer_pool_misses.load(AtomOrd::Relaxed);
+            let cache_len_before = pager.inner.buffer_pool.lock().len();
+            let err = pager
+                .read_main_page(page_id, requested_realm, PageKind::BTreeLeaf)
+                .await
+                .err()
+                .unwrap();
+
+            assert!(matches!(err, PagedbError::ChecksumFailure));
+            assert_eq!(
+                pager.inner.buffer_pool_misses.load(AtomOrd::Relaxed),
+                misses_before,
+                "cached realm mismatch must not fall back to disk"
+            );
+            assert_eq!(pager.inner.buffer_pool.lock().len(), cache_len_before);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

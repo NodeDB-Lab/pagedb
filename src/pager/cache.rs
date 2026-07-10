@@ -32,9 +32,10 @@ pub struct Page {
     /// Page kind recorded at write time; used by the Pager flush path to
     /// reconstruct the correct AAD for each dirty page.
     pub kind_byte: u8,
-    /// Realm that owns this cached plaintext. Used by the Pager read path to
-    /// reject cross-realm cache hits without a VFS round-trip.
-    pub realm_id_bytes: [u8; 16],
+    /// Realm that owns this cached plaintext. `None` marks metadata-less test
+    /// pages, which the Pager read path must reject rather than treat as a
+    /// cache hit.
+    pub realm_id_bytes: Option<[u8; 16]>,
 }
 
 impl Page {
@@ -43,7 +44,7 @@ impl Page {
         Self {
             bytes,
             kind_byte: 0,
-            realm_id_bytes: [0u8; 16],
+            realm_id_bytes: None,
         }
     }
 
@@ -52,7 +53,7 @@ impl Page {
         Self {
             bytes,
             kind_byte,
-            realm_id_bytes: [0u8; 16],
+            realm_id_bytes: None,
         }
     }
 
@@ -61,7 +62,7 @@ impl Page {
         Self {
             bytes,
             kind_byte,
-            realm_id_bytes,
+            realm_id_bytes: Some(realm_id_bytes),
         }
     }
 }
@@ -321,7 +322,11 @@ mod tests {
     fn insert_and_get() {
         let mut c = PageCache::with_capacity(4);
         c.insert((FileKey::Main, 1), page(0));
-        assert!(c.get((FileKey::Main, 1)).is_some());
+        assert_eq!(
+            c.get((FileKey::Main, 1))
+                .map(|cached| cached.realm_id_bytes),
+            Some(None)
+        );
     }
 
     #[test]
