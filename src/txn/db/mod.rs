@@ -5,6 +5,7 @@ mod apply_journal;
 mod catalog;
 mod core;
 mod gc;
+#[cfg(not(target_arch = "wasm32"))]
 mod manifest_validation;
 mod misc;
 mod open;
