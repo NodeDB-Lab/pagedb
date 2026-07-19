@@ -604,6 +604,7 @@ impl<V: Vfs> Pager<V> {
     /// AAD is constructed from on-disk header bytes, not from `Pager.active_epoch`
     /// or the configured cipher. This makes mixed-epoch and mixed-cipher coexistence
     /// work correctly without global invariants.
+    #[allow(clippy::too_many_lines)]
     async fn read_page(
         &self,
         file: FileKey,
@@ -738,6 +739,7 @@ impl<V: Vfs> Pager<V> {
         Err(last_err.unwrap_or(PagedbError::ChecksumFailure))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn flush_file(
         &self,
         file: FileKey,

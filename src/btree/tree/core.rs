@@ -174,8 +174,7 @@ impl<V: Vfs> BTree<V> {
         } else {
             let consumed = self.free_page_consumed.as_ref().map(|c| c.lock());
             let pos = self.freed.iter().rposition(|&id| {
-                id >= self.reuse_threshold
-                    || consumed.as_ref().is_some_and(|c| c.contains(&id))
+                id >= self.reuse_threshold || consumed.as_ref().is_some_and(|c| c.contains(&id))
             });
             drop(consumed);
             if let Some(pos) = pos {
