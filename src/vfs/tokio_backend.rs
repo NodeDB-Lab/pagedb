@@ -668,7 +668,13 @@ impl VfsFile for TokioFile {
     }
 
     async fn len(&self) -> Result<u64> {
-        let f = self.inner.lock().await;
+        let mut f = self.inner.lock().await;
+        // `metadata` is the one file operation that does not wait for a write
+        // already submitted to the runtime's background pool, so on a loaded
+        // pool it can observe the pre-write length even though `write_at` has
+        // returned. Flush first so the reported length reflects every
+        // completed write. On a read-only handle this is a no-op.
+        f.flush().await.map_err(PagedbError::Io)?;
         Ok(f.metadata().await.map_err(PagedbError::Io)?.len())
     }
 
