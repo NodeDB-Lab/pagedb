@@ -52,7 +52,11 @@ fn key(i: u64) -> Vec<u8> {
 /// depends on `generation`, so rewrites flip records between inline and
 /// overflow representations, churning overflow-chain allocation and release.
 fn value(i: u64, generation: u64) -> Vec<u8> {
-    let len = if (i + generation) % 10 == 0 { 3000 } else { 300 };
+    let len = if (i + generation) % 10 == 0 {
+        3000
+    } else {
+        300
+    };
     let seed = (i.wrapping_mul(31)).wrapping_add(generation) as u8;
     vec![seed; len]
 }
@@ -71,7 +75,8 @@ async fn verify_all<V: Vfs + Clone>(db: &Db<V>, expected: &BTreeMap<u64, u64>) {
         match got {
             None => panic!("key {i} missing (generation {generation})"),
             Some(v) => assert_eq!(
-                v, want,
+                v,
+                want,
                 "key {i} wrong value: got len {}, want generation {generation} len {}",
                 v.len(),
                 want.len()
@@ -111,7 +116,9 @@ async fn sustained_impl<V: Vfs + Clone>(vfs: V) {
     // Simple deterministic LCG for choosing rewrite targets.
     let mut rng: u64 = 0x243F_6A88_85A3_08D3;
     let mut lcg = move || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rng
     };
 
@@ -154,7 +161,9 @@ async fn reopen_cycle_impl<V: Vfs + Clone>(vfs: V) {
     let mut next_key: u64 = 0;
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut lcg = move || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rng
     };
 
@@ -368,7 +377,9 @@ async fn concurrent_impl<V: Vfs + Clone + Send + Sync + 'static>(vfs: V) {
     let mut next_key: u64 = 0;
     let mut rng: u64 = 0xDEAD_BEEF_CAFE_F00D;
     let mut lcg = move || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rng
     };
     for _batch in 0..60u64 {
@@ -395,7 +406,11 @@ async fn concurrent_impl<V: Vfs + Clone + Send + Sync + 'static>(vfs: V) {
     }
 
     let report = run_deep_walk(&db).await.unwrap();
-    assert!(report.is_clean(), "deep walk issues: {:?}", report.page_issues);
+    assert!(
+        report.is_clean(),
+        "deep walk issues: {:?}",
+        report.page_issues
+    );
     verify_all(&db, &expected).await;
     drop(db);
 
@@ -404,7 +419,11 @@ async fn concurrent_impl<V: Vfs + Clone + Send + Sync + 'static>(vfs: V) {
         .unwrap();
     verify_all(&db, &expected).await;
     let report = run_deep_walk(&db).await.unwrap();
-    assert!(report.is_clean(), "post-reopen issues: {:?}", report.page_issues);
+    assert!(
+        report.is_clean(),
+        "post-reopen issues: {:?}",
+        report.page_issues
+    );
 }
 
 /// Randomized structural stress across many seeds: variable-length keys
@@ -519,9 +538,10 @@ async fn randomized_impl<V: Vfs + Clone>(seeds: u64, mut make_vfs: impl FnMut(u6
                     .unwrap_or_else(|e| panic!("seed {seed} round {round} reopen: {e:?}"));
                 let r = db.begin_read().await.unwrap();
                 for (&i, &generation) in &expected {
-                    let got = r.get(&skey(i)).await.unwrap_or_else(|e| {
-                        panic!("seed {seed} round {round} get {i}: {e:?}")
-                    });
+                    let got = r
+                        .get(&skey(i))
+                        .await
+                        .unwrap_or_else(|e| panic!("seed {seed} round {round} get {i}: {e:?}"));
                     assert_eq!(
                         got.as_deref(),
                         Some(sval(i, generation).as_slice()),
