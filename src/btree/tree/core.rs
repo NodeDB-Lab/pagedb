@@ -23,10 +23,14 @@ pub struct BTree<V: Vfs> {
     pub(super) freed: Vec<u64>,
     pub(super) page_size: usize,
     /// Minimum `page_id` that may be recycled from `freed` within this session.
-    /// Pages below this threshold were live in prior snapshots and may still be
-    /// accessed by pinned readers; they must not be overwritten until the
-    /// deferred-free queue allows it. Set to `next_page_id` when any reader is
-    /// tracked; set to 0 when no readers are pinned (safe to recycle freely).
+    /// Pages below this threshold existed before the session began: they are
+    /// still referenced by the last durable header (a copy-on-write free does
+    /// not unreference them on disk until the *next* header lands) and may
+    /// also be pinned by reader snapshots. They must not be overwritten
+    /// in-session; they re-enter circulation through the deferred-free queue
+    /// once the free-list naming them is durable. Callers set this to the
+    /// session-start `next_page_id`, so only pages bump-allocated within the
+    /// session are recyclable immediately.
     pub(super) reuse_threshold: u64,
     /// Leaves modified during this write session but not yet promoted via
     /// `CoW` to a fresh page. Keyed by the leaf's current `page_id` as referenced
@@ -108,8 +112,9 @@ impl<V: Vfs> BTree<V> {
 
     /// Set the reuse threshold. Any freed page with `page_id < threshold` will
     /// not be recycled within this session; it goes to `self.freed` for later
-    /// deferred-queue promotion. Call with `next_page_id` when tracked readers
-    /// are present; call with `0` when no readers are pinned.
+    /// deferred-queue promotion. Call with the session-start `next_page_id`:
+    /// pages below it are still referenced by the last durable header and must
+    /// keep their on-disk bytes until the header that frees them is durable.
     pub fn set_reuse_threshold(&mut self, threshold: u64) {
         self.reuse_threshold = threshold;
     }
@@ -153,16 +158,29 @@ impl<V: Vfs> BTree<V> {
         // the reuse threshold: a page below it may still be live in a pinned
         // reader's snapshot, so it can't be reused until the durable free-list
         // clears it (it leaves via `drain_freed` at commit instead).
+        //
+        // Exception: a below-threshold page originally drawn from the shared
+        // cache this session (recorded in `free_page_consumed`) is free per
+        // the last durable header regardless of what this session wrote to it
+        // since, so recycling it again in-session is crash-safe — a failed or
+        // torn commit leaves the durable header referencing none of its
+        // content. Without this, every cache-drawn page freed by a later
+        // in-session split is burned for the rest of the txn and allocation
+        // falls through to bump growth.
         if self.reuse_threshold == 0 {
             if let Some(id) = self.freed.pop() {
                 return id;
             }
-        } else if let Some(pos) = self
-            .freed
-            .iter()
-            .rposition(|&id| id >= self.reuse_threshold)
-        {
-            return self.freed.remove(pos);
+        } else {
+            let consumed = self.free_page_consumed.as_ref().map(|c| c.lock());
+            let pos = self.freed.iter().rposition(|&id| {
+                id >= self.reuse_threshold
+                    || consumed.as_ref().is_some_and(|c| c.contains(&id))
+            });
+            drop(consumed);
+            if let Some(pos) = pos {
+                return self.freed.remove(pos);
+            }
         }
         // Then draw from the shared cross-commit cache. It is loaded at txn
         // begin with *only* free-list pages below the reclamation floor — pages
