@@ -619,6 +619,14 @@ impl<V: Vfs> Pager<V> {
                 if page.realm_id_bytes != Some(realm_id.0) {
                     return Err(PagedbError::ChecksumFailure);
                 }
+                // Enforce the same kind binding a cold read's AAD enforces.
+                // Without this, a stale pointer reading a recycled page under
+                // the wrong kind succeeds while the page is warm and only
+                // starts failing after eviction — hiding structural damage
+                // until long after the write that caused it.
+                if page.kind_byte != 0 && page.kind_byte != expected_kind.as_byte() {
+                    return Err(PagedbError::ChecksumFailure);
+                }
                 self.inner.record_hit(file);
                 cache.pin((file, page_id));
                 return Ok(PageGuard {
@@ -720,6 +728,13 @@ impl<V: Vfs> Pager<V> {
                 Err(e) => return Err(e),
             }
         }
+        tracing::error!(
+            page_id,
+            ?file,
+            expected_kind = ?expected_kind,
+            realm = ?realm_id.0,
+            "page AEAD/MAC verification failed on read"
+        );
         Err(last_err.unwrap_or(PagedbError::ChecksumFailure))
     }
 
@@ -744,8 +759,11 @@ impl<V: Vfs> Pager<V> {
         let flush_epoch = self.active_epoch.load(AtomOrd::SeqCst);
 
         // Serial gather: snapshot each dirty page's plaintext + kind under the
-        // cache lock. Cheap memcpy; no AEAD work happens here.
+        // cache lock. Cheap memcpy; no AEAD work happens here. The gathered
+        // `Arc<Page>` is retained per pid so the dirty-clear below can detect
+        // pages replaced by a concurrent writer during the (slow) seal+write.
         let mut prepared: Vec<(u64, PageKind, Vec<u8>)> = Vec::with_capacity(dirty_ids.len());
+        let mut gathered: Vec<(u64, Arc<Page>)> = Vec::with_capacity(dirty_ids.len());
         for pid in &dirty_ids {
             let page = self
                 .inner
@@ -755,6 +773,7 @@ impl<V: Vfs> Pager<V> {
                 .ok_or_else(|| {
                     PagedbError::Io(std::io::Error::other("dirty page missing from cache"))
                 })?;
+            gathered.push((*pid, page.clone()));
             let kind = if page.kind_byte != 0 {
                 PageKind::from_byte(page.kind_byte)?
             } else {
@@ -765,6 +784,7 @@ impl<V: Vfs> Pager<V> {
             let mut wire = vec![0u8; page_size];
             let plain = body(&page.bytes);
             wire[HEADER_LEN..HEADER_LEN + plain.len()].copy_from_slice(plain);
+            tracing::trace!(page_id = *pid, ?kind, ?file, "flush: writing page");
             prepared.push((*pid, kind, wire));
         }
 
@@ -843,10 +863,25 @@ impl<V: Vfs> Pager<V> {
             f.sync().await?;
         }
 
-        // Clear dirty flags.
+        // Clear dirty flags — but ONLY for pages still holding the exact
+        // `Arc<Page>` we gathered. A concurrent writer replaces the Arc on
+        // every write; unconditionally clearing here would wipe its dirty
+        // flag while its content never reached disk (lost update → stale
+        // page on next cold read → AEAD/kind mismatch).
+        // A replaced page keeps its flag and flushes on the next cycle.
         let mut cache = self.inner.cache_for_key(file).lock();
-        for pid in dirty_ids {
-            cache.clear_dirty((file, pid));
+        for (pid, snapshot) in gathered {
+            match cache.get((file, pid)) {
+                Some(current) if Arc::ptr_eq(&current, &snapshot) => {
+                    cache.clear_dirty((file, pid));
+                }
+                _ => {
+                    tracing::debug!(
+                        page_id = pid,
+                        "page re-dirtied during flush; keeping dirty for next cycle"
+                    );
+                }
+            }
         }
         Ok(())
     }
