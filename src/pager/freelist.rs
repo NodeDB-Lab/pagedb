@@ -56,6 +56,18 @@ pub async fn read_chain<V: Vfs + Clone>(
         let mut cnt_b = [0u8; 4];
         cnt_b.copy_from_slice(&body[8..12]);
         let count = u32::from_le_bytes(cnt_b) as usize;
+        if count > (body.len().saturating_sub(PAGE_HEADER_LEN)) / ENTRY_LEN {
+            // On-disk count cannot come from write_chain (which caps chunks at
+            // capacity): the page under the Free kind byte holds foreign or
+            // torn content. Surface corruption instead of panicking on the
+            // slice overrun below — a panic here poisons the pager mutex and
+            // wedges every subsequent commit.
+            return Err(PagedbError::corruption(
+                crate::errors::CorruptionDetail::CatalogRowInvalid {
+                    field: "freelist chain page entry count exceeds capacity",
+                },
+            ));
+        }
         for i in 0..count {
             let off = PAGE_HEADER_LEN + i * ENTRY_LEN;
             let mut cid_b = [0u8; 8];
@@ -104,7 +116,11 @@ pub async fn rewrite_chain<V: Vfs + Clone>(
         if chain_pages.len() >= need {
             break;
         }
-        if let Some(h) = hosts.next() {
+        // Carve a host only while at least one entry would remain afterwards:
+        // carving the final entry would leave the chain page with nothing to
+        // store and orphan the host (no longer an entry, never a chain page).
+        let host = if remaining > 1 { hosts.next() } else { None };
+        if let Some(h) = host {
             carved.insert(h);
             chain_pages.push(h);
         } else {
@@ -122,6 +138,16 @@ pub async fn rewrite_chain<V: Vfs + Clone>(
 /// linking them into a chain. Returns the new head page id, or `0` when there
 /// is nothing to write. The pages are inserted into the pager's dirty set; the
 /// caller flushes and commits the header (carrying the returned head).
+///
+/// Every supplied page is written: when the entries run out before the pages
+/// do (a host carve in [`rewrite_chain`] can shrink the entry set across a
+/// page boundary), the trailing pages carry zero entries but stay properly
+/// linked. Skipping them instead would leave the last data page's `next`
+/// pointing at a page whose on-disk bytes were never rewritten — a durable
+/// chain pointer into stale content, which either fails authentication at the
+/// next chain read (wedging every subsequent commit) or, worse, still
+/// authenticates as an older chain generation and silently resurrects free
+/// entries for pages that are live again.
 pub async fn write_chain<V: Vfs + Clone>(
     pager: &Pager<V>,
     realm_id: RealmId,
@@ -139,9 +165,6 @@ pub async fn write_chain<V: Vfs + Clone>(
     for (i, &page_id) in chain_pages.iter().enumerate() {
         let chunk = &entries[written..(written + cap).min(entries.len())];
         let next = chain_pages.get(i + 1).copied().unwrap_or(0);
-        // The last page used carries 0 as `next` even if more pages were
-        // supplied than needed (they go unused).
-        let next = if chunk.is_empty() { 0 } else { next };
         let mut body = vec![0u8; body_len];
         body[0..8].copy_from_slice(&next.to_le_bytes());
         let chunk_len = u32::try_from(chunk.len())
@@ -156,9 +179,6 @@ pub async fn write_chain<V: Vfs + Clone>(
             .write_main_page(page_id, realm_id, PageKind::Free, &body)
             .await?;
         written += chunk.len();
-        if written >= entries.len() {
-            break;
-        }
     }
     Ok(chain_pages[0])
 }
