@@ -1,24 +1,43 @@
-# Release pipeline. Triggered by pushing a tag of the form `vX.Y.Z` or
-# `vX.Y.Z-label.N` (pre-release).
+# Manual distribution workflow. Push a v* tag first; `Release Prepare` runs the
+# test suite and builds the fsck binaries. Then run this workflow with that tag
+# and the successful prepare run ID.
 #
-# Flow:
-#   1. validate-version  — tag matches Cargo.toml version, format is sane.
-#   2. ci                — gate on the full reusable test workflow.
-#   3. build-binaries    — build `pagedb-fsck` for every shipped triple.
-#   4. github-release    — publish a GitHub release with the binaries attached.
+# The GitHub Release consumes the prepare run's artifacts, so a failed publish
+# or release stage is retried by re-dispatching with only that stage enabled —
+# the tests and the binaries are never rebuilt to fix a crates.io timeout or a
+# bad release body.
 #
-# Crate publish: skipped. The crate's `publish = false` in Cargo.toml — this
-# repo ships binaries and a library API surface for embedders pulling from
-# git, not via crates.io. Flip the flag and add a `publish-crates` job
-# modeled on the NodeDB / oxipdf workflows if that ever changes.
+# Stages:
+#   publish_crate   -> crates.io (single crate; verifying publish)
+#   github_release  -> GitHub Release with the fsck binaries attached
+#
+# Each stage is idempotent: an already-indexed version is skipped, the release
+# is overwritten in place. Re-running is safe.
+#
+# Required secret: CARGO_REGISTRY_TOKEN.
 
 name: Release
-run-name: Release ${{ github.ref_name }}
+run-name: Release ${{ inputs.tag }}
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v0.1.0"
+        required: true
+        type: string
+      prepare_run_id:
+        description: "Successful Release Prepare run ID holding the binaries"
+        required: true
+        type: string
+      publish_crate:
+        description: "Publish pagedb to crates.io"
+        type: boolean
+        default: true
+      github_release:
+        description: "Create the GitHub Release"
+        type: boolean
+        default: true
 
 concurrency:
   group: release
@@ -31,154 +50,93 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Validate tag ────────────────────────────────────────────────────────
+  # Always runs. Cheap, and it guarantees the dispatched tag still means what
+  # the prepare run assumed it meant.
   validate-version:
-    name: Validate Version Tag
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      ref: ${{ inputs.tag }}
+
+  # ── crates.io ────────────────────────────────────────────────────────────────
+  # pagedb is a single leaf crate — no publish-order tiers. A verifying publish
+  # (no --no-verify) is the strongest guarantee the uploaded tarball builds from
+  # a clean checkout, and there is no inter-crate index race to skip it for.
+  publish-crate:
+    name: Publish to crates.io
+    needs: validate-version
+    if: inputs.publish_crate
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      is_full_release: ${{ steps.version.outputs.is_full_release }}
+    environment: crates.io
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Validate tag against Cargo.toml
-        id: version
+      # The verifying publish compiles the packaged lib + the pagedb-fsck bin
+      # against crates.io deps. The io-uring VFS backend needs nothing extra,
+      # but clang/libclang keeps parity with the test image in case a future
+      # build-dep needs bindgen.
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Publish pagedb
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          TAG_VERSION="${TAG#v}"
-
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 \
+          VERSION=$(cargo metadata --no-deps --format-version=1 \
             | jq -r '.packages[] | select(.name == "pagedb") | .version')
-          CARGO_BASE=$(echo "$CARGO_VERSION" | grep -oP '^\d+\.\d+\.\d+')
 
-          echo "Tag version:        $TAG_VERSION"
-          echo "Cargo.toml version: $CARGO_VERSION"
-          echo "Cargo.toml base:    $CARGO_BASE"
+          is_published() {
+            curl -sf \
+              -H "User-Agent: pagedb-ci (github.com/nodedb-lab/pagedb)" \
+              "https://crates.io/api/v1/crates/pagedb/$1" > /dev/null 2>&1
+          }
 
-          if [[ ! "$TAG_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[a-zA-Z]+\.[0-9]+)?$ ]]; then
-            echo "::error::Invalid tag format '$TAG'. Expected: vX.Y.Z or vX.Y.Z-label.N"
-            exit 1
+          if is_published "$VERSION"; then
+            echo "pagedb@$VERSION already published — skipping"
+            exit 0
           fi
 
-          TAG_BASE="${BASH_REMATCH[1]}"
+          echo "Publishing pagedb@$VERSION..."
+          cargo publish -p pagedb
 
-          if [[ "$TAG_BASE" != "$CARGO_BASE" ]]; then
-            echo "::error::Base version mismatch! Tag '$TAG_BASE' != Cargo.toml '$CARGO_BASE'"
-            exit 1
-          fi
-
-          if [[ "$TAG_VERSION" == *-* ]]; then
-            echo "is_full_release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_full_release=true" >> "$GITHUB_OUTPUT"
-          fi
-          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-
-  # ── CI gate (full reusable workflow) ────────────────────────────────────
-  ci:
-    name: CI Gate
-    needs: validate-version
-    uses: ./.github/workflows/ci.yml
-
-  # ── Build pagedb-fsck binary per target ─────────────────────────────────
-  build-binaries:
-    name: Build fsck (${{ matrix.label }})
-    needs: [validate-version, ci]
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runs-on: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            label: linux-x64
-            ext: ""
-          - runs-on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            label: linux-arm64
-            ext: ""
-          - runs-on: macos-latest
-            target: aarch64-apple-darwin
-            label: macos-arm64
-            ext: ""
-          - runs-on: macos-13
-            target: x86_64-apple-darwin
-            label: macos-x64
-            ext: ""
-          - runs-on: windows-latest
-            target: x86_64-pc-windows-msvc
-            label: windows-x64
-            ext: ".exe"
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust + target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fsck-${{ matrix.target }}
-
-      - name: Build pagedb-fsck
-        run: cargo build --release --bin pagedb-fsck --target ${{ matrix.target }}
-
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-          cd target/${{ matrix.target }}/release
-          chmod +x pagedb-fsck
-          tar czf pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz pagedb-fsck
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cd target/${{ matrix.target }}/release
-          $name = "pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.zip"
-          Compress-Archive -Path "pagedb-fsck${{ matrix.ext }}" -DestinationPath $name
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fsck-${{ matrix.label }}
-          path: |
-            target/${{ matrix.target }}/release/pagedb-fsck-*.tar.gz
-            target/${{ matrix.target }}/release/pagedb-fsck-*.zip
-          if-no-files-found: error
-          retention-days: 1
-
-  # ── GitHub Release ──────────────────────────────────────────────────────
+  # ── GitHub Release ───────────────────────────────────────────────────────────
+  # Independent of publish-crate: a crates.io outage must not block cutting the
+  # release, and re-running this stage alone is the fix for a bad release body.
   github-release:
     name: Create GitHub Release
-    needs: [validate-version, build-binaries]
+    needs: validate-version
+    if: inputs.github_release
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
-      - name: Download artifacts
+      - name: Download fsck artifacts
         uses: actions/download-artifact@v4
         with:
-          path: ./artifacts
           pattern: "fsck-*"
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: ./artifacts
           merge-multiple: true
 
-      - name: Create release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           name: pagedb ${{ needs.validate-version.outputs.version }}
           generate_release_notes: true
           draft: false
-          prerelease: ${{ needs.validate-version.outputs.is_full_release == 'false' }}
+          prerelease: ${{ needs.validate-version.outputs.is_full_release != 'true' }}
           files: artifacts/*
           fail_on_unmatched_files: true

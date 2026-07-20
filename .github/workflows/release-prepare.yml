@@ -1,0 +1,137 @@
+# Tag gate for a releasable build. Pushing a v* tag validates the tag, runs the
+# full test suite, and builds the `pagedb-fsck` binaries once. Nothing is
+# published and nothing leaves the repo.
+#
+# The manual `Release` workflow then consumes THIS run's binary artifacts by run
+# ID for the GitHub Release, so a failure in the publish or release stage can be
+# fixed and retried without repeating the tests or the compile.
+#
+# Artifacts are retained 14 days: that is the window in which a `Release` run can
+# still resume from this prepare run.
+
+name: Release Prepare
+run-name: Release Prepare ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-prepare-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-version:
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      ref: ${{ github.ref_name }}
+
+  # Full lint + cross-platform test + wasm/features/bench gates. Calls test.yml
+  # directly rather than ci.yml, whose PR-draft gate skips under workflow_call.
+  ci:
+    name: CI Gate
+    needs: validate-version
+    uses: ./.github/workflows/test.yml
+
+  # ── Build pagedb-fsck binary per target ─────────────────────────────────
+  build-binaries:
+    name: Build fsck (${{ matrix.label }})
+    needs: [validate-version, ci]
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+            ext: ""
+          - runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: linux-arm64
+            ext: ""
+          - runs-on: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+            ext: ""
+          - runs-on: macos-13
+            target: x86_64-apple-darwin
+            label: macos-x64
+            ext: ""
+          - runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fsck-${{ matrix.target }}
+
+      - name: Build pagedb-fsck
+        run: cargo build --release --bin pagedb-fsck --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          chmod +x pagedb-fsck
+          tar czf pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz pagedb-fsck
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          $name = "pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.zip"
+          Compress-Archive -Path "pagedb-fsck${{ matrix.ext }}" -DestinationPath $name
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fsck-${{ matrix.label }}
+          path: |
+            target/${{ matrix.target }}/release/pagedb-fsck-*.tar.gz
+            target/${{ matrix.target }}/release/pagedb-fsck-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  summary:
+    name: Release instructions
+    needs: [validate-version, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          {
+            echo "## Prepared v${VERSION}"
+            echo
+            echo "Tests passed and the fsck binaries are built. Publish with:"
+            echo
+            echo '```sh'
+            echo "gh workflow run release.yml -R ${REPO} \\"
+            echo "  -f tag=v${VERSION} \\"
+            echo "  -f prepare_run_id=${RUN_ID}"
+            echo '```'
+            echo
+            echo "If one stage fails, re-run the same command with only the"
+            echo "remaining stage enabled (e.g. \`-f publish_crate=false\`)."
+            echo "Nothing is recompiled."
+          } >> "$GITHUB_STEP_SUMMARY"
