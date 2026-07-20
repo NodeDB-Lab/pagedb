@@ -32,7 +32,12 @@ bytes = "1"
 tracing = "0.1"
 parking_lot = "0.12"
 rayon = "1"
-getrandom = { version = "0.2", features = ["js"] }
+# `std` is required (not just `js`): `PagedbError::Randomness(#[from]
+# getrandom::Error)` relies on `getrandom::Error: std::error::Error`, which
+# getrandom only provides under `std`. In the workspace a sibling crate enabled
+# `std` via feature unification, masking the gap — published standalone, pagedb
+# must declare the feature it actually uses.
+getrandom = { version = "0.2", features = ["js", "std"] }
 
 # tokio's `rt-multi-thread` and `fs` features are not supported on
 # `wasm32-unknown-unknown`. Split per target so OPFS builds compile.

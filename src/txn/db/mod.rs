@@ -5,6 +5,11 @@ mod apply_journal;
 mod catalog;
 mod core;
 mod gc;
+// Serves the native-only incremental-snapshot apply path: its sole caller is
+// `snapshot` (wasm-gated below) and it imports `SnapshotManifest` from the
+// wasm-gated `crate::snapshot::export`. Gate it the same way so the wasm build
+// does not pull an import that is configured out.
+#[cfg(not(target_arch = "wasm32"))]
 mod manifest_validation;
 mod misc;
 mod open;
