@@ -70,7 +70,7 @@ jobs:
             label: windows-x64
             ext: ".exe"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust + target
         uses: dtolnay/rust-toolchain@stable
@@ -80,6 +80,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fsck-${{ matrix.target }}
+
+      - name: Set version from tag
+        shell: bash
+        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
 
       - name: Build pagedb-fsck
         run: cargo build --release --bin pagedb-fsck --target ${{ matrix.target }}
@@ -100,7 +104,7 @@ jobs:
           $name = "pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.zip"
           Compress-Archive -Path "pagedb-fsck${{ matrix.ext }}" -DestinationPath $name
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fsck-${{ matrix.label }}
           path: |

@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: crates.io
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
 
@@ -81,6 +81,9 @@ jobs:
       # build-dep needs bindgen.
       - name: Install LLVM/Clang
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Set version from tag
+        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
 
       - name: Publish pagedb
         env:
@@ -102,7 +105,9 @@ jobs:
           fi
 
           echo "Publishing pagedb@$VERSION..."
-          cargo publish -p pagedb
+          # --allow-dirty: stamp_version.sh may have edited Cargo.toml for a
+          # prerelease tag; the verifying publish still runs.
+          cargo publish -p pagedb --allow-dirty
 
   # ── GitHub Release ───────────────────────────────────────────────────────────
   # Independent of publish-crate: a crates.io outage must not block cutting the
@@ -116,13 +121,13 @@ jobs:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Download fsck artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: "fsck-*"
           run-id: ${{ inputs.prepare_run_id }}
@@ -131,7 +136,7 @@ jobs:
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           name: pagedb ${{ needs.validate-version.outputs.version }}
