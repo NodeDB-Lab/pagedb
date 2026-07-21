@@ -79,19 +79,30 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         db.notify_writer_waiting();
         let visibility_guard = db.visibility_gate.write().await;
 
-        // Pages freed *within this txn* must not be recycled within it while a
-        // reader is pinned (they may still be live in a prior snapshot). The
-        // reuse threshold gates the per-txn freed list for that; the shared
-        // cache is gated separately (it holds only floor-safe pages — below).
+        // Pages freed *within this txn* must never be recycled within the same
+        // txn if they existed before it began: a copy-on-write free means the
+        // page is still referenced by the last durable header, and its bytes
+        // must stay intact on disk until the header that unreferences it is
+        // itself durable. Overwriting such a page and then crashing (or failing
+        // the commit after some pages flushed) leaves the durable header
+        // pointing at foreign content — detected only later as an AEAD/MAC
+        // failure on read, with the store unrecoverable.
+        //
+        // The threshold is therefore always `next_page_id` as of begin: only
+        // pages bump-allocated *by this txn* (id >= threshold, referenced by no
+        // header and no snapshot) are recyclable in-session. Pre-existing pages
+        // freed here become reusable on a later txn's begin, via the shared
+        // cache below, once the free-list naming them is durable and the
+        // reclamation floor clears them.
+        //
+        // (Previously this was 0 when no reader was tracked, which recycled
+        // durable-header-referenced pages in-session and silently corrupted the
+        // store under crash or commit-failure timing.)
         let min_reader = {
             let readers = db.tracked_readers.lock();
             readers.iter().map(|r| r.commit_id.0).min()
         };
-        let reuse_threshold = if min_reader.is_none() {
-            0
-        } else {
-            guard.next_page_id
-        };
+        let reuse_threshold = guard.next_page_id;
 
         // Load the durable free-list and rebuild the shared allocator cache with
         // exactly the pages below the reclamation floor — the older of the

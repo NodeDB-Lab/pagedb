@@ -50,6 +50,15 @@ impl<V: Vfs> BTree<V> {
                 };
                 self.write_internal(new_root_page, &internal).await?;
                 self.root_page_id = new_root_page;
+                // The tree grew a level: every cached dirty-leaf parent path
+                // still starts at the old root (or its split halves). Prepend
+                // the new root so flush's spine walk reaches it — otherwise
+                // the new root's child pointers are never rewritten when those
+                // halves are CoW'd at flush, leaving the durable root pointing
+                // at freed pages.
+                for path in self.dirty_parent_paths.values_mut() {
+                    path.insert(0, new_root_page);
+                }
                 return Ok(());
             }
 
@@ -77,12 +86,18 @@ impl<V: Vfs> BTree<V> {
                 self.free_page(internal_page);
                 // An internal page that other dirty leaves' parent paths
                 // reference has been replaced and freed; remap them. The
-                // split case promotes the old internal: keys ≤ promoted live
-                // on `new_internal_page`, the rest on `right_internal_page`.
-                // For path-remapping (used only to find ancestors to CoW)
-                // either replacement is acceptable, so substitute with the
-                // left replacement.
-                self.remap_dirty_parent_paths(internal_page, new_internal_page);
+                // split distributes the old internal's children across two
+                // pages, so each path must be remapped to the half that
+                // actually holds its next hop — substituting the wrong half
+                // means flush's spine walk never visits the true parent, its
+                // stale child pointer survives, and the durable tree ends up
+                // referencing a freed leaf page.
+                self.remap_dirty_parent_paths_split(
+                    internal_page,
+                    new_internal_page,
+                    right_internal_page,
+                    &right,
+                );
                 child_old = internal_page;
                 left_replacement = new_internal_page;
                 right_to_insert = right_internal_page;
@@ -122,8 +137,44 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
+    /// Substitute every occurrence of `old` in cached dirty-leaf parent paths
+    /// with whichever split half actually contains the path's next hop as a
+    /// child. Used after [`propagate_split_up`](Self::propagate_split_up)
+    /// splits an internal page that other dirty leaves' paths reference: the
+    /// old page's children are distributed across `left_new` and `right_new`,
+    /// and flush's spine walk only rewrites child pointers in internals the
+    /// paths name — so each path must name the half its leaf descends from.
+    /// The next hop is the path element after `old`, or the dirty leaf's own
+    /// `page_id` when `old` is the path's last element.
+    fn remap_dirty_parent_paths_split(
+        &mut self,
+        old: u64,
+        left_new: u64,
+        right_new: u64,
+        right: &Internal,
+    ) {
+        if self.dirty_parent_paths.is_empty() {
+            return;
+        }
+        let right_children: std::collections::HashSet<u64> = std::iter::once(right.leftmost_child)
+            .chain(right.entries.iter().map(|e| e.right_child))
+            .collect();
+        for (leaf_id, path) in &mut self.dirty_parent_paths {
+            for i in 0..path.len() {
+                if path[i] == old {
+                    let next_hop = path.get(i + 1).copied().unwrap_or(*leaf_id);
+                    path[i] = if right_children.contains(&next_hop) {
+                        right_new
+                    } else {
+                        left_new
+                    };
+                }
+            }
+        }
+    }
+
     /// Substitute every occurrence of `old` with `new` in cached dirty-leaf
-    /// parent paths. Used after a split or a spine `CoW` in
+    /// parent paths. Used after a spine `CoW` in
     /// [`propagate_split_up`](Self::propagate_split_up) replaces an internal
     /// page that other dirty leaves' paths reference.
     fn remap_dirty_parent_paths(&mut self, old: u64, new: u64) {
