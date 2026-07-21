@@ -1,0 +1,30 @@
+[package]
+name = "pagedb-engine-comparison"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Benchmark-only cross-engine comparison harness for PageDB"
+
+[dev-dependencies]
+fastrand = "2"
+fluxbench = "0.1"
+pagedb = { path = "../.." }
+redb = "2"
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[[bench]]
+name = "btree"
+path = "btree.rs"
+harness = false
+test = false
+
+[[bench]]
+name = "comparison"
+path = "comparison.rs"
+harness = false
+test = false

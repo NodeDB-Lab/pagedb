@@ -10,7 +10,7 @@
 //!   - individual writes / batch writes: per-txn latency, many samples
 //!   - random reads / range reads: per-op latency on a preloaded DB
 //!
-//! Run with: `cargo bench --bench comparison`
+//! Run with: `cargo bench -p pagedb-engine-comparison --bench comparison`
 
 #![allow(dead_code)] // verify/synthetic/compare placeholder structs
 

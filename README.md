@@ -57,13 +57,19 @@ pagedb's answer: **one substrate, two surfaces.** Engines that want their own fo
 
 ## Benchmarks
 
-Measured on native NVMe, AES-NI host, single thread, via [`fluxbench`](./benches). Reproduce with:
+Measured on native NVMe, AES-NI host, single thread, via `fluxbench`. Reproduce the
+PageDB-owned benches and the isolated cross-engine suite with:
 
 ```bash
-cargo bench --bench btree
-cargo bench --bench comparison
 cargo bench --bench segment
+cargo bench -p pagedb-engine-comparison --bench btree
+cargo bench -p pagedb-engine-comparison --bench comparison
 ```
+
+The comparison suite is a non-default workspace package under
+[`benchmarks/engine-comparison`](./benchmarks/engine-comparison). Normal
+`cargo test` and `cargo nextest` runs for the `pagedb` package therefore do not
+resolve or compile RocksDB, redb, or SQLite.
 
 ### vs. redb (B+ tree, in-process)
 
