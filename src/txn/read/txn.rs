@@ -153,9 +153,7 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
         }
         let tree = self.catalog_tree();
         let start = Catalog::segment_key(self.db.realm_id, prefix.as_bytes())?;
-        let mut end = start.clone();
-        end.push(0xFF);
-        let rows = tree.collect_range(&start, &end).await?;
+        let rows = tree.scan_prefix(&start).await?;
         let mut out = Vec::with_capacity(rows.len());
         for (_k, v) in rows {
             out.push(Catalog::decode_segment_meta(&v)?);

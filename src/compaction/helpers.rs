@@ -60,9 +60,7 @@ pub(super) async fn list_all_segments_inner<V: Vfs + Clone>(
         pager.page_size(),
     );
     let start = vec![CatalogRowKind::Segment as u8];
-    let mut end = start.clone();
-    end.push(0xFF);
-    let rows = tree.collect_range(&start, &end).await?;
+    let rows = tree.scan_prefix(&start).await?;
     let mut out = Vec::with_capacity(rows.len());
     for (_k, v) in rows {
         let meta = Catalog::decode_segment_meta(&v)?;
@@ -88,9 +86,7 @@ pub(super) async fn find_segment_name_inner<V: Vfs + Clone>(
         pager.page_size(),
     );
     let start = vec![CatalogRowKind::Segment as u8];
-    let mut end = start.clone();
-    end.push(0xFF);
-    let rows = tree.collect_range(&start, &end).await?;
+    let rows = tree.scan_prefix(&start).await?;
     for (k, v) in rows {
         let meta = Catalog::decode_segment_meta(&v)?;
         if meta.segment_id == *segment_id && k.len() > 17 {

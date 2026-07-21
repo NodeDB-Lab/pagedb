@@ -161,12 +161,7 @@ impl<V: Vfs + Clone> Db<V> {
             );
 
             let seg_start = vec![CatalogRowKind::Segment as u8];
-            let mut seg_end = seg_start.clone();
-            seg_end.push(0xFF);
-            let seg_rows = tree
-                .collect_range(&seg_start, &seg_end)
-                .await
-                .unwrap_or_default();
+            let seg_rows = tree.scan_prefix(&seg_start).await.unwrap_or_default();
             let seg_count = u32::try_from(seg_rows.len()).unwrap_or(u32::MAX);
             let seg_bytes: u64 = seg_rows
                 .iter()

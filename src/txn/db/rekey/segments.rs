@@ -348,9 +348,7 @@ impl<V: Vfs + Clone> Db<V> {
         }
         let tree = self.rekey_catalog_tree(state);
         let start = vec![CatalogRowKind::RekeySegmentProgress as u8];
-        let mut end = start.clone();
-        end.push(0xFF);
-        let rows = tree.collect_range(&start, &end).await?;
+        let rows = tree.scan_prefix(&start).await?;
         let mut out = BTreeMap::new();
         for (key, value) in rows {
             if key.len() != 17 {
@@ -371,9 +369,7 @@ impl<V: Vfs + Clone> Db<V> {
         }
         let tree = self.rekey_catalog_tree(state);
         let start = vec![CatalogRowKind::Segment as u8];
-        let mut end = start.clone();
-        end.push(0xFF);
-        tree.collect_range(&start, &end)
+        tree.scan_prefix(&start)
             .await?
             .into_iter()
             .map(|(key, value)| {

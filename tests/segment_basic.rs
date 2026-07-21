@@ -308,3 +308,41 @@ async fn read_txn_pins_catalog_snapshot() {
     let page = reader.read_page(1).await.unwrap();
     assert!(page.starts_with(b"v1"));
 }
+
+/// Catalog segment rows are keyed `[0x01, realm(16), name]`. A "kind-prefix"
+/// scan (start `[0x01]`, as used by the live-segment stats) that bounded its end
+/// with an appended `0xFF` byte stopped at `[0x01, 0xFF]` (exclusive) and thus
+/// dropped every row of a realm whose first byte is `0xFF`. The scan must bound
+/// by prefix (`scan_prefix`), not by an appended sentinel. The same boundary
+/// defect made rekey migration of a segment whose random `segment_id` began with
+/// `0xFF` fail with an unverifiable-header corruption.
+#[tokio::test(flavor = "current_thread")]
+async fn segments_under_high_byte_realm_are_listed_and_counted() {
+    let realm = RealmId::new([0xFF; 16]);
+    let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, realm)
+        .await
+        .unwrap();
+
+    let mut w = db
+        .create_segment(realm, SegmentKind::Unspecified)
+        .await
+        .unwrap();
+    w.append_page(SegmentPageKind::Data, b"high-realm")
+        .await
+        .unwrap();
+    let meta = w.seal().await.unwrap();
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("engine.idx", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let rx = db.begin_read().await.unwrap();
+    let listed = rx.list_segments("").await.unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "segment hidden from list_segments under 0xFF realm"
+    );
+    assert_eq!(db.stats().await.unwrap().segments_live, 1);
+}

@@ -323,9 +323,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         let mut prefix = Vec::with_capacity(17);
         prefix.push(0x01u8); // CatalogRowKind::Segment
         prefix.extend_from_slice(&realm.0);
-        let mut end = prefix.clone();
-        end.push(0xFF);
-        let rows = self.catalog_tree.collect_range(&prefix, &end).await?;
+        let rows = self.catalog_tree.scan_prefix(&prefix).await?;
         let mut committed: u64 = 0;
         for (_, v) in rows {
             let meta = Catalog::decode_segment_meta(&v)?;

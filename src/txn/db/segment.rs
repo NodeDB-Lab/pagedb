@@ -72,9 +72,7 @@ impl<V: Vfs + Clone> Db<V> {
             self.page_size,
         );
         let start = Catalog::segment_key(realm, prefix.as_bytes())?;
-        let mut end = start.clone();
-        end.push(0xFF);
-        let rows = tree.collect_range(&start, &end).await?;
+        let rows = tree.scan_prefix(&start).await?;
         let mut out = Vec::with_capacity(rows.len());
         for (_k, v) in rows {
             let meta = Catalog::decode_segment_meta(&v)?;
@@ -296,9 +294,7 @@ impl<V: Vfs + Clone> Db<V> {
             self.page_size,
         );
         let start = vec![CatalogRowKind::Segment as u8];
-        let mut end = start.clone();
-        end.push(0xFF);
-        let rows = tree.collect_range(&start, &end).await?;
+        let rows = tree.scan_prefix(&start).await?;
         let mut out = Vec::with_capacity(rows.len());
         for (_k, v) in rows {
             let meta = Catalog::decode_segment_meta(&v)?;
