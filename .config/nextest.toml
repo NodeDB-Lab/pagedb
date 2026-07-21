@@ -1,10 +1,49 @@
 [profile.default]
-# Serial group for crash / recovery tests (used by later slices).
+# Everything not pinned to a group below runs at full parallelism.
 test-threads = "num-cpus"
 
+# ── Invariant-critical, scheduling-sensitive suites run one at a time ─────────
+# These exercise multi-phase async flows where correctness depends on precise
+# task/commit ordering: rekey epoch transitions, crash/recovery replay, the
+# apply-journal, GC reader-pin drains, snapshot/compaction publication, and the
+# nonce/counter anchors. Under heavy CPU contention (a fully parallel CI runner)
+# their internal task scheduling shifts and latent ordering races surface as
+# false failures — e.g. a rekey aborting with an unverifiable-header corruption.
+# Pinning them to a single-threaded group removes that contention so a failure
+# here means a real invariant break, not a co-tenant starving the runtime.
 [[profile.default.overrides]]
-filter = "test(/crash/)"
+filter = """
+    binary(crash_basic)
+    | binary(recovery_basic)
+    | binary(rekey_basic)
+    | binary(fsck_deep)
+    | binary(durability)
+    | binary(snapshot_basic)
+    | binary(compaction_basic)
+    | binary(compaction_incremental)
+    | binary(deferred_free_reclaim)
+    | binary(reader_stall_policy)
+    | (binary(pagedb) & (
+        test(/crash/) | test(/recover/) | test(/rekey/)
+        | test(/anchor/) | test(/torn/) | test(/journal/) | test(/replay/)
+    ))
+"""
 test-group = "serial"
+
+# ── Heavy real-disk suites throttled to avoid I/O oversubscription ───────────
+# io_uring / tokio-fs VFS coverage and the randomized structural-stress reopen
+# cycles do real fsync/rename traffic and each run for tens of seconds. They are
+# independent (own temp dirs), so they need not be single-file, but letting the
+# whole fleet hit the disk at once inflates latency and can trip timing-based
+# assertions. A small cap keeps them overlapping without saturating the device.
+[[profile.default.overrides]]
+filter = """
+    binary(vfs_iouring)
+    | binary(vfs_tokio)
+    | binary(structural_repro)
+"""
+test-group = "disk-heavy"
 
 [test-groups]
 serial = { max-threads = 1 }
+disk-heavy = { max-threads = 2 }
