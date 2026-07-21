@@ -174,6 +174,14 @@ pub fn decode_record(buf: &[u8]) -> Result<ApplyJournalRecord> {
     let action_count = u32::from_le_bytes(b4) as usize;
     off += 4;
 
+    // Every action consumes at least one kind byte plus a 16-byte segment id.
+    // Reject hostile counts before they can drive a giant allocation.
+    if action_count > buf.len().saturating_sub(off) / 17 {
+        return Err(PagedbError::corruption(
+            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        ));
+    }
+
     let mut actions = Vec::with_capacity(action_count);
     for _ in 0..action_count {
         if off >= buf.len() {
@@ -213,6 +221,12 @@ pub fn decode_record(buf: &[u8]) -> Result<ApplyJournalRecord> {
                 ));
             }
         }
+    }
+
+    if off != buf.len() {
+        return Err(PagedbError::corruption(
+            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        ));
     }
 
     Ok(ApplyJournalRecord {
@@ -399,6 +413,25 @@ mod tests {
         assert_eq!(pages.len(), 1);
         let decoded = decode_journal_stream(&pages[0]).unwrap();
         assert_eq!(decoded.actions.len(), 1);
+    }
+
+    #[test]
+    fn decode_record_rejects_trailing_bytes_inside_record() {
+        let mut record = encode_record(&promotes(1));
+        record.push(0xAA);
+
+        let err = decode_record(&record).expect_err("trailing record bytes must be corruption");
+        assert!(matches!(err, PagedbError::Corruption(_)));
+    }
+
+    #[test]
+    fn decode_record_rejects_impossible_action_count_before_allocation() {
+        let mut record = Vec::new();
+        record.extend_from_slice(&42u64.to_le_bytes());
+        record.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let err = decode_record(&record).expect_err("impossible action count must be corruption");
+        assert!(matches!(err, PagedbError::Corruption(_)));
     }
 
     async fn mk_pager() -> crate::pager::Pager<crate::vfs::memory::MemVfs> {
