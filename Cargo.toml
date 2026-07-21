@@ -1,7 +1,7 @@
 [workspace]
 members = ["benchmarks/engine-comparison"]
 default-members = ["."]
-resolver = "2"
+resolver = "3"
 
 [package]
 name = "pagedb"

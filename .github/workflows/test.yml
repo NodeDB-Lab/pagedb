@@ -55,11 +55,13 @@ jobs:
 
       - name: Keep external engines out of the PageDB package
         run: |
-          if cargo tree -p pagedb --edges normal,build,dev --prefix none |
-            rg -q '^(librocksdb-sys|libsqlite3-sys|redb|rocksdb|rusqlite) v'; then
-            echo "::error::External comparison engine leaked into the pagedb dependency graph."
-            exit 1
-          fi
+          for features in "" "--all-features"; do
+            if cargo tree -p pagedb $features --edges normal,build,dev --prefix none |
+              rg -q '^(librocksdb-sys|libsqlite3-sys|redb|rocksdb|rusqlite) v'; then
+              echo "::error::External comparison engine leaked into the pagedb dependency graph (${features:-default features})."
+              exit 1
+            fi
+          done
 
       - name: Clippy (all targets, all features)
         run: cargo clippy -p pagedb --all-targets --all-features -- -D warnings
