@@ -46,11 +46,6 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # The comparison benchmark links rocksdb (librocksdb-sys), whose build
-      # runs bindgen and needs libclang. clippy --all-targets compiles it.
-      - name: Install LLVM/Clang
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: lint
@@ -58,14 +53,22 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Keep external engines out of the PageDB package
+        run: |
+          if cargo tree -p pagedb --edges normal,build,dev --prefix none |
+            rg -q '^(librocksdb-sys|libsqlite3-sys|redb|rocksdb|rusqlite) v'; then
+            echo "::error::External comparison engine leaked into the pagedb dependency graph."
+            exit 1
+          fi
+
       - name: Clippy (all targets, all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy -p pagedb --all-targets --all-features -- -D warnings
 
       - name: Build docs
-        run: cargo doc --no-deps --all-features
+        run: cargo doc -p pagedb --no-deps --all-features
 
       - name: Run doctests
-        run: cargo test --doc --all-features
+        run: cargo test -p pagedb --doc --all-features
 
       # Enforces the rule in CLAUDE.md: no checklist-letter or build-order
       # scaffolding may leak into source / Cargo.toml / README. Greps for
@@ -95,19 +98,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # nextest compiles the dev-dependency graph (incl. rocksdb →
-      # librocksdb-sys → bindgen → libclang). Windows runner images ship LLVM;
-      # Linux and macOS need it installed.
-      - name: Install LLVM/Clang (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-
-      - name: Install LLVM/Clang (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install llvm
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
-
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: test-${{ matrix.os }}
@@ -120,7 +110,7 @@ jobs:
       # Always nextest — crash-recovery tests rely on the serial group in
       # .config/nextest.toml that `cargo test` ignores.
       - name: Run tests
-        run: cargo nextest run --all-features --no-fail-fast
+        run: cargo nextest run -p pagedb --all-features --no-fail-fast
 
       - name: Upload nextest report
         if: always()
@@ -167,7 +157,7 @@ jobs:
           prefix-key: cross-${{ matrix.target }}
 
       - name: cargo check --lib
-        run: cargo check --target ${{ matrix.target }} --lib
+        run: cargo check -p pagedb --target ${{ matrix.target }} --lib
 
   # ─────────────────────────────────────────────────────────────────────────
   wasm:
@@ -196,7 +186,7 @@ jobs:
           prefix-key: wasm-${{ matrix.target }}
 
       - name: cargo check --lib
-        run: cargo check --target ${{ matrix.target }} --lib ${{ matrix.features }}
+        run: cargo check -p pagedb --target ${{ matrix.target }} --lib ${{ matrix.features }}
 
   # ─────────────────────────────────────────────────────────────────────────
   features:
@@ -216,17 +206,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # --benches compiles the comparison bench, which links rocksdb
-      # (librocksdb-sys) — its build runs bindgen and needs libclang.
-      - name: Install LLVM/Clang
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: features
 
       - name: cargo check
-        run: cargo check --lib --bins --tests --benches ${{ matrix.flags }}
+        run: cargo check -p pagedb --lib --bins --tests --benches ${{ matrix.flags }}
 
   # ─────────────────────────────────────────────────────────────────────────
   bench:
@@ -238,8 +223,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # cargo bench builds the dev-dependency graph (rocksdb → librocksdb-sys →
-      # bindgen → libclang), even when only the btree/segment benches are named.
+      # The isolated comparison package links RocksDB (librocksdb-sys), whose
+      # build runs bindgen and needs libclang.
       - name: Install LLVM/Clang
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
@@ -251,7 +236,9 @@ jobs:
       # dispatched workflow so we don't pay the runtime on every PR. This
       # job catches "the bench no longer compiles" regressions.
       - name: Build benches
-        run: cargo bench --no-run --bench btree --bench segment
+        run: |
+          cargo bench --no-run -p pagedb --bench segment
+          cargo bench --no-run -p pagedb-engine-comparison --bench btree --bench comparison
 
   # ─────────────────────────────────────────────────────────────────────────
   audit:

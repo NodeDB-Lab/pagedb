@@ -9,7 +9,7 @@
 //! of the threat model; comparing redb vs `pagedb-plain` isolates the
 //! structural cost (CoW shadow paging, AAD, MAC-only, durable reader pins).
 //!
-//! Run with: `cargo bench --bench btree`
+//! Run with: `cargo bench -p pagedb-engine-comparison --bench btree`
 
 #![allow(dead_code)] // verify/synthetic/compare placeholder structs
 

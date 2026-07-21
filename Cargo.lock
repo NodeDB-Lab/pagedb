@@ -1179,7 +1179,6 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "dispatch2",
- "fastrand",
  "fluxbench",
  "futures",
  "getrandom 0.2.17",
@@ -1192,9 +1191,6 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "rayon",
- "redb",
- "rocksdb",
- "rusqlite",
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
@@ -1210,6 +1206,20 @@ dependencies = [
  "web-sys",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "pagedb-engine-comparison"
+version = "0.0.0"
+dependencies = [
+ "fastrand",
+ "fluxbench",
+ "pagedb",
+ "redb",
+ "rocksdb",
+ "rusqlite",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

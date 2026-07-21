@@ -1,3 +1,8 @@
+[workspace]
+members = ["benchmarks/engine-comparison"]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "pagedb"
 version = "0.1.0"
@@ -118,34 +123,19 @@ tokio = { version = "1", features = [
     "test-util",
 ] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-redb = "2"
 tempfile = "3"
 aes-gcm = "0.10"
 fluxbench = "0.1"
-rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
-fastrand = "2"
 
 [[bin]]
 name = "pagedb-fsck"
 path = "src/bin/pagedb-fsck.rs"
 
-# `test = false`: these are benchmarks, not tests. Without it, `cargo test`
-# (and nextest) compile every `harness = false` bench and run its `main` as a
-# test — pulling heavy dev-deps (rocksdb → libclang) into the test build on
-# every platform and executing benchmarks during the test run.
-[[bench]]
-name = "btree"
-harness = false
-test = false
-
+# These are executable benchmarks, not test harnesses. The cross-engine suite
+# is a separate non-default workspace package so normal PageDB tests never
+# resolve its RocksDB, redb, or SQLite dependencies.
 [[bench]]
 name = "segment"
-harness = false
-test = false
-
-[[bench]]
-name = "comparison"
 harness = false
 test = false
 
