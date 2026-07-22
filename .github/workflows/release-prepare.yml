@@ -61,7 +61,9 @@ jobs:
             target: aarch64-apple-darwin
             label: macos-arm64
             ext: ""
-          - runs-on: macos-13
+          # x86_64-apple-darwin cross-compiles on Apple Silicon; the Intel
+          # macos-13 image was retired, so build it on the arm64 runner.
+          - runs-on: macos-latest
             target: x86_64-apple-darwin
             label: macos-x64
             ext: ""
