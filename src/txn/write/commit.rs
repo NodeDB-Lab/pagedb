@@ -122,11 +122,27 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .collect();
 
         // Assemble the new free-list: prior-free pages (kept with their original
-        // freeing-commit tag) plus this commit's frees and the now-superseded
-        // old chain pages, both tagged with this commit.
+        // freeing-commit tag) plus this commit's data-page frees, tagged with
+        // this commit so the reclamation floor gates them behind any reader that
+        // still sees them.
         let mut entries: Vec<(u64, u64)> = prior_free;
         entries.extend(all_freed.iter().map(|&pid| (new_commit_id, pid)));
-        entries.extend(old_chain.iter().map(|&pid| (new_commit_id, pid)));
+
+        // The superseded old-chain pages are writer-only metadata — NO reader
+        // snapshot ever traverses the free-list — so, unlike data-page frees,
+        // they must not be floor-gated by pinned readers. Tag them with the
+        // sentinel commit `0`, which is below every real reclamation floor (real
+        // commit ids start at 1), so the next commit can recycle them regardless
+        // of any long-lived reader. This is crash-safe: the in-session reuse
+        // threshold (`next_page_id` at begin) already prevents reusing them
+        // before this commit's header — the one that supersedes them — is
+        // durable. Without this, a pinned reader keeps the old-chain pages
+        // un-reclaimable, they re-enter the chain as free entries, and the chain
+        // grows by its own size every commit — a feedback loop that eventually
+        // makes one commit exceed the per-commit nonce budget and wedges the
+        // store (and, short of that, is severe write amplification).
+        const CHAIN_METADATA_CID: u64 = 0;
+        entries.extend(old_chain.iter().map(|&pid| (CHAIN_METADATA_CID, pid)));
 
         // The reader-stall policy fires only on entries genuinely stuck behind
         // a pin — those at/above the reclamation floor. Drainable entries (below
