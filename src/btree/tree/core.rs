@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::errors::PagedbError;
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::{PageGuard, Pager};
 use crate::vfs::Vfs;
@@ -208,31 +207,15 @@ impl<V: Vfs> BTree<V> {
         Ok(kind)
     }
 
-    /// Read a B+ tree node page without knowing its kind in advance. Tries
-    /// the Leaf AAD first; on AEAD mismatch (= page is actually Internal)
-    /// retries with the Internal AAD. Returns the pinned page guard and the
-    /// decoded kind so the caller can build the matching accessor on
-    /// borrowed bytes without a second cache lookup.
+    /// Read a B+ tree node page without knowing its kind in advance. The pager
+    /// authenticates under the page's own header kind byte, so leaf and internal
+    /// nodes are each read correctly in a single pass. Returns the pinned page
+    /// guard and the decoded kind so the caller can build the matching accessor
+    /// on borrowed bytes without a second cache lookup.
     pub(crate) async fn read_node_guard(&self, page_id: u64) -> Result<(PageGuard, NodeKind)> {
-        match self
-            .pager
-            .read_main_page(page_id, self.realm_id, PageKind::BTreeLeaf)
-            .await
-        {
-            Ok(g) => {
-                let kind = read_header(g.body_ref())?.kind;
-                Ok((g, kind))
-            }
-            Err(PagedbError::ChecksumFailure) => {
-                let g = self
-                    .pager
-                    .read_main_page(page_id, self.realm_id, PageKind::BTreeInternal)
-                    .await?;
-                let kind = read_header(g.body_ref())?.kind;
-                Ok((g, kind))
-            }
-            Err(e) => Err(e),
-        }
+        let (g, _page_kind) = self.pager.read_main_node(page_id, self.realm_id).await?;
+        let kind = read_header(g.body_ref())?.kind;
+        Ok((g, kind))
     }
 
     pub(super) async fn read_leaf(&self, page_id: u64) -> Result<Leaf> {

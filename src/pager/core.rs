@@ -17,7 +17,8 @@ use crate::crypto::{Aad, CipherId, Nonce};
 use crate::errors::PagedbError;
 use crate::pager::cache::{Page, PageCache};
 use crate::pager::format::data_page::{
-    ENVELOPE_OVERHEAD, HEADER_LEN, body, extract_page_header_ids, open_data_page, seal_data_page,
+    ENVELOPE_OVERHEAD, HEADER_LEN, body, extract_page_header_ids, extract_page_kind,
+    open_data_page, seal_data_page,
 };
 use crate::pager::format::page_kind::PageKind;
 use crate::txn::db::rekey::EpochKeyring;
@@ -180,6 +181,48 @@ pub struct Pager<V: Vfs> {
     observer_retry_count: u32,
 }
 
+/// How a read resolves the `page_kind` used to build the AAD.
+#[derive(Debug, Clone, Copy)]
+enum KindBinding {
+    /// The caller knows the kind; authenticate strictly under it. A page whose
+    /// header kind byte differs is a misroute / structural damage.
+    Fixed(PageKind),
+    /// The kind is not known in advance (B+ tree navigation): trust the page's
+    /// own authenticated header kind byte, restricted to the two node kinds.
+    Node,
+}
+
+impl KindBinding {
+    /// Resolve the kind for a warm cache hit, given the cached page's kind byte.
+    fn resolve_cached(self, cached_kind_byte: u8) -> Result<PageKind> {
+        match self {
+            Self::Fixed(k) => {
+                if cached_kind_byte != 0 && cached_kind_byte != k.as_byte() {
+                    return Err(PagedbError::ChecksumFailure);
+                }
+                Ok(k)
+            }
+            Self::Node => match PageKind::from_byte(cached_kind_byte) {
+                Ok(k @ (PageKind::BTreeLeaf | PageKind::BTreeInternal)) => Ok(k),
+                _ => Err(PagedbError::ChecksumFailure),
+            },
+        }
+    }
+
+    /// Resolve the kind to authenticate under on a cold read, from the on-disk
+    /// page header. For `Node`, the header kind byte selects a leaf or internal
+    /// node; anything else means the pointer led to a non-node page.
+    fn resolve_on_disk(self, page_buf: &[u8]) -> Result<PageKind> {
+        match self {
+            Self::Fixed(k) => Ok(k),
+            Self::Node => match extract_page_kind(page_buf) {
+                Ok(k @ (PageKind::BTreeLeaf | PageKind::BTreeInternal)) => Ok(k),
+                _ => Err(PagedbError::ChecksumFailure),
+            },
+        }
+    }
+}
+
 impl<V: Vfs> Pager<V> {
     pub(crate) fn page_size(&self) -> usize {
         self.cfg.page_size
@@ -303,11 +346,36 @@ impl<V: Vfs> Pager<V> {
             return Err(PagedbError::IllegalPageKind);
         }
         tracing::trace!(name = "pager.read_page", page_id, "reading main db page");
+        let (guard, _kind) = self
+            .read_page(
+                FileKey::Main,
+                page_id,
+                realm_id,
+                KindBinding::Fixed(expected_kind),
+                MAIN_DB_SEGMENT_ID,
+            )
+            .await?;
+        Ok(guard)
+    }
+
+    /// Read a main.db B+ tree node whose kind (leaf vs internal) is not known in
+    /// advance, returning the pinned guard and the decoded kind. The page's own
+    /// authenticated header kind byte selects the AAD, so a single read+decrypt
+    /// suffices — unlike probing one kind, catching the `ChecksumFailure`, and
+    /// retrying the other, which reads and AEAD-checks twice and logs the first
+    /// (expected) miss as an error. A page that is neither a leaf nor an
+    /// internal node (a misrouted pointer, or one that fails to authenticate
+    /// under its own declared kind) surfaces as `ChecksumFailure`.
+    pub async fn read_main_node(
+        &self,
+        page_id: u64,
+        realm_id: RealmId,
+    ) -> Result<(PageGuard, PageKind)> {
         self.read_page(
             FileKey::Main,
             page_id,
             realm_id,
-            expected_kind,
+            KindBinding::Node,
             MAIN_DB_SEGMENT_ID,
         )
         .await
@@ -324,14 +392,16 @@ impl<V: Vfs> Pager<V> {
         if !expected_kind.is_segment() {
             return Err(PagedbError::IllegalPageKind);
         }
-        self.read_page(
-            FileKey::Segment(segment_id),
-            page_id,
-            realm_id,
-            expected_kind,
-            segment_id,
-        )
-        .await
+        let (guard, _kind) = self
+            .read_page(
+                FileKey::Segment(segment_id),
+                page_id,
+                realm_id,
+                KindBinding::Fixed(expected_kind),
+                segment_id,
+            )
+            .await?;
+        Ok(guard)
     }
 
     /// Write (insert into cache as dirty) a main.db page. The copy-on-write caller has
@@ -435,14 +505,16 @@ impl<V: Vfs> Pager<V> {
         page_id: u64,
         realm_id: RealmId,
     ) -> Result<PageGuard> {
-        self.read_page(
-            FileKey::ApplyJournal(journal_id),
-            page_id,
-            realm_id,
-            PageKind::ApplyJournal,
-            journal_id,
-        )
-        .await
+        let (guard, _kind) = self
+            .read_page(
+                FileKey::ApplyJournal(journal_id),
+                page_id,
+                realm_id,
+                KindBinding::Fixed(PageKind::ApplyJournal),
+                journal_id,
+            )
+            .await?;
+        Ok(guard)
     }
 
     /// Remove an apply-journal sidecar file and drop all its in-memory state
@@ -610,9 +682,9 @@ impl<V: Vfs> Pager<V> {
         file: FileKey,
         page_id: u64,
         realm_id: RealmId,
-        expected_kind: PageKind,
+        binding: KindBinding,
         segment_id: [u8; 16],
-    ) -> Result<PageGuard> {
+    ) -> Result<(PageGuard, PageKind)> {
         // Cache fast-path: verify realm matches to prevent cross-realm hits.
         {
             let mut cache = self.inner.cache_for_key(file).lock();
@@ -620,21 +692,25 @@ impl<V: Vfs> Pager<V> {
                 if page.realm_id_bytes != Some(realm_id.0) {
                     return Err(PagedbError::ChecksumFailure);
                 }
-                // Enforce the same kind binding a cold read's AAD enforces.
-                // Without this, a stale pointer reading a recycled page under
-                // the wrong kind succeeds while the page is warm and only
-                // starts failing after eviction — hiding structural damage
-                // until long after the write that caused it.
-                if page.kind_byte != 0 && page.kind_byte != expected_kind.as_byte() {
-                    return Err(PagedbError::ChecksumFailure);
-                }
+                // Resolve the page kind under the caller's binding. A `Fixed`
+                // binding enforces the same kind check a cold read's AAD does:
+                // without it, a stale pointer reading a recycled page under the
+                // wrong kind succeeds while the page is warm and only starts
+                // failing after eviction — hiding structural damage until long
+                // after the write that caused it. A `Node` binding instead
+                // trusts the page's own (authenticated) kind byte and returns
+                // it, restricted to the two B+ tree node kinds.
+                let kind = binding.resolve_cached(page.kind_byte)?;
                 self.inner.record_hit(file);
                 cache.pin((file, page_id));
-                return Ok(PageGuard {
-                    page,
-                    key: (file, page_id),
-                    inner: self.inner.clone(),
-                });
+                return Ok((
+                    PageGuard {
+                        page,
+                        key: (file, page_id),
+                        inner: self.inner.clone(),
+                    },
+                    kind,
+                ));
             }
         }
 
@@ -687,9 +763,19 @@ impl<V: Vfs> Pager<V> {
                 }
             };
 
+            // Resolve the kind to authenticate under. `Fixed` uses the caller's
+            // kind (a mismatch with the on-disk byte is a misroute detected by
+            // the AAD). `Node` reads the page's own kind byte and authenticates
+            // under it, so a leaf and an internal node are each read correctly
+            // in one pass; a byte that is neither node kind means the pointer
+            // led somewhere structurally wrong and is surfaced immediately.
+            let auth_kind = match binding.resolve_on_disk(&buf) {
+                Ok(k) => k,
+                Err(e) => return Err(e),
+            };
             let aad = Aad::from_fields(AadFields {
                 cipher_id: on_disk_cipher_id.as_byte(),
-                page_kind: expected_kind.as_byte(),
+                page_kind: auth_kind.as_byte(),
                 mk_epoch: on_disk_epoch,
                 page_id,
                 realm_id,
@@ -708,19 +794,18 @@ impl<V: Vfs> Pager<V> {
             };
             match decrypt_result {
                 Ok(_header) => {
-                    let page = Arc::new(Page::new_with_meta(
-                        buf,
-                        expected_kind.as_byte(),
-                        realm_id.0,
-                    ));
+                    let page = Arc::new(Page::new_with_meta(buf, auth_kind.as_byte(), realm_id.0));
                     let mut cache = self.inner.cache_for_key(file).lock();
                     let _ = cache.insert((file, page_id), page.clone());
                     cache.pin((file, page_id));
-                    return Ok(PageGuard {
-                        page,
-                        key: (file, page_id),
-                        inner: self.inner.clone(),
-                    });
+                    return Ok((
+                        PageGuard {
+                            page,
+                            key: (file, page_id),
+                            inner: self.inner.clone(),
+                        },
+                        auth_kind,
+                    ));
                 }
                 Err(e @ PagedbError::ChecksumFailure) => {
                     last_err = Some(e);
@@ -732,7 +817,7 @@ impl<V: Vfs> Pager<V> {
         tracing::error!(
             page_id,
             ?file,
-            expected_kind = ?expected_kind,
+            binding = ?binding,
             realm = ?realm_id.0,
             "page AEAD/MAC verification failed on read"
         );

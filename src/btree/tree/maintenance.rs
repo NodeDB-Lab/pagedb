@@ -26,30 +26,13 @@ impl<V: Vfs> BTree<V> {
         let mut stack: Vec<u64> = vec![self.root_page_id];
         let mut count: u64 = 0;
         while let Some(page_id) = stack.pop() {
-            // Determine kind by reading node header via epoch-routed path.
-            // Try leaf page kind first; on AAD mismatch try internal.
+            // Determine kind by reading the node under its own header kind byte.
             let (is_leaf, body_bytes) = {
-                match self
-                    .pager
-                    .read_main_page(page_id, self.realm_id, PageKind::BTreeLeaf)
-                    .await
-                {
-                    Ok(g) => {
-                        let body = g.body();
-                        let header = read_header(&body)?;
-                        let is_leaf = header.kind == NodeKind::Leaf;
-                        (is_leaf, body.to_vec())
-                    }
-                    Err(PagedbError::ChecksumFailure) => {
-                        let g = self
-                            .pager
-                            .read_main_page(page_id, self.realm_id, PageKind::BTreeInternal)
-                            .await?;
-                        let body = g.body();
-                        (false, body.to_vec())
-                    }
-                    Err(e) => return Err(e),
-                }
+                let (g, _page_kind) = self.pager.read_main_node(page_id, self.realm_id).await?;
+                let body = g.body();
+                let header = read_header(&body)?;
+                let is_leaf = header.kind == NodeKind::Leaf;
+                (is_leaf, body.to_vec())
             };
 
             if is_leaf {
@@ -139,28 +122,14 @@ impl<V: Vfs> BTree<V> {
                 continue;
             }
             let (is_leaf, body_bytes) = {
-                match self
-                    .pager
-                    .read_main_page(page_id, self.realm_id, PageKind::BTreeLeaf)
-                    .await
-                {
-                    Ok(g) => {
+                match self.pager.read_main_node(page_id, self.realm_id).await {
+                    Ok((g, _page_kind)) => {
                         let body = g.body();
                         let header = read_header(&body)?;
                         let is_leaf = header.kind == NodeKind::Leaf;
                         (is_leaf, body.to_vec())
                     }
-                    Err(PagedbError::ChecksumFailure) => {
-                        match self
-                            .pager
-                            .read_main_page(page_id, self.realm_id, PageKind::BTreeInternal)
-                            .await
-                        {
-                            Ok(g) => (false, g.body().to_vec()),
-                            Err(_) => continue, // unreadable — best effort
-                        }
-                    }
-                    Err(_) => continue,
+                    Err(_) => continue, // unreadable — best effort
                 }
             };
 

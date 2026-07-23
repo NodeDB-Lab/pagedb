@@ -104,6 +104,18 @@ pub fn extract_page_header_ids(page_buf: &[u8]) -> Result<(CipherId, u64)> {
     Ok((cipher_id, mk_epoch))
 }
 
+/// Extract the on-disk `page_kind` byte from a page header without decrypting.
+/// The kind byte is plaintext header metadata (bound into the AEAD AAD), so a
+/// tampered byte still fails authentication in [`open_data_page`]; peeking it is
+/// safe and lets a kind-agnostic reader (B+ tree navigation) pick the AAD kind
+/// from the page itself instead of authenticating twice to discover the kind.
+pub fn extract_page_kind(page_buf: &[u8]) -> Result<PageKind> {
+    if page_buf.len() <= OFF_PAGE_KIND {
+        return Err(PagedbError::PayloadTooLarge);
+    }
+    PageKind::from_byte(page_buf[OFF_PAGE_KIND])
+}
+
 /// Open a data page in place. On success, returns the parsed header and the
 /// body slot of `page_buf` holds the decrypted plaintext. On failure
 /// (`ChecksumFailure`), the body slot is in an unspecified state and the
