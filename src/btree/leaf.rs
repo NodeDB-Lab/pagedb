@@ -159,6 +159,11 @@ impl Leaf {
                     total_len,
                     root_page_id,
                 } => {
+                    assert!(
+                        *root_page_id >= 4,
+                        "encoding leaf record with wild overflow root_page_id={root_page_id} \
+                         (reserved page — use-after-free / stale value)"
+                    );
                     write_u16_le(body, after_key, OVERFLOW_SENTINEL);
                     write_u64_le(body, after_key + 2, *total_len);
                     write_u64_le(body, after_key + 2 + 8, *root_page_id);

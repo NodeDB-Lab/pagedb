@@ -160,20 +160,18 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .count() as u64;
         self.db.evaluate_stall_policy(stuck)?;
 
-        // Debug invariant (opt-in via `PAGEDB_INVARIANT_CHECKS`): capture every
-        // page this commit places on the free-list. After the roots are
-        // published we verify none of them is still reachable from the new tree
-        // — i.e. no live page was freed. Catches the use-after-free at the exact
-        // commit that introduces it, while the freed page is still a valid node
-        // on disk (before any later commit recycles it).
-        // Debug/test builds only (`cfg!(debug_assertions)` short-circuits the
-        // env lookup in release, so release commits pay nothing).
-        let invariant_freed: Option<Vec<u64>> =
-            if cfg!(debug_assertions) && std::env::var("PAGEDB_INVARIANT_CHECKS").is_ok() {
-                Some(entries.iter().map(|(_, pid)| *pid).collect())
-            } else {
-                None
-            };
+        // Structural invariant (opt-in via the `PAGEDB_INVARIANT_CHECKS` env
+        // var — off by default, so normal commits pay nothing). Captures every
+        // page this commit places on the free-list; after the roots are
+        // published, a strict structural walk (`find_dangling`) plus this
+        // freed-set check verify no live page was freed / left referenced —
+        // pinpointing a use-after-free at the exact commit that introduces it.
+        let invariant_freed: Option<Vec<u64>> = if std::env::var("PAGEDB_INVARIANT_CHECKS").is_ok()
+        {
+            Some(entries.iter().map(|(_, pid)| *pid).collect())
+        } else {
+            None
+        };
 
         // Rewrite the chain, hosting it on the floor-safe pages (the cache
         // remainder) and bump-allocating only if those run out.
@@ -261,7 +259,10 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             use crate::btree::BTree;
             let freed_set: std::collections::HashSet<u64> = freed.into_iter().collect();
             let mut reachable = std::collections::BTreeSet::new();
-            for root in [new_root, new_catalog_root].into_iter().filter(|&r| r != 0) {
+            for (label, root) in [("data", new_root), ("catalog", new_catalog_root)] {
+                if root == 0 {
+                    continue;
+                }
                 let tree = BTree::open(
                     self.db.pager.clone(),
                     self.db.realm_id,
@@ -269,6 +270,16 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
                     new_next,
                     self.db.page_size,
                 );
+                // Strict structural check: pinpoint the FIRST dangling pointer
+                // (freed/reused page still referenced) at the exact commit that
+                // introduces it — catches lost-reparent use-after-frees the
+                // freed-set check below misses (page freed in a PRIOR commit).
+                if let Some(desc) = tree.find_dangling().await {
+                    panic!(
+                        "PAGEDB INVARIANT VIOLATED: commit {new_commit_id} \
+                         {label}_root={root}: {desc}"
+                    );
+                }
                 let _ = tree.collect_all_page_ids(&mut reachable).await;
             }
             for pid in reachable {
