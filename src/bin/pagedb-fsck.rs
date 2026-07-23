@@ -7,6 +7,8 @@
 use std::process::ExitCode;
 
 #[cfg(not(target_arch = "wasm32"))]
+use pagedb::options::{OpenOptions, RetainPolicy};
+#[cfg(not(target_arch = "wasm32"))]
 use pagedb::vfs::tokio_backend::TokioVfs;
 #[cfg(not(target_arch = "wasm32"))]
 use pagedb::{Db, RealmId, run_deep_walk};
@@ -21,8 +23,9 @@ fn main() {
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: pagedb-fsck <path> [--deep] [<hex-kek>]");
-        eprintln!("(KEK may also be set via PAGEDB_KEK env var; defaults to zeros)");
+        eprintln!("usage: pagedb-fsck <path> [--deep] [--realm <hex16>] [<hex-kek>]");
+        eprintln!("(KEK may also be set via PAGEDB_KEK env var; defaults to zeros.");
+        eprintln!(" --realm defaults to all-ones; nodedb-lite stores use all-zeros.)");
         return ExitCode::from(2);
     }
     let path = &args[1];
@@ -30,9 +33,13 @@ async fn main() -> ExitCode {
     // Parse optional flags and positional KEK.
     let mut deep = false;
     let mut kek_hex: Option<String> = None;
-    for arg in args.iter().skip(2) {
+    let mut realm_hex: Option<String> = None;
+    let mut it = args.iter().skip(2);
+    while let Some(arg) = it.next() {
         if arg == "--deep" {
             deep = true;
+        } else if arg == "--realm" {
+            realm_hex = it.next().cloned();
         } else if kek_hex.is_none() {
             kek_hex = Some(arg.clone());
         }
@@ -52,10 +59,23 @@ async fn main() -> ExitCode {
         None => [0u8; 32],
     };
 
-    let vfs = TokioVfs::new(path);
-    let realm = RealmId::new([1; 16]);
+    let realm = match realm_hex {
+        Some(s) => match pagedb::hex::parse_hex::<16>(&s) {
+            Some(r) => RealmId::new(r),
+            None => {
+                eprintln!("invalid hex realm (must be 32 hex chars / 16 bytes)");
+                return ExitCode::from(2);
+            }
+        },
+        None => RealmId::new([1; 16]),
+    };
 
-    let db = match Db::open_existing(vfs, kek, 4096, realm).await {
+    let vfs = TokioVfs::new(path);
+
+    // Read-only: a checker must never mutate the store it inspects. Match
+    // nodedb-lite's open options (commit history disabled) so lite stores open.
+    let opts = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    let db = match Db::open_read_only(vfs, kek, 4096, realm, opts).await {
         Ok(db) => db,
         Err(e) => {
             eprintln!("pagedb-fsck: error opening directory: {e}");
