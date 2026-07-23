@@ -160,6 +160,21 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .count() as u64;
         self.db.evaluate_stall_policy(stuck)?;
 
+        // Debug invariant (opt-in via `PAGEDB_INVARIANT_CHECKS`): capture every
+        // page this commit places on the free-list. After the roots are
+        // published we verify none of them is still reachable from the new tree
+        // — i.e. no live page was freed. Catches the use-after-free at the exact
+        // commit that introduces it, while the freed page is still a valid node
+        // on disk (before any later commit recycles it).
+        // Debug/test builds only (`cfg!(debug_assertions)` short-circuits the
+        // env lookup in release, so release commits pay nothing).
+        let invariant_freed: Option<Vec<u64>> =
+            if cfg!(debug_assertions) && std::env::var("PAGEDB_INVARIANT_CHECKS").is_ok() {
+                Some(entries.iter().map(|(_, pid)| *pid).collect())
+            } else {
+                None
+            };
+
         // Rewrite the chain, hosting it on the floor-safe pages (the cache
         // remainder) and bump-allocating only if those run out.
         let (new_free_list_root, new_next_page) = freelist::rewrite_chain(
@@ -237,6 +252,34 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // commit_history_root_page_id and commit_history_root_version are
         // already updated inside write_commit_history_entry.
         self.committed_or_aborted = true;
+
+        // Debug invariant: no page just freed may still be reachable from the
+        // freshly-published tree. A violation is a use-after-free (a live page
+        // freed / a parent pointer not reparented) — panic loudly at the source
+        // commit so the daemon workload pinpoints the buggy path.
+        if let Some(freed) = invariant_freed {
+            use crate::btree::BTree;
+            let freed_set: std::collections::HashSet<u64> = freed.into_iter().collect();
+            let mut reachable = std::collections::BTreeSet::new();
+            for root in [new_root, new_catalog_root].into_iter().filter(|&r| r != 0) {
+                let tree = BTree::open(
+                    self.db.pager.clone(),
+                    self.db.realm_id,
+                    root,
+                    new_next,
+                    self.db.page_size,
+                );
+                let _ = tree.collect_all_page_ids(&mut reachable).await;
+            }
+            for pid in reachable {
+                assert!(
+                    !freed_set.contains(&pid),
+                    "PAGEDB INVARIANT VIOLATED: commit {new_commit_id} freed page {pid} \
+                     but it is still reachable from the new tree (data_root={new_root}, \
+                     catalog_root={new_catalog_root}) — use-after-free / lost reparent"
+                );
+            }
+        }
 
         // `visibility_guard` was acquired before the reclamation-floor scan
         // in `WriteTxn::begin` and remains held through this publication.
