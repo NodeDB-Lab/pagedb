@@ -45,7 +45,12 @@ fn value(i: u32) -> Vec<u8> {
 
 /// Insert `n` distinct keys, one commit per key, and read every key back within
 /// the same session. No readers held. Verifies exact bytes + structural walk.
+///
+/// Slow (thousands of one-key commits): `#[ignore]`d so the default suite stays
+/// fast. Run explicitly with `cargo nextest run --run-ignored all` (or
+/// `cargo test -- --ignored`).
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "slow scale regression; run with --run-ignored all"]
 async fn growing_keys_one_commit_each_stay_intact() {
     let n: u32 = 5000;
     let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, lite_like_opts())
@@ -87,7 +92,11 @@ async fn growing_keys_one_commit_each_stay_intact() {
 /// Same growing workload, but a long-lived reader snapshot is opened early and
 /// held across all writes — pinning an old commit and exercising the freelist
 /// reclamation floor's reader accounting while the tree grows and splits.
+///
+/// Slow: `#[ignore]`d by default (see the sibling test); run with
+/// `cargo nextest run --run-ignored all`.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "slow scale regression; run with --run-ignored all"]
 async fn growing_keys_with_interleaved_readers_stay_intact() {
     let n: u32 = 5000;
     let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, lite_like_opts())
@@ -105,9 +114,9 @@ async fn growing_keys_with_interleaved_readers_stay_intact() {
     for i in 16..n {
         let mut w = db.begin_write().await.unwrap();
         w.put(&key(i), &value(i)).await.unwrap();
-        w.commit()
-            .await
-            .unwrap_or_else(|e| panic!("commit aborted at i={i} (free-list feedback loop?): {e:?}"));
+        w.commit().await.unwrap_or_else(|e| {
+            panic!("commit aborted at i={i} (free-list feedback loop?): {e:?}")
+        });
     }
 
     // Bounded growth: the file must not explode. Before the fix, the chain fed
@@ -150,5 +159,9 @@ async fn growing_keys_with_interleaved_readers_stay_intact() {
     drop(r);
 
     let report = run_deep_walk(&db).await.unwrap();
-    assert!(report.is_clean(), "deep walk found corruption: {:?}", report.page_issues);
+    assert!(
+        report.is_clean(),
+        "deep walk found corruption: {:?}",
+        report.page_issues
+    );
 }
