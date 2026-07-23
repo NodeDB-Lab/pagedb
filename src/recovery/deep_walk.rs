@@ -317,6 +317,24 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     }
 
     // ------------------------------------------------------------------ //
+    // 1b. Structural descent: every internal-node child pointer must resolve
+    // to a valid B+ tree node. A pointer to a Free/non-node page is a
+    // use-after-free dangling pointer — the page's own AEAD still verifies
+    // (under its recycled kind), so the physical page-walk above cannot catch
+    // it; only a keyed descent that authenticates each child *as a node* can.
+    // ------------------------------------------------------------------ //
+    let (data_root, hist_root) = {
+        let state = db.writer.lock().await;
+        (state.root_page_id, state.commit_history_root_page_id)
+    };
+    for root in [data_root, catalog_root, hist_root]
+        .into_iter()
+        .filter(|&r| r != 0)
+    {
+        check_dangling_child_pointers(db, root, next_page_id, &mut report).await;
+    }
+
+    // ------------------------------------------------------------------ //
     // 2. Walk every segment in seg/.
     // ------------------------------------------------------------------ //
     if catalog_root == 0 {
@@ -525,4 +543,80 @@ async fn collect_reachable_pages<V: Vfs + Clone>(db: &Db<V>) -> BTreeSet<u64> {
     }
 
     reachable
+}
+
+/// Descend `root` breadth-first, authenticating every internal-node child
+/// pointer *as a B+ tree node*. Any pointer to a page that is out of range or
+/// does not read back as a leaf/internal node (e.g. a recycled `Free` page) is
+/// a use-after-free dangling pointer; it is appended to `report.page_issues`.
+async fn check_dangling_child_pointers<V: Vfs + Clone>(
+    db: &Db<V>,
+    root: u64,
+    next_page_id: u64,
+    report: &mut DeepWalkReport,
+) {
+    use crate::btree::internal::Internal;
+
+    let mut visited: BTreeSet<u64> = BTreeSet::new();
+    let mut queue: Vec<u64> = vec![root];
+    // Bound the walk defensively so a corrupt cyclic tree cannot spin forever.
+    let mut budget: u64 = next_page_id.saturating_mul(2).saturating_add(16);
+
+    while let Some(page_id) = queue.pop() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        if !visited.insert(page_id) {
+            continue;
+        }
+        // The physical page-walk above already reports unreadable pages.
+        let Ok((guard, kind)) = db.pager.read_main_node(page_id, db.realm_id).await else {
+            continue;
+        };
+        if kind != PageKind::BTreeInternal {
+            continue; // leaf: nothing to descend
+        }
+        let Ok(internal) = Internal::decode(guard.body_ref()) else {
+            continue;
+        };
+        drop(guard);
+        let children = std::iter::once(internal.leftmost_child)
+            .chain(internal.entries.iter().map(|e| e.right_child));
+        for child in children {
+            if child == 0 {
+                continue;
+            }
+            if child >= next_page_id {
+                report.page_issues.push(PageIssue {
+                    page_id,
+                    description: format!(
+                        "internal node child pointer → {child} is past next_page_id ({next_page_id})"
+                    ),
+                });
+                continue;
+            }
+            if db.pager.read_main_node(child, db.realm_id).await.is_ok() {
+                queue.push(child);
+            } else {
+                // The child page does not authenticate as a btree node — a
+                // freed/recycled page still referenced by this parent.
+                let mut buf = vec![0u8; db.page_size];
+                let kind_byte = if let Ok(f) = db.vfs.open(&db.main_db_path, OpenMode::Read).await {
+                    let _ = f.read_at(child * db.page_size as u64, &mut buf).await;
+                    buf.get(1).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                report.page_issues.push(PageIssue {
+                    page_id: child,
+                    description: format!(
+                        "dangling child pointer: internal node {page_id} references page \
+                         {child}, which is not a valid btree node (on-disk kind byte \
+                         0x{kind_byte:02x}) — use-after-free"
+                    ),
+                });
+            }
+        }
+    }
 }
