@@ -37,6 +37,12 @@ use std::collections::HashSet;
 use super::super::db::{CommitHistoryMeta, encode_free_list_root};
 use super::txn::WriteTxn;
 
+/// Sentinel freeing-commit id for superseded free-list *chain* pages. It is
+/// below every real reclamation floor (real commit ids start at 1), so those
+/// writer-only metadata pages — which no reader snapshot ever traverses — are
+/// immediately recyclable regardless of any long-lived reader pin.
+const CHAIN_METADATA_CID: u64 = 0;
+
 impl<V: Vfs + Clone> WriteTxn<'_, V> {
     /// Flush dirty pages, write the A/B header, apply pending segment side
     /// effects, and publish the new root to readers. Returns the assigned
@@ -141,7 +147,6 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // grows by its own size every commit — a feedback loop that eventually
         // makes one commit exceed the per-commit nonce budget and wedges the
         // store (and, short of that, is severe write amplification).
-        const CHAIN_METADATA_CID: u64 = 0;
         entries.extend(old_chain.iter().map(|&pid| (CHAIN_METADATA_CID, pid)));
 
         // The reader-stall policy fires only on entries genuinely stuck behind
