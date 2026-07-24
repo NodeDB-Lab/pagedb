@@ -1,9 +1,9 @@
 //! Cross-platform native VFS backed by `tokio::fs`. Advisory locks use a
 //! two-layer protocol: an in-process state machine provides fast single-process
-//! exclusion, and `fcntl(F_SETLK)` on Unix and `LockFileEx` on Windows back
-//! each lock with a real OS-level exclusive/shared mutex for cross-process
-//! exclusion. On other targets only the in-process layer is used. The trait
-//! contract from `traits.rs` is the durable surface.
+//! exclusion, and an OS-level lock backs each one for cross-process exclusion —
+//! `fcntl` OFD locks (`F_OFD_SETLK`) on Linux, classic `F_SETLK` on other Unix,
+//! and `LockFileEx` on Windows. On other targets only the in-process layer is
+//! used. The trait contract from `traits.rs` is the durable surface.
 //!
 //! `unsafe` is permitted here for platform lock primitives (fcntl on Unix,
 //! `LockFileEx` on Windows).
@@ -49,8 +49,26 @@ struct InProcLockEntry {
 // Unix cross-process lock via fcntl(F_SETLK).
 // ---------------------------------------------------------------------------
 
-/// On Unix, holds an open file descriptor whose advisory lock (`F_SETLK`) is
-/// released when this struct is dropped (fd close triggers lock release).
+/// On Unix, holds an open file descriptor whose advisory lock is released when
+/// this struct is dropped (fd close triggers lock release).
+///
+/// On Linux the lock is an **OFD** (open file description) lock
+/// (`F_OFD_SETLK`), which is owned by the open file description rather than the
+/// process. This avoids two notorious `F_SETLK` (process-associated) footguns
+/// that can drop or defeat a writer lock and let a second opener corrupt the
+/// store:
+///
+/// 1. *Release-on-any-close*: a process `F_SETLK` lock is dropped the moment
+///    the process closes **any** fd to that inode, not just the locking fd — an
+///    unrelated open/close of the lock path silently frees the lock.
+/// 2. *Self-non-conflict*: a second `F_SETLK` request from the **same** process
+///    succeeds instead of conflicting, so two `TokioVfs` instances (with
+///    independent in-process lock tables) can both "acquire" and double-open.
+///
+/// OFD locks are per-description: closing other fds does not release them, and
+/// two open descriptions conflict even within one process.
+///
+/// Non-Linux Unix (e.g. macOS, which lacks OFD locks) falls back to `F_SETLK`.
 #[cfg(unix)]
 struct OsFcntlHandle {
     _file: std::fs::File,
@@ -88,11 +106,19 @@ impl OsFcntlHandle {
             l_pid: 0,
         };
 
+        // Prefer OFD locks on Linux (see the type doc); fall back to classic
+        // process locks elsewhere. Both use the identical `flock` payload and
+        // the same non-blocking `*_SETLK` semantics (EAGAIN/EACCES == conflict).
+        #[cfg(target_os = "linux")]
+        let cmd = libc::F_OFD_SETLK;
+        #[cfg(not(target_os = "linux"))]
+        let cmd = libc::F_SETLK;
+
         // SAFETY: `fd` is valid (owned by `file` above which stays alive past
         // this call); `flock` is a plain C struct fully initialised above.
-        // F_SETLK is non-blocking: EAGAIN/EACCES means another process holds
-        // a conflicting lock.
-        let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &flock) };
+        // The command is non-blocking: EAGAIN/EACCES means another open
+        // description (OFD) or process (F_SETLK) holds a conflicting lock.
+        let rc = unsafe { libc::fcntl(fd, cmd, &flock) };
         if rc == -1 {
             let err = std::io::Error::last_os_error();
             let raw = err.raw_os_error().unwrap_or(0);
@@ -217,8 +243,9 @@ pub struct TokioLockHandle {
     /// Shared in-process lock entry; released on drop.
     lock_ref: Arc<InProcLockEntry>,
     kind: LockKind,
-    /// On Unix: holds the fcntl-locked file open. Dropped (and thus unlocked)
-    /// together with this handle.
+    /// On Unix: holds the fcntl-locked file open (an OFD lock on Linux, a
+    /// process `F_SETLK` lock elsewhere). Dropped (and thus unlocked) together
+    /// with this handle.
     #[cfg(unix)]
     _os_lock: OsFcntlHandle,
     /// On Windows: holds the LockFileEx-locked file open. Explicitly unlocked
@@ -777,6 +804,30 @@ mod tests {
         let _h = vfs.lock_exclusive("/db").await.unwrap();
         assert!(vfs.lock_exclusive("/db").await.is_err());
         assert!(vfs.lock_shared("/db").await.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two independent `TokioVfs` instances over the same directory have
+    /// separate in-process lock tables, so only the OS-level lock can stop them
+    /// double-opening the same store. On Linux the OFD lock conflicts even
+    /// within one process; classic `F_SETLK` would not (it is process-owned and
+    /// self-non-conflicting). This is the defense-in-depth that keeps a single
+    /// buggy process from concurrently opening one store's writer twice.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exclusive_lock_conflicts_across_vfs_instances_same_process() {
+        let dir = tempdir();
+        let vfs_a = TokioVfs::new(&dir);
+        let vfs_b = TokioVfs::new(&dir);
+
+        let _h = vfs_a.lock_exclusive("/db").await.unwrap();
+        // Different instance, same process, same path: the in-proc guard cannot
+        // see across instances, so the OFD lock must reject this.
+        assert!(matches!(
+            vfs_b.lock_exclusive("/db").await,
+            Err(PagedbError::AlreadyLocked)
+        ));
 
         std::fs::remove_dir_all(&dir).ok();
     }
