@@ -251,6 +251,11 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // already updated inside write_commit_history_entry.
         self.committed_or_aborted = true;
 
+        // Black box: record the commit + how many pages it freed into the
+        // flight recorder. Freeing commits are the operations most implicated
+        // in page recycling, so this trail is what a corruption report needs.
+        crate::diag::committed(new_commit_id, all_freed.len());
+
         // Debug invariant: no page just freed may still be reachable from the
         // freshly-published tree. A violation is a use-after-free (a live page
         // freed / a parent pointer not reparented) — panic loudly at the source

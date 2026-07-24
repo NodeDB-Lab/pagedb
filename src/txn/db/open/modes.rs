@@ -138,7 +138,12 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
     ) -> Result<Self> {
         let kek = kek.into();
-        Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Standalone).await
+        let db =
+            Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Standalone).await?;
+        // Black box: mark the epoch boundary — freed-page use-after-free
+        // surfaces on reopen, so the trail needs to know when one happened.
+        crate::diag::reopened(db.latest_commit().0);
+        Ok(db)
     }
 
     /// Open a frozen-snapshot database without write access.

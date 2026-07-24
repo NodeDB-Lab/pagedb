@@ -821,6 +821,17 @@ impl<V: Vfs> Pager<V> {
             realm = ?realm_id.0,
             "page AEAD/MAC verification failed on read"
         );
+        // Black box: capture a structured corruption report (and, once per
+        // process, a snapshot of the store for offline `pagedb-fsck`) so this
+        // is debuggable from production without reproduction. Inert unless the
+        // host app called `blackbox::init`.
+        crate::diag::page_read_verify_failed(
+            &self.cfg.main_db_path,
+            page_id,
+            &crate::diag::dbg_str(&file),
+            &crate::diag::dbg_str(&binding),
+            &realm_id,
+        );
         Err(last_err.unwrap_or(PagedbError::ChecksumFailure))
     }
 
