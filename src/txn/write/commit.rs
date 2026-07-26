@@ -289,7 +289,16 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
                          {label}_root={root}: {desc}"
                     );
                 }
-                let _ = tree.collect_all_page_ids(&mut reachable).await;
+                // The collection is authoritative: an error means the freshly
+                // published tree could not be fully authenticated and decoded,
+                // so the freed-set check below would pass only because the set
+                // is short. Fail at the source commit rather than vacuously.
+                if let Err(e) = tree.collect_all_page_ids(&mut reachable).await {
+                    panic!(
+                        "PAGEDB INVARIANT VIOLATED: commit {new_commit_id} \
+                         {label}_root={root}: reachability walk failed: {e}"
+                    );
+                }
             }
             for pid in reachable {
                 assert!(
