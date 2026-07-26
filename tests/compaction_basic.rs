@@ -120,6 +120,111 @@ async fn compact_truncates_main_db() {
     }
 }
 
+// ─── Top-of-keyspace keys survive a dense repack ─────────────────────────────
+
+/// A dense repack rebuilds the main tree from a full enumeration of the old
+/// one. That enumeration must be unbounded: keys are arbitrary byte strings
+/// with no reserved sentinel and no length ceiling, so a scan bounded by any
+/// invented maximum drops the records at the top of the keyspace and publishes
+/// a truncated-but-internally-consistent tree — silent, durable data loss.
+///
+/// Covers the exact `[0xFF; 256]` boundary plus a key extending it, and checks
+/// both immediately after the repack and after reopening the store, so the
+/// assertion is about what was durably published rather than cached state.
+#[tokio::test(flavor = "current_thread")]
+async fn compact_now_preserves_top_of_keyspace_keys() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
+
+    let high_key = [0xFF; 256];
+    let mut higher_key = vec![0xFFu8; 256];
+    higher_key.push(0x00);
+    let high_value = b"high-key-value";
+    let ordinary_value = [0x2A; 128];
+
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(&high_key, high_value).await.unwrap();
+        txn.put(&higher_key, high_value).await.unwrap();
+        for i in 0u32..240 {
+            txn.put(format!("ordinary-{i:06}").as_bytes(), &ordinary_value)
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    // Free enough pages that the repack has something to reclaim.
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for i in 0u32..230 {
+            txn.delete(format!("ordinary-{i:06}").as_bytes())
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let stats = db.compact_now().await.unwrap();
+    // `main_db_pages_reclaimed` is written only by the dense repack, so this
+    // proves the path under test actually ran rather than returning early.
+    assert!(
+        stats.main_db_pages_reclaimed > 0,
+        "setup did not enter dense repack: {stats:?}"
+    );
+
+    // The ordinary survivor keeps the test honest: it fails an over-broad
+    // special case that only rescues high-byte keys.
+    async fn assert_all_present(
+        db: &Db<MemVfs>,
+        high_key: &[u8],
+        higher_key: &[u8],
+        high_value: &[u8],
+        ordinary_value: &[u8],
+        when: &str,
+    ) {
+        let read = db.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(high_key).await.unwrap().as_deref(),
+            Some(high_value),
+            "[0xFF; 256] key lost {when}"
+        );
+        assert_eq!(
+            read.get(higher_key).await.unwrap().as_deref(),
+            Some(high_value),
+            "key extending [0xFF; 256] lost {when}"
+        );
+        assert_eq!(
+            read.get(b"ordinary-000239").await.unwrap().as_deref(),
+            Some(ordinary_value),
+            "ordinary survivor lost {when}"
+        );
+    }
+
+    assert_all_present(
+        &db,
+        &high_key,
+        &higher_key,
+        high_value,
+        &ordinary_value,
+        "after repack",
+    )
+    .await;
+
+    drop(db);
+    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    assert_all_present(
+        &reopened,
+        &high_key,
+        &higher_key,
+        high_value,
+        &ordinary_value,
+        "after reopen",
+    )
+    .await;
+}
+
 // ─── Large (overflow-backed) values survive a full repack ─────────────────────
 
 /// Values larger than the inline threshold (`PAGE / 4`) are stored as overflow

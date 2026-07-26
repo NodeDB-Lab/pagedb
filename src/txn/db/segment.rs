@@ -102,9 +102,7 @@ impl<V: Vfs + Clone> Db<V> {
                 next,
                 self.page_size,
             );
-            let start = vec![0x01u8];
-            let end = vec![0x02u8];
-            let rows = tree.collect_range(&start, &end).await?;
+            let rows = tree.scan_prefix(&[CatalogRowKind::Segment as u8]).await?;
             for (_, v) in rows {
                 let meta = Catalog::decode_segment_meta(&v)?;
                 if meta.segment_id == segment_id {

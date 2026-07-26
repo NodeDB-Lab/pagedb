@@ -350,7 +350,9 @@ impl<V: Vfs + Clone> Db<V> {
                 manifest.next_page_id_at_target,
                 self.page_size,
             );
-            let rows = tree.collect_range(&[0x01], &[0x02]).await?;
+            let rows = tree
+                .scan_prefix(&[crate::catalog::codec::CatalogRowKind::Segment as u8])
+                .await?;
             let mut entries = Vec::with_capacity(rows.len());
             for (_, value) in rows {
                 entries.push(crate::catalog::codec::Catalog::decode_segment_meta(&value)?);

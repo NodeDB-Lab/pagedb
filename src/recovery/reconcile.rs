@@ -95,12 +95,7 @@ async fn verify_catalog_entries<V: Vfs + Clone>(
         next_page_id,
         page_size,
     );
-    let start = vec![CatalogRowKind::Segment as u8];
-    let mut end = start.clone();
-    end[0] = end[0]
-        .checked_add(1)
-        .ok_or_else(|| PagedbError::arithmetic_overflow("catalog segment range"))?;
-    let rows = tree.collect_range(&start, &end).await?;
+    let rows = tree.scan_prefix(&[CatalogRowKind::Segment as u8]).await?;
     let mut expected = Vec::with_capacity(rows.len());
     let mut catalog_entries = Vec::with_capacity(rows.len());
 

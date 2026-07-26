@@ -262,19 +262,17 @@ impl<V: Vfs + Clone> Db<V> {
                 false,
             ))
         } else {
-            // Find the oldest available: scan from the beginning.
-            let start = 0u64.to_be_bytes().to_vec();
-            let end = u64::MAX.to_be_bytes().to_vec();
-            let oldest = tree
-                .collect_range(&start, &end)
-                .await?
-                .into_iter()
-                .next()
-                .map_or(CommitId(latest_commit_id), |(k, _)| {
+            // Find the oldest available: scan the whole history tree. An
+            // exclusive `u64::MAX` upper bound would hide the newest commit
+            // once ids reach the top of the range.
+            let oldest = tree.collect_all().await?.into_iter().next().map_or(
+                CommitId(latest_commit_id),
+                |(k, _)| {
                     let mut b = [0u8; 8];
                     b.copy_from_slice(&k[..8]);
                     CommitId(u64::from_be_bytes(b))
-                });
+                },
+            );
             Err(PagedbError::CommitGone {
                 commit,
                 oldest_available: oldest,

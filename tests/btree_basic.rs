@@ -141,6 +141,39 @@ async fn forward_scan_returns_sorted() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn collect_all_returns_every_key_including_the_top_of_the_keyspace() {
+    // Keys are arbitrary byte strings: there is no reserved sentinel and no
+    // length ceiling, so no concrete upper bound is outside the valid domain.
+    // `collect_all` must therefore be unbounded — a range scan against any
+    // invented maximum would silently drop the keys asserted here.
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    let v = vec![0u8; 16];
+    for i in 0..200u32 {
+        tree.put(format!("k{i:04}").as_bytes(), &v).await.unwrap();
+    }
+    // The exact sentinel a bounded scan would have used, and a key extending it.
+    tree.put(&[0xFF; 256], &v).await.unwrap();
+    let mut beyond = vec![0xFFu8; 256];
+    beyond.push(0x00);
+    tree.put(&beyond, &v).await.unwrap();
+
+    let all = tree.collect_all().await.unwrap();
+    assert_eq!(all.len(), 202);
+    let keys: Vec<&[u8]> = all.iter().map(|(k, _)| k.as_slice()).collect();
+    assert!(keys.windows(2).all(|w| w[0] < w[1]), "not ascending");
+    assert_eq!(keys[200], &[0xFF; 256]);
+    assert_eq!(keys[201], beyond.as_slice());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn collect_all_on_empty_tree_is_empty() {
+    let pager = fresh_pager().await;
+    let tree = fresh_tree(pager);
+    assert!(tree.collect_all().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn large_value_stored_via_overflow() {
     // G2: values exceeding page_size/4 are stored as overflow chains rather
     // than rejected. Verify round-trip correctness.

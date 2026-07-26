@@ -38,6 +38,36 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
+    /// Collect every key-value pair in the tree, in ascending key order.
+    ///
+    /// Deliberately expressed as an unbounded traversal rather than a range
+    /// scan against an invented maximum key. Keys are arbitrary byte strings
+    /// with no reserved sentinel and no length ceiling, so *no* concrete upper
+    /// bound is beyond the valid key domain: a bounded "scan everything" would
+    /// silently drop records at the top of the keyspace (`[0xFF; N]` and any
+    /// key extending it). Callers that need the whole tree must use this.
+    pub async fn collect_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if self.root_page_id == 0 {
+            return Ok(Vec::new());
+        }
+        // The empty key sorts below every stored key, so the descent lands on
+        // the leftmost leaf.
+        let mut path = self.path_to_leaf_for_key(&[]).await?;
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        loop {
+            let leaf_id = *path.last().expect("non-empty path");
+            let leaf = self.read_leaf(leaf_id).await?;
+            for (k, v) in &leaf.records {
+                let val = self.resolve_leaf_value(v).await?;
+                out.push((k.clone(), val));
+            }
+            match self.next_leaf_after(&path).await? {
+                Some(next_path) => path = next_path,
+                None => return Ok(out),
+            }
+        }
+    }
+
     /// Return the smallest key in the tree, or `None` if the tree is empty.
     /// Descends the leftmost spine only — O(tree height), not O(tree size).
     pub async fn first_key(&self) -> Result<Option<Vec<u8>>> {
