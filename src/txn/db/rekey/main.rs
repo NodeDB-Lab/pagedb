@@ -1,5 +1,6 @@
 //! Main-database rekey transition and durable intent publication.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 use subtle::ConstantTimeEq;
@@ -16,7 +17,9 @@ use crate::vfs::Vfs;
 
 #[cfg(test)]
 use super::super::core::RekeyTestFault;
-use super::super::core::{Db, WriterState, encode_free_list_root, encode_root_ref};
+use super::super::core::{
+    Db, WriterState, decode_commit_meta, encode_free_list_root, encode_root_ref,
+};
 use super::intent::{intent_proof, migrate_legacy, validate_intent_for_current_cipher};
 
 impl<V: Vfs + Clone> Db<V> {
@@ -192,6 +195,7 @@ impl<V: Vfs + Clone> Db<V> {
         // target header was published.
         self.pager
             .set_active_mk_epoch(target_master_key.clone(), intent.target_mk_epoch);
+        let mut rewritten = BTreeMap::new();
         let main_tree = BTree::open(
             self.pager.clone(),
             self.realm_id,
@@ -199,8 +203,8 @@ impl<V: Vfs + Clone> Db<V> {
             state.next_page_id,
             self.page_size,
         );
-        main_tree.rekey_walk().await?;
-        if state.commit_history_root_page_id != 0 {
+        main_tree.rekey_walk_unique(&mut rewritten).await?;
+        let retained_history = if state.commit_history_root_page_id != 0 {
             let history_tree = BTree::open(
                 self.pager.clone(),
                 self.realm_id,
@@ -208,7 +212,37 @@ impl<V: Vfs + Clone> Db<V> {
                 state.next_page_id,
                 self.page_size,
             );
-            history_tree.rekey_walk().await?;
+            let entries = history_tree.collect_all().await?;
+            history_tree.rekey_walk_unique(&mut rewritten).await?;
+            entries
+                .into_iter()
+                .map(|(_, value)| decode_commit_meta(&value))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        for historical in retained_history {
+            for root_page_id in [
+                historical.active_root_page_id,
+                historical.catalog_root_page_id,
+            ] {
+                if root_page_id == 0 {
+                    continue;
+                }
+                BTree::open(
+                    self.pager.clone(),
+                    self.realm_id,
+                    root_page_id,
+                    historical.next_page_id,
+                    self.page_size,
+                )
+                .rekey_walk_unique(&mut rewritten)
+                .await?;
+            }
+            // Historical readers traverse only retained data and catalog
+            // roots. The recorded free-list root is writer-only metadata whose
+            // superseded chain pages may already have been recycled. Only the
+            // current header's live chain below is safe to follow.
         }
         if state.free_list_root_page_id != 0 {
             let (_, chain_pages) = crate::pager::freelist::read_chain(

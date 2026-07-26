@@ -1,7 +1,10 @@
 //! Rekey integration tests: main-db and immutable-segment transitions.
 
+use pagedb::options::RetainPolicy;
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, Evictable, PagedbError, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{
+    Db, Evictable, OpenOptions, PagedbError, RealmId, RealmQuotas, SegmentKind, SegmentPageKind,
+};
 
 const PAGE: usize = 4096;
 const KEK0: [u8; 32] = [0xAA; 32];
@@ -55,6 +58,100 @@ async fn rekey_main_db_only() {
         Some(b"value-gamma".as_slice())
     );
     drop(rx);
+}
+
+/// Rekey must rewrite roots named only by retained commit-history metadata
+/// before the source epoch is retired.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_preserves_retained_historical_snapshots_after_reopen() {
+    let vfs = MemVfs::new();
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded);
+    let db = Db::open_internal_with_options(vfs.clone(), KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    db.set_realm_quotas(
+        REALM,
+        RealmQuotas {
+            max_pages: Some(10),
+            ..RealmQuotas::default()
+        },
+    )
+    .await
+    .unwrap();
+    let historical_large = vec![0xA5; PAGE * 3];
+    let latest_large = vec![0x5A; PAGE * 2];
+
+    let first = {
+        let mut tx = db.begin_write().await.unwrap();
+        for index in 0u16..256 {
+            tx.put(
+                format!("history-key-{index:04}").as_bytes(),
+                &index.to_le_bytes(),
+            )
+            .await
+            .unwrap();
+        }
+        tx.put(b"versioned", b"before-rekey").await.unwrap();
+        tx.put(b"historical-overflow", &historical_large)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap()
+    };
+    db.set_realm_quotas(
+        REALM,
+        RealmQuotas {
+            max_pages: Some(20),
+            ..RealmQuotas::default()
+        },
+    )
+    .await
+    .unwrap();
+    {
+        let mut tx = db.begin_write().await.unwrap();
+        tx.put(b"versioned", b"latest").await.unwrap();
+        tx.put(b"historical-overflow", &latest_large).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    db.rekey_db(KEK0, 1).await.unwrap();
+    drop(db);
+
+    let reopened = Db::open_existing(vfs, KEK0, PAGE, REALM).await.unwrap();
+    let historical = reopened.begin_read_at(first).await.unwrap();
+    assert_eq!(
+        historical.get(b"versioned").await.unwrap().as_deref(),
+        Some(b"before-rekey".as_slice())
+    );
+    assert_eq!(
+        historical
+            .get(b"historical-overflow")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(historical_large.as_slice())
+    );
+    let first_index = 0u16.to_le_bytes();
+    assert_eq!(
+        historical
+            .get(b"history-key-0000")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(first_index.as_slice())
+    );
+    assert!(matches!(
+        historical.open_segment("absent").await,
+        Err(PagedbError::NotFound)
+    ));
+    let latest = reopened.begin_read().await.unwrap();
+    assert_eq!(
+        latest.get(b"versioned").await.unwrap().as_deref(),
+        Some(b"latest".as_slice())
+    );
+    assert_eq!(
+        latest.get(b"historical-overflow").await.unwrap().as_deref(),
+        Some(latest_large.as_slice())
+    );
 }
 
 // ── Test 2 ─────────────────────────────────────────────────────────────────
