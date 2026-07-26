@@ -26,8 +26,14 @@ targets = [
 version = 2
 yanked = "deny"
 ignore = [
-    # Add advisory IDs here with a comment explaining the exception, e.g.
-    # "RUSTSEC-YYYY-NNNN", # only triggers on a code path we don't use; see #123
+    # FluxBench 0.1.3 is the latest release and pulls fxhash only through its
+    # dev-only CLI/reporting stack. It is absent from PageDB's normal/build
+    # graph; no maintained fxhash release or FluxBench upgrade is available.
+    "RUSTSEC-2025-0057",
+    # Same boundary as above: number_prefix is reachable only through
+    # FluxBench -> indicatif in the dev-only benchmark CLI. Consumers never
+    # resolve it, and the advisory has no safe upgrade.
+    "RUSTSEC-2025-0119",
 ]
 
 # ────────────────────────────────────────────────────────────────────────
