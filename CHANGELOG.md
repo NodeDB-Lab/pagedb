@@ -6,19 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- Snapshot export, restore, and incremental apply now fail closed on malformed,
-  incomplete, extra, or unreadable artifacts instead of silently skipping
-  pages or segment files; exported files are synced before success.
-- Incremental apply authenticates its exact reachable page and segment sets,
-  invalidates stale cached plaintext after raw page writes, preserves published
-  base pages, rejects stale future-page dependencies, and journals both segment
-  promotion and tombstoning before publishing the target header.
-
-## [0.1.0] - 2026-06-07
-
-Initial release.
+The first stable release. Pre-releases are published as `0.1.0-beta.N`; the
+entries below describe `0.1.0` as a whole rather than deltas against a shipped
+version, since none exists yet.
 
 ### Added
 
@@ -40,7 +30,9 @@ Initial release.
   (Grand Central Dispatch), Android, WASM/OPFS, and WASI backends, plus a
   tokio thread-pool fallback and an in-memory backend, with format-bit identity
   across targets.
-- **Snapshots** — `snapshot_to`, `restore_from`, and incremental apply.
+- **Snapshots** — `snapshot_to`, `restore_from`, and incremental apply, each
+  authenticated against the exact state its manifest describes. Destinations
+  must be empty; malformed or incomplete artifacts fail closed.
 - **Recovery** — open-flow GC, apply-journal replay, deep-walk `fsck`, and the
   `pagedb-fsck` binary.
 - **Online rekey** — rekey the database under a new key with mixed-cipher and
@@ -53,5 +45,7 @@ Initial release.
 - Single-writer per database; multi-writer cross-process is not supported.
 - Writes carry per-page AEAD and copy-on-write overhead; for throughput-bound
   plaintext KV workloads a generic store may be faster.
-
-[0.1.0]: https://github.com/nodedb-lab/pagedb/releases/tag/v0.1.0
+- An incremental snapshot cannot always be applied: if the producer recycled a
+  page the follower's own free-list chain or commit-history tree still hosts,
+  apply reports `PagedbError::SnapshotBasePageReused` and the follower needs a
+  full snapshot or a nearer base commit.

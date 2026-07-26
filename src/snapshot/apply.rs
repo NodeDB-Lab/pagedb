@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::Result;
 use crate::errors::PagedbError;
+use crate::pager::page_space::is_reserved;
 
 /// Pages consumed from one `pages.delta` stream during an incremental apply.
 pub struct AppliedDeltaPages {
@@ -29,7 +30,6 @@ pub async fn apply_delta_pages(
     dst_main_db_path: &Path,
     page_size: usize,
     protected_page_ids: &BTreeSet<u64>,
-    base_allocation_floor: u64,
     target_next_page_id: u64,
 ) -> Result<AppliedDeltaPages> {
     let delta_path = src_path.join("pages.delta");
@@ -68,13 +68,24 @@ pub async fn apply_delta_pages(
             .await
             .map_err(PagedbError::Io)?;
         let page_id = u64::from_be_bytes(id_buf);
-        if page_id < base_allocation_floor
-            || page_id >= target_next_page_id
-            || protected_page_ids.contains(&page_id)
-        {
+        // Reserved pages are the A/B headers and the apply-journal slots. A
+        // delta record naming one would overwrite the very state that makes the
+        // apply recoverable, so it is rejected by identity rather than by
+        // happening to fall under some allocation bound.
+        if is_reserved(page_id) || page_id >= target_next_page_id {
             return Err(PagedbError::snapshot_artifact_invalid(
                 "pages.delta.page_id",
             ));
+        }
+        // The follower keeps its own free-list chain and commit-history tree
+        // across an apply, and those pages are invisible to the producer, which
+        // can neither predict nor avoid them. A collision is therefore not a
+        // malformed artifact — both states are internally sound, they simply
+        // cannot be related by a page delta — so it reports as
+        // `SnapshotBasePageReused` and the remedy is a full snapshot or a nearer
+        // base. Caught here, before `main.db` is opened for writing.
+        if protected_page_ids.contains(&page_id) {
+            return Err(PagedbError::snapshot_base_page_reused(page_id));
         }
         if !page_ids.insert(page_id) {
             return Err(PagedbError::snapshot_artifact_invalid(

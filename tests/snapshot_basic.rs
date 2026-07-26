@@ -614,6 +614,116 @@ async fn promote_to_follower_allows_apply() {
     std::fs::remove_dir_all(&delta_dir).ok();
 }
 
+/// A writer that recycles pages between the base and target commits still
+/// produces an applicable delta.
+///
+/// Page reuse is the steady state of the free-list design, not an edge case: the
+/// reclamation floor exists so freed pages come back. A page id below the base
+/// commit's allocation cursor therefore proves nothing on its own — what matters
+/// is whether the page was *live* at the base. Treating the cursor as a liveness
+/// boundary rejects healthy snapshots from any database that has ever deleted
+/// anything, which is why this walks a full delete-and-refill cycle rather than
+/// only appending.
+#[tokio::test(flavor = "current_thread")]
+async fn incremental_round_trip_survives_page_reuse_below_the_base_cursor() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+
+    // Grow the tree well past a single page, so deleting most of it frees
+    // interior pages rather than just trimming one leaf.
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for index in 0u16..512 {
+            txn.put(format!("reuse-{index:04}").as_bytes(), &[index as u8; 64])
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    // Free most of those pages. They stay on the durable free list, below the
+    // allocation cursor the base commit will record.
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for index in 0u16..480 {
+            txn.delete(format!("reuse-{index:04}").as_bytes())
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let base = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    // Refill. The allocator draws from the free list, so the target tree is
+    // reachable through pages whose ids sit below `base`'s cursor.
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for index in 0u16..480 {
+            txn.put(format!("refill-{index:04}").as_bytes(), &[0xC7; 64])
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let target = db.latest_commit();
+    let base_next_page_id = {
+        let txn = db.begin_read_at(base).await.unwrap();
+        txn.next_page_id()
+    };
+
+    db.snapshot_incremental_to(base, &delta_dir)
+        .await
+        .expect("page reuse below the base cursor must still export");
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    let stats = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect("a delta carrying recycled page ids must still apply");
+    assert!(stats.pages_applied > 0);
+    assert_eq!(follower.latest_commit(), target);
+
+    // The scenario is only meaningful if reuse actually happened; otherwise this
+    // silently degrades into the append-only case the other tests already cover.
+    let rtxn = follower.begin_read().await.unwrap();
+    assert!(
+        rtxn.next_page_id() <= base_next_page_id.saturating_add(64),
+        "expected the refill to recycle freed pages rather than extend the file: \
+         base cursor {base_next_page_id}, target cursor {}",
+        rtxn.next_page_id()
+    );
+    for index in 0u16..480 {
+        assert_eq!(
+            rtxn.get(format!("refill-{index:04}").as_bytes())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some([0xC7; 64].as_slice()),
+            "refilled key {index} missing after apply"
+        );
+        assert_eq!(
+            rtxn.get(format!("reuse-{index:04}").as_bytes())
+                .await
+                .unwrap(),
+            None,
+            "deleted key {index} came back after apply"
+        );
+    }
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn apply_incremental_surfaces_staging_dir_sync_failure_then_retry_succeeds() {
     let src_dir = tempdir();
@@ -943,8 +1053,19 @@ async fn incremental_snapshot_rejects_missing_changed_main_page() {
     std::fs::remove_dir_all(&delta_dir).ok();
 }
 
+/// Export succeeds when the target reaches pages below the base allocation
+/// cursor, and actually ships them.
+///
+/// The cursor is an allocation watermark, not a liveness boundary. A page that
+/// was on the free list at the base commit is legitimately reallocated for the
+/// target, and shipping it is safe precisely because nothing reachable from the
+/// base points at it. Rejecting on the cursor would make incremental snapshots
+/// unusable for any database that has ever deleted anything.
+///
+/// The complementary end-to-end case — that such a delta also *applies* — is
+/// `incremental_round_trip_survives_page_reuse_below_the_base_cursor`.
 #[tokio::test(flavor = "current_thread")]
-async fn incremental_snapshot_rejects_reused_pages_below_base_cursor() {
+async fn incremental_snapshot_exports_reused_pages_below_base_cursor() {
     let src_dir = tempdir();
     let snap_dir = tempdir();
     let delta_dir = tempdir();
@@ -981,13 +1102,31 @@ async fn incremental_snapshot_rejects_reused_pages_below_base_cursor() {
         t.put(b"reused-after-base", &new_value).await.unwrap();
         t.commit().await.unwrap();
     }
-    let err = db
+    let base_next_page_id = {
+        let txn = db.begin_read_at(base).await.unwrap();
+        txn.next_page_id()
+    };
+    let stats = db
         .snapshot_incremental_to(base, &delta_dir)
         .await
-        .expect_err("incremental snapshot must reject reused pages below the base cursor");
+        .expect("reused pages below the base cursor must still export");
+    assert!(stats.pages_written > 0);
+
+    // Prove the scenario is the intended one: at least one shipped record names
+    // a page id below the base cursor. Without this the test would still pass on
+    // an implementation that only ever appends.
+    let delta = std::fs::read(delta_dir.join("pages.delta")).unwrap();
+    let record_size = 8 + PAGE;
+    assert_eq!(delta.len() % record_size, 0, "delta must be whole records");
+    let recycled = delta
+        .chunks_exact(record_size)
+        .map(|record| u64::from_be_bytes(record[..8].try_into().unwrap()))
+        .filter(|page_id| *page_id < base_next_page_id)
+        .count();
     assert!(
-        matches!(err, PagedbError::Unsupported),
-        "expected Unsupported for reused pages below base cursor, got {err:?}"
+        recycled > 0,
+        "expected the refill to recycle freed pages below the base cursor \
+         ({base_next_page_id}); the delta shipped none"
     );
 
     std::fs::remove_dir_all(&src_dir).ok();
@@ -1167,7 +1306,15 @@ async fn apply_incremental_rejects_delta_record_at_target_next_page_id() {
 // Test 11: apply_incremental rejects delta records below the base next-page id.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
-async fn apply_incremental_rejects_delta_record_below_base_next_page_id_without_mutating_base() {
+/// A delta record naming a page the base still holds live is refused, and the
+/// refusal leaves the base intact.
+///
+/// The injected id is the base snapshot's own active root — a page the follower
+/// is still reading through. What makes it inadmissible is that it is base-live,
+/// not that it sorts below some allocation cursor: recycled ids below that
+/// cursor are ordinary and are covered by
+/// `incremental_snapshot_exports_reused_pages_below_base_cursor`.
+async fn apply_incremental_refuses_to_overwrite_a_base_live_page_without_mutating_base() {
     let src_dir = tempdir();
     let snap_dir = tempdir();
     let delta_dir = tempdir();
@@ -1214,10 +1361,13 @@ async fn apply_incremental_rejects_delta_record_below_base_next_page_id_without_
     let err = follower
         .apply_incremental(&delta_dir)
         .await
-        .expect_err("apply_incremental must reject records below the base next-page id");
+        .expect_err("apply_incremental must refuse to overwrite a base-live page");
     assert!(
-        matches!(err, PagedbError::Corruption(_)),
-        "expected Corruption for below-base delta record, got {err:?}"
+        matches!(
+            err,
+            PagedbError::SnapshotBasePageReused { page_id } if page_id == stale_page_id
+        ),
+        "expected SnapshotBasePageReused naming page {stale_page_id}, got {err:?}"
     );
 
     let rtxn = follower.begin_read().await.unwrap();
