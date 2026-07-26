@@ -56,6 +56,17 @@ pub enum PagedbError {
     #[error("incremental snapshot is incompatible: {field}")]
     SnapshotIncompatible { field: &'static str },
 
+    /// The target state reuses a page the base commit still hosts, so the delta
+    /// cannot be expressed without overwriting state a follower on that base
+    /// still depends on.
+    ///
+    /// Not a corruption: both states are internally sound. They simply cannot be
+    /// related by a page delta, and the correct remedy is a full snapshot or a
+    /// nearer base commit — which is why this is distinct from
+    /// [`CorruptionDetail::SnapshotArtifactInvalid`].
+    #[error("incremental snapshot would overwrite base-live page {page_id}")]
+    SnapshotBasePageReused { page_id: u64 },
+
     #[error("commit {commit:?} is durable but unpublished; reopen required")]
     DurablyCommittedButUnpublished { commit: CommitId },
 
@@ -431,6 +442,12 @@ impl PagedbError {
     #[must_use]
     pub const fn snapshot_incompatible(field: &'static str) -> Self {
         Self::SnapshotIncompatible { field }
+    }
+
+    /// Canonical constructor for a target state that reuses a base-live page.
+    #[must_use]
+    pub const fn snapshot_base_page_reused(page_id: u64) -> Self {
+        Self::SnapshotBasePageReused { page_id }
     }
 
     /// Canonical constructor for a handle whose newest durable commit could

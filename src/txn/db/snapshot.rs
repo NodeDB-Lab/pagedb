@@ -22,7 +22,7 @@ use crate::vfs::tokio_backend::TokioVfs;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
-use super::core::{Db, ReaderSnapshot, decode_commit_meta};
+use super::core::{Db, ReaderSnapshot};
 use super::util::{get_vfs_root, page_size_log2};
 
 async fn collect_tree_page_ids<V: Vfs + Clone>(
@@ -48,17 +48,38 @@ async fn collect_tree_page_ids<V: Vfs + Clone>(
     Ok(page_ids)
 }
 
-async fn collect_published_page_ids<V: Vfs + Clone>(
+/// The two page sets a base state contributes to an incremental apply.
+///
+/// They are deliberately distinct. `reader_visible` is the data and catalog
+/// reachable set — the *only* set both sides of the protocol can compute, so it
+/// is what defines which pages a delta must carry. `published` additionally
+/// covers the free-list chain and commit-history tree, which
+/// [`Db::apply_incremental`] carries over from the follower's own header rather
+/// than taking from the producer; those pages stay live across the apply and
+/// must never be overwritten, but the producer cannot see them, so they can only
+/// ever be a write guard — never part of the delta's definition.
+///
+/// Conflating the two is what makes a healthy snapshot look malformed:
+/// subtracting `published` when deciding *which pages a delta should contain*
+/// turns every page the producer legitimately allocated over a follower-local
+/// free-list page into an unexplained set mismatch.
+struct BasePageSets {
+    reader_visible: BTreeSet<u64>,
+    published: BTreeSet<u64>,
+}
+
+async fn collect_base_page_sets<V: Vfs + Clone>(
     db: &Db<V>,
     snapshot: ReaderSnapshot,
-) -> crate::Result<BTreeSet<u64>> {
-    let mut page_ids = collect_tree_page_ids(
+) -> crate::Result<BasePageSets> {
+    let reader_visible = collect_tree_page_ids(
         db,
         snapshot.root_page_id,
         snapshot.catalog_root_page_id,
         snapshot.next_page_id,
     )
     .await?;
+    let mut published = reader_visible.clone();
     if snapshot.commit_history_root_page_id != 0 {
         let history = crate::btree::BTree::open(
             db.pager.clone(),
@@ -67,7 +88,7 @@ async fn collect_published_page_ids<V: Vfs + Clone>(
             snapshot.next_page_id,
             db.page_size,
         );
-        history.collect_all_page_ids(&mut page_ids).await?;
+        history.collect_all_page_ids(&mut published).await?;
     }
     if snapshot.free_list_root_page_id != 0 {
         let (_entries, chain_pages) = crate::pager::freelist::read_chain(
@@ -76,33 +97,38 @@ async fn collect_published_page_ids<V: Vfs + Clone>(
             snapshot.free_list_root_page_id,
         )
         .await?;
-        page_ids.extend(chain_pages);
+        published.extend(chain_pages);
     }
-    Ok(page_ids)
+    Ok(BasePageSets {
+        reader_visible,
+        published,
+    })
 }
 
-async fn published_allocation_floor<V: Vfs + Clone>(
-    db: &Db<V>,
-    snapshot: ReaderSnapshot,
-) -> crate::Result<u64> {
-    if snapshot.commit_history_root_page_id == 0 {
-        return Ok(snapshot.next_page_id);
-    }
-    let history = crate::btree::BTree::open(
-        db.pager.clone(),
-        db.realm_id,
-        snapshot.commit_history_root_page_id,
-        snapshot.next_page_id,
-        db.page_size,
-    );
-    let key = snapshot.commit_id.to_be_bytes();
-    match history.get(&key).await? {
-        Some(value) => Ok(decode_commit_meta(&value)?.next_page_id),
-        None => Ok(snapshot.next_page_id),
-    }
+/// What a failed export or restore is allowed to delete.
+///
+/// Cleanup must undo what the operation created and nothing else. A caller that
+/// pre-created an empty output directory — `mkdir -p /backups/snap-1`, then
+/// snapshot into it — still owns that directory after a failure, so the
+/// distinction is recorded up front rather than inferred afterwards from an
+/// `io::ErrorKind` that any number of unrelated operations also produce.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DestinationOwnership {
+    /// The directory did not exist; a failure removes it entirely.
+    Created,
+    /// The directory already existed and was empty; a failure removes only the
+    /// contents written into it.
+    PreExisting,
 }
 
-async fn ensure_restore_destination_empty(dst_path: &std::path::Path) -> crate::Result<()> {
+/// Require an empty destination and record whether it already existed.
+///
+/// A non-empty destination is refused rather than merged into: a snapshot
+/// artifact describes one exact state, and mixing it with unrelated pre-existing
+/// pages or segment files produces a directory that authenticates as neither.
+async fn claim_empty_destination(
+    dst_path: &std::path::Path,
+) -> crate::Result<DestinationOwnership> {
     match fs::read_dir(dst_path).await {
         Ok(mut entries) => {
             if entries
@@ -113,22 +139,41 @@ async fn ensure_restore_destination_empty(dst_path: &std::path::Path) -> crate::
             {
                 return Err(crate::errors::PagedbError::Io(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
-                    format!("restore destination is not empty: {}", dst_path.display()),
+                    format!("snapshot destination is not empty: {}", dst_path.display()),
                 )));
             }
-            Ok(())
+            Ok(DestinationOwnership::PreExisting)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(DestinationOwnership::Created)
+        }
         Err(error) => Err(crate::errors::PagedbError::Io(error)),
     }
 }
 
-async fn cleanup_failed_snapshot(dst_path: &std::path::Path, error: &crate::errors::PagedbError) {
-    if !matches!(
-        error,
-        crate::errors::PagedbError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists
-    ) {
-        let _ = fs::remove_dir_all(dst_path).await;
+/// Roll back a failed export or restore, leaving the destination reusable.
+///
+/// Errors are discarded deliberately: the caller is already returning the
+/// failure that matters, and a cleanup error must not replace it with something
+/// less diagnostic.
+async fn cleanup_failed_snapshot(dst_path: &std::path::Path, ownership: DestinationOwnership) {
+    match ownership {
+        DestinationOwnership::Created => {
+            let _ = fs::remove_dir_all(dst_path).await;
+        }
+        DestinationOwnership::PreExisting => {
+            let Ok(mut entries) = fs::read_dir(dst_path).await else {
+                return;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+                    let _ = fs::remove_dir_all(&path).await;
+                } else {
+                    let _ = fs::remove_file(&path).await;
+                }
+            }
+        }
     }
 }
 
@@ -213,6 +258,50 @@ async fn validate_restored_snapshot(
 }
 
 impl<V: Vfs + Clone> Db<V> {
+    /// Segment rows of the catalog tree rooted at `catalog_root_page_id`.
+    ///
+    /// Reads the catalog at an explicit root rather than through a `ReadTxn`, so
+    /// a caller comparing a base and a target catalog can hold both at once —
+    /// and so the base side can be drawn from the same published snapshot its
+    /// page sets came from.
+    async fn catalog_segment_metas(
+        &self,
+        catalog_root_page_id: u64,
+        next_page_id: u64,
+    ) -> crate::Result<Vec<crate::catalog::codec::SegmentMeta>> {
+        if catalog_root_page_id == 0 {
+            return Ok(Vec::new());
+        }
+        let tree = crate::btree::BTree::open(
+            self.pager.clone(),
+            self.realm_id,
+            catalog_root_page_id,
+            next_page_id,
+            self.page_size,
+        );
+        let rows = tree
+            .scan_prefix(&[crate::catalog::codec::CatalogRowKind::Segment as u8])
+            .await?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for (_, value) in rows {
+            entries.push(crate::catalog::codec::Catalog::decode_segment_meta(&value)?);
+        }
+        Ok(entries)
+    }
+
+    async fn catalog_segment_ids(
+        &self,
+        catalog_root_page_id: u64,
+        next_page_id: u64,
+    ) -> crate::Result<BTreeSet<[u8; 16]>> {
+        Ok(self
+            .catalog_segment_metas(catalog_root_page_id, next_page_id)
+            .await?
+            .into_iter()
+            .map(|meta| meta.segment_id)
+            .collect())
+    }
+
     /// Full verbatim snapshot of the database at the current `latest_commit`.
     ///
     /// Not available on `wasm32` targets (requires native file system access).
@@ -263,8 +352,16 @@ impl<V: Vfs + Clone> Db<V> {
         };
 
         let src_root = get_vfs_root(&*self.vfs)?;
+        let ownership = claim_empty_destination(dst_path).await?;
+        // Bound before the await: the guard is a `parking_lot` read lock and
+        // must not be alive across a suspension point. This is a length floor
+        // for the verbatim `main.db` copy, not a set-membership claim, so the
+        // currently published snapshot is the right source even though `txn`
+        // pins a possibly earlier commit — any later commit only grows the file.
         let published_snapshot = *self.snapshot.read();
-        let required_page_ids = collect_published_page_ids(self, published_snapshot).await?;
+        let required_page_ids = collect_base_page_sets(self, published_snapshot)
+            .await?
+            .published;
         let highest_required_main_page = required_page_ids.iter().next_back().copied().unwrap_or(1);
         let stats = match snapshot_full(
             &src_root,
@@ -278,7 +375,7 @@ impl<V: Vfs + Clone> Db<V> {
         {
             Ok(stats) => stats,
             Err(error) => {
-                cleanup_failed_snapshot(dst_path, &error).await;
+                cleanup_failed_snapshot(dst_path, ownership).await;
                 return Err(error);
             }
         };
@@ -306,7 +403,7 @@ impl<V: Vfs + Clone> Db<V> {
         if manifest.kind != 0 {
             return Err(crate::errors::PagedbError::snapshot_incompatible("kind"));
         }
-        ensure_restore_destination_empty(dst_path).await?;
+        let ownership = claim_empty_destination(dst_path).await?;
 
         let restore_result = async {
             // Create destination directory.
@@ -329,7 +426,12 @@ impl<V: Vfs + Clone> Db<V> {
                 .map_err(crate::errors::PagedbError::Io)?;
 
             // Copy segment files without collapsing directory or entry errors.
+            // Names are screened here, before anything opens the destination: a
+            // file that is not a segment identity is an undeclared sidecar, and
+            // letting open-time recovery meet it first reports artifact
+            // corruption as whatever error that recovery path happens to raise.
             let seg_src = src_path.join("seg");
+            let mut copied_segments: u32 = 0;
             match fs::read_dir(&seg_src).await {
                 Ok(mut entries) => {
                     while let Some(entry) = entries
@@ -337,16 +439,31 @@ impl<V: Vfs + Clone> Db<V> {
                         .await
                         .map_err(crate::errors::PagedbError::Io)?
                     {
-                        let name = entry.file_name();
-                        fs::copy(entry.path(), seg_dst.join(name))
+                        let name = entry.file_name().into_string().map_err(|_| {
+                            crate::errors::PagedbError::snapshot_artifact_invalid("segment.name")
+                        })?;
+                        if crate::hex::parse_hex::<16>(&name).is_none() {
+                            return Err(crate::errors::PagedbError::snapshot_artifact_invalid(
+                                "segment.name",
+                            ));
+                        }
+                        fs::copy(entry.path(), seg_dst.join(&name))
                             .await
                             .map_err(crate::errors::PagedbError::Io)?;
+                        copied_segments = copied_segments.checked_add(1).ok_or_else(|| {
+                            crate::errors::PagedbError::snapshot_artifact_invalid("segments_count")
+                        })?;
                     }
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound
                         && manifest.segments_count == 0 => {}
                 Err(error) => return Err(crate::errors::PagedbError::Io(error)),
+            }
+            if copied_segments != manifest.segments_count {
+                return Err(crate::errors::PagedbError::snapshot_artifact_invalid(
+                    "segments",
+                ));
             }
 
             // Open and authenticate every manifest-referenced root and segment
@@ -356,25 +473,13 @@ impl<V: Vfs + Clone> Db<V> {
             let realm_id = crate::RealmId(manifest.realm_id);
             let dst_vfs = TokioVfs::new(dst_path);
             let restored =
-                Db::<TokioVfs>::open_read_only(dst_vfs, kek, page_size, realm_id, options)
-                    .await
-                    .map_err(|error| match error {
-                        // A syntactically named but malformed undeclared
-                        // sidecar can be discovered by open-time recovery
-                        // before the exact catalog/file-set check below.
-                        // In a restore artifact this is corruption, not an
-                        // unsupported host capability.
-                        crate::errors::PagedbError::Unsupported => {
-                            crate::errors::PagedbError::snapshot_artifact_invalid("segments")
-                        }
-                        other => other,
-                    })?;
+                Db::<TokioVfs>::open_read_only(dst_vfs, kek, page_size, realm_id, options).await?;
             validate_restored_snapshot(&manifest, &restored).await?;
             Ok(restored)
         }
         .await;
-        if let Err(error) = &restore_result {
-            cleanup_failed_snapshot(dst_path, error).await;
+        if restore_result.is_err() {
+            cleanup_failed_snapshot(dst_path, ownership).await;
         }
         restore_result
     }
@@ -415,16 +520,28 @@ impl<V: Vfs + Clone> Db<V> {
             base_next_page_id,
         )
         .await?;
+        // Exactly the formula `apply_incremental` re-derives from the manifest.
+        // Both sides must compute this the same way or a healthy snapshot fails
+        // the follower's set comparison.
         let changed_page_ids: Vec<u64> = target_page_ids
             .difference(&base_page_ids)
             .copied()
             .collect();
-        if changed_page_ids
-            .iter()
-            .any(|page_id| *page_id < base_next_page_id)
-        {
-            return Err(crate::errors::PagedbError::Unsupported);
-        }
+        // Deliberately no producer-side page-reuse check. A page id below the
+        // base allocation cursor proves nothing: a page that was *free* at the
+        // base commit is legitimately reallocated for the target, and shipping
+        // it is safe precisely because no base-reachable state points at it.
+        // Rejecting on the cursor would fail every database that has ever
+        // deleted anything.
+        //
+        // The one collision that does matter — a page the follower's own
+        // free-list chain or commit-history tree still hosts — is invisible
+        // from here. The follower keeps both across an apply, and the base
+        // commit's recorded free-list root is superseded writer metadata whose
+        // pages a later commit may already have recycled, so reading it to
+        // guess would authenticate a page that is no longer a free-list page at
+        // all. The follower owns that check and runs it before any byte reaches
+        // `main.db`.
 
         // Current segments.
         let current_segments = txn.list_segments("").await?;
@@ -469,6 +586,7 @@ impl<V: Vfs + Clone> Db<V> {
         };
 
         let src_root = get_vfs_root(&*self.vfs)?;
+        let ownership = claim_empty_destination(dst_path).await?;
 
         let stats = match snapshot_incremental(
             &src_root,
@@ -483,7 +601,7 @@ impl<V: Vfs + Clone> Db<V> {
         {
             Ok(stats) => stats,
             Err(error) => {
-                cleanup_failed_snapshot(dst_path, &error).await;
+                cleanup_failed_snapshot(dst_path, ownership).await;
                 return Err(error);
             }
         };
@@ -550,17 +668,19 @@ impl<V: Vfs + Clone> Db<V> {
         };
         let manifest = decode_manifest(&manifest_bytes, &hk_raw)?;
         self.validate_incremental_manifest(&manifest, &manifest_bytes[118..224])?;
+        // One sample of the published base. Its page sets and its segment set
+        // are compared against each other below, so drawing them from two
+        // independent reads would let a concurrent `gc_now` — which Follower
+        // mode permits — split the base state across the comparison and make a
+        // valid delta look inconsistent.
         let base_snapshot = *self.snapshot.read();
-        let protected_page_ids = collect_published_page_ids(self, base_snapshot).await?;
-        let base_allocation_floor = published_allocation_floor(self, base_snapshot).await?;
-        let base_segment_ids: BTreeSet<[u8; 16]> = self
-            .begin_read()
-            .await?
-            .list_segments("")
-            .await?
-            .into_iter()
-            .map(|meta| meta.segment_id)
-            .collect();
+        let base_pages = collect_base_page_sets(self, base_snapshot).await?;
+        let base_segment_ids = self
+            .catalog_segment_ids(
+                base_snapshot.catalog_root_page_id,
+                base_snapshot.next_page_id,
+            )
+            .await?;
 
         let page_size = usize::try_from(manifest.page_size)
             .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("page_size"))?;
@@ -574,8 +694,7 @@ impl<V: Vfs + Clone> Db<V> {
             src_path,
             &dst_main_db,
             page_size,
-            &protected_page_ids,
-            base_allocation_floor,
+            &base_pages.published,
             manifest.next_page_id_at_target,
         )
         .await?;
@@ -591,8 +710,13 @@ impl<V: Vfs + Clone> Db<V> {
             manifest.next_page_id_at_target,
         )
         .await?;
+        // The same formula the producer used to build the delta:
+        // target-reachable minus base-reader-visible. Subtracting the wider
+        // `published` set here instead would demand a delta the producer cannot
+        // construct, because it cannot see this follower's free-list or
+        // commit-history pages.
         let expected_delta_page_ids: BTreeSet<u64> = target_page_ids
-            .difference(&protected_page_ids)
+            .difference(&base_pages.reader_visible)
             .copied()
             .collect();
         if applied_pages.page_ids != expected_delta_page_ids {
@@ -601,25 +725,12 @@ impl<V: Vfs + Clone> Db<V> {
             ));
         }
 
-        let target_segments = if manifest.target_catalog_root_page_id == 0 {
-            Vec::new()
-        } else {
-            let tree = crate::btree::BTree::open(
-                self.pager.clone(),
-                self.realm_id,
+        let target_segments = self
+            .catalog_segment_metas(
                 manifest.target_catalog_root_page_id,
                 manifest.next_page_id_at_target,
-                self.page_size,
-            );
-            let rows = tree
-                .scan_prefix(&[crate::catalog::codec::CatalogRowKind::Segment as u8])
-                .await?;
-            let mut entries = Vec::with_capacity(rows.len());
-            for (_, value) in rows {
-                entries.push(crate::catalog::codec::Catalog::decode_segment_meta(&value)?);
-            }
-            entries
-        };
+            )
+            .await?;
         let target_segment_ids: BTreeSet<[u8; 16]> =
             target_segments.iter().map(|meta| meta.segment_id).collect();
         let expected_promoted_segment_ids: BTreeSet<[u8; 16]> = target_segment_ids
