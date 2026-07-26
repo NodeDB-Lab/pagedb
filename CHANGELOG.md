@@ -29,7 +29,9 @@ version, since none exists yet.
 - **Cross-platform VFS** — Linux (`io_uring`), Windows (IOCP), macOS/iOS
   (Grand Central Dispatch), Android, WASM/OPFS, and WASI backends, plus a
   tokio thread-pool fallback and an in-memory backend, with format-bit identity
-  across targets.
+  across targets. Backends may complete a positional read or write in several
+  calls; PageDB finishes the caller's whole buffer before treating authenticated
+  metadata as present or durable.
 - **Snapshots** — `snapshot_to`, `restore_from`, and incremental apply, each
   authenticated against the exact state its manifest describes. Destinations
   must be empty; malformed or incomplete artifacts fail closed.

@@ -14,7 +14,7 @@ use crate::pager::Pager;
 use crate::pager::format::data_page::{body, extract_page_header_ids, open_data_page};
 use crate::pager::format::page_kind::PageKind;
 use crate::vfs::types::OpenMode;
-use crate::vfs::{Vfs, VfsFile, checked_read_progress};
+use crate::vfs::{Vfs, VfsFile, read_exact_at_borrowed};
 
 use super::authenticated_metadata::{
     ExtentIndexDecodeContext, authenticate_segment_metadata, decode_extent_index,
@@ -228,13 +228,7 @@ impl<V: Vfs + Clone> SegmentReader<V> {
             .checked_mul(page_size)
             .ok_or_else(|| PagedbError::arithmetic_overflow("segment page offset"))?;
         let mut buf = vec![0u8; self.page_size];
-        let mut read_offset = offset;
-        let mut remaining = &mut buf[..];
-        while !remaining.is_empty() {
-            let read = self.file.read_at(read_offset, remaining).await?;
-            checked_read_progress(&mut read_offset, read, remaining.len())?;
-            remaining = remaining.split_at_mut(read).1;
-        }
+        read_exact_at_borrowed!(self.file, offset, &mut buf[..])?;
 
         // Try each segment page kind; AAD binding rejects wrong ones.
         let try_kinds = [
