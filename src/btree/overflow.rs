@@ -1,20 +1,17 @@
 //! Overflow page encode / decode and chain management.
 //!
-//! Overflow pages form a singly-linked chain: each page body carries a `next`
-//! pointer (page id, 0 = end of chain) followed by raw data bytes. Chain pages
-//! (not the root) always use `PageKind::Overflow`.
+//! An overflow value is a singly-linked chain of pages. Each page body carries a
+//! `next` pointer (page id, 0 = end of chain) followed by raw data bytes.
 //!
-//! ## v1 root layout (`PageKind::Overflow`)
-//! `next[8] || data_len[4] || data[...]`
+//! - Root page (`PageKind::OverflowRoot`): `refcount[4] || next[8] || data_len[4] || data`.
+//!   The `refcount: u32` enables shared chains — `increment_ref` CoW-copies the
+//!   root with `refcount + 1`; `release` CoW-copies it with `refcount - 1` and,
+//!   when it reaches 0, frees the entire chain.
+//! - Chain page (`PageKind::Overflow`): `next[8] || data_len[4] || data`.
 //!
-//! ## v2 root layout (`PageKind::OverflowRoot`)
-//! `refcount[4] || next[8] || data_len[4] || data[...]`
-//!
-//! v2 root pages carry a `refcount: u32` enabling shared overflow chains.
-//! `increment_ref` CoW-copies the root with `refcount + 1`.
-//! `release` CoW-copies the root with `refcount - 1`; if it reaches 0 the
-//! entire chain is freed. Chain pages (not the root) continue to use
-//! `PageKind::Overflow` and `OVERFLOW_HEADER_LEN`.
+//! The two layouts differ only in the root's 4-byte `refcount` prefix, so the
+//! `next` pointer sits at byte 4 in the root and byte 0 in a chain page — any
+//! chain walk must account for that offset.
 
 use crate::errors::PagedbError;
 use crate::pager::Pager;
@@ -34,20 +31,19 @@ pub fn inline_value_threshold(page_size: usize) -> usize {
     page_size / 4
 }
 
-/// Extra bytes at the start of a v2 root body before the standard header:
+/// Extra bytes at the start of a root body before the standard header:
 /// `refcount[4]`.
-const OVERFLOW_ROOT_V2_PREFIX: usize = 4;
+const OVERFLOW_ROOT_PREFIX: usize = 4;
 
-/// Header length for a v2 root page:
-/// `refcount[4] || next[8] || data_len[4]`.
-pub const OVERFLOW_ROOT_HEADER_LEN: usize = OVERFLOW_ROOT_V2_PREFIX + OVERFLOW_HEADER_LEN;
+/// Header length for a root page: `refcount[4] || next[8] || data_len[4]`.
+pub const OVERFLOW_ROOT_HEADER_LEN: usize = OVERFLOW_ROOT_PREFIX + OVERFLOW_HEADER_LEN;
 
 #[must_use]
 pub fn overflow_page_capacity(page_size: usize) -> usize {
     page_size - ENVELOPE_OVERHEAD - OVERFLOW_HEADER_LEN
 }
 
-/// Capacity of a v2 root page body (4 bytes smaller than a chain page).
+/// Capacity of a root page body (4 bytes smaller than a chain page).
 #[must_use]
 pub fn overflow_root_capacity(page_size: usize) -> usize {
     page_size - ENVELOPE_OVERHEAD - OVERFLOW_ROOT_HEADER_LEN
@@ -93,9 +89,9 @@ pub fn decode_overflow(body: &[u8]) -> Result<(u64, &[u8])> {
     Ok((next, &body[12..12 + data_len]))
 }
 
-/// Encode a v2 overflow root page body (`PageKind::OverflowRoot`).
+/// Encode an overflow root page body (`PageKind::OverflowRoot`).
 /// `data.len()` must be ≤ `overflow_root_capacity(page_size)`.
-fn encode_overflow_root_v2(body: &mut [u8], refcount: u32, next: u64, data: &[u8]) -> Result<()> {
+fn encode_overflow_root(body: &mut [u8], refcount: u32, next: u64, data: &[u8]) -> Result<()> {
     let page_size = body.len() + ENVELOPE_OVERHEAD;
     let cap = overflow_root_capacity(page_size);
     if data.len() > cap {
@@ -113,8 +109,8 @@ fn encode_overflow_root_v2(body: &mut [u8], refcount: u32, next: u64, data: &[u8
     Ok(())
 }
 
-/// Decode a v2 overflow root page body. Returns `(refcount, next, data_slice)`.
-fn decode_overflow_root_v2(body: &[u8]) -> Result<(u32, u64, &[u8])> {
+/// Decode an overflow root page body. Returns `(refcount, next, data_slice)`.
+fn decode_overflow_root(body: &[u8]) -> Result<(u32, u64, &[u8])> {
     if body.len() < OVERFLOW_ROOT_HEADER_LEN {
         return Err(PagedbError::corruption(
             crate::errors::CorruptionDetail::HeaderUnverifiable,
@@ -137,55 +133,36 @@ fn decode_overflow_root_v2(body: &[u8]) -> Result<(u32, u64, &[u8])> {
     Ok((refcount, next, &body[16..16 + data_len]))
 }
 
-/// Decoded contents of an overflow root page (v1 or v2).
+/// Decoded contents of an overflow root page.
 pub struct RootPageInfo {
-    /// Reference count. Always 1 for v1 roots (treated as single-owner).
+    /// Reference count (shared-chain owner count).
     pub refcount: u32,
     /// `next` page id in the chain (0 = end).
     pub next: u64,
     /// Data bytes stored in the root page.
     pub root_data: Vec<u8>,
-    /// True iff this is a v2 root (`PageKind::OverflowRoot`).
-    pub is_v2: bool,
 }
 
-/// Read the root page of an overflow chain. Tries `OverflowRoot` (v2) first,
-/// falls back to `Overflow` (v1). v1 roots are reported with `refcount = 1`.
+/// Read the root page of an overflow chain (`PageKind::OverflowRoot`).
 pub async fn read_root_page<V: Vfs>(
     pager: &Pager<V>,
     realm_id: RealmId,
     root_page_id: u64,
 ) -> Result<RootPageInfo> {
-    // Try v2 first.
-    if let Ok(guard) = pager
-        .read_main_page(root_page_id, realm_id, PageKind::OverflowRoot)
-        .await
-    {
-        let body = guard.body();
-        let (refcount, next, data) = decode_overflow_root_v2(&body)?;
-        return Ok(RootPageInfo {
-            refcount,
-            next,
-            root_data: data.to_vec(),
-            is_v2: true,
-        });
-    }
-    // Fall back to v1: treat as refcount=1.
     let guard = pager
-        .read_main_page(root_page_id, realm_id, PageKind::Overflow)
+        .read_main_page(root_page_id, realm_id, PageKind::OverflowRoot)
         .await?;
     let body = guard.body();
-    let (next, data) = decode_overflow(&body)?;
+    let (refcount, next, data) = decode_overflow_root(&body)?;
     Ok(RootPageInfo {
-        refcount: 1,
+        refcount,
         next,
         root_data: data.to_vec(),
-        is_v2: false,
     })
 }
 
 /// Write a value's overflow chain via the Pager. The root page is written as
-/// `PageKind::OverflowRoot` (v2) with `refcount = 1`; chain pages use
+/// `PageKind::OverflowRoot` with `refcount = 1`; chain pages use
 /// `PageKind::Overflow`. Returns the root page's `page_id`.
 pub async fn write_chain<V: Vfs>(
     pager: &Pager<V>,
@@ -229,7 +206,7 @@ pub async fn write_chain<V: Vfs>(
         let chunk = &value[start..end];
         let mut body = vec![0u8; page_size - ENVELOPE_OVERHEAD];
         if is_root {
-            encode_overflow_root_v2(&mut body, 1, next, chunk)?;
+            encode_overflow_root(&mut body, 1, next, chunk)?;
             pager
                 .write_main_page(page_ids[i], realm_id, PageKind::OverflowRoot, &body)
                 .await?;
@@ -262,7 +239,7 @@ pub async fn increment_ref<V: Vfs>(
         .checked_add(1)
         .ok_or_else(|| PagedbError::Io(std::io::Error::other("overflow refcount overflow")))?;
     let mut body = vec![0u8; page_size - ENVELOPE_OVERHEAD];
-    encode_overflow_root_v2(&mut body, new_refcount, info.next, &info.root_data)?;
+    encode_overflow_root(&mut body, new_refcount, info.next, &info.root_data)?;
     pager
         .write_main_page(new_page_id, realm_id, PageKind::OverflowRoot, &body)
         .await?;
@@ -314,7 +291,7 @@ pub async fn release<V: Vfs>(
 
     let new_refcount = info.refcount - 1;
     let mut body = vec![0u8; page_size - ENVELOPE_OVERHEAD];
-    encode_overflow_root_v2(&mut body, new_refcount, info.next, &info.root_data)?;
+    encode_overflow_root(&mut body, new_refcount, info.next, &info.root_data)?;
     pager
         .write_main_page(new_page_id, realm_id, PageKind::OverflowRoot, &body)
         .await?;
@@ -323,9 +300,7 @@ pub async fn release<V: Vfs>(
     })
 }
 
-/// Read a value's overflow chain via the Pager. Follows `next` pointers until
-/// 0. Handles both v1 (`PageKind::Overflow` root) and v2
-/// (`PageKind::OverflowRoot` root) transparently.
+/// Read a value's overflow chain via the Pager. Follows `next` pointers until 0.
 pub async fn read_chain<V: Vfs>(
     pager: &Pager<V>,
     realm_id: RealmId,
@@ -356,7 +331,7 @@ pub async fn read_chain<V: Vfs>(
 }
 
 /// Collect every `page_id` in an overflow chain. Does not modify any pages.
-/// Handles v1 and v2 roots. Used when refcount tracking is handled externally.
+/// Used when refcount tracking is handled externally.
 pub async fn collect_chain<V: Vfs>(
     pager: &Pager<V>,
     realm_id: RealmId,
@@ -391,10 +366,10 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_root_v2() {
+    fn round_trip_root() {
         let mut body = vec![0u8; 4096 - ENVELOPE_OVERHEAD];
-        encode_overflow_root_v2(&mut body, 3, 99, b"world").unwrap();
-        let (rc, n, d) = decode_overflow_root_v2(&body).unwrap();
+        encode_overflow_root(&mut body, 3, 99, b"world").unwrap();
+        let (rc, n, d) = decode_overflow_root(&body).unwrap();
         assert_eq!(rc, 3);
         assert_eq!(n, 99);
         assert_eq!(d, b"world");
@@ -404,7 +379,7 @@ mod tests {
     fn capacity_4k_page() {
         // chain: 4096 - 40 - 12 = 4044
         assert_eq!(overflow_page_capacity(4096), 4044);
-        // root v2: 4096 - 40 - 16 = 4040
+        // root: 4096 - 40 - 16 = 4040
         assert_eq!(overflow_root_capacity(4096), 4040);
     }
 }

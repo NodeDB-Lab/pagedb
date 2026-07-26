@@ -163,6 +163,14 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) aborted_readers: parking_lot::Mutex<std::collections::HashSet<u64>>,
     /// Sentinel-lock handles acquired at open. Released (dropped) when the `Db` drops.
     pub(crate) sentinel_locks: Vec<<V as Vfs>::LockHandle>,
+    /// Set only by open paths that actually run the sentinel-lock acquisition
+    /// sequence for a writer mode (`open_with_mode`'s Standalone/Follower
+    /// dispatch, the locking `open_internal_with_options_and_cipher` wrapper,
+    /// and `promote_to_follower`). Constructors that bypass locking on
+    /// purpose — `open_existing`'s direct entry points, meant to be reached
+    /// through `Db::open` — leave this `false`, so the debug-only write guard
+    /// only fires where a lock was actually supposed to be held.
+    pub(crate) lock_required: bool,
     /// Snapshot of the reader-visible roots, published atomically at each
     /// writer commit. Read-only paths use this as their sole current-state
     /// publication channel, so readers see either the prior complete commit or
@@ -255,6 +263,22 @@ pub(super) struct HeaderFieldsParams {
 }
 
 impl<V: Vfs + Clone> Db<V> {
+    /// Whether this handle currently holds a writer sentinel lock
+    /// (`.writer.lock`, acquired for `Standalone`/`Follower` mode).
+    fn holds_write_lock(&self) -> bool {
+        !self.sentinel_locks.is_empty()
+    }
+
+    /// Debug-only write-path guard: true unless this handle was opened
+    /// through a path that was supposed to hold the writer sentinel
+    /// (`lock_required`) but doesn't. Handles opened through locking-exempt
+    /// entry points (`lock_required == false`) always pass — see the
+    /// `lock_required` field doc for which those are. Used by
+    /// `debug_assert!`; release builds pay nothing for this check.
+    pub(crate) fn write_lock_satisfied(&self) -> bool {
+        !self.lock_required || self.holds_write_lock()
+    }
+
     /// Retire an obsolete source epoch immediately when no reader can still
     /// resolve a pre-cutover snapshot; otherwise defer retirement until the
     /// tracked reader set drains.

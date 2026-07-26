@@ -168,6 +168,10 @@ impl<V: Vfs> BTree<V> {
         // falls through to bump growth.
         if self.reuse_threshold == 0 {
             if let Some(id) = self.freed.pop() {
+                assert!(
+                    id >= 4,
+                    "allocate_page recycled reserved page {id} from freed"
+                );
                 return id;
             }
         } else {
@@ -177,7 +181,12 @@ impl<V: Vfs> BTree<V> {
             });
             drop(consumed);
             if let Some(pos) = pos {
-                return self.freed.remove(pos);
+                let id = self.freed.remove(pos);
+                assert!(
+                    id >= 4,
+                    "allocate_page recycled reserved page {id} from freed"
+                );
+                return id;
             }
         }
         // Then draw from the shared cross-commit cache. It is loaded at txn
@@ -187,6 +196,10 @@ impl<V: Vfs> BTree<V> {
         // commit path removes it from the durable free-list.
         if let Some(cache) = &self.free_page_cache {
             if let Some(id) = cache.lock().pop() {
+                assert!(
+                    id >= 4,
+                    "allocate_page recycled reserved page {id} from free-list cache"
+                );
                 if let Some(consumed) = &self.free_page_consumed {
                     consumed.lock().push(id);
                 }
@@ -194,11 +207,22 @@ impl<V: Vfs> BTree<V> {
             }
         }
         let id = self.next_page_id;
+        assert!(
+            id >= 4,
+            "allocate_page bumped into reserved page {id} (next_page_id corrupted low)"
+        );
         self.next_page_id += 1;
         id
     }
 
     pub(super) fn free_page(&mut self, page_id: u64) {
+        // Pages 0..=3 are reserved (A/B headers + apply-journal) and must never
+        // enter the free-list: freeing one lets a later allocation hand it back
+        // as a data/overflow page, producing a wild pointer into a header page.
+        assert!(
+            page_id >= 4,
+            "free_page called on reserved page {page_id} (use-after-free / wild pointer)"
+        );
         self.freed.push(page_id);
     }
 

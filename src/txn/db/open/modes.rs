@@ -1,6 +1,6 @@
 //! Mode policy, sentinel acquisition, and public mode constructors.
 
-use crate::crypto::SecretKey;
+use crate::crypto::{CipherId, SecretKey};
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
 use crate::vfs::Vfs;
@@ -138,7 +138,12 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
     ) -> Result<Self> {
         let kek = kek.into();
-        Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Standalone).await
+        let db =
+            Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Standalone).await?;
+        // Black box: mark the epoch boundary — freed-page use-after-free
+        // surfaces on reopen, so the trail needs to know when one happened.
+        crate::diag::reopened(db.latest_commit().0);
+        Ok(db)
     }
 
     /// Open a frozen-snapshot database without write access.
@@ -204,6 +209,12 @@ impl<V: Vfs + Clone> Db<V> {
                 return Err(PagedbError::RestoredNotPromoted);
             }
             acquire_interlocking_mode_lock(&vfs, capabilities, &mut locks).await?;
+            let lock_path = match capabilities.long_lived_lock() {
+                LongLivedLock::Writer => WRITER_LOCK_PATH,
+                LongLivedLock::FrozenReader => FROZEN_READERS_LOCK_PATH,
+                LongLivedLock::Observer => OBSERVERS_LOCK_PATH,
+            };
+            crate::diag::lock_acquired(&format!("{mode:?}"), lock_path);
             drop(acquisition);
             exists
         };
@@ -211,10 +222,25 @@ impl<V: Vfs + Clone> Db<V> {
         let mut db = if main_db_exists {
             Self::open_existing_inner(vfs, kek, page_size, realm, options, mode).await?
         } else {
-            Self::open_internal_with_options(vfs, kek, page_size, realm, options).await?
+            // The caller already holds the writer sentinel acquired above, so
+            // bootstrap through the lock-free inner path rather than
+            // `open_internal_with_options`, which would try to reacquire it.
+            Self::open_internal_with_options_and_cipher_unlocked(
+                vfs,
+                kek,
+                page_size,
+                realm,
+                options,
+                CipherId::Aes256Gcm,
+            )
+            .await?
         };
         db.mode = mode;
         db.sentinel_locks = locks;
+        // Only writer modes (Standalone/Follower) are ever expected to reach
+        // the commit path this flag guards; ReadOnly/Observer hold a
+        // different sentinel kind and never write.
+        db.lock_required = capabilities.allows_user_writes();
         Ok(db)
     }
 
@@ -231,16 +257,24 @@ impl<V: Vfs + Clone> Db<V> {
             .vfs
             .lock_exclusive(FROZEN_READERS_LOCK_PATH)
             .await
-            .map_err(|_| PagedbError::ReadersPresent)?;
+            .map_err(|_| {
+                crate::diag::lock_rejected("follower", FROZEN_READERS_LOCK_PATH, "readers_present");
+                PagedbError::ReadersPresent
+            })?;
         drop(frozen_probe);
         let writer_lock = self
             .vfs
             .lock_exclusive(WRITER_LOCK_PATH)
             .await
-            .map_err(|_| PagedbError::AlreadyOpen)?;
+            .map_err(|_| {
+                crate::diag::lock_rejected("follower", WRITER_LOCK_PATH, "already_open");
+                PagedbError::AlreadyOpen
+            })?;
         drop(acquisition);
+        crate::diag::lock_acquired("follower", WRITER_LOCK_PATH);
         self.pager.enable_write_access().await;
         self.sentinel_locks.push(writer_lock);
+        self.lock_required = true;
         self.mode = DbMode::Follower;
         Ok(self)
     }
@@ -257,25 +291,32 @@ async fn main_db_exists<V: Vfs>(vfs: &V) -> Result<bool> {
     }
 }
 
-async fn acquire_interlocking_mode_lock<V: Vfs>(
+pub(super) async fn acquire_interlocking_mode_lock<V: Vfs>(
     vfs: &V,
     capabilities: DbModeCapabilities,
     locks: &mut Vec<V::LockHandle>,
 ) -> Result<()> {
     match capabilities.long_lived_lock() {
         LongLivedLock::Writer => {
-            let frozen_probe = vfs
-                .lock_exclusive(FROZEN_READERS_LOCK_PATH)
-                .await
-                .map_err(|_| PagedbError::ReadersPresent)?;
+            let frozen_probe =
+                vfs.lock_exclusive(FROZEN_READERS_LOCK_PATH)
+                    .await
+                    .map_err(|_| {
+                        crate::diag::lock_rejected(
+                            "writer",
+                            FROZEN_READERS_LOCK_PATH,
+                            "readers_present",
+                        );
+                        PagedbError::ReadersPresent
+                    })?;
             drop(frozen_probe);
             acquire_long_lived_lock(vfs, LongLivedLock::Writer, locks).await
         }
         LongLivedLock::FrozenReader => {
-            let writer_probe = vfs
-                .lock_exclusive(WRITER_LOCK_PATH)
-                .await
-                .map_err(|_| PagedbError::WriterPresent)?;
+            let writer_probe = vfs.lock_exclusive(WRITER_LOCK_PATH).await.map_err(|_| {
+                crate::diag::lock_rejected("frozen_reader", WRITER_LOCK_PATH, "writer_present");
+                PagedbError::WriterPresent
+            })?;
             drop(writer_probe);
             acquire_long_lived_lock(vfs, LongLivedLock::FrozenReader, locks).await
         }
@@ -291,18 +332,26 @@ async fn acquire_long_lived_lock<V: Vfs>(
     locks: &mut Vec<V::LockHandle>,
 ) -> Result<()> {
     let handle = match lock {
-        LongLivedLock::Writer => vfs
-            .lock_exclusive(WRITER_LOCK_PATH)
-            .await
-            .map_err(|_| PagedbError::AlreadyOpen)?,
-        LongLivedLock::FrozenReader => vfs
-            .lock_shared(FROZEN_READERS_LOCK_PATH)
-            .await
-            .map_err(|_| PagedbError::AlreadyLocked)?,
-        LongLivedLock::Observer => vfs
-            .lock_shared(OBSERVERS_LOCK_PATH)
-            .await
-            .map_err(|_| PagedbError::AlreadyLocked)?,
+        LongLivedLock::Writer => vfs.lock_exclusive(WRITER_LOCK_PATH).await.map_err(|_| {
+            crate::diag::lock_rejected("writer", WRITER_LOCK_PATH, "already_open");
+            PagedbError::AlreadyOpen
+        })?,
+        LongLivedLock::FrozenReader => {
+            vfs.lock_shared(FROZEN_READERS_LOCK_PATH)
+                .await
+                .map_err(|_| {
+                    crate::diag::lock_rejected(
+                        "frozen_reader",
+                        FROZEN_READERS_LOCK_PATH,
+                        "already_locked",
+                    );
+                    PagedbError::AlreadyLocked
+                })?
+        }
+        LongLivedLock::Observer => vfs.lock_shared(OBSERVERS_LOCK_PATH).await.map_err(|_| {
+            crate::diag::lock_rejected("observer", OBSERVERS_LOCK_PATH, "already_locked");
+            PagedbError::AlreadyLocked
+        })?,
     };
     locks.push(handle);
     Ok(())
