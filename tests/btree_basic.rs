@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
 use pagedb::btree::BTree;
+use pagedb::btree::internal::Internal;
+use pagedb::btree::leaf::{Leaf, LeafValue};
+use pagedb::btree::node::body_capacity;
 use pagedb::crypto::CipherId;
 use pagedb::crypto::kdf::derive_mk;
-use pagedb::pager::{Pager, PagerConfig};
+use pagedb::errors::CorruptionDetail;
+use pagedb::pager::{PageKind, Pager, PagerConfig};
 use pagedb::vfs::memory::MemVfs;
 use pagedb::{PagedbError, RealmId};
 
@@ -271,4 +275,131 @@ async fn put_append_after_regular_put_re_descends() {
     // Now further appends must be > "z99".
     assert!(tree.put_append(b"z00", b"v").await.is_err());
     tree.put_append(b"zzz", b"v").await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_node_rejects_authenticated_envelope_body_kind_mismatch() {
+    let pager = fresh_pager().await;
+    let realm = RealmId::new([1; 16]);
+
+    let mut leaf = Leaf::new();
+    leaf.upsert(b"k", LeafValue::Inline(b"v".to_vec()));
+    let mut leaf_body = vec![0u8; body_capacity(PAGE)];
+    leaf.encode(&mut leaf_body).unwrap();
+
+    let child_leaf_page_id = 62;
+    pager
+        .write_main_page(child_leaf_page_id, realm, PageKind::BTreeLeaf, &leaf_body)
+        .await
+        .unwrap();
+
+    let internal = Internal {
+        leftmost_child: child_leaf_page_id,
+        entries: Vec::new(),
+    };
+    let mut internal_body = vec![0u8; body_capacity(PAGE)];
+    internal.encode(&mut internal_body).unwrap();
+
+    for (page_id, envelope_kind, body) in [
+        (61, PageKind::BTreeLeaf, internal_body.as_slice()),
+        (64, PageKind::BTreeInternal, leaf_body.as_slice()),
+    ] {
+        pager
+            .write_main_page(page_id, realm, envelope_kind, body)
+            .await
+            .unwrap();
+        let tree = BTree::open(pager.clone(), realm, page_id, 65, PAGE);
+        let error = tree
+            .get(b"k")
+            .await
+            .expect_err("authenticated envelope and decoded node kinds must agree");
+
+        assert!(matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::HeaderUnverifiable)
+        ));
+    }
+}
+
+/// A page reaches the decoder already authenticated, so its bytes are whatever
+/// a key holder wrote — not necessarily what a correct writer would write. The
+/// node header's `prefix_len` and `slot_count`, and every slot-directory entry,
+/// are used directly as slice indices; unvalidated, a malformed value panics
+/// the library instead of reporting corruption. Each case below panicked before
+/// the body was structurally validated at parse time.
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_node_body_reports_corruption_instead_of_panicking() {
+    use pagedb::btree::node::{HEADER_LEN, NodeKind, write_header, write_slot_offset};
+
+    let capacity = body_capacity(PAGE);
+
+    // prefix_len far past the body: the prefix slice alone runs off the end.
+    let mut oversized_prefix = vec![0u8; capacity];
+    write_header(&mut oversized_prefix, NodeKind::Leaf, 1, 60_000, 0, 0);
+
+    // Slot directory extends past the body.
+    let mut oversized_directory = vec![0u8; capacity];
+    write_header(&mut oversized_directory, NodeKind::Leaf, 60_000, 0, 0, 0);
+
+    // Directory fits, but a slot points at an offset outside the body.
+    let mut wild_slot = vec![0u8; capacity];
+    write_header(&mut wild_slot, NodeKind::Leaf, 1, 0, 0, 0);
+    write_slot_offset(&mut wild_slot, 0, 0, u16::MAX);
+
+    // Slot points just inside the body, but the record it describes overruns it.
+    let mut truncated_record = vec![0u8; capacity];
+    write_header(&mut truncated_record, NodeKind::Leaf, 1, 0, 0, 0);
+    let record_offset = capacity - 4;
+    write_slot_offset(&mut truncated_record, 0, 0, record_offset as u16);
+    truncated_record[record_offset..record_offset + 2].copy_from_slice(&600u16.to_le_bytes());
+
+    // Same class on the internal-node record layout.
+    let mut wild_internal = vec![0u8; capacity];
+    write_header(&mut wild_internal, NodeKind::Internal, 1, 0, 0, 0);
+    write_slot_offset(&mut wild_internal, 0, 0, (capacity - 3) as u16);
+
+    let cases: [(&str, Vec<u8>, PageKind); 5] = [
+        (
+            "prefix_len past body",
+            oversized_prefix,
+            PageKind::BTreeLeaf,
+        ),
+        (
+            "slot directory past body",
+            oversized_directory,
+            PageKind::BTreeLeaf,
+        ),
+        ("slot offset past body", wild_slot, PageKind::BTreeLeaf),
+        (
+            "record overruns body",
+            truncated_record,
+            PageKind::BTreeLeaf,
+        ),
+        (
+            "internal record overruns body",
+            wild_internal,
+            PageKind::BTreeInternal,
+        ),
+    ];
+
+    let pager = fresh_pager().await;
+    let realm = RealmId::new([1; 16]);
+    for (index, (label, body, envelope_kind)) in cases.into_iter().enumerate() {
+        let page_id = 80 + index as u64;
+        assert!(body.len() > HEADER_LEN);
+        pager
+            .write_main_page(page_id, realm, envelope_kind, &body)
+            .await
+            .unwrap();
+        let tree = BTree::open(pager.clone(), realm, page_id, page_id + 1, PAGE);
+
+        let error = tree.get(b"k").await.expect_err(label);
+        assert!(
+            matches!(
+                error,
+                PagedbError::Corruption(CorruptionDetail::HeaderUnverifiable)
+            ),
+            "{label}: expected HeaderUnverifiable, got {error:?}"
+        );
+    }
 }

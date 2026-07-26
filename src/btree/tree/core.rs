@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::errors::{CorruptionDetail, PagedbError};
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::{PageGuard, Pager};
 use crate::vfs::Vfs;
@@ -233,13 +234,30 @@ impl<V: Vfs> BTree<V> {
 
     /// Read a B+ tree node page without knowing its kind in advance. The pager
     /// authenticates under the page's own header kind byte, so leaf and internal
-    /// nodes are each read correctly in a single pass. Returns the pinned page
-    /// guard and the decoded kind so the caller can build the matching accessor
-    /// on borrowed bytes without a second cache lookup.
+    /// nodes are each read correctly in a single pass. The encrypted body header
+    /// must agree with that authenticated envelope kind; disagreement indicates
+    /// a malformed page, not a different node type. Returns the pinned page guard
+    /// and decoded kind so the caller can build the matching accessor on borrowed
+    /// bytes without a second cache lookup.
     pub(crate) async fn read_node_guard(&self, page_id: u64) -> Result<(PageGuard, NodeKind)> {
-        let (g, _page_kind) = self.pager.read_main_node(page_id, self.realm_id).await?;
-        let kind = read_header(g.body_ref())?.kind;
-        Ok((g, kind))
+        let (guard, authenticated_kind) = self.pager.read_main_node(page_id, self.realm_id).await?;
+        let decoded_kind = read_header(guard.body_ref())?.kind;
+        let expected_kind = match authenticated_kind {
+            PageKind::BTreeLeaf => NodeKind::Leaf,
+            PageKind::BTreeInternal => NodeKind::Internal,
+            // Unreachable today: `KindBinding::Node` already restricts the
+            // authenticated kind to the two node kinds on both the warm and
+            // cold pager paths. Kept so this boundary stays total if the pager
+            // ever admits another kind here — a silent widening would otherwise
+            // turn into a mis-typed accessor rather than an error.
+            _ => return Err(PagedbError::IllegalPageKind),
+        };
+        if decoded_kind != expected_kind {
+            return Err(PagedbError::corruption(
+                CorruptionDetail::HeaderUnverifiable,
+            ));
+        }
+        Ok((guard, decoded_kind))
     }
 
     pub(super) async fn read_leaf(&self, page_id: u64) -> Result<Leaf> {

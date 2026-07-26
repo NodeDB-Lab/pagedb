@@ -3,6 +3,10 @@
 //! Included by each bench binary with `mod common;`. It is not a bench target
 //! itself (Cargo only auto-discovers `benches/*.rs` and `benches/*/main.rs`).
 
+// Each bench binary compiles its own copy of this module and uses a subset of
+// it, so anything another target needs is dead code here.
+#![allow(dead_code)]
+
 use std::any::Any;
 use std::cell::RefCell;
 
