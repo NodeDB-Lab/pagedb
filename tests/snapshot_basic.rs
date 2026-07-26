@@ -1,17 +1,20 @@
 //! Integration tests for snapshot_to / restore_from / promote_to_follower /
 //! apply_incremental / snapshot_incremental_to.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
+use pagedb::options::RetainPolicy;
 use pagedb::snapshot::export::{
-    SnapshotManifest, decode_manifest, derive_snapshot_hk_key, encode_manifest,
+    SnapshotManifest, decode_manifest, derive_snapshot_hk_key, encode_manifest, open_manifest,
 };
 use pagedb::vfs::tokio_backend::{TokioFile, TokioLockHandle, TokioVfs};
 use pagedb::vfs::{OpenMode, Vfs};
 use pagedb::{
-    ApplyStats, Db, DbMode, OpenOptions, PagedbError, RealmId, SegmentKind, SegmentPageKind,
-    SnapshotStats,
+    ApplyStats, CommitId, Db, DbMode, OpenOptions, PagedbError, RealmId, SegmentKind,
+    SegmentPageKind, SnapshotStats,
 };
 
 const PAGE: usize = 4096;
@@ -19,14 +22,11 @@ const KEK: [u8; 32] = [7u8; 32];
 const REALM: RealmId = RealmId::new([1u8; 16]);
 
 fn tempdir() -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    p.push(format!("pagedb-snap-{}-{}", std::process::id(), nanos));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    tempfile::Builder::new()
+        .prefix("pagedb-snap-")
+        .tempdir()
+        .unwrap()
+        .keep()
 }
 
 async fn make_db(root: &std::path::Path) -> Db<TokioVfs> {
@@ -101,6 +101,109 @@ impl Vfs for RenameFaultVfs {
     }
 }
 
+async fn make_db_with_options(root: &std::path::Path, options: OpenOptions) -> Db<TokioVfs> {
+    let vfs = TokioVfs::new(root);
+    Db::open(vfs, KEK, PAGE, REALM, options).await.unwrap()
+}
+
+fn hex_lower(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").unwrap();
+    }
+    out
+}
+
+fn create_stale_snapshot_sidecar(snapshot_dir: &std::path::Path) {
+    let stale_seg_dir = snapshot_dir.join("seg");
+    std::fs::create_dir_all(&stale_seg_dir).unwrap();
+    std::fs::write(
+        stale_seg_dir.join("00000000000000000000000000000001"),
+        b"stale",
+    )
+    .unwrap();
+}
+
+#[derive(Clone)]
+struct FailStagingSyncTokioVfs {
+    inner: TokioVfs,
+    fail_staging_sync: Arc<AtomicBool>,
+}
+
+impl FailStagingSyncTokioVfs {
+    fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: TokioVfs::new(root),
+            fail_staging_sync: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_next_staging_sync(&self) {
+        self.fail_staging_sync.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Vfs for FailStagingSyncTokioVfs {
+    type File = TokioFile;
+    type LockHandle = TokioLockHandle;
+
+    async fn open(&self, path: &str, mode: OpenMode) -> pagedb::Result<Self::File> {
+        self.inner.open(path, mode).await
+    }
+
+    async fn remove(&self, path: &str) -> pagedb::Result<()> {
+        self.inner.remove(path).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> pagedb::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn list_dir(&self, path: &str) -> pagedb::Result<Vec<String>> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn mkdir_all(&self, path: &str) -> pagedb::Result<()> {
+        self.inner.mkdir_all(path).await
+    }
+
+    async fn sync_dir(&self, path: &str) -> pagedb::Result<()> {
+        if path == "seg/.staging" && self.fail_staging_sync.swap(false, Ordering::SeqCst) {
+            return Err(PagedbError::Io(std::io::Error::other(
+                "injected staging sync fault",
+            )));
+        }
+        self.inner.sync_dir(path).await
+    }
+
+    async fn lock_exclusive(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+        self.inner.lock_exclusive(path).await
+    }
+
+    async fn lock_shared(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+        self.inner.lock_shared(path).await
+    }
+
+    fn root_path(&self) -> Option<&std::path::Path> {
+        Some(self.inner.root_path())
+    }
+}
+
+#[test]
+fn tempdir_helper_allocates_unique_roots() {
+    let dirs: Vec<_> = (0..128).map(|_| tempdir()).collect();
+    let mut paths = dirs.clone();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), dirs.len());
+
+    for dir in dirs {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: full snapshot then restore reads data back.
 // ---------------------------------------------------------------------------
@@ -148,7 +251,11 @@ async fn restore_yields_readonly_db() {
     let snap_dir = tempdir();
     let dst_dir = tempdir();
 
-    let db = make_db(&src_dir).await;
+    let db = make_db_with_options(
+        &src_dir,
+        OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded),
+    )
+    .await;
     db.snapshot_to(&snap_dir).await.unwrap();
     drop(db);
 
@@ -170,7 +277,292 @@ async fn restore_yields_readonly_db() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: promote_to_follower allows applying a real incremental.
+// Test 3: restore_from rejects corrupt active-root main.db pages.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_corrupt_active_root_page() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    let manifest = open_manifest(&snap_dir.join("manifest"), &KEK)
+        .await
+        .unwrap();
+    assert_ne!(
+        manifest.target_active_root_page_id, 0,
+        "test setup must produce a non-empty active tree"
+    );
+    let main_path = snap_dir.join("main.db");
+    let mut bytes = std::fs::read(&main_path).unwrap();
+    let corrupt_at = manifest.target_active_root_page_id as usize * PAGE + 128;
+    assert!(
+        bytes.len() > corrupt_at,
+        "test setup must include the active root page in full snapshot main.db"
+    );
+    bytes[corrupt_at] ^= 0xFF;
+    std::fs::write(&main_path, bytes).unwrap();
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject corrupt active-root pages"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            PagedbError::ChecksumFailure | PagedbError::Corruption(_)
+        ),
+        "expected page authentication failure, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: failed restore leaves the destination reusable.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_failure_leaves_destination_reusable() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    let manifest = open_manifest(&snap_dir.join("manifest"), &KEK)
+        .await
+        .unwrap();
+    let main_path = snap_dir.join("main.db");
+    let original_main = std::fs::read(&main_path).unwrap();
+    let mut corrupt_main = original_main.clone();
+    let corrupt_at = manifest.target_active_root_page_id as usize * PAGE + 128;
+    assert!(
+        corrupt_main.len() > corrupt_at,
+        "test setup must include the active root page in full snapshot main.db"
+    );
+    corrupt_main[corrupt_at] ^= 0xFF;
+    std::fs::write(&main_path, corrupt_main).unwrap();
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("corrupt snapshot must fail restore"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            PagedbError::ChecksumFailure | PagedbError::Corruption(_)
+        ),
+        "expected page authentication failure, got {err:?}"
+    );
+
+    std::fs::write(&main_path, original_main).unwrap();
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .expect("failed restore must leave the destination reusable");
+    let rtxn = restored.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"base").await.unwrap().as_deref(),
+        Some(b"data".as_slice())
+    );
+    drop(rtxn);
+    drop(restored);
+    drop(db);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: restore_from rejects non-empty destination directories.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_non_empty_destination() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_to(&snap_dir).await.unwrap();
+    drop(db);
+
+    let stale_seg = dst_dir.join("seg");
+    std::fs::create_dir_all(&stale_seg).unwrap();
+    std::fs::write(stale_seg.join("00000000000000000000000000000000"), b"stale").unwrap();
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject a non-empty destination"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Io(_)),
+        "expected Io for non-empty destination, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: restore_from rejects a manifest whose root fields do not match main.db.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_manifest_active_root_mismatch() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    let manifest_path = snap_dir.join("manifest");
+    let mut manifest = open_manifest(&manifest_path, &KEK).await.unwrap();
+    assert_ne!(
+        manifest.target_active_root_page_id, 0,
+        "test setup must produce a non-empty active tree"
+    );
+    let hk_key = derive_snapshot_hk_key(&KEK, &manifest.kek_salt, manifest.mk_epoch).unwrap();
+    manifest.target_active_root_page_id = 0;
+    std::fs::write(manifest_path, encode_manifest(&manifest, &hk_key)).unwrap();
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject manifest/header root mismatch"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            PagedbError::IdentityForked
+                | PagedbError::Corruption(_)
+                | PagedbError::SnapshotIncompatible {
+                    field: "target_active_root_page_id"
+                }
+        ),
+        "expected identity/corruption failure for manifest/header mismatch, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: restore_from rejects an incremental snapshot manifest.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_incremental_snapshot_manifest() {
+    let src_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"later", b"value").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&delta_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject an incremental snapshot manifest"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            PagedbError::Corruption(_) | PagedbError::SnapshotIncompatible { field: "kind" }
+        ),
+        "expected Corruption for incremental snapshot manifest, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_manifest_with_trailing_bytes() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    let manifest_path = snap_dir.join("manifest");
+    let mut bytes = std::fs::read(&manifest_path).unwrap();
+    bytes.push(0xAA);
+    std::fs::write(&manifest_path, bytes).unwrap();
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject non-canonical manifest length"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for manifest trailing bytes, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: promote_to_follower allows applying a real incremental.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn promote_to_follower_allows_apply() {
@@ -180,6 +572,11 @@ async fn promote_to_follower_allows_apply() {
     let delta_dir = tempdir();
 
     let db = make_db(&src_dir).await;
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(b"base", b"before-snapshot").await.unwrap();
+        txn.commit().await.unwrap();
+    }
     let c1 = db.latest_commit();
     db.snapshot_to(&snap_dir).await.unwrap();
 
@@ -217,8 +614,99 @@ async fn promote_to_follower_allows_apply() {
     std::fs::remove_dir_all(&delta_dir).ok();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_surfaces_staging_dir_sync_failure_then_retry_succeeds() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"stable").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let base = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    let meta = {
+        let mut s = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        s.append_page(SegmentPageKind::Data, b"post-base segment")
+            .await
+            .unwrap();
+        s.seal().await.unwrap()
+    };
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("post-base.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(base, &delta_dir).await.unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    drop(restored);
+
+    let vfs = FailStagingSyncTokioVfs::new(&dst_dir);
+    let restored = Db::open_read_only(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    vfs.fail_next_staging_sync();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must surface failed staging directory syncs");
+    assert!(
+        matches!(err, PagedbError::Io(_)),
+        "expected staging sync I/O error, got {err:?}"
+    );
+    assert_eq!(
+        follower.latest_commit(),
+        base,
+        "failed staging sync must leave the follower on the base commit"
+    );
+    {
+        let rtxn = follower.begin_read().await.unwrap();
+        assert_eq!(
+            rtxn.get(b"base").await.unwrap().as_deref(),
+            Some(b"stable" as &[u8])
+        );
+        assert!(
+            rtxn.open_segment("post-base.seg").await.is_err(),
+            "failed apply must not expose the target segment"
+        );
+    }
+
+    let stats = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect("retry after transient staging sync fault must succeed");
+    assert_eq!(stats.segments_promoted, 1);
+    assert!(
+        follower.latest_commit() > base,
+        "successful retry must advance the follower commit"
+    );
+    let rtxn = follower.begin_read().await.unwrap();
+    let reader = rtxn.open_segment("post-base.seg").await.unwrap();
+    let page = reader.read_page(1).await.unwrap();
+    assert!(page.starts_with(b"post-base segment"));
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
 // ---------------------------------------------------------------------------
-// Test 4: incremental carries only changed pages.
+// Test 5: incremental carries only changed pages.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn incremental_carries_only_changed_pages() {
@@ -226,14 +714,17 @@ async fn incremental_carries_only_changed_pages() {
     let snap1_dir = tempdir();
     let snap2_dir = tempdir();
 
-    let db = make_db(&src_dir).await;
-    // Write some initial data.
+    let db = make_db_with_options(
+        &src_dir,
+        OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded),
+    )
+    .await;
+    // Write a small base that does not create free pages before the base
+    // cursor; reused below-base pages are covered by the dedicated rejection
+    // regression below.
     {
         let mut t = db.begin_write().await.unwrap();
-        for i in 0u32..50 {
-            let k = format!("key{i:03}");
-            t.put(k.as_bytes(), b"init").await.unwrap();
-        }
+        t.put(b"key000", b"init").await.unwrap();
         t.commit().await.unwrap();
     }
     let c1 = db.latest_commit();
@@ -242,10 +733,7 @@ async fn incremental_carries_only_changed_pages() {
     // Write more data to advance the commit.
     {
         let mut t = db.begin_write().await.unwrap();
-        for i in 0u32..10 {
-            let k = format!("new{i:03}");
-            t.put(k.as_bytes(), b"added").await.unwrap();
-        }
+        t.put(b"new000", b"added").await.unwrap();
         t.commit().await.unwrap();
     }
 
@@ -265,7 +753,36 @@ async fn incremental_carries_only_changed_pages() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: apply_incremental advances commit and data matches.
+// Test 6: incremental snapshots require a readable base commit.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn incremental_snapshot_rejects_missing_base_commit() {
+    let src_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let missing_base = CommitId::new(99);
+    let err = db
+        .snapshot_incremental_to(missing_base, &delta_dir)
+        .await
+        .expect_err("incremental snapshots must reject an unreadable base commit");
+    assert!(
+        matches!(err, PagedbError::CommitGone { .. }),
+        "expected CommitGone for missing base commit, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: apply_incremental advances commit and data matches.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn apply_incremental_advances_commit() {
@@ -331,7 +848,777 @@ async fn apply_incremental_advances_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: standalone db calling apply_incremental returns IdentityForked.
+// Test 8: apply_incremental rejects a delta when the follower is past its base.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_delta_when_follower_not_at_base_commit() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    follower.apply_incremental(&delta_dir).await.unwrap();
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject a delta whose base is not the follower commit");
+    assert!(
+        matches!(
+            err,
+            PagedbError::IdentityForked
+                | PagedbError::SnapshotIncompatible {
+                    field: "base_commit"
+                }
+        ),
+        "expected IdentityForked for base-commit mismatch, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn incremental_snapshot_rejects_missing_changed_main_page() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(src_dir.join("main.db"))
+        .unwrap()
+        .set_len((PAGE * 2) as u64)
+        .unwrap();
+
+    let err = db
+        .snapshot_incremental_to(c1, &delta_dir)
+        .await
+        .expect_err("incremental snapshot must reject missing changed main.db pages");
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+        "expected UnexpectedEof for missing changed main page, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn incremental_snapshot_rejects_reused_pages_below_base_cursor() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(2));
+    let db = make_db_with_options(&src_dir, options.clone()).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        for i in 0u32..48 {
+            t.put(format!("old-{i:03}").as_bytes(), &vec![i as u8; PAGE * 2])
+                .await
+                .unwrap();
+        }
+        t.commit().await.unwrap();
+    }
+    {
+        let mut t = db.begin_write().await.unwrap();
+        for i in 0u32..48 {
+            t.delete(format!("old-{i:03}").as_bytes()).await.unwrap();
+        }
+        t.commit().await.unwrap();
+    }
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base-marker", b"retained").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let base = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    let new_value = vec![0xC7; PAGE * 2];
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"reused-after-base", &new_value).await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let err = db
+        .snapshot_incremental_to(base, &delta_dir)
+        .await
+        .expect_err("incremental snapshot must reject reused pages below the base cursor");
+    assert!(
+        matches!(err, PagedbError::Unsupported),
+        "expected Unsupported for reused pages below base cursor, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: apply_incremental rejects a truncated delta stream.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_truncated_delta_stream() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    let delta_path = delta_dir.join("pages.delta");
+    assert!(
+        std::fs::metadata(&delta_path).unwrap().len() > 8,
+        "test setup must produce a non-empty delta stream"
+    );
+    std::fs::write(&delta_path, [0xAA]).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject a truncated delta stream");
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for truncated delta stream, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"base").await.unwrap().as_deref(),
+        Some(b"data".as_slice())
+    );
+    assert_eq!(rtxn.get(b"new_key").await.unwrap().as_deref(), None);
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: apply_incremental rejects delta records for header pages.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_header_page_delta_record() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let mut delta = Vec::with_capacity(8 + PAGE);
+    delta.extend_from_slice(&0u64.to_be_bytes());
+    delta.extend_from_slice(&vec![0xAA; PAGE]);
+    std::fs::write(delta_dir.join("pages.delta"), delta).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject header-page delta records");
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for header-page delta record, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: apply_incremental rejects delta records beyond the target page range.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_delta_record_at_target_next_page_id() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let manifest = std::fs::read(delta_dir.join("manifest")).unwrap();
+    let target_next_page_id = u64::from_le_bytes(manifest[74..82].try_into().unwrap());
+    let mut delta = Vec::with_capacity(8 + PAGE);
+    delta.extend_from_slice(&target_next_page_id.to_be_bytes());
+    delta.extend_from_slice(&vec![0xAA; PAGE]);
+    std::fs::write(delta_dir.join("pages.delta"), delta).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject out-of-range delta records");
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for out-of-range delta record, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: apply_incremental rejects delta records below the base next-page id.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_delta_record_below_base_next_page_id_without_mutating_base() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+    let base_manifest = open_manifest(&snap_dir.join("manifest"), &KEK)
+        .await
+        .unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let stale_page_id = base_manifest.target_active_root_page_id;
+    assert!(
+        stale_page_id >= 2 && stale_page_id < base_manifest.next_page_id_at_target,
+        "test setup needs an existing non-header base page"
+    );
+    let delta_path = delta_dir.join("pages.delta");
+    let original_delta = std::fs::read(&delta_path).unwrap();
+    let mut malicious_delta = Vec::with_capacity(original_delta.len() + 8 + PAGE);
+    malicious_delta.extend_from_slice(&stale_page_id.to_be_bytes());
+    malicious_delta.extend_from_slice(&vec![0xAA; PAGE]);
+    malicious_delta.extend_from_slice(&original_delta);
+    std::fs::write(&delta_path, malicious_delta).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject records below the base next-page id");
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for below-base delta record, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    let base = rtxn
+        .get(b"base")
+        .await
+        .expect("failed apply must not corrupt existing base pages");
+    assert_eq!(base.as_deref(), Some(b"data".as_slice()));
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: apply_incremental rejects duplicate delta records.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_duplicate_delta_page_records() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let delta_path = delta_dir.join("pages.delta");
+    let original_delta = std::fs::read(&delta_path).unwrap();
+    assert!(
+        original_delta.len() >= 8 + PAGE,
+        "test setup must produce at least one delta page"
+    );
+    let duplicate_page_id = u64::from_be_bytes(original_delta[..8].try_into().unwrap());
+    let mut duplicated_delta = Vec::with_capacity(original_delta.len() + 8 + PAGE);
+    duplicated_delta.extend_from_slice(&original_delta);
+    duplicated_delta.extend_from_slice(&duplicate_page_id.to_be_bytes());
+    duplicated_delta.extend_from_slice(&vec![0xAA; PAGE]);
+    std::fs::write(delta_path, duplicated_delta).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject duplicate delta records");
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for duplicate delta record, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: apply_incremental rejects corrupt target active-root delta pages.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_corrupt_target_active_root_delta_page() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let manifest = std::fs::read(delta_dir.join("manifest")).unwrap();
+    let target_active_root_page_id = u64::from_le_bytes(manifest[102..110].try_into().unwrap());
+    let delta_path = delta_dir.join("pages.delta");
+    let mut delta = std::fs::read(&delta_path).unwrap();
+    let record_len = 8 + PAGE;
+    let mut corrupted = false;
+    for record in delta.chunks_exact_mut(record_len) {
+        let page_id = u64::from_be_bytes(record[..8].try_into().unwrap());
+        if page_id == target_active_root_page_id {
+            record[8 + 128] ^= 0xFF;
+            corrupted = true;
+            break;
+        }
+    }
+    assert!(
+        corrupted,
+        "test setup must include target active root page {target_active_root_page_id} in pages.delta"
+    );
+    std::fs::write(&delta_path, delta).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject corrupt target active-root delta pages");
+    assert!(
+        matches!(
+            err,
+            PagedbError::ChecksumFailure | PagedbError::Corruption(_)
+        ),
+        "expected page authentication failure, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"base").await.unwrap().as_deref(),
+        Some(b"data".as_slice())
+    );
+    assert_eq!(
+        rtxn.get(b"new_key").await.unwrap().as_deref(),
+        None,
+        "failed incremental apply must not advance the active root"
+    );
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: apply_incremental rejects a full snapshot manifest.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_full_snapshot_manifest() {
+    let src_dir = tempdir();
+    let base_snap_dir = tempdir();
+    let full_snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_to(&base_snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"later", b"value").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_to(&full_snap_dir).await.unwrap();
+    drop(db);
+
+    let restored =
+        Db::<TokioVfs>::restore_from(&base_snap_dir, &dst_dir, OpenOptions::default(), KEK)
+            .await
+            .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&full_snap_dir)
+        .await
+        .expect_err("apply_incremental must reject a full snapshot manifest");
+    assert!(
+        matches!(
+            err,
+            PagedbError::Corruption(_) | PagedbError::SnapshotIncompatible { field: "kind" }
+        ),
+        "expected Corruption for full snapshot manifest, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&base_snap_dir).ok();
+    std::fs::remove_dir_all(&full_snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_manifest_with_trailing_bytes() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"later", b"value").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let manifest_path = delta_dir.join("manifest");
+    let mut bytes = std::fs::read(&manifest_path).unwrap();
+    bytes.push(0xAA);
+    std::fs::write(&manifest_path, bytes).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject non-canonical manifest length");
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for manifest trailing bytes, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: apply_incremental rejects a correctly MACed wrong-realm manifest.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_wrong_realm_manifest() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let manifest_path = delta_dir.join("manifest");
+    let mut manifest = open_manifest(&manifest_path, &KEK).await.unwrap();
+    let hk_key = derive_snapshot_hk_key(&KEK, &manifest.kek_salt, manifest.mk_epoch).unwrap();
+    manifest.realm_id = [2u8; 16];
+    std::fs::write(manifest_path, encode_manifest(&manifest, &hk_key)).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject a wrong-realm incremental manifest");
+    assert!(
+        matches!(
+            err,
+            PagedbError::IdentityForked
+                | PagedbError::Corruption(_)
+                | PagedbError::SnapshotIncompatible { field: "realm_id" }
+        ),
+        "expected identity failure for wrong-realm manifest, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"base").await.unwrap().as_deref(),
+        Some(b"data".as_slice())
+    );
+    assert_eq!(
+        rtxn.get(b"new_key").await.unwrap().as_deref(),
+        None,
+        "failed incremental apply must not advance the active root"
+    );
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: apply_incremental rejects target commits that do not advance.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_non_advancing_target_commit() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+
+    let manifest_path = delta_dir.join("manifest");
+    let mut manifest = open_manifest(&manifest_path, &KEK).await.unwrap();
+    let hk_key = derive_snapshot_hk_key(&KEK, &manifest.kek_salt, manifest.mk_epoch).unwrap();
+    manifest.target_commit = manifest.base_commit;
+    std::fs::write(manifest_path, encode_manifest(&manifest, &hk_key)).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject non-advancing target commits");
+    assert!(
+        matches!(
+            err,
+            PagedbError::IdentityForked
+                | PagedbError::Corruption(_)
+                | PagedbError::SnapshotIncompatible {
+                    field: "target_commit"
+                }
+        ),
+        "expected identity/corruption failure for non-advancing target commit, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"base").await.unwrap().as_deref(),
+        Some(b"data".as_slice())
+    );
+    assert_eq!(
+        rtxn.get(b"new_key").await.unwrap().as_deref(),
+        None,
+        "failed incremental apply must not install new content under the base commit id"
+    );
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: standalone db calling apply_incremental returns IdentityForked.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn apply_incremental_rejects_on_standalone() {
@@ -352,7 +1639,7 @@ async fn apply_incremental_rejects_on_standalone() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: snapshot includes segments; restored db can read segment.
+// Test 14: snapshot includes segments; restored db can read segment.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn snapshot_includes_segments() {
@@ -394,7 +1681,1088 @@ async fn snapshot_includes_segments() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: manifest corruption detected.
+// Test 15: snapshot_to rejects a catalog segment whose file is missing.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_to_rejects_missing_catalog_segment_file() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    let meta = {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        w.seal().await.unwrap()
+    };
+    let segment_path = src_dir.join("seg").join(hex_lower(&meta.segment_id));
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("missing-source.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+    assert!(
+        segment_path.is_file(),
+        "test setup must create the linked live segment file"
+    );
+    std::fs::remove_file(&segment_path).unwrap();
+
+    let err = match db.snapshot_to(&snap_dir).await {
+        Ok(_) => panic!("snapshot_to must reject a catalog segment whose file is missing"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound),
+        "expected NotFound for missing catalog segment file, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: snapshot_to rejects non-empty output directories.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_to_rejects_non_empty_destination() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    create_stale_snapshot_sidecar(&snap_dir);
+
+    let err = match db.snapshot_to(&snap_dir).await {
+        Ok(_) => panic!("snapshot_to must reject a non-empty destination"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+        "expected AlreadyExists for non-empty snapshot destination, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: failed snapshot_to leaves the destination reusable.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_to_failure_leaves_destination_reusable() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    let meta = {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        w.seal().await.unwrap()
+    };
+    let segment_path = src_dir.join("seg").join(hex_lower(&meta.segment_id));
+    let backup_path = segment_path.with_extension("bak");
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("retry-full.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+    std::fs::rename(&segment_path, &backup_path).unwrap();
+
+    let err = match db.snapshot_to(&snap_dir).await {
+        Ok(_) => panic!("snapshot_to must reject a catalog segment whose file is missing"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound),
+        "expected NotFound for missing catalog segment file, got {err:?}"
+    );
+
+    std::fs::rename(&backup_path, &segment_path).unwrap();
+    let stats = db
+        .snapshot_to(&snap_dir)
+        .await
+        .expect("failed snapshot_to must leave the destination reusable");
+    assert_eq!(stats.segments_written, 1);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_to_rejects_missing_main_page() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"full-missing-page", b"value").await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(src_dir.join("main.db"))
+        .unwrap()
+        .set_len((PAGE * 2) as u64)
+        .unwrap();
+
+    let err = db
+        .snapshot_to(&snap_dir)
+        .await
+        .expect_err("snapshot_to must reject missing main.db pages");
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+        "expected UnexpectedEof for missing main.db page, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_to_rejects_missing_header_referenced_main_page() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    let second_value = vec![0xB2; PAGE * 3];
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"overflow-a", &vec![0xA1; PAGE * 3]).await.unwrap();
+        t.put(b"overflow-b", &second_value).await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let rtxn = db.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"overflow-b").await.unwrap().as_deref(),
+        Some(second_value.as_slice()),
+        "test setup must make the committed payload readable before truncation"
+    );
+    drop(rtxn);
+
+    db.snapshot_to(&snap_dir).await.unwrap();
+    let manifest = open_manifest(&snap_dir.join("manifest"), &KEK)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&snap_dir).unwrap();
+
+    let highest_root_page = manifest
+        .target_active_root_page_id
+        .max(manifest.target_catalog_root_page_id);
+    let truncated_len = (highest_root_page + 1) * PAGE as u64;
+    let main_path = src_dir.join("main.db");
+    let original_len = std::fs::metadata(&main_path).unwrap().len();
+    assert!(
+        original_len > truncated_len,
+        "test setup must allocate header-referenced pages beyond the root/catalog watermark"
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&main_path)
+        .unwrap()
+        .set_len(truncated_len)
+        .unwrap();
+
+    let err = db
+        .snapshot_to(&snap_dir)
+        .await
+        .expect_err("snapshot_to must reject missing header-referenced pages");
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+        "expected UnexpectedEof for missing header-referenced page, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: snapshot_incremental_to rejects a new segment whose file is missing.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_incremental_to_rejects_missing_new_segment_file() {
+    let src_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+
+    let meta = {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        w.seal().await.unwrap()
+    };
+    let segment_path = src_dir.join("seg").join(hex_lower(&meta.segment_id));
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("missing-incremental.seg", &meta)
+            .await
+            .unwrap();
+        t.commit().await.unwrap();
+    }
+    assert!(
+        segment_path.is_file(),
+        "test setup must create the linked live segment file"
+    );
+    std::fs::remove_file(&segment_path).unwrap();
+
+    let err = match db.snapshot_incremental_to(c1, &delta_dir).await {
+        Ok(_) => panic!("snapshot_incremental_to must reject a new segment whose file is missing"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound),
+        "expected NotFound for missing new segment file, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: snapshot_incremental_to rejects non-empty output directories.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_incremental_to_rejects_non_empty_destination() {
+    let src_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"new_key", b"new_val").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    create_stale_snapshot_sidecar(&delta_dir);
+
+    let err = match db.snapshot_incremental_to(c1, &delta_dir).await {
+        Ok(_) => panic!("snapshot_incremental_to must reject a non-empty destination"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+        "expected AlreadyExists for non-empty incremental destination, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: failed snapshot_incremental_to leaves the destination reusable.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_incremental_to_failure_leaves_destination_reusable() {
+    let src_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    let meta = {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        w.seal().await.unwrap()
+    };
+    let segment_path = src_dir.join("seg").join(hex_lower(&meta.segment_id));
+    let backup_path = segment_path.with_extension("bak");
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("retry-incremental.seg", &meta)
+            .await
+            .unwrap();
+        t.commit().await.unwrap();
+    }
+    std::fs::rename(&segment_path, &backup_path).unwrap();
+
+    let err = match db.snapshot_incremental_to(c1, &delta_dir).await {
+        Ok(_) => panic!("snapshot_incremental_to must reject a new segment whose file is missing"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound),
+        "expected NotFound for missing new segment file, got {err:?}"
+    );
+
+    std::fs::rename(&backup_path, &segment_path).unwrap();
+    let stats = db
+        .snapshot_incremental_to(c1, &delta_dir)
+        .await
+        .expect("failed snapshot_incremental_to must leave the destination reusable");
+    assert_eq!(stats.segments_written, 1);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: apply_incremental rejects renamed segment sidecars.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_renamed_manifest_declared_segment_file() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let meta = {
+            let mut s = db
+                .create_segment(REALM, SegmentKind::Unspecified)
+                .await
+                .unwrap();
+            s.append_page(SegmentPageKind::Data, b"segment-after-base")
+                .await
+                .unwrap();
+            s.set_manifest(b"mf").unwrap();
+            s.seal().await.unwrap()
+        };
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("renamed.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let stats = db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    assert_eq!(stats.segments_written, 1);
+    let seg_files: Vec<_> = std::fs::read_dir(delta_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        seg_files.len(),
+        1,
+        "test setup must produce exactly one incremental segment sidecar"
+    );
+    let original_sidecar = &seg_files[0];
+    let fake_sidecar = delta_dir
+        .join("seg")
+        .join("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
+    std::fs::rename(original_sidecar, fake_sidecar).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject renamed manifest-declared segment files");
+    assert!(
+        matches!(
+            err,
+            PagedbError::Corruption(_)
+                | PagedbError::SnapshotIncompatible {
+                    field: "segments_count"
+                }
+        ),
+        "expected Corruption for renamed segment sidecar, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert!(
+        rtxn.open_segment("renamed.seg").await.is_err(),
+        "failed incremental apply must not advance the catalog"
+    );
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// Test 18: restore_from rejects missing manifest-declared segment files.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_missing_manifest_declared_segment_file() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        let meta = w.seal().await.unwrap();
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("missing-full.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let stats = db.snapshot_to(&snap_dir).await.unwrap();
+    assert_eq!(stats.segments_written, 1);
+    let seg_files: Vec<_> = std::fs::read_dir(snap_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        seg_files.len(),
+        1,
+        "test setup must produce exactly one full-snapshot segment sidecar"
+    );
+    for file in seg_files {
+        std::fs::remove_file(file).unwrap();
+    }
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject missing manifest-declared segment files"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            PagedbError::Corruption(_)
+                | PagedbError::SnapshotIncompatible {
+                    field: "segments_count"
+                }
+        ),
+        "expected Corruption for missing full-snapshot segment sidecar, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: restore_from rejects renamed manifest-declared segment files.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_renamed_manifest_declared_segment_file() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        let meta = w.seal().await.unwrap();
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("renamed-full.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let stats = db.snapshot_to(&snap_dir).await.unwrap();
+    assert_eq!(stats.segments_written, 1);
+    let seg_files: Vec<_> = std::fs::read_dir(snap_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        seg_files.len(),
+        1,
+        "test setup must produce exactly one full-snapshot segment sidecar"
+    );
+    let fake_sidecar = snap_dir
+        .join("seg")
+        .join("efefefefefefefefefefefefefefefef");
+    std::fs::rename(&seg_files[0], fake_sidecar).unwrap();
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject renamed manifest-declared segment files"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for renamed full-snapshot segment sidecar, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: restore_from rejects corrupt segment data pages.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_corrupt_segment_data_page() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        let meta = w.seal().await.unwrap();
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("corrupt.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let stats = db.snapshot_to(&snap_dir).await.unwrap();
+    assert_eq!(stats.segments_written, 1);
+    let seg_files: Vec<_> = std::fs::read_dir(snap_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        seg_files.len(),
+        1,
+        "test setup must produce exactly one full-snapshot segment sidecar"
+    );
+    let mut bytes = std::fs::read(&seg_files[0]).unwrap();
+    assert!(
+        bytes.len() > PAGE + 128,
+        "test setup must include a data page to corrupt"
+    );
+    bytes[PAGE + 128] ^= 0xFF;
+    std::fs::write(&seg_files[0], bytes).unwrap();
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject corrupt segment data pages"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            PagedbError::ChecksumFailure | PagedbError::Corruption(_)
+        ),
+        "expected segment authentication failure, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: restore_from rejects extra manifest-undeclared segment files.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn restore_rejects_extra_manifest_undeclared_segment_file() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut w = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        w.append_page(SegmentPageKind::Data, b"seg-content")
+            .await
+            .unwrap();
+        w.set_manifest(b"mf").unwrap();
+        let meta = w.seal().await.unwrap();
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("my.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let stats = db.snapshot_to(&snap_dir).await.unwrap();
+    assert_eq!(stats.segments_written, 1);
+    std::fs::write(
+        snap_dir
+            .join("seg")
+            .join("abababababababababababababababab"),
+        b"manifest-undeclared segment",
+    )
+    .unwrap();
+    drop(db);
+
+    let err = match Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+    {
+        Ok(_) => panic!("restore_from must reject manifest-undeclared segment files"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption for extra full-snapshot segment sidecar, got {err:?}"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: apply_incremental rejects missing manifest-declared segment files.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_missing_manifest_declared_segment_file() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let meta = {
+            let mut s = db
+                .create_segment(REALM, SegmentKind::Unspecified)
+                .await
+                .unwrap();
+            s.append_page(SegmentPageKind::Data, b"segment-after-base")
+                .await
+                .unwrap();
+            s.set_manifest(b"mf").unwrap();
+            s.seal().await.unwrap()
+        };
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("missing.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let stats = db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    assert_eq!(stats.segments_written, 1);
+    let seg_files: Vec<_> = std::fs::read_dir(delta_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        seg_files.len(),
+        1,
+        "test setup must produce exactly one incremental segment sidecar"
+    );
+    for file in seg_files {
+        std::fs::remove_file(file).unwrap();
+    }
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject missing manifest-declared segment files");
+    assert!(
+        matches!(
+            err,
+            PagedbError::Corruption(_)
+                | PagedbError::SnapshotIncompatible {
+                    field: "segments_count"
+                }
+        ),
+        "expected Corruption for missing segment sidecar, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"base").await.unwrap().as_deref(),
+        Some(b"data".as_slice())
+    );
+    assert!(
+        rtxn.open_segment("missing.seg").await.is_err(),
+        "failed incremental apply must not advance the catalog"
+    );
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_delta_depending_on_leftover_future_pages() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let meta = {
+            let mut s = db
+                .create_segment(REALM, SegmentKind::Unspecified)
+                .await
+                .unwrap();
+            s.append_page(SegmentPageKind::Data, b"segment-after-base")
+                .await
+                .unwrap();
+            s.set_manifest(b"mf").unwrap();
+            s.seal().await.unwrap()
+        };
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"later", b"value").await.unwrap();
+        t.link_segment("leftover.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    drop(db);
+
+    let original_delta = std::fs::read(delta_dir.join("pages.delta")).unwrap();
+    assert!(
+        original_delta.len() > PAGE,
+        "test setup must produce at least one changed main-db page"
+    );
+    let seg_files: Vec<_> = std::fs::read_dir(delta_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        seg_files.len(),
+        1,
+        "test setup must produce exactly one segment sidecar"
+    );
+    let saved_segments: Vec<_> = seg_files
+        .iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    for (path, bytes) in &saved_segments {
+        assert!(
+            bytes.len() > PAGE + 128,
+            "test setup must include a segment data page to corrupt"
+        );
+        let mut corrupt = bytes.clone();
+        corrupt[PAGE + 128] ^= 0xFF;
+        std::fs::write(path, corrupt).unwrap();
+    }
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("first apply must fail after writing delta pages");
+    assert!(
+        matches!(
+            err,
+            PagedbError::ChecksumFailure | PagedbError::Corruption(_)
+        ),
+        "expected corrupt sidecar authentication failure, got {err:?}"
+    );
+    assert_eq!(
+        follower.latest_commit(),
+        c1,
+        "failed apply must not advance the follower header"
+    );
+
+    for (path, bytes) in &saved_segments {
+        std::fs::write(path, bytes).unwrap();
+    }
+    let manifest = std::fs::read(delta_dir.join("manifest")).unwrap();
+    let target_active_root_page_id = u64::from_le_bytes(manifest[102..110].try_into().unwrap());
+    let mut corrupt_retry_delta = original_delta;
+    let mut corrupted = false;
+    for record in corrupt_retry_delta.chunks_exact_mut(8 + PAGE) {
+        let page_id = u64::from_be_bytes(record[..8].try_into().unwrap());
+        if page_id == target_active_root_page_id {
+            record[8 + 128] ^= 0xFF;
+            corrupted = true;
+            break;
+        }
+    }
+    assert!(
+        corrupted,
+        "test setup must include the target active root in pages.delta"
+    );
+    std::fs::write(delta_dir.join("pages.delta"), corrupt_retry_delta).unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("retry must authenticate rewritten pages instead of using cached leftovers");
+    assert!(
+        matches!(
+            err,
+            PagedbError::ChecksumFailure | PagedbError::Corruption(_)
+        ),
+        "expected authentication failure for a corrupt retry over leftover future pages, got {err:?}"
+    );
+    assert_eq!(
+        follower.latest_commit(),
+        c1,
+        "incomplete retry must not advance the follower header"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: apply_incremental rejects corrupt new segment sidecars.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_rejects_corrupt_new_segment_sidecar() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.put(b"base", b"data").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let meta = {
+            let mut s = db
+                .create_segment(REALM, SegmentKind::Unspecified)
+                .await
+                .unwrap();
+            s.append_page(SegmentPageKind::Data, b"segment-after-base")
+                .await
+                .unwrap();
+            s.set_manifest(b"mf").unwrap();
+            s.seal().await.unwrap()
+        };
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("corrupt-new.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+
+    let stats = db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    assert_eq!(stats.segments_written, 1);
+    let seg_files: Vec<_> = std::fs::read_dir(delta_dir.join("seg"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        seg_files.len(),
+        1,
+        "test setup must produce exactly one incremental segment sidecar"
+    );
+    let mut bytes = std::fs::read(&seg_files[0]).unwrap();
+    assert!(
+        bytes.len() > PAGE + 128,
+        "test setup must include a data page to corrupt"
+    );
+    bytes[PAGE + 128] ^= 0xFF;
+    std::fs::write(&seg_files[0], bytes).unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("apply_incremental must reject corrupt new segment sidecars");
+    assert!(
+        matches!(
+            err,
+            PagedbError::ChecksumFailure | PagedbError::Corruption(_)
+        ),
+        "expected segment authentication failure, got {err:?}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert!(
+        rtxn.open_segment("corrupt-new.seg").await.is_err(),
+        "failed incremental apply must not advance the catalog"
+    );
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 24: apply_incremental tombstones segments removed by the target catalog.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_tombstones_segment_removed_by_target_catalog() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    let meta = {
+        let mut s = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        s.append_page(SegmentPageKind::Data, b"segment-before-unlink")
+            .await
+            .unwrap();
+        s.set_manifest(b"mf").unwrap();
+        s.seal().await.unwrap()
+    };
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.link_segment("removed.seg", &meta).await.unwrap();
+        t.commit().await.unwrap();
+    }
+    let c1 = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    {
+        let mut t = db.begin_write().await.unwrap();
+        t.unlink_segment("removed.seg").await.unwrap();
+        t.commit().await.unwrap();
+    }
+    db.snapshot_incremental_to(c1, &delta_dir).await.unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    let live_path = dst_dir.join("seg").join(hex_lower(&meta.segment_id));
+    assert!(
+        live_path.is_file(),
+        "base restore must contain the segment before the unlink delta is applied"
+    );
+
+    let stats = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect("unlink delta should apply successfully");
+    assert_eq!(
+        stats.segments_tombstoned, 1,
+        "apply_incremental must report the removed segment tombstone"
+    );
+    assert!(
+        !live_path.exists(),
+        "removed segment must not remain at its live path after apply"
+    );
+    let tombstone_dir = dst_dir.join("seg").join(".tombstone");
+    let tombstone_count = std::fs::read_dir(&tombstone_dir)
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count();
+    assert_eq!(tombstone_count, 1);
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert!(
+        rtxn.open_segment("removed.seg").await.is_err(),
+        "applied target catalog must no longer expose the removed segment"
+    );
+    drop(rtxn);
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 25: manifest corruption detected.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn manifest_corruption_detected() {
@@ -605,6 +2973,11 @@ async fn failed_apply_promote_poisoned_handle_reopens_and_replays_journal_before
     let dst_dir = tempdir();
 
     let source = make_db(&src_dir).await;
+    {
+        let mut write = source.begin_write().await.unwrap();
+        write.put(b"base", b"before-snapshot").await.unwrap();
+        write.commit().await.unwrap();
+    }
     let base = source.latest_commit();
     source.snapshot_to(&snap_dir).await.unwrap();
     let meta = {

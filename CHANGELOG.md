@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Snapshot export, restore, and incremental apply now fail closed on malformed,
+  incomplete, extra, or unreadable artifacts instead of silently skipping
+  pages or segment files; exported files are synced before success.
+- Incremental apply authenticates its exact reachable page and segment sets,
+  invalidates stale cached plaintext after raw page writes, preserves published
+  base pages, rejects stale future-page dependencies, and journals both segment
+  promotion and tombstoning before publishing the target header.
+
 ## [0.1.0] - 2026-06-07
 
 Initial release.

@@ -85,6 +85,29 @@ impl<V: Vfs + Clone> SegmentReader<V> {
         .await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn open_internal_at_path(
+        pager: Arc<Pager<V>>,
+        catalog_meta: SegmentMeta,
+        path: &str,
+        mmap_budget_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        mmap_budget_limit: u64,
+    ) -> Result<Self> {
+        let page_size = pager.page_size();
+        let file = pager.vfs().open(path, OpenMode::Read).await?;
+        Self::finish_open(
+            pager,
+            catalog_meta,
+            page_size,
+            file,
+            MmapBudget {
+                used: mmap_budget_used,
+                limit: mmap_budget_limit,
+            },
+        )
+        .await
+    }
+
     /// Open a sealed replacement from either publication location. The
     /// replacement identity is durable progress, so a missing or malformed
     /// file must fail closed rather than being regenerated.

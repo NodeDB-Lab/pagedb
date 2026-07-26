@@ -12,7 +12,7 @@ use crate::vfs::Vfs;
 use crate::vfs::types::OpenMode;
 use crate::{RealmId, Result};
 
-use super::core::{Db, PendingTombstone, WriterState};
+use super::core::{Db, PendingTombstone};
 
 /// Result of reconciling post-header segment effects. A deferred tombstone is
 /// safe to publish because the old live file is extra data not referenced by
@@ -277,27 +277,5 @@ impl<V: Vfs + Clone> Db<V> {
         let key = Catalog::segment_key(realm, name.as_bytes())?;
         let value = tree.get(&key).await?.ok_or(PagedbError::NotFound)?;
         Catalog::decode_segment_meta(&value)
-    }
-
-    /// List all segment entries in the catalog.
-    pub(super) async fn list_all_segments(&self, state: &WriterState) -> Result<Vec<SegmentMeta>> {
-        if state.catalog_root_page_id == 0 {
-            return Ok(Vec::new());
-        }
-        let tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        let start = vec![CatalogRowKind::Segment as u8];
-        let rows = tree.scan_prefix(&start).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (_k, v) in rows {
-            let meta = Catalog::decode_segment_meta(&v)?;
-            out.push(meta);
-        }
-        Ok(out)
     }
 }

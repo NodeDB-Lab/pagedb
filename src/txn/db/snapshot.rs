@@ -3,6 +3,8 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::BTreeSet;
+
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::recovery::journal::{
@@ -18,10 +20,197 @@ use crate::txn::mode::DbMode;
 use crate::vfs::Vfs;
 use crate::vfs::tokio_backend::TokioVfs;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
-use super::core::Db;
+use super::core::{Db, ReaderSnapshot, decode_commit_meta};
 use super::util::{get_vfs_root, page_size_log2};
+
+async fn collect_tree_page_ids<V: Vfs + Clone>(
+    db: &Db<V>,
+    active_root_page_id: u64,
+    catalog_root_page_id: u64,
+    next_page_id: u64,
+) -> crate::Result<BTreeSet<u64>> {
+    let mut page_ids = BTreeSet::new();
+    for root_page_id in [active_root_page_id, catalog_root_page_id] {
+        if root_page_id == 0 {
+            continue;
+        }
+        let tree = crate::btree::BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            root_page_id,
+            next_page_id,
+            db.page_size,
+        );
+        tree.collect_all_page_ids(&mut page_ids).await?;
+    }
+    Ok(page_ids)
+}
+
+async fn collect_published_page_ids<V: Vfs + Clone>(
+    db: &Db<V>,
+    snapshot: ReaderSnapshot,
+) -> crate::Result<BTreeSet<u64>> {
+    let mut page_ids = collect_tree_page_ids(
+        db,
+        snapshot.root_page_id,
+        snapshot.catalog_root_page_id,
+        snapshot.next_page_id,
+    )
+    .await?;
+    if snapshot.commit_history_root_page_id != 0 {
+        let history = crate::btree::BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            snapshot.commit_history_root_page_id,
+            snapshot.next_page_id,
+            db.page_size,
+        );
+        history.collect_all_page_ids(&mut page_ids).await?;
+    }
+    if snapshot.free_list_root_page_id != 0 {
+        let (_entries, chain_pages) = crate::pager::freelist::read_chain(
+            &db.pager,
+            db.realm_id,
+            snapshot.free_list_root_page_id,
+        )
+        .await?;
+        page_ids.extend(chain_pages);
+    }
+    Ok(page_ids)
+}
+
+async fn published_allocation_floor<V: Vfs + Clone>(
+    db: &Db<V>,
+    snapshot: ReaderSnapshot,
+) -> crate::Result<u64> {
+    if snapshot.commit_history_root_page_id == 0 {
+        return Ok(snapshot.next_page_id);
+    }
+    let history = crate::btree::BTree::open(
+        db.pager.clone(),
+        db.realm_id,
+        snapshot.commit_history_root_page_id,
+        snapshot.next_page_id,
+        db.page_size,
+    );
+    let key = snapshot.commit_id.to_be_bytes();
+    match history.get(&key).await? {
+        Some(value) => Ok(decode_commit_meta(&value)?.next_page_id),
+        None => Ok(snapshot.next_page_id),
+    }
+}
+
+async fn ensure_restore_destination_empty(dst_path: &std::path::Path) -> crate::Result<()> {
+    match fs::read_dir(dst_path).await {
+        Ok(mut entries) => {
+            if entries
+                .next_entry()
+                .await
+                .map_err(crate::errors::PagedbError::Io)?
+                .is_some()
+            {
+                return Err(crate::errors::PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("restore destination is not empty: {}", dst_path.display()),
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::errors::PagedbError::Io(error)),
+    }
+}
+
+async fn cleanup_failed_snapshot(dst_path: &std::path::Path, error: &crate::errors::PagedbError) {
+    if !matches!(
+        error,
+        crate::errors::PagedbError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists
+    ) {
+        let _ = fs::remove_dir_all(dst_path).await;
+    }
+}
+
+async fn validate_restored_snapshot(
+    manifest: &SnapshotManifest,
+    restored: &Db<TokioVfs>,
+) -> crate::Result<()> {
+    let snapshot = *restored.snapshot.read();
+    if snapshot.commit_id != manifest.target_commit {
+        return Err(crate::errors::PagedbError::snapshot_incompatible(
+            "target_commit",
+        ));
+    }
+    if snapshot.next_page_id != manifest.next_page_id_at_target {
+        return Err(crate::errors::PagedbError::snapshot_incompatible(
+            "next_page_id_at_target",
+        ));
+    }
+    if snapshot.root_page_id != manifest.target_active_root_page_id {
+        return Err(crate::errors::PagedbError::snapshot_incompatible(
+            "target_active_root_page_id",
+        ));
+    }
+    if snapshot.catalog_root_page_id != manifest.target_catalog_root_page_id {
+        return Err(crate::errors::PagedbError::snapshot_incompatible(
+            "target_catalog_root_page_id",
+        ));
+    }
+
+    collect_tree_page_ids(
+        restored,
+        snapshot.root_page_id,
+        snapshot.catalog_root_page_id,
+        snapshot.next_page_id,
+    )
+    .await?;
+
+    let expected_segments = restored.list_segments(restored.realm_id, "").await?;
+    let expected_ids: BTreeSet<[u8; 16]> = expected_segments
+        .iter()
+        .map(|meta| meta.segment_id)
+        .collect();
+    let mut actual_ids = BTreeSet::new();
+    let mut entries = fs::read_dir(restored.vfs.root_path().join("seg"))
+        .await
+        .map_err(crate::errors::PagedbError::Io)?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(crate::errors::PagedbError::Io)?
+    {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| crate::errors::PagedbError::snapshot_artifact_invalid("segment.name"))?;
+        let segment_id = crate::hex::parse_hex::<16>(&name)
+            .ok_or_else(|| crate::errors::PagedbError::snapshot_artifact_invalid("segment.name"))?;
+        actual_ids.insert(segment_id);
+    }
+    if actual_ids != expected_ids
+        || u32::try_from(actual_ids.len()).ok() != Some(manifest.segments_count)
+    {
+        return Err(crate::errors::PagedbError::snapshot_artifact_invalid(
+            "segments",
+        ));
+    }
+
+    let mmap_limit = u64::try_from(restored.options.mmap_view_scratch_bytes).unwrap_or(u64::MAX);
+    for meta in expected_segments {
+        let reader = crate::segment::reader::SegmentReader::open_internal(
+            restored.pager.clone(),
+            meta.clone(),
+            restored.mmap_bytes_in_use.clone(),
+            mmap_limit,
+        )
+        .await?;
+        for page_id in 1..meta.page_count.saturating_sub(1) {
+            let _ = reader.read_page(page_id).await?;
+        }
+    }
+    Ok(())
+}
 
 impl<V: Vfs + Clone> Db<V> {
     /// Full verbatim snapshot of the database at the current `latest_commit`.
@@ -74,8 +263,25 @@ impl<V: Vfs + Clone> Db<V> {
         };
 
         let src_root = get_vfs_root(&*self.vfs)?;
-
-        let stats = snapshot_full(&src_root, dst_path, &manifest, &hk_raw, &segment_ids).await?;
+        let published_snapshot = *self.snapshot.read();
+        let required_page_ids = collect_published_page_ids(self, published_snapshot).await?;
+        let highest_required_main_page = required_page_ids.iter().next_back().copied().unwrap_or(1);
+        let stats = match snapshot_full(
+            &src_root,
+            dst_path,
+            &manifest,
+            &hk_raw,
+            &segment_ids,
+            highest_required_main_page,
+        )
+        .await
+        {
+            Ok(stats) => stats,
+            Err(error) => {
+                cleanup_failed_snapshot(dst_path, &error).await;
+                return Err(error);
+            }
+        };
         drop(txn); // unpin
         Ok(stats)
     }
@@ -97,58 +303,80 @@ impl<V: Vfs + Clone> Db<V> {
         // Verify and parse manifest.
         let manifest_src = src_path.join("manifest");
         let manifest = open_manifest(&manifest_src, kek.as_bytes()).await?;
-
-        // Create destination directory.
-        fs::create_dir_all(dst_path)
-            .await
-            .map_err(crate::errors::PagedbError::Io)?;
-        let seg_dst = dst_path.join("seg");
-        fs::create_dir_all(&seg_dst)
-            .await
-            .map_err(crate::errors::PagedbError::Io)?;
-
-        // Copy manifest.
-        let mut manifest_bytes = [0u8; 240];
-        {
-            let mut f = fs::File::open(&manifest_src)
-                .await
-                .map_err(crate::errors::PagedbError::Io)?;
-            f.read_exact(&mut manifest_bytes)
-                .await
-                .map_err(crate::errors::PagedbError::Io)?;
+        if manifest.kind != 0 {
+            return Err(crate::errors::PagedbError::snapshot_incompatible("kind"));
         }
-        {
-            let mut f = fs::File::create(dst_path.join("manifest"))
+        ensure_restore_destination_empty(dst_path).await?;
+
+        let restore_result = async {
+            // Create destination directory.
+            fs::create_dir_all(dst_path)
                 .await
                 .map_err(crate::errors::PagedbError::Io)?;
-            f.write_all(&manifest_bytes)
+            let seg_dst = dst_path.join("seg");
+            fs::create_dir_all(&seg_dst)
                 .await
                 .map_err(crate::errors::PagedbError::Io)?;
-        }
 
-        // Copy main.db.
-        fs::copy(src_path.join("main.db"), dst_path.join("main.db"))
-            .await
-            .map_err(crate::errors::PagedbError::Io)?;
+            // Copy the already length- and MAC-validated manifest.
+            fs::copy(&manifest_src, dst_path.join("manifest"))
+                .await
+                .map_err(crate::errors::PagedbError::Io)?;
 
-        // Copy segment files.
-        let seg_src = src_path.join("seg");
-        if let Ok(mut rd) = fs::read_dir(&seg_src).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let name = entry.file_name();
-                let src_file = seg_src.join(&name);
-                let dst_file = seg_dst.join(&name);
-                fs::copy(&src_file, &dst_file)
-                    .await
-                    .map_err(crate::errors::PagedbError::Io)?;
+            // Copy main.db.
+            fs::copy(src_path.join("main.db"), dst_path.join("main.db"))
+                .await
+                .map_err(crate::errors::PagedbError::Io)?;
+
+            // Copy segment files without collapsing directory or entry errors.
+            let seg_src = src_path.join("seg");
+            match fs::read_dir(&seg_src).await {
+                Ok(mut entries) => {
+                    while let Some(entry) = entries
+                        .next_entry()
+                        .await
+                        .map_err(crate::errors::PagedbError::Io)?
+                    {
+                        let name = entry.file_name();
+                        fs::copy(entry.path(), seg_dst.join(name))
+                            .await
+                            .map_err(crate::errors::PagedbError::Io)?;
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && manifest.segments_count == 0 => {}
+                Err(error) => return Err(crate::errors::PagedbError::Io(error)),
             }
-        }
 
-        // Open the restored Db in ReadOnly mode.
-        let page_size = manifest.page_size as usize;
-        let realm_id = crate::RealmId(manifest.realm_id);
-        let dst_vfs = TokioVfs::new(dst_path);
-        Db::<TokioVfs>::open_read_only(dst_vfs, kek, page_size, realm_id, options).await
+            // Open and authenticate every manifest-referenced root and segment
+            // before returning a usable handle.
+            let page_size = usize::try_from(manifest.page_size)
+                .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("page_size"))?;
+            let realm_id = crate::RealmId(manifest.realm_id);
+            let dst_vfs = TokioVfs::new(dst_path);
+            let restored =
+                Db::<TokioVfs>::open_read_only(dst_vfs, kek, page_size, realm_id, options)
+                    .await
+                    .map_err(|error| match error {
+                        // A syntactically named but malformed undeclared
+                        // sidecar can be discovered by open-time recovery
+                        // before the exact catalog/file-set check below.
+                        // In a restore artifact this is corruption, not an
+                        // unsupported host capability.
+                        crate::errors::PagedbError::Unsupported => {
+                            crate::errors::PagedbError::snapshot_artifact_invalid("segments")
+                        }
+                        other => other,
+                    })?;
+            validate_restored_snapshot(&manifest, &restored).await?;
+            Ok(restored)
+        }
+        .await;
+        if let Err(error) = &restore_result {
+            cleanup_failed_snapshot(dst_path, error).await;
+        }
+        restore_result
     }
 
     /// Page-diff snapshot since `base_commit`. Emits only pages changed since
@@ -167,27 +395,42 @@ impl<V: Vfs + Clone> Db<V> {
         let target_active_root_page_id = txn.root_page_id();
         let target_catalog_root_page_id = txn.catalog_root_page_id();
 
-        // Get base snapshot's next_page_id by reading the commit history.
-        let base_txn_result = self.begin_read_at(base_commit).await;
-        let base_next_page_id = base_txn_result
-            .as_ref()
-            .map_or(0u64, crate::txn::ReadTxn::next_page_id);
-        let base_catalog_root = base_txn_result
-            .as_ref()
-            .map_or(0u64, crate::txn::ReadTxn::catalog_root_page_id);
+        // A missing base is not an empty baseline: without its roots there is
+        // no sound way to determine which pages the follower must preserve.
+        let base_txn = self.begin_read_at(base_commit).await?;
+        let base_next_page_id = base_txn.next_page_id();
+        let base_catalog_root = base_txn.catalog_root_page_id();
 
-        // Pages changed = all pages with page_id >= base_next_page_id (allocated after base).
-        // Also include all pages reachable from current root that have id >= base_next_page_id.
-        let changed_page_ids: Vec<u64> = (base_next_page_id..target_next_page_id).collect();
+        let target_page_ids = collect_tree_page_ids(
+            self,
+            target_active_root_page_id,
+            target_catalog_root_page_id,
+            target_next_page_id,
+        )
+        .await?;
+        let base_page_ids = collect_tree_page_ids(
+            self,
+            base_txn.root_page_id(),
+            base_catalog_root,
+            base_next_page_id,
+        )
+        .await?;
+        let changed_page_ids: Vec<u64> = target_page_ids
+            .difference(&base_page_ids)
+            .copied()
+            .collect();
+        if changed_page_ids
+            .iter()
+            .any(|page_id| *page_id < base_next_page_id)
+        {
+            return Err(crate::errors::PagedbError::Unsupported);
+        }
 
         // Current segments.
         let current_segments = txn.list_segments("").await?;
         // Base segments (from base catalog).
         let base_segments: Vec<crate::catalog::codec::SegmentMeta> = if base_catalog_root != 0 {
-            match &base_txn_result {
-                Ok(bt) => bt.list_segments("").await.unwrap_or_default(),
-                Err(_) => Vec::new(),
-            }
+            base_txn.list_segments("").await?
         } else {
             Vec::new()
         };
@@ -227,7 +470,7 @@ impl<V: Vfs + Clone> Db<V> {
 
         let src_root = get_vfs_root(&*self.vfs)?;
 
-        let stats = snapshot_incremental(
+        let stats = match snapshot_incremental(
             &src_root,
             dst_path,
             &manifest,
@@ -236,7 +479,14 @@ impl<V: Vfs + Clone> Db<V> {
             base_next_page_id,
             &changed_page_ids,
         )
-        .await?;
+        .await
+        {
+            Ok(stats) => stats,
+            Err(error) => {
+                cleanup_failed_snapshot(dst_path, &error).await;
+                return Err(error);
+            }
+        };
 
         drop(txn);
         Ok(stats)
@@ -281,6 +531,16 @@ impl<V: Vfs + Clone> Db<V> {
             let mut f = fs::File::open(&manifest_path)
                 .await
                 .map_err(crate::errors::PagedbError::Io)?;
+            if f.metadata()
+                .await
+                .map_err(crate::errors::PagedbError::Io)?
+                .len()
+                != 240
+            {
+                return Err(crate::errors::PagedbError::snapshot_artifact_invalid(
+                    "manifest.length",
+                ));
+            }
             let mut buf = [0u8; 240];
             let _ = f
                 .read_exact(&mut buf)
@@ -290,6 +550,17 @@ impl<V: Vfs + Clone> Db<V> {
         };
         let manifest = decode_manifest(&manifest_bytes, &hk_raw)?;
         self.validate_incremental_manifest(&manifest, &manifest_bytes[118..224])?;
+        let base_snapshot = *self.snapshot.read();
+        let protected_page_ids = collect_published_page_ids(self, base_snapshot).await?;
+        let base_allocation_floor = published_allocation_floor(self, base_snapshot).await?;
+        let base_segment_ids: BTreeSet<[u8; 16]> = self
+            .begin_read()
+            .await?
+            .list_segments("")
+            .await?
+            .into_iter()
+            .map(|meta| meta.segment_id)
+            .collect();
 
         let page_size = usize::try_from(manifest.page_size)
             .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("page_size"))?;
@@ -299,54 +570,44 @@ impl<V: Vfs + Clone> Db<V> {
         let dst_main_db = vfs_root.join("main.db");
 
         // Write delta pages to main.db.
-        let pages_applied = apply_delta_pages(src_path, &dst_main_db, page_size).await?;
+        let applied_pages = apply_delta_pages(
+            src_path,
+            &dst_main_db,
+            page_size,
+            &protected_page_ids,
+            base_allocation_floor,
+            manifest.next_page_id_at_target,
+        )
+        .await?;
+        // Raw delta writes bypass the Pager. Discard unpinned main-db cache
+        // entries before authenticating the target so a retry cannot validate
+        // stale plaintext left by an earlier failed apply.
+        self.pager.reset_main_pages();
 
-        // Stage new segment files in `.staging/` so they can be promoted
-        // atomically after the header swap via the apply journal.
-        let dst_seg_root = vfs_root.join("seg");
-        let staging_dir = dst_seg_root.join(".staging");
-        let staging_existed = match tokio::fs::metadata(&staging_dir).await {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(crate::errors::PagedbError::Io(error)),
-        };
-        let staged_ids = stage_snapshot_segments(src_path, &dst_seg_root).await?;
-        let segments_promoted = u32::try_from(staged_ids.len())
-            .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("segments_count"))?;
-        if segments_promoted != manifest.segments_count {
-            for segment_id in &staged_ids {
-                let path = staging_dir.join(crate::hex::to_hex_lower(segment_id));
-                tokio::fs::remove_file(path)
-                    .await
-                    .map_err(crate::errors::PagedbError::Io)?;
-            }
-            if !staging_existed {
-                tokio::fs::remove_dir(&staging_dir)
-                    .await
-                    .map_err(crate::errors::PagedbError::Io)?;
-            }
-            return Err(crate::errors::PagedbError::snapshot_incompatible(
-                "segments_count",
+        let target_page_ids = collect_tree_page_ids(
+            self,
+            manifest.target_active_root_page_id,
+            manifest.target_catalog_root_page_id,
+            manifest.next_page_id_at_target,
+        )
+        .await?;
+        let expected_delta_page_ids: BTreeSet<u64> = target_page_ids
+            .difference(&protected_page_ids)
+            .copied()
+            .collect();
+        if applied_pages.page_ids != expected_delta_page_ids {
+            return Err(crate::errors::PagedbError::snapshot_artifact_invalid(
+                "pages.delta.reachability",
             ));
         }
 
-        let new_commit_id = manifest.target_commit;
-        let mut state = self.writer.lock().await;
-        self.ensure_usable()?;
-
-        // Reconcile the target catalog against the currently published one.
-        // The target pages are already present on disk, so this comparison can
-        // record both staged promotions and old live segments that must be
-        // tombstoned after the header becomes durable.
-        let old_segments = self.list_all_segments(&state).await?;
-        let target_catalog_root = manifest.target_catalog_root_page_id;
-        let target_segments = if target_catalog_root == 0 {
+        let target_segments = if manifest.target_catalog_root_page_id == 0 {
             Vec::new()
         } else {
             let tree = crate::btree::BTree::open(
                 self.pager.clone(),
                 self.realm_id,
-                target_catalog_root,
+                manifest.target_catalog_root_page_id,
                 manifest.next_page_id_at_target,
                 self.page_size,
             );
@@ -359,18 +620,67 @@ impl<V: Vfs + Clone> Db<V> {
             }
             entries
         };
-        let target_ids: std::collections::HashSet<[u8; 16]> =
+        let target_segment_ids: BTreeSet<[u8; 16]> =
             target_segments.iter().map(|meta| meta.segment_id).collect();
+        let expected_promoted_segment_ids: BTreeSet<[u8; 16]> = target_segment_ids
+            .difference(&base_segment_ids)
+            .copied()
+            .collect();
+        let expected_tombstoned_segment_ids: BTreeSet<[u8; 16]> = base_segment_ids
+            .difference(&target_segment_ids)
+            .copied()
+            .collect();
+        if expected_promoted_segment_ids.len() != manifest.segments_count as usize {
+            return Err(crate::errors::PagedbError::snapshot_artifact_invalid(
+                "segments_count",
+            ));
+        }
+
+        // Stage new segment files in `.staging/` so they can be promoted
+        // atomically after the header swap via the apply journal.
+        let dst_seg_root = vfs_root.join("seg");
+        let staged_ids =
+            stage_snapshot_segments(src_path, &dst_seg_root, &expected_promoted_segment_ids)
+                .await?;
+        if !staged_ids.is_empty() {
+            self.vfs.sync_dir("seg/.staging").await?;
+        }
+        let segments_promoted = u32::try_from(staged_ids.len())
+            .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("segments_count"))?;
+        let segments_tombstoned = u32::try_from(expected_tombstoned_segment_ids.len())
+            .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("segments_count"))?;
+        let mmap_limit = u64::try_from(self.options.mmap_view_scratch_bytes).unwrap_or(u64::MAX);
+        for meta in target_segments
+            .iter()
+            .filter(|meta| expected_promoted_segment_ids.contains(&meta.segment_id))
+        {
+            let staged_path = crate::segment::writer::staging_path(&meta.segment_id);
+            let reader = crate::segment::reader::SegmentReader::open_internal_at_path(
+                self.pager.clone(),
+                meta.clone(),
+                &staged_path,
+                self.mmap_bytes_in_use.clone(),
+                mmap_limit,
+            )
+            .await?;
+            for page_id in 1..meta.page_count.saturating_sub(1) {
+                let _ = reader.read_page(page_id).await?;
+            }
+        }
+
+        let new_commit_id = manifest.target_commit;
         let mut actions: Vec<JournalAction> = staged_ids
             .iter()
             .map(|&segment_id| JournalAction::Promote { segment_id })
             .collect();
-        actions.extend(old_segments.into_iter().filter_map(|meta| {
-            (!target_ids.contains(&meta.segment_id)).then_some(JournalAction::Tombstone {
-                segment_id: meta.segment_id,
+        actions.extend(expected_tombstoned_segment_ids.iter().map(|&segment_id| {
+            JournalAction::Tombstone {
+                segment_id,
                 tombstone_commit_id: new_commit_id,
-            })
+            }
         }));
+        let mut state = self.writer.lock().await;
+        self.ensure_usable()?;
 
         // Write the journal record to a fresh apply-journal sidecar via the
         // Pager AEAD path. A fresh, never-reused `journal_id` guarantees the
@@ -486,9 +796,9 @@ impl<V: Vfs + Clone> Db<V> {
         }
 
         Ok(crate::snapshot::ApplyStats {
-            pages_applied,
+            pages_applied: applied_pages.pages_applied,
             segments_promoted,
-            segments_tombstoned: 0,
+            segments_tombstoned,
         })
     }
 }
