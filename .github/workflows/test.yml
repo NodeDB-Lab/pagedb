@@ -11,6 +11,8 @@
 #   test        — `cargo nextest run` on Linux / macOS / Windows. Crash tests
 #                 are serialised by `.config/nextest.toml`, which `cargo test`
 #                 ignores — that is why this workflow always uses nextest.
+#   invariants  — the same suite with PAGEDB_INVARIANT_CHECKS set, so the
+#                 opt-in commit-time structural checks are actually exercised.
 #   cross       — `cargo check` across every Tier-1/Tier-2 target the VFS
 #                 backend matrix in resource/architecture.md §8 covers, so a
 #                 platform-specific backend never regresses unnoticed.
@@ -119,6 +121,50 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: nextest-${{ matrix.os }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # The commit-time freed-page / reachability invariant is opt-in: with
+  # PAGEDB_INVARIANT_CHECKS unset, `WriteTxn::commit` probes the variable once
+  # and does nothing else, so the `test` job above never runs a single line of
+  # it. Without this lane a regression in the check — or a healthy commit that
+  # it starts rejecting — is invisible until someone enables it by hand.
+  #
+  # Linux-only and single-config on purpose: the check is pure page-graph
+  # traversal with no platform-specific or feature-gated code, so a second
+  # runner would buy nothing. It is deliberately expensive (it walks the data,
+  # catalog, and commit-history trees on every commit), which is why it stays
+  # opt-in rather than becoming the default for the whole matrix.
+  invariants:
+    name: Invariant checks
+    runs-on: ubuntu-latest
+    env:
+      # Only presence is checked, never the value.
+      PAGEDB_INVARIANT_CHECKS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: invariants
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Run tests with commit invariants enabled
+        run: cargo nextest run -p pagedb --all-features --no-fail-fast
+
+      - name: Upload nextest report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-invariants
           path: target/nextest/default/junit.xml
           if-no-files-found: ignore
 
