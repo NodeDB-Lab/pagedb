@@ -57,6 +57,17 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // Note: span is not entered via `.entered()` to keep this async fn's
         // future `Send`. Use `tracing::instrument` or enter in sync sections only.
         let new_commit_id = self.guard.latest_commit_id + 1;
+        let precommit_history_state =
+            std::env::var_os("PAGEDB_INVARIANT_CHECKS")
+                .is_some()
+                .then(|| {
+                    (
+                        self.guard.next_page_id,
+                        self.guard.commit_history_root_page_id,
+                        self.guard.commit_history_root_version,
+                        self.guard.commit_history_count,
+                    )
+                });
 
         // ── Materialize all trees first ──────────────────────────────────────
         // Done before accounting freed pages so every copy-on-write spine free
@@ -164,18 +175,35 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .count() as u64;
         self.db.evaluate_stall_policy(stuck)?;
 
-        // Structural invariant (opt-in via the `PAGEDB_INVARIANT_CHECKS` env
-        // var — off by default, so normal commits pay nothing). Captures every
-        // page this commit places on the free-list; after the roots are
-        // published, a strict structural walk (`find_dangling`) plus this
-        // freed-set check verify no live page was freed / left referenced —
-        // pinpointing a use-after-free at the exact commit that introduces it.
-        let invariant_freed: Option<Vec<u64>> = if std::env::var("PAGEDB_INVARIANT_CHECKS").is_ok()
-        {
-            Some(entries.iter().map(|(_, pid)| *pid).collect())
-        } else {
-            None
-        };
+        // Opt-in structural invariant. Run before the free-list rewrite and
+        // durable header swap so a violation cannot publish a commit that the
+        // caller observes as failed. Check every live tree, including commit
+        // history, and keep the strict dangling-pointer walk that detects pages
+        // freed in an earlier commit.
+        if let Some(precommit_history_state) = precommit_history_state {
+            let freed = entries.iter().map(|&(_, page_id)| page_id).collect();
+            if let Err(violation) = assert_freed_pages_unreachable(
+                self.db,
+                [
+                    new_root,
+                    new_catalog_root,
+                    self.guard.commit_history_root_page_id,
+                ],
+                self.guard.next_page_id,
+                &freed,
+                new_commit_id,
+            )
+            .await
+            {
+                (
+                    self.guard.next_page_id,
+                    self.guard.commit_history_root_page_id,
+                    self.guard.commit_history_root_version,
+                    self.guard.commit_history_count,
+                ) = precommit_history_state;
+                panic!("{violation}");
+            }
+        }
 
         // Rewrite the chain, hosting it on the floor-safe pages (the cache
         // remainder) and bump-allocating only if those run out.
@@ -260,56 +288,6 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // in page recycling, so this trail is what a corruption report needs.
         crate::diag::committed(new_commit_id, all_freed.len());
 
-        // Debug invariant: no page just freed may still be reachable from the
-        // freshly-published tree. A violation is a use-after-free (a live page
-        // freed / a parent pointer not reparented) — panic loudly at the source
-        // commit so the daemon workload pinpoints the buggy path.
-        if let Some(freed) = invariant_freed {
-            use crate::btree::BTree;
-            let freed_set: std::collections::HashSet<u64> = freed.into_iter().collect();
-            let mut reachable = std::collections::BTreeSet::new();
-            for (label, root) in [("data", new_root), ("catalog", new_catalog_root)] {
-                if root == 0 {
-                    continue;
-                }
-                let tree = BTree::open(
-                    self.db.pager.clone(),
-                    self.db.realm_id,
-                    root,
-                    new_next,
-                    self.db.page_size,
-                );
-                // Strict structural check: pinpoint the FIRST dangling pointer
-                // (freed/reused page still referenced) at the exact commit that
-                // introduces it — catches lost-reparent use-after-frees the
-                // freed-set check below misses (page freed in a PRIOR commit).
-                if let Some(desc) = tree.find_dangling().await {
-                    panic!(
-                        "PAGEDB INVARIANT VIOLATED: commit {new_commit_id} \
-                         {label}_root={root}: {desc}"
-                    );
-                }
-                // The collection is authoritative: an error means the freshly
-                // published tree could not be fully authenticated and decoded,
-                // so the freed-set check below would pass only because the set
-                // is short. Fail at the source commit rather than vacuously.
-                if let Err(e) = tree.collect_all_page_ids(&mut reachable).await {
-                    panic!(
-                        "PAGEDB INVARIANT VIOLATED: commit {new_commit_id} \
-                         {label}_root={root}: reachability walk failed: {e}"
-                    );
-                }
-            }
-            for pid in reachable {
-                assert!(
-                    !freed_set.contains(&pid),
-                    "PAGEDB INVARIANT VIOLATED: commit {new_commit_id} freed page {pid} \
-                     but it is still reachable from the new tree (data_root={new_root}, \
-                     catalog_root={new_catalog_root}) — use-after-free / lost reparent"
-                );
-            }
-        }
-
         // `visibility_guard` was acquired before the reclamation-floor scan
         // in `WriteTxn::begin` and remains held through this publication.
         let _visibility = &self.visibility_guard;
@@ -352,6 +330,104 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
     }
 }
 
+#[derive(Debug)]
+enum FreedPageInvariantViolation {
+    Dangling {
+        commit_id: u64,
+        tree_name: &'static str,
+        root: u64,
+        description: String,
+    },
+    Traversal {
+        commit_id: u64,
+        tree_name: &'static str,
+        root: u64,
+        error: PagedbError,
+    },
+    ReachableFreed {
+        commit_id: u64,
+        page_id: u64,
+    },
+}
+
+impl std::fmt::Display for FreedPageInvariantViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dangling {
+                commit_id,
+                tree_name,
+                root,
+                description,
+            } => write!(
+                formatter,
+                "PAGEDB INVARIANT VIOLATED: commit {commit_id} \
+                 {tree_name}_root={root}: {description}"
+            ),
+            Self::Traversal {
+                commit_id,
+                tree_name,
+                root,
+                error,
+            } => write!(
+                formatter,
+                "PAGEDB INVARIANT VIOLATED: commit {commit_id} could not traverse the \
+                 new {tree_name} tree rooted at page {root}: {error}"
+            ),
+            Self::ReachableFreed { commit_id, page_id } => write!(
+                formatter,
+                "PAGEDB INVARIANT VIOLATED: commit {commit_id} freed page {page_id}, but it is \
+                 still reachable from the new data/catalog/history roots"
+            ),
+        }
+    }
+}
+
+async fn assert_freed_pages_unreachable<V: Vfs + Clone>(
+    db: &super::super::db::Db<V>,
+    roots: [u64; 3],
+    next_page_id: u64,
+    freed: &HashSet<u64>,
+    commit_id: u64,
+) -> std::result::Result<(), FreedPageInvariantViolation> {
+    let mut reachable = std::collections::BTreeSet::new();
+    for (tree_name, root) in ["data", "catalog", "commit-history"]
+        .into_iter()
+        .zip(roots)
+        .filter(|(_, root)| *root != 0)
+    {
+        let tree = crate::btree::BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            root,
+            next_page_id,
+            db.page_size,
+        );
+        if let Some(description) = tree.find_dangling().await {
+            return Err(FreedPageInvariantViolation::Dangling {
+                commit_id,
+                tree_name,
+                root,
+                description,
+            });
+        }
+        tree.collect_all_page_ids(&mut reachable)
+            .await
+            .map_err(|error| FreedPageInvariantViolation::Traversal {
+                commit_id,
+                tree_name,
+                root,
+                error,
+            })?;
+    }
+
+    for page_id in reachable {
+        if freed.contains(&page_id) {
+            return Err(FreedPageInvariantViolation::ReachableFreed { commit_id, page_id });
+        }
+    }
+    Ok(())
+}
+
 fn page_size_log2(page_size: usize) -> Result<u8> {
     match page_size {
         4096 => Ok(12),
@@ -371,5 +447,175 @@ fn encode_retain_policy(policy: &crate::options::RetainPolicy) -> (u8, u64) {
         crate::options::RetainPolicy::Age(d) => (1, d.as_secs()),
         crate::options::RetainPolicy::Unbounded => (2, 0),
         crate::options::RetainPolicy::Disabled => (3, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::OpenOptions;
+    use crate::vfs::memory::MemVfs;
+
+    async fn populated_db() -> crate::Db<MemVfs> {
+        let db = crate::Db::open_internal_with_options(
+            MemVfs::new(),
+            [7u8; 32],
+            4096,
+            crate::RealmId::new([3u8; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
+        let mut write = db.begin_write().await.unwrap();
+        write.put(b"live", b"value").await.unwrap();
+        write.commit().await.unwrap();
+        db
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invariant_rejects_a_reachable_commit_history_page() {
+        let db = populated_db().await;
+        let (history_root, next_page_id) = {
+            let state = db.writer.lock().await;
+            (state.commit_history_root_page_id, state.next_page_id)
+        };
+        assert_ne!(history_root, 0, "the fixture must create commit history");
+
+        let violation = assert_freed_pages_unreachable(
+            &db,
+            [0, 0, history_root],
+            next_page_id,
+            &HashSet::from([history_root]),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            violation,
+            FreedPageInvariantViolation::ReachableFreed { page_id, .. }
+                if page_id == history_root
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invariant_rejects_an_unreadable_root() {
+        let db = populated_db().await;
+        let next_page_id = db.writer.lock().await.next_page_id;
+        let unreadable_root = next_page_id + 100;
+
+        let violation = assert_freed_pages_unreachable(
+            &db,
+            [unreadable_root, 0, 0],
+            unreadable_root + 1,
+            &HashSet::new(),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            violation,
+            FreedPageInvariantViolation::Dangling {
+                tree_name: "data",
+                root,
+                ..
+            } if root == unreadable_root
+        ));
+    }
+
+    #[test]
+    fn invariant_failure_precedes_durable_publication() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "txn::write::commit::tests::invariant_failure_precedes_durable_publication_child",
+                "--nocapture",
+            ])
+            .env("PAGEDB_INVARIANT_CHECKS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "invariant subprocess failed: {status}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "subprocess helper; the parent supplies PAGEDB_INVARIANT_CHECKS"]
+    async fn invariant_failure_precedes_durable_publication_child() {
+        assert!(std::env::var_os("PAGEDB_INVARIANT_CHECKS").is_some());
+        let vfs = MemVfs::new();
+        let db = Arc::new(
+            crate::Db::open_internal_with_options(
+                vfs.clone(),
+                [7u8; 32],
+                4096,
+                crate::RealmId::new([3u8; 16]),
+                OpenOptions::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        {
+            let mut write = db.begin_write().await.unwrap();
+            write.put(b"live", b"value").await.unwrap();
+            write.commit().await.unwrap();
+        }
+        let (commit_before, data_root, history_state_before) = {
+            let state = db.writer.lock().await;
+            (
+                state.latest_commit_id,
+                state.root_page_id,
+                (
+                    state.next_page_id,
+                    state.commit_history_root_page_id,
+                    state.commit_history_root_version,
+                    state.commit_history_count,
+                ),
+            )
+        };
+
+        let task_db = Arc::clone(&db);
+        let failure = tokio::spawn(async move {
+            let mut write = task_db.begin_write().await.unwrap();
+            write.free_set_loaded.push((0, data_root));
+            write.commit().await
+        })
+        .await;
+        assert!(
+            failure.is_err(),
+            "the injected invariant violation must panic"
+        );
+        drop(failure);
+
+        let state = db.writer.lock().await;
+        assert_eq!(state.latest_commit_id, commit_before);
+        assert_eq!(
+            (
+                state.next_page_id,
+                state.commit_history_root_page_id,
+                state.commit_history_root_version,
+                state.commit_history_count,
+            ),
+            history_state_before
+        );
+        drop(state);
+        drop(db);
+
+        let reopened = crate::Db::open(
+            vfs,
+            [7u8; 32],
+            4096,
+            crate::RealmId::new([3u8; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.latest_commit().0, commit_before);
+        let read = reopened.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(b"live").await.unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
     }
 }
