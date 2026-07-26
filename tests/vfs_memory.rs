@@ -50,6 +50,31 @@ async fn vectored_read_write_round_trip() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn vectored_write_rejects_offset_overflow_without_partial_write() {
+    let vfs = MemVfs::new();
+    let mut file = vfs.open("/x", OpenMode::CreateNew).await.unwrap();
+    let requests = [
+        WriteReq {
+            offset: 0,
+            buf: b"kept-out",
+        },
+        WriteReq {
+            offset: u64::MAX,
+            buf: b"x",
+        },
+    ];
+
+    let error = file
+        .write_at_vectored(&requests)
+        .await
+        .expect_err("the invalid request must reject the entire vector");
+    assert!(matches!(error, PagedbError::Io(_)));
+
+    let mut actual = [0xff; 8];
+    assert_eq!(file.read_at(0, &mut actual).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn vectored_read_zero_fills_past_eof() {
     let vfs = MemVfs::new();
     let mut f = vfs.open("/x", OpenMode::CreateNew).await.unwrap();

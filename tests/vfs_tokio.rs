@@ -1,17 +1,40 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Integration tests for `TokioVfs` — real disk I/O under a temporary directory.
 
+use pagedb::errors::PagedbError;
 use pagedb::vfs::tokio_backend::TokioVfs;
 use pagedb::vfs::{OpenMode, ReadReq, Vfs, VfsFile, WriteReq};
 
 fn tempdir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    p.push(format!("pagedb-vfs-tokio-{}-{}", std::process::id(), nanos));
-    std::fs::create_dir_all(&p).unwrap();
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    p.push(format!(
+        "pagedb-vfs-tokio-{}-{nanos}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&p).unwrap();
     p
+}
+
+#[test]
+fn tempdir_helper_allocates_unique_roots() {
+    let dirs: Vec<_> = (0..128).map(|_| tempdir()).collect();
+    let mut paths = dirs.clone();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), dirs.len());
+
+    for dir in dirs {
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -78,12 +101,112 @@ async fn vectored_write_then_read() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn vectored_write_rejects_offset_overflow_without_partial_write() {
+    let dir = tempdir();
+    let vfs = TokioVfs::new(&dir);
+    let mut file = vfs
+        .open("/vec-overflow", OpenMode::CreateNew)
+        .await
+        .unwrap();
+    let requests = [
+        WriteReq {
+            offset: 0,
+            buf: b"kept-out",
+        },
+        WriteReq {
+            offset: u64::MAX,
+            buf: b"x",
+        },
+    ];
+
+    let error = file
+        .write_at_vectored(&requests)
+        .await
+        .expect_err("the invalid request must reject the entire vector");
+    assert!(matches!(error, PagedbError::Io(_)));
+
+    let mut actual = [0xff; 8];
+    assert_eq!(file.read_at(0, &mut actual).await.unwrap(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn sync_dir_succeeds() {
     let dir = tempdir();
     let vfs = TokioVfs::new(&dir);
     vfs.mkdir_all("/sub").await.unwrap();
     // sync_dir is best-effort; must not error on supported platforms.
     vfs.sync_dir("/sub").await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejects_parent_directory_escape() {
+    let dir = tempdir();
+    let root_name = dir.file_name().unwrap().to_string_lossy();
+    let escaped_file = dir
+        .parent()
+        .unwrap()
+        .join(format!("{root_name}-escaped-file"));
+    let escaped_dir = dir
+        .parent()
+        .unwrap()
+        .join(format!("{root_name}-escaped-dir"));
+    let vfs = TokioVfs::new(&dir);
+
+    let open_result = vfs.open("../escaped-file", OpenMode::CreateNew).await;
+    let escaped_file_was_created = escaped_file.exists();
+    std::fs::remove_file(&escaped_file).ok();
+    let open_error = match open_result {
+        Ok(_) => panic!("open must reject paths outside the configured root"),
+        Err(error) => error,
+    };
+    match open_error {
+        PagedbError::Io(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+    assert!(
+        !escaped_file_was_created,
+        "an invalid open path must not create a file outside the VFS root"
+    );
+
+    let mkdir_result = vfs.mkdir_all("../escaped-dir").await;
+    let escaped_dir_was_created = escaped_dir.exists();
+    std::fs::remove_dir_all(&escaped_dir).ok();
+    let mkdir_error = mkdir_result.expect_err("mkdir_all must reject a root escape");
+    match mkdir_error {
+        PagedbError::Io(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+    assert!(
+        !escaped_dir_was_created,
+        "an invalid mkdir path must not create a directory outside the VFS root"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lock_paths_are_normalized_before_conflict_check() {
+    let dir = tempdir();
+    let vfs = TokioVfs::new(&dir);
+    let _held = vfs.lock_exclusive("/db.lock").await.unwrap();
+
+    let error = match vfs.lock_exclusive("db.lock").await {
+        Ok(_) => panic!("equivalent logical paths must share one lock domain"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, PagedbError::AlreadyLocked));
+
+    let error = match vfs.lock_shared("db.lock").await {
+        Ok(_) => panic!("equivalent logical paths must share one lock domain"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, PagedbError::AlreadyLocked));
     std::fs::remove_dir_all(&dir).ok();
 }
 

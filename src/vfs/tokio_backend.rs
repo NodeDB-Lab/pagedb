@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::Result;
 use crate::errors::PagedbError;
 
-use super::traits::{Vfs, VfsFile};
+use super::traits::{Vfs, VfsFile, canonical_native_path, resolve_native_path};
 use super::types::{OpenMode, ReadReq, WriteReq};
 
 // ---------------------------------------------------------------------------
@@ -298,8 +298,12 @@ impl TokioVfs {
         }
     }
 
-    fn resolve(&self, p: &str) -> PathBuf {
-        self.inner.root.join(p.trim_start_matches('/'))
+    fn canonical_logical_path(path: &str) -> Result<String> {
+        canonical_native_path(path)
+    }
+
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        resolve_native_path(&self.inner.root, path)
     }
 
     /// Return the filesystem root directory of this VFS instance.
@@ -343,7 +347,7 @@ impl Vfs for TokioVfs {
     type LockHandle = TokioLockHandle;
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         // Ensure parent directories exist for create modes.
         if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
             if let Some(parent) = p.parent() {
@@ -397,7 +401,7 @@ impl Vfs for TokioVfs {
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         match fs::remove_file(&p).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -406,8 +410,8 @@ impl Vfs for TokioVfs {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let f = self.resolve(from);
-        let t = self.resolve(to);
+        let f = self.resolve(from)?;
+        let t = self.resolve(to)?;
         if let Some(parent) = t.parent() {
             fs::create_dir_all(parent).await.map_err(PagedbError::Io)?;
         }
@@ -415,7 +419,7 @@ impl Vfs for TokioVfs {
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         let mut entries = match fs::read_dir(&p).await {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -432,12 +436,12 @@ impl Vfs for TokioVfs {
     }
 
     async fn mkdir_all(&self, path: &str) -> Result<()> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         fs::create_dir_all(&p).await.map_err(PagedbError::Io)
     }
 
     async fn sync_dir(&self, path: &str) -> Result<()> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         // Open the directory with std::fs (synchronous) to call sync_all.
         // On platforms where opening a directory handle is unsupported or
         // syncing it returns Unsupported/PermissionDenied (e.g., some Windows
@@ -475,7 +479,8 @@ impl Vfs for TokioVfs {
     }
 
     async fn lock_exclusive(&self, path: &str) -> Result<Self::LockHandle> {
-        let entry = self.lookup_or_create_entry(path);
+        let logical_path = Self::canonical_logical_path(path)?;
+        let entry = self.lookup_or_create_entry(&logical_path);
         // In-process guard first: fast fail if the same process already holds
         // any lock on this path.
         {
@@ -489,7 +494,7 @@ impl Vfs for TokioVfs {
         // so another process opening the same directory is also excluded.
         #[cfg(unix)]
         {
-            let lock_path = self.resolve(path);
+            let lock_path = self.resolve(&logical_path)?;
             if let Some(parent) = lock_path.parent() {
                 std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
             }
@@ -511,7 +516,7 @@ impl Vfs for TokioVfs {
         // lock so another process is also excluded.
         #[cfg(windows)]
         {
-            let lock_path = self.resolve(path);
+            let lock_path = self.resolve(&logical_path)?;
             if let Some(parent) = lock_path.parent() {
                 std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
             }
@@ -543,7 +548,8 @@ impl Vfs for TokioVfs {
     }
 
     async fn lock_shared(&self, path: &str) -> Result<Self::LockHandle> {
-        let entry = self.lookup_or_create_entry(path);
+        let logical_path = Self::canonical_logical_path(path)?;
+        let entry = self.lookup_or_create_entry(&logical_path);
         {
             let mut s = entry.state.lock();
             match *s {
@@ -554,7 +560,7 @@ impl Vfs for TokioVfs {
         }
         #[cfg(unix)]
         {
-            let lock_path = self.resolve(path);
+            let lock_path = self.resolve(&logical_path)?;
             if let Some(parent) = lock_path.parent() {
                 std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
             }
@@ -577,7 +583,7 @@ impl Vfs for TokioVfs {
         }
         #[cfg(windows)]
         {
-            let lock_path = self.resolve(path);
+            let lock_path = self.resolve(&logical_path)?;
             if let Some(parent) = lock_path.parent() {
                 std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
             }
@@ -659,6 +665,11 @@ impl VfsFile for TokioFile {
         if !self.writable {
             return Err(PagedbError::ReadOnly);
         }
+        let buf_len = u64::try_from(buf.len())
+            .map_err(|_| PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;
+        offset.checked_add(buf_len).ok_or_else(|| {
+            PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        })?;
         let mut f = self.inner.lock().await;
         f.seek(std::io::SeekFrom::Start(offset))
             .await
@@ -670,6 +681,14 @@ impl VfsFile for TokioFile {
     async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> Result<()> {
         if !self.writable {
             return Err(PagedbError::ReadOnly);
+        }
+        for req in reqs {
+            let buf_len = u64::try_from(req.buf.len()).map_err(|_| {
+                PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            })?;
+            req.offset.checked_add(buf_len).ok_or_else(|| {
+                PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            })?;
         }
         let mut f = self.inner.lock().await;
         for req in reqs {
@@ -723,17 +742,75 @@ mod tests {
     use super::*;
 
     fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
         p.push(format!(
-            "pagedb-tokio-unit-{}-{}",
-            std::process::id(),
-            nanos
+            "pagedb-tokio-unit-{}-{nanos}-{sequence}",
+            std::process::id()
         ));
-        std::fs::create_dir_all(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn tempdir_helper_allocates_unique_roots() {
+        let dirs: Vec<_> = (0..128).map(|_| tempdir()).collect();
+        let mut paths = dirs.clone();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), dirs.len());
+
+        for dir in dirs {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn canonical_logical_paths_have_one_spelling() {
+        assert_eq!(
+            TokioVfs::canonical_logical_path("/main.db").unwrap(),
+            "/main.db"
+        );
+        assert_eq!(
+            TokioVfs::canonical_logical_path("main.db").unwrap(),
+            "/main.db"
+        );
+        assert_eq!(
+            TokioVfs::canonical_logical_path("/seg/file/").unwrap(),
+            "/seg/file"
+        );
+        assert_eq!(
+            TokioVfs::canonical_logical_path(r"seg\file").unwrap(),
+            "/seg/file"
+        );
+        assert_eq!(TokioVfs::canonical_logical_path("/").unwrap(), "/");
+    }
+
+    #[test]
+    fn rejects_parent_current_and_empty_path_components() {
+        let vfs = TokioVfs::new("/tmp/pagedb-root");
+
+        for path in [
+            "../escape",
+            "/seg/../escape",
+            "./main.db",
+            "seg/./x",
+            "seg//x",
+        ] {
+            let error = vfs.resolve(path).unwrap_err();
+            match error {
+                PagedbError::Io(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

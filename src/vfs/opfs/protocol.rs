@@ -94,10 +94,12 @@ pub enum OpfsResult {
     Locked { lock_id: u32 },
     /// Generic success (no payload).
     Ok,
-    /// Byte data returned from a read.
-    Data { bytes: Vec<u8> },
-    /// File size in bytes.
-    Size { len: u64 },
+    /// Byte data and the raw JavaScript count returned from a read.
+    Data { bytes: Vec<u8>, count: f64 },
+    /// Raw JavaScript count returned from a write.
+    Written { count: f64 },
+    /// Raw JavaScript file size.
+    Size { len: f64 },
     /// Directory entries (names only, not full paths).
     Entries { names: Vec<String> },
     /// Operation failed.

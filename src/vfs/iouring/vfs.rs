@@ -16,7 +16,7 @@ use crate::errors::PagedbError;
 
 use super::file::IouringFile;
 use super::ring::Ring;
-use crate::vfs::traits::Vfs;
+use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
 
 // ---------------------------------------------------------------------------
@@ -159,8 +159,8 @@ impl IouringVfs {
         })
     }
 
-    fn resolve(&self, p: &str) -> PathBuf {
-        self.inner.root.join(p.trim_start_matches('/'))
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        resolve_native_path(&self.inner.root, path)
     }
 
     fn lookup_or_create_entry(&self, path: &str) -> Arc<InProcLockEntry> {
@@ -176,7 +176,8 @@ impl IouringVfs {
     }
 
     fn do_lock(&self, path: &str, kind: LockKind) -> Result<IouringLockHandle> {
-        let entry = self.lookup_or_create_entry(path);
+        let logical_path = canonical_native_path(path)?;
+        let entry = self.lookup_or_create_entry(&logical_path);
         // In-process guard first.
         {
             let mut s = entry.state.lock();
@@ -187,7 +188,7 @@ impl IouringVfs {
                 _ => return Err(PagedbError::AlreadyLocked),
             }
         }
-        let lock_path = self.resolve(path);
+        let lock_path = self.resolve(&logical_path)?;
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
         }
@@ -217,7 +218,7 @@ impl Vfs for IouringVfs {
     type LockHandle = IouringLockHandle;
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
@@ -267,7 +268,7 @@ impl Vfs for IouringVfs {
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         match std::fs::remove_file(&p) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -276,8 +277,8 @@ impl Vfs for IouringVfs {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let f = self.resolve(from);
-        let t = self.resolve(to);
+        let f = self.resolve(from)?;
+        let t = self.resolve(to)?;
         if let Some(parent) = t.parent() {
             std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
         }
@@ -285,7 +286,7 @@ impl Vfs for IouringVfs {
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         let iter = match std::fs::read_dir(&p) {
             Ok(it) => it,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -303,12 +304,12 @@ impl Vfs for IouringVfs {
     }
 
     async fn mkdir_all(&self, path: &str) -> Result<()> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         std::fs::create_dir_all(&p).map_err(PagedbError::Io)
     }
 
     async fn sync_dir(&self, path: &str) -> Result<()> {
-        let p = self.resolve(path);
+        let p = self.resolve(path)?;
         // Open the directory with O_RDONLY|O_DIRECTORY and fsync the fd.
         let dir = match std::fs::File::open(&p) {
             Ok(d) => d,

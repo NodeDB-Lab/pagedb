@@ -14,7 +14,10 @@ use parking_lot::Mutex;
 
 use crate::Result;
 use crate::errors::PagedbError;
-use crate::vfs::traits::VfsFile;
+use crate::vfs::traits::{
+    VfsFile, checked_indexed_completion, checked_iouring_positioned_offset, checked_read_count,
+    checked_signed_file_len, write_all_at,
+};
 use crate::vfs::types::{ReadReq, WriteReq};
 
 /// Per-file handle backed by an `std::fs::File` fd and the shared `io_uring`.
@@ -31,6 +34,22 @@ impl IouringFile {
             writable,
             ring,
         }
+    }
+
+    fn check_write_range(offset: u64, len: usize) -> Result<()> {
+        let len = u64::try_from(len).map_err(|_| {
+            PagedbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer length does not fit in u64",
+            ))
+        })?;
+        offset.checked_add(len).ok_or_else(|| {
+            PagedbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "write offset overflow",
+            ))
+        })?;
+        Ok(())
     }
 
     /// Submit a single SQE, wait for exactly one CQE with matching
@@ -117,16 +136,18 @@ impl IouringFile {
                 }
             }
             ring.submit_and_wait(chunk_len)?;
+            let mut chunk_results = vec![None; chunk_len];
             let mut found = 0usize;
             {
                 let mut cq = ring.completion();
                 cq.sync();
                 for cqe in cq.by_ref() {
-                    let ud = cqe.user_data();
-                    if ud < chunk_len as u64 {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let idx = base + ud as usize;
-                        results[idx] = cqe.result();
+                    if checked_indexed_completion(&mut chunk_results, cqe.user_data(), cqe.result())
+                        .map_err(|error| match error {
+                            PagedbError::Io(io) => io,
+                            other => std::io::Error::other(other.to_string()),
+                        })?
+                    {
                         found += 1;
                     }
                     if found == chunk_len {
@@ -138,6 +159,10 @@ impl IouringFile {
                 return Err(std::io::Error::other(
                     "io_uring: fewer CQEs returned than submitted",
                 ));
+            }
+            for (index, result) in chunk_results.into_iter().enumerate() {
+                results[base + index] = result
+                    .ok_or_else(|| std::io::Error::other("io_uring: missing indexed CQE result"))?;
             }
             base = end;
         }
@@ -158,6 +183,7 @@ impl VfsFile for IouringFile {
         if buf.is_empty() {
             return Ok(0);
         }
+        checked_iouring_positioned_offset(offset, buf.len())?;
         let fd = Fd(self.file.as_raw_fd());
         let len = u32::try_from(buf.len())
             .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
@@ -172,7 +198,7 @@ impl VfsFile for IouringFile {
         let n = unsafe { Self::submit_one(&mut ring, &entry, 0) }.map_err(PagedbError::Io)?;
         // n >= 0 guaranteed by submit_one (negative becomes Err).
         #[allow(clippy::cast_sign_loss)]
-        Ok(n as usize)
+        checked_read_count(n as usize, buf.len())
     }
 
     async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> Result<()> {
@@ -183,6 +209,7 @@ impl VfsFile for IouringFile {
         // Build one Read SQE per request; each gets its index as user_data.
         let mut entries: Vec<io_uring::squeue::Entry> = Vec::with_capacity(reqs.len());
         for (i, req) in reqs.iter_mut().enumerate() {
+            checked_iouring_positioned_offset(req.offset, req.buf.len())?;
             let len = u32::try_from(req.buf.len())
                 .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
             entries.push(
@@ -208,7 +235,7 @@ impl VfsFile for IouringFile {
             }
             // res >= 0 guaranteed above.
             #[allow(clippy::cast_sign_loss)]
-            let nread = res as usize;
+            let nread = checked_read_count(res as usize, req.buf.len())?;
             for b in &mut req.buf[nread..] {
                 *b = 0;
             }
@@ -223,6 +250,7 @@ impl VfsFile for IouringFile {
         if buf.is_empty() {
             return Ok(0);
         }
+        Self::check_write_range(offset, buf.len())?;
         let fd = Fd(self.file.as_raw_fd());
         let len = u32::try_from(buf.len())
             .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
@@ -246,30 +274,85 @@ impl VfsFile for IouringFile {
         if reqs.is_empty() {
             return Ok(());
         }
+        for req in reqs {
+            Self::check_write_range(req.offset, req.buf.len())?;
+        }
         let fd = Fd(self.file.as_raw_fd());
-        // Build one Write SQE per request; each gets its index as user_data.
+        // Empty requests are already complete. Skipping them also ensures that
+        // a zero-byte CQE always represents impossible progress on real data.
         let mut entries: Vec<io_uring::squeue::Entry> = Vec::with_capacity(reqs.len());
+        let mut entry_to_request = Vec::with_capacity(reqs.len());
         for (i, req) in reqs.iter().enumerate() {
+            if req.buf.is_empty() {
+                continue;
+            }
             let len = u32::try_from(req.buf.len())
                 .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
+            let user_data = u64::try_from(entry_to_request.len()).map_err(|_| {
+                PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "too many vectored write requests",
+                ))
+            })?;
             entries.push(
                 opcode::Write::new(fd, req.buf.as_ptr(), len)
                     .offset(req.offset)
                     .build()
-                    .user_data(i as u64),
+                    .user_data(user_data),
             );
+            entry_to_request.push(i);
+        }
+        if entries.is_empty() {
+            return Ok(());
         }
 
-        let mut ring = self.ring.lock();
-        // SAFETY: `req.buf` slices are tied to the `reqs` argument's `'_`
-        // lifetime. The ring lock is held across submit+drain.
-        let results =
-            unsafe { Self::submit_batch(&mut ring, &entries) }.map_err(PagedbError::Io)?;
+        let results = {
+            let mut ring = self.ring.lock();
+            // SAFETY: `req.buf` slices are tied to the `reqs` argument's `'_`
+            // lifetime. The ring lock is held across submit+drain.
+            unsafe { Self::submit_batch(&mut ring, &entries) }.map_err(PagedbError::Io)?
+        };
+        drop(entries);
 
-        for &res in &results {
+        let mut short_writes = Vec::new();
+        for (entry_index, &res) in results.iter().enumerate() {
             if res < 0 {
                 return Err(PagedbError::Io(std::io::Error::from_raw_os_error(-res)));
             }
+            let written = usize::try_from(res)
+                .map_err(|_| PagedbError::Io(std::io::Error::other("negative write result")))?;
+            let request_index = entry_to_request[entry_index];
+            let request = &reqs[request_index];
+            if written > request.buf.len() {
+                return Err(PagedbError::Io(std::io::Error::other(
+                    "io_uring write overreported bytes",
+                )));
+            }
+            if written == 0 {
+                return Err(PagedbError::Io(std::io::Error::from(
+                    std::io::ErrorKind::WriteZero,
+                )));
+            }
+            if written < request.buf.len() {
+                short_writes.push((request_index, written));
+            }
+        }
+
+        for (request_index, written) in short_writes {
+            let request = &reqs[request_index];
+            let written_u64 = u64::try_from(written).map_err(|_| {
+                PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "write count does not fit in u64",
+                ))
+            })?;
+            let offset = request.offset.checked_add(written_u64).ok_or_else(|| {
+                PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "write offset overflow",
+                ))
+            })?;
+            write_all_at(self, offset, &request.buf[written..]).await?;
         }
         Ok(())
     }
@@ -291,14 +374,10 @@ impl VfsFile for IouringFile {
         // v0.7. Use the syscall directly via libc; for regular files this is
         // synchronous and does not trigger disk I/O in the common path.
         //
-        // SAFETY: `self.file.as_raw_fd()` is a valid open fd for the lifetime
-        // of this method call (`self` keeps `file` alive). `len` fits in
-        // `libc::off_t` (i64) on any 64-bit Linux target; on 32-bit targets
-        // `off_t` is 32-bit but `_FILE_OFFSET_BITS=64` is standard, so the
-        // cast is safe in practice. We allow the truncation lint here because
-        // we are on Linux where `off_t` is always i64 in practice.
-        #[allow(clippy::cast_possible_wrap)]
-        let rc = unsafe { libc::ftruncate(self.file.as_raw_fd(), len as libc::off_t) };
+        let len = checked_signed_file_len(len, "ftruncate")?;
+        // SAFETY: `self.file.as_raw_fd()` is valid for this method call and
+        // `len` was checked before entering the signed native syscall.
+        let rc = unsafe { libc::ftruncate(self.file.as_raw_fd(), len) };
         if rc != 0 {
             return Err(PagedbError::Io(std::io::Error::last_os_error()));
         }

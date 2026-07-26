@@ -1,7 +1,7 @@
 //! `GcdFile`: per-file I/O against a `DispatchIO` channel.
 //!
 //! The channel is created in `DISPATCH_IO_RANDOM` mode and owns a duplicated
-//! file descriptor (so dispatch_io can asynchronously close its own copy when
+//! file descriptor (so `dispatch_io` can asynchronously close its own copy when
 //! the channel is released, independently of the `std::fs::File` we hold).
 //! Reads and writes call `dispatch_io_read` / `dispatch_io_write` with block
 //! handlers; the handlers accumulate chunks and, on `done`, send the result
@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use block2::{Block, DynBlock, RcBlock};
+use block2::{DynBlock, RcBlock};
 use dispatch2::{DispatchData, DispatchIO, DispatchIOCloseFlags, DispatchQueue, DispatchRetained};
 
 use crate::Result;
 use crate::errors::PagedbError;
-use crate::vfs::traits::VfsFile;
+use crate::vfs::traits::{VfsFile, checked_signed_file_len};
 use crate::vfs::types::{ReadReq, WriteReq};
 
 pub struct GcdFile {
@@ -81,6 +81,37 @@ impl GcdFile {
     fn fd(&self) -> std::os::unix::io::RawFd {
         self.file.as_raw_fd()
     }
+
+    fn checked_dispatch_offset(offset: u64, len: usize) -> Result<libc::off_t> {
+        let last = if len > 0 {
+            let last_delta = u64::try_from(len - 1).map_err(|_| {
+                PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "buffer length does not fit in u64",
+                ))
+            })?;
+            offset.checked_add(last_delta).ok_or_else(|| {
+                PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "dispatch_io offset range overflow",
+                ))
+            })?
+        } else {
+            offset
+        };
+        libc::off_t::try_from(last).map_err(|_| {
+            PagedbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "dispatch_io offset range does not fit into libc::off_t",
+            ))
+        })?;
+        offset.try_into().map_err(|_| {
+            PagedbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "dispatch_io offset does not fit into libc::off_t",
+            ))
+        })
+    }
 }
 
 impl Drop for GcdFile {
@@ -100,7 +131,7 @@ impl Drop for GcdFile {
 fn submit_read(
     channel: &DispatchIO,
     queue: &DispatchQueue,
-    offset: u64,
+    offset: libc::off_t,
     len: usize,
     tx: tokio::sync::oneshot::Sender<std::io::Result<Vec<u8>>>,
 ) {
@@ -135,22 +166,15 @@ fn submit_read(
             }
         });
 
-    // SAFETY: transmute is from the stand-in block signature to the typedef
-    // declared by dispatch2 — the ABI is identical because `bool` and `u8`
-    // share the same one-byte ABI, and a `*mut DispatchData` is bit-identical
-    // to a `*mut c_void`.
-    let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> = unsafe {
-        std::mem::transmute::<
-            *mut Block<dyn Fn(u8, *mut c_void, libc::c_int)>,
-            *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>,
-        >(RcBlock::as_ptr(&handler))
-    };
+    // SAFETY: ABI-compatible pointer cast to the typedef declared by dispatch2.
+    // `bool` and `u8` are one byte, while both data arguments are pointers.
+    let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> =
+        RcBlock::as_ptr(&handler).cast::<DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>>();
 
     // SAFETY: channel and queue are valid (owned by the caller's `GcdFile`);
     // the handler block is retained by libdispatch on submission.
     unsafe {
-        #[allow(clippy::cast_possible_wrap)]
-        channel.read(offset as libc::off_t, len, queue, handler_ptr);
+        channel.read(offset, len, queue, handler_ptr);
     }
     // libdispatch has retained the block internally; we can drop our Rc.
     drop(handler);
@@ -162,7 +186,7 @@ fn submit_read(
 fn submit_write(
     channel: &DispatchIO,
     queue: &DispatchQueue,
-    offset: u64,
+    offset: libc::off_t,
     buf: &[u8],
     tx: tokio::sync::oneshot::Sender<std::io::Result<()>>,
 ) {
@@ -185,19 +209,14 @@ fn submit_write(
         },
     );
 
-    // SAFETY: ABI-compatible transmute; see `submit_read`.
-    let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> = unsafe {
-        std::mem::transmute::<
-            *mut Block<dyn Fn(u8, *mut c_void, libc::c_int)>,
-            *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>,
-        >(RcBlock::as_ptr(&handler))
-    };
+    // SAFETY: ABI-compatible pointer cast; see `submit_read`.
+    let handler_ptr: *mut DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)> =
+        RcBlock::as_ptr(&handler).cast::<DynBlock<dyn Fn(bool, *mut DispatchData, libc::c_int)>>();
 
     // SAFETY: channel/queue/data all valid; libdispatch retains both the data
     // object and the handler block for the operation's duration.
     unsafe {
-        #[allow(clippy::cast_possible_wrap)]
-        channel.write(offset as libc::off_t, &data, queue, handler_ptr);
+        channel.write(offset, &data, queue, handler_ptr);
     }
     drop(handler);
     drop(data);
@@ -209,6 +228,7 @@ impl VfsFile for GcdFile {
             return Ok(0);
         }
         let len = buf.len();
+        let offset = Self::checked_dispatch_offset(offset, len)?;
         let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<Vec<u8>>>();
         // The handler block and its raw block pointer are `!Send`; submitting
         // from a synchronous helper keeps them out of this future's state
@@ -227,6 +247,10 @@ impl VfsFile for GcdFile {
     }
 
     async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> Result<()> {
+        for req in reqs.iter() {
+            Self::checked_dispatch_offset(req.offset, req.buf.len())?;
+        }
+
         // dispatch_io operations are intrinsically sequential per channel
         // (the channel serialises ops in submission order); issuing them one
         // at a time matches that and keeps the bridge simple.
@@ -247,6 +271,7 @@ impl VfsFile for GcdFile {
             return Ok(0);
         }
         let len = buf.len();
+        let offset = Self::checked_dispatch_offset(offset, len)?;
         let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
         // `!Send` handler/data confined to a synchronous helper; see `read_at`.
         submit_write(&self.channel, &self.queue, offset, buf, tx);
@@ -260,6 +285,9 @@ impl VfsFile for GcdFile {
     async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> Result<()> {
         if !self.writable {
             return Err(PagedbError::ReadOnly);
+        }
+        for req in reqs {
+            Self::checked_dispatch_offset(req.offset, req.buf.len())?;
         }
         for req in reqs {
             self.write_at(req.offset, req.buf).await?;
@@ -282,10 +310,10 @@ impl VfsFile for GcdFile {
         if !self.writable {
             return Err(PagedbError::ReadOnly);
         }
-        // SAFETY: `fd()` valid as above; `len` fits in `libc::off_t` on
-        // 64-bit Apple targets (`off_t` is `i64` on macOS / iOS).
-        #[allow(clippy::cast_possible_wrap)]
-        let rc = unsafe { libc::ftruncate(self.fd(), len as libc::off_t) };
+        let len = checked_signed_file_len(len, "ftruncate")?;
+        // SAFETY: `fd()` is valid as above and `len` was checked to fit the
+        // signed native file-offset type.
+        let rc = unsafe { libc::ftruncate(self.fd(), len) };
         if rc != 0 {
             return Err(PagedbError::Io(std::io::Error::last_os_error()));
         }
