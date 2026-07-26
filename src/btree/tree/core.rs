@@ -245,6 +245,11 @@ impl<V: Vfs> BTree<V> {
         let expected_kind = match authenticated_kind {
             PageKind::BTreeLeaf => NodeKind::Leaf,
             PageKind::BTreeInternal => NodeKind::Internal,
+            // Unreachable today: `KindBinding::Node` already restricts the
+            // authenticated kind to the two node kinds on both the warm and
+            // cold pager paths. Kept so this boundary stays total if the pager
+            // ever admits another kind here — a silent widening would otherwise
+            // turn into a mis-typed accessor rather than an error.
             _ => return Err(PagedbError::IllegalPageKind),
         };
         if decoded_kind != expected_kind {

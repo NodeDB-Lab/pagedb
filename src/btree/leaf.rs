@@ -4,8 +4,8 @@ use crate::Result;
 use crate::errors::PagedbError;
 
 use super::node::{
-    HEADER_LEN, NodeHeader, NodeKind, body_capacity, read_header, read_u16_le, read_u64_le,
-    slot_offset, write_header, write_slot_offset, write_u16_le, write_u64_le,
+    HEADER_LEN, NodeHeader, NodeKind, OVERFLOW_SENTINEL, body_capacity, read_u16_le, read_u64_le,
+    slot_offset, validate_node_body, write_header, write_slot_offset, write_u16_le, write_u64_le,
 };
 
 /// Value stored in a leaf record — either inline bytes or a pointer to an
@@ -37,9 +37,6 @@ pub struct Leaf {
     pub records: Vec<(Vec<u8>, LeafValue)>,
 }
 
-/// Sentinel `value_len` that signals an overflow record.
-const OVERFLOW_SENTINEL: u16 = 0xFFFF;
-
 impl Leaf {
     #[must_use]
     pub fn new() -> Self {
@@ -51,7 +48,7 @@ impl Leaf {
     }
 
     pub fn decode(body: &[u8]) -> Result<Self> {
-        let h: NodeHeader = read_header(body)?;
+        let h: NodeHeader = validate_node_body(body)?;
         if h.kind != NodeKind::Leaf {
             return Err(PagedbError::corruption(
                 crate::errors::CorruptionDetail::HeaderUnverifiable,
@@ -270,7 +267,7 @@ impl<'a> LeafAccessor<'a> {
     /// Parse the leaf header and return an accessor borrowing `body`. Performs
     /// no record allocations and does not touch the slot directory or records.
     pub fn new(body: &'a [u8]) -> Result<Self> {
-        let h = read_header(body)?;
+        let h = validate_node_body(body)?;
         if h.kind != NodeKind::Leaf {
             return Err(PagedbError::corruption(
                 crate::errors::CorruptionDetail::HeaderUnverifiable,

@@ -1105,8 +1105,17 @@ mod tests {
         assert_eq!(&got[..5], b"hello");
     }
 
+    /// `read_main_node` must discover a node's kind from one physical read.
+    ///
+    /// This locks the single-read shape of the API, not the B+ tree's
+    /// envelope/body agreement check — that check lives in
+    /// `BTree::read_node_guard` and is covered by the corruption regressions in
+    /// `tests/btree_basic.rs`. Kept separate on purpose: the agreement check is
+    /// only free because the authenticated kind arrives with the page, so if a
+    /// refactor reintroduces a second read here, the check stops being free and
+    /// this test is what says so.
     #[tokio::test(flavor = "current_thread")]
-    async fn cold_node_read_authenticates_the_declared_kind_once() {
+    async fn read_main_node_discovers_kind_in_a_single_read() {
         let pager = mk_pager().await;
         let realm = RealmId([1; 16]);
         let mut body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
