@@ -17,15 +17,9 @@ async fn second_disk_open_fails_fast_without_corrupting_first_handle() {
     let dir = tempfile::tempdir().unwrap();
     let vfs = TokioVfs::new(dir.path());
 
-    let db = Db::open(
-        vfs.clone(),
-        KEK,
-        PAGE,
-        REALM,
-        OpenOptions::default(),
-    )
-    .await
-    .unwrap();
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
 
     // Write a key through the first (and only legitimate) handle.
     let mut w = db.begin_write().await.unwrap();

@@ -140,7 +140,9 @@ mod imp {
     }
 }
 
-pub use imp::{committed, flushed, lock_acquired, lock_rejected, page_read_verify_failed, reopened};
+pub use imp::{
+    committed, flushed, lock_acquired, lock_rejected, page_read_verify_failed, reopened,
+};
 
 /// Convenience for call sites that hold `Debug`-only types: format a value for
 /// a report field. Kept here so the (rare, failure-path-only) allocation is
