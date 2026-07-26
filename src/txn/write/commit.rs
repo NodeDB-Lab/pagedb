@@ -49,6 +49,10 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
     /// `CommitId`.
     #[allow(clippy::too_many_lines)]
     pub async fn commit(mut self) -> Result<CommitId> {
+        debug_assert!(
+            self.db.write_lock_satisfied(),
+            "page write without held writer lock"
+        );
         let _span = tracing::debug_span!("txn.commit");
         // Note: span is not entered via `.entered()` to keep this async fn's
         // future `Send`. Use `tracing::instrument` or enter in sync sections only.

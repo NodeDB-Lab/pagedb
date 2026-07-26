@@ -32,6 +32,33 @@ mod imp {
         });
     }
 
+    /// Breadcrumb: a sentinel lock (writer, frozen-reader, or observer) was
+    /// acquired at open — marks who holds exclusivity over a store.
+    pub fn lock_acquired(mode: &str, path: &str) {
+        blackbox::breadcrumb!(Info, "pagedb.lock_acquired", "sentinel lock acquired", {
+            "mode": mode,
+            "path": path,
+        });
+    }
+
+    /// Breadcrumb: a sentinel lock acquisition was rejected — a concurrent
+    /// open lost the race, so the failure has a trail even though it never
+    /// touched the store.
+    pub fn lock_rejected(mode: &str, path: &str, reason: &str) {
+        blackbox::breadcrumb!(Info, "pagedb.lock_rejected", "sentinel lock rejected", {
+            "mode": mode,
+            "path": path,
+            "reason": reason,
+        });
+    }
+
+    /// Breadcrumb: dirty pages were flushed and fsynced to durable storage.
+    pub fn flushed(bytes: u64) {
+        blackbox::breadcrumb!(Debug, "pagedb.flushed", "flushed to disk", {
+            "bytes": bytes,
+        });
+    }
+
     /// Forensic context for a page that failed AEAD/MAC verification on read —
     /// mirrors what `pagedb-fsck` would report for the same page.
     struct PageReadVerifyFailure {
@@ -100,6 +127,9 @@ mod imp {
 
     pub fn reopened(_latest_commit: u64) {}
     pub fn committed(_commit_id: u64, _freed_pages: usize) {}
+    pub fn lock_acquired(_mode: &str, _path: &str) {}
+    pub fn lock_rejected(_mode: &str, _path: &str, _reason: &str) {}
+    pub fn flushed(_bytes: u64) {}
     pub fn page_read_verify_failed(
         _main_db_path: &str,
         _page_id: u64,
@@ -110,7 +140,7 @@ mod imp {
     }
 }
 
-pub use imp::{committed, page_read_verify_failed, reopened};
+pub use imp::{committed, flushed, lock_acquired, lock_rejected, page_read_verify_failed, reopened};
 
 /// Convenience for call sites that hold `Debug`-only types: format a value for
 /// a report field. Kept here so the (rare, failure-path-only) allocation is

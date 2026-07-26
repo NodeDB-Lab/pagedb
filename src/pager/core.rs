@@ -960,6 +960,7 @@ impl<V: Vfs> Pager<V> {
             f.write_at_vectored(&reqs).await?;
             f.sync().await?;
         }
+        crate::diag::flushed(page_size_u64.saturating_mul(reqs.len() as u64));
 
         // Clear dirty flags — but ONLY for pages still holding the exact
         // `Arc<Page>` we gathered. A concurrent writer replaces the Arc on

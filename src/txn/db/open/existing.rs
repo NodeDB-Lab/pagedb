@@ -256,6 +256,11 @@ impl<V: Vfs + Clone> Db<V> {
             mode,
             aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
             sentinel_locks: Vec::new(),
+            // Direct callers of `open_existing`/`open_existing_with_options`
+            // bypass locking on purpose (they're meant to be reached through
+            // `Db::open`, which locks and then overwrites both fields on the
+            // returned handle). See the `lock_required` field doc.
+            lock_required: false,
             snapshot: Arc::new(parking_lot::RwLock::new(ReaderSnapshot {
                 commit_id: latest_commit,
                 root_page_id: fields.active_root_page_id,

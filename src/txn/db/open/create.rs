@@ -14,10 +14,11 @@ use crate::pager::{Pager, PagerConfig};
 use crate::vfs::Vfs;
 use crate::{CommitId, RealmId, Result};
 
-use super::super::super::mode::DbMode;
+use super::super::super::mode::{ACQUISITION_LOCK_PATH, DbMode, WRITER_LOCK_PATH};
 use super::super::super::policy::ReaderStallPolicy;
 use super::super::core::{Db, ReaderSnapshot, WriterState};
 use super::super::util::page_size_log2;
+use super::modes::acquire_interlocking_mode_lock;
 
 struct FreshDbState<V: Vfs + Clone> {
     pager: Pager<V>,
@@ -95,6 +96,12 @@ impl<V: Vfs + Clone> Db<V> {
             mode: DbMode::Standalone,
             aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
             sentinel_locks: Vec::new(),
+            // Callers of the unlocked constructor (this fn) are responsible
+            // for setting `lock_required`/`sentinel_locks` on the returned
+            // handle once they've done their own locking; see
+            // `open_internal_with_options_and_cipher` and
+            // `open_with_mode` in modes.rs.
+            lock_required: false,
             snapshot: Arc::new(parking_lot::RwLock::new(ReaderSnapshot {
                 commit_id: 0,
                 root_page_id: 0,
@@ -174,6 +181,11 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// Full constructor: explicit cipher and explicit memory budgets.
+    ///
+    /// Bootstraps a fresh database directly, bypassing `Db::open`'s mode
+    /// dispatch — so this acquires the same writer sentinel `Db::open` would
+    /// before writing the initial header. Without it, two concurrent callers
+    /// of this function could race the bootstrap write unlocked.
     pub async fn open_internal_with_options_and_cipher(
         vfs: V,
         kek: impl Into<SecretKey>,
@@ -183,6 +195,33 @@ impl<V: Vfs + Clone> Db<V> {
         cipher_id: CipherId,
     ) -> Result<Self> {
         let kek = kek.into();
+        let acquisition = vfs.lock_exclusive(ACQUISITION_LOCK_PATH).await?;
+        let mut locks = Vec::new();
+        acquire_interlocking_mode_lock(&vfs, DbMode::Standalone.open_capabilities(), &mut locks)
+            .await?;
+        crate::diag::lock_acquired("standalone", WRITER_LOCK_PATH);
+        drop(acquisition);
+        let mut db = Self::open_internal_with_options_and_cipher_unlocked(
+            vfs, kek, page_size, realm, options, cipher_id,
+        )
+        .await?;
+        db.sentinel_locks = locks;
+        db.lock_required = true;
+        Ok(db)
+    }
+
+    /// Bootstrap logic shared by `open_internal_with_options_and_cipher` and
+    /// `Db::open`'s Standalone dispatch. Callers must hold the writer
+    /// sentinel (or be constructing one) before invoking this, since it
+    /// writes the initial header unconditionally.
+    pub(super) async fn open_internal_with_options_and_cipher_unlocked(
+        vfs: V,
+        kek: SecretKey,
+        page_size: usize,
+        realm: RealmId,
+        options: OpenOptions,
+        cipher_id: CipherId,
+    ) -> Result<Self> {
         let main_db_path = "/main.db".to_string();
         let (file_id, kek_salt) = crate::crypto::random::database_identity()?;
         let mk_epoch = 0u64;
