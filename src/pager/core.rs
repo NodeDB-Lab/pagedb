@@ -608,6 +608,15 @@ impl<V: Vfs> Pager<V> {
     ///
     /// `read_main_page` now always routes to the on-disk epoch/cipher, so this
     /// simply reads then marks dirty.
+    ///
+    /// The dirty set is kept inside the configured buffer-pool budget. A rekey
+    /// re-seals every page a root can reach, and dirty entries are never
+    /// evicted (the cache's eviction scan skips them), so without an intermediate
+    /// flush the walk would pin the whole decrypted database in memory no
+    /// matter what budget the caller asked for. Flushing mid-walk is safe and
+    /// idempotent: the active epoch is already the target, so a page re-read
+    /// after being re-sealed opens under the same key, and a crash resumes
+    /// from the durable rekey intent.
     pub async fn rewrite_page_under_current_epoch(
         &self,
         page_id: u64,
@@ -618,10 +627,15 @@ impl<V: Vfs> Pager<V> {
             .read_main_page(page_id, realm_id, expected_kind)
             .await?;
         let file = FileKey::Main;
-        let mut cache = self.inner.cache_for_key(file).lock();
-        cache.mark_dirty((file, page_id));
-        drop(cache);
+        let over_budget = {
+            let mut cache = self.inner.cache_for_key(file).lock();
+            cache.mark_dirty((file, page_id));
+            cache.dirty_len() >= self.cfg.buffer_pool_pages.max(1)
+        };
         drop(guard);
+        if over_budget {
+            self.flush_main(realm_id).await?;
+        }
         Ok(())
     }
 

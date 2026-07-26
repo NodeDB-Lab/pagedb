@@ -18,6 +18,7 @@ use crate::vfs::Vfs;
 #[cfg(test)]
 use super::super::core::RekeyTestFault;
 use super::super::core::{Db, WriterState};
+use super::main::RekeyCatalogCommit;
 
 struct SegmentEntry {
     key: Vec<u8>,
@@ -249,6 +250,7 @@ impl<V: Vfs + Clone> Db<V> {
         tree.put(&source.key, &Catalog::encode_segment_meta(replacement))
             .await?;
         tree.flush().await?;
+        let freed_pages = tree.drain_freed();
         let effects = [
             SegmentSideEffect::Promote {
                 segment_id: replacement.segment_id,
@@ -260,11 +262,14 @@ impl<V: Vfs + Clone> Db<V> {
         ];
         self.commit_rekey_catalog_root(
             state,
-            tree.root_page_id(),
-            tree.next_page_id(),
+            RekeyCatalogCommit {
+                catalog_root_page_id: tree.root_page_id(),
+                next_page_id: tree.next_page_id(),
+                freed_pages: &freed_pages,
+                effects: &effects,
+            },
             intent.target_mk_epoch,
             target_hk,
-            &effects,
         )
         .await
         .map(|_| ())
@@ -285,13 +290,17 @@ impl<V: Vfs + Clone> Db<V> {
         )
         .await?;
         tree.flush().await?;
+        let freed_pages = tree.drain_freed();
         self.commit_rekey_catalog_root(
             state,
-            tree.root_page_id(),
-            tree.next_page_id(),
+            RekeyCatalogCommit {
+                catalog_root_page_id: tree.root_page_id(),
+                next_page_id: tree.next_page_id(),
+                freed_pages: &freed_pages,
+                effects: &[],
+            },
             header_epoch,
             header_hk,
-            &[],
         )
         .await?;
         #[cfg(test)]
@@ -311,13 +320,17 @@ impl<V: Vfs + Clone> Db<V> {
             .delete(&Catalog::rekey_segment_progress_key(source_id))
             .await?;
         tree.flush().await?;
+        let freed_pages = tree.drain_freed();
         self.commit_rekey_catalog_root(
             state,
-            tree.root_page_id(),
-            tree.next_page_id(),
+            RekeyCatalogCommit {
+                catalog_root_page_id: tree.root_page_id(),
+                next_page_id: tree.next_page_id(),
+                freed_pages: &freed_pages,
+                effects: &[],
+            },
             header_epoch,
             header_hk,
-            &[],
         )
         .await?;
         #[cfg(test)]

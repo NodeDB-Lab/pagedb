@@ -14,7 +14,7 @@ use crate::errors::PagedbError;
 use crate::pager::PageKind;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
-use crate::vfs::{OpenMode, Vfs, VfsFile};
+use crate::vfs::{OpenMode, Vfs, VfsFile, read_exact_at};
 
 #[cfg(test)]
 use super::super::core::RekeyTestFault;
@@ -28,20 +28,30 @@ use super::intent::{intent_proof, migrate_legacy, validate_intent_for_current_ci
 /// retention runs.
 const HISTORY_ROOT_BATCH: usize = 512;
 
-async fn read_main_page_kind<F: VfsFile>(file: &F, offset: u64) -> Result<Option<PageKind>> {
+/// One catalog rewrite a rekey stage is about to make durable.
+///
+/// The new root and allocation cursor, the pages the rewrite superseded, and
+/// the segment side effects it publishes all describe the same transition, so
+/// they travel together rather than as loose positional arguments.
+pub(super) struct RekeyCatalogCommit<'a> {
+    pub catalog_root_page_id: u64,
+    pub next_page_id: u64,
+    pub freed_pages: &'a [u64],
+    pub effects: &'a [crate::txn::write::SegmentSideEffect],
+}
+
+/// Read the cleartext kind byte of a `main.db` page, or `None` when the page
+/// has been cleared.
+///
+/// Only selects which AAD binding to authenticate under; the pager still
+/// verifies the full envelope against that same kind, so a tampered byte
+/// cannot launder a page into another role — it fails the tag instead.
+async fn read_main_page_kind<F: VfsFile + ?Sized>(
+    file: &mut F,
+    offset: u64,
+) -> Result<Option<PageKind>> {
     let mut envelope = [0u8; 2];
-    let mut filled = 0;
-    while filled < envelope.len() {
-        let read = file
-            .read_at(offset + filled as u64, &mut envelope[filled..])
-            .await?;
-        if read == 0 {
-            return Err(PagedbError::Io(std::io::Error::from(
-                std::io::ErrorKind::UnexpectedEof,
-            )));
-        }
-        filled += read;
-    }
+    read_exact_at(file, offset, &mut envelope).await?;
     if envelope == [0, 0] {
         return Ok(None);
     }
@@ -287,12 +297,12 @@ impl<V: Vfs + Clone> Db<V> {
             return Ok(());
         }
 
-        let file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
+        let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
         for page_id in reusable_pages {
             let offset = page_id
                 .checked_mul(self.page_size as u64)
                 .ok_or_else(|| PagedbError::arithmetic_overflow("free-list page offset"))?;
-            let Some(kind) = read_main_page_kind(&file, offset).await? else {
+            let Some(kind) = read_main_page_kind(&mut file, offset).await? else {
                 continue;
             };
             self.pager
@@ -302,23 +312,30 @@ impl<V: Vfs + Clone> Db<V> {
         Ok(())
     }
 
-    /// Re-encrypt pages superseded by copy-on-write catalog transitions after
-    /// the target-authenticated header is durable. No live root discovers
-    /// these residual pages, but physical integrity scans still authenticate
-    /// every non-zero page and the source epoch is retired on success.
-    async fn rewrite_rekey_residual_main_pages(&self, state: &WriterState) -> Result<()> {
-        let file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
-        for page_id in 4..state.next_page_id {
-            let offset = page_id
-                .checked_mul(self.page_size as u64)
-                .ok_or_else(|| PagedbError::arithmetic_overflow("main-db page offset"))?;
-            let Some(kind) = read_main_page_kind(&file, offset).await? else {
-                continue;
-            };
-            self.pager
-                .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
-                .await?;
+    /// Re-seal the live catalog tree under the target epoch.
+    ///
+    /// Every other reader-visible root is re-sealed before the target header is
+    /// published. The catalog is the one that cannot be: until the target
+    /// header is durable it must stay source-readable, because it carries the
+    /// rekey intent that an open able to verify only the stale A/B side uses to
+    /// admit recovery. So it is re-sealed here instead, once that anchor is in
+    /// place and while both keys are still installed.
+    ///
+    /// The walk is the same bounded, deduplicating traversal the data tree
+    /// uses — proportional to unique reachable catalog pages, not to the size
+    /// of the file.
+    async fn rewrite_rekey_catalog_pages(&self, state: &WriterState) -> Result<()> {
+        if state.catalog_root_page_id == 0 {
+            return Ok(());
         }
+        let catalog = BTree::open(
+            self.pager.clone(),
+            self.realm_id,
+            state.catalog_root_page_id,
+            state.next_page_id,
+            self.page_size,
+        );
+        catalog.rekey_walk_unique(&mut BTreeMap::new()).await?;
         Ok(())
     }
 
@@ -427,7 +444,13 @@ impl<V: Vfs + Clone> Db<V> {
         target_header_key: &DerivedKey,
     ) -> Result<()> {
         if matches!(intent.stage, RekeyStage::HeaderTargetPublished) {
-            self.rewrite_rekey_residual_main_pages(state).await?;
+            self.rewrite_rekey_catalog_pages(state).await?;
+            // The pages the intent write above superseded are already on the
+            // durable free list, so this pass also re-seals them; from here on
+            // every catalog page is target-sealed and later transitions can
+            // only supersede target-epoch pages.
+            self.rewrite_free_list_pages(state.free_list_root_page_id)
+                .await?;
             self.pager.flush_main(self.realm_id).await?;
             intent.stage = RekeyStage::MainDone;
             self.write_rekey_intent_locked(
@@ -520,13 +543,17 @@ impl<V: Vfs + Clone> Db<V> {
         )
         .await?;
         tree.flush().await?;
+        let freed_pages = tree.drain_freed();
         self.commit_rekey_catalog_root(
             state,
-            tree.root_page_id(),
-            tree.next_page_id(),
+            RekeyCatalogCommit {
+                catalog_root_page_id: tree.root_page_id(),
+                next_page_id: tree.next_page_id(),
+                freed_pages: &freed_pages,
+                effects: &[],
+            },
             header_epoch,
             header_hk,
-            &[],
         )
         .await
         .map(|_| ())
@@ -550,27 +577,85 @@ impl<V: Vfs + Clone> Db<V> {
         );
         let _ = tree.delete(&Catalog::rekey_state_key()).await?;
         tree.flush().await?;
+        let freed_pages = tree.drain_freed();
         self.commit_rekey_catalog_root(
             state,
-            tree.root_page_id(),
-            tree.next_page_id(),
+            RekeyCatalogCommit {
+                catalog_root_page_id: tree.root_page_id(),
+                next_page_id: tree.next_page_id(),
+                freed_pages: &freed_pages,
+                effects: &[],
+            },
             header_epoch,
             header_hk,
-            &[],
         )
         .await
         .map(|_| ())
     }
 
+    /// Fold pages a rekey-time catalog rewrite superseded into the durable free
+    /// list, returning the allocation cursor the header must record.
+    ///
+    /// Every ordinary commit routes its copy-on-write leftovers here. Without
+    /// it a rekey abandons pages at each intent transition: unreachable from
+    /// any root, absent from the free list, and — once the source epoch is
+    /// retired — sealed under a key that no longer exists. Entries carry the
+    /// current commit id, so the reclamation floor still withholds any page a
+    /// live reader or retained history root can still name.
+    async fn record_rekey_freed_pages(
+        &self,
+        state: &mut WriterState,
+        freed_pages: &[u64],
+        next_page_id: u64,
+    ) -> Result<u64> {
+        if freed_pages.is_empty() {
+            return Ok(next_page_id);
+        }
+        let (mut entries, old_chain) = crate::pager::freelist::read_chain(
+            &self.pager,
+            self.realm_id,
+            state.free_list_root_page_id,
+        )
+        .await?;
+        entries.extend(
+            freed_pages
+                .iter()
+                .map(|&page_id| (state.latest_commit_id, page_id)),
+        );
+        // Chain pages are writer-only metadata that no reader snapshot ever
+        // traverses, so they carry a commit id below every real floor and are
+        // immediately recyclable — the same rule the ordinary commit path uses.
+        entries.extend(old_chain.into_iter().map(|page_id| (0, page_id)));
+        let (new_free_list_root, new_next_page_id) = crate::pager::freelist::rewrite_chain(
+            &self.pager,
+            self.realm_id,
+            self.page_size,
+            entries,
+            Vec::new(),
+            next_page_id,
+        )
+        .await?;
+        state.free_list_root_page_id = new_free_list_root;
+        self.pager.flush_main(self.realm_id).await?;
+        Ok(new_next_page_id)
+    }
+
     pub(super) async fn commit_rekey_catalog_root(
         &self,
         state: &mut WriterState,
-        catalog_root_page_id: u64,
-        next_page_id: u64,
+        catalog: RekeyCatalogCommit<'_>,
         header_epoch: u64,
         hk: &DerivedKey,
-        effects: &[crate::txn::write::SegmentSideEffect],
     ) -> Result<super::super::segment::SegmentReconciliation> {
+        let RekeyCatalogCommit {
+            catalog_root_page_id,
+            next_page_id,
+            freed_pages,
+            effects,
+        } = catalog;
+        let next_page_id = self
+            .record_rekey_freed_pages(state, freed_pages, next_page_id)
+            .await?;
         let next_page_id = next_page_id.max(state.next_page_id);
         let new_seq = state
             .seq
@@ -953,13 +1038,17 @@ mod tests {
             .unwrap();
         catalog.flush().await.unwrap();
         let source_header_key = db.hk.read().clone();
+        let freed_pages = catalog.drain_freed();
         db.commit_rekey_catalog_root(
             &mut state,
-            catalog.root_page_id(),
-            catalog.next_page_id(),
+            RekeyCatalogCommit {
+                catalog_root_page_id: catalog.root_page_id(),
+                next_page_id: catalog.next_page_id(),
+                freed_pages: &freed_pages,
+                effects: &[],
+            },
             0,
             &source_header_key,
-            &[],
         )
         .await
         .unwrap();
