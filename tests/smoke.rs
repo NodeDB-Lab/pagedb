@@ -42,6 +42,9 @@ fn every_variant_displays() {
         PagedbError::ChecksumFailure,
         PagedbError::corruption(CorruptionDetail::HeaderUnverifiable),
         PagedbError::structural_header_invalid("main.db", "magic"),
+        PagedbError::page_chain_cycle("btree_descent", 41),
+        PagedbError::leaf_sibling_mismatch(31, 31, None),
+        PagedbError::BulkLoadNotMonotonic,
         PagedbError::vfs_contract_violated(
             "read_at",
             "reported more bytes than the caller requested",

@@ -93,7 +93,7 @@ impl<V: Vfs> BTree<V> {
             NodeKind::Internal => InternalAccessor::new(start_guard.body_ref())?.child_for(key),
         };
         // Descend from the first child onward. Subsequent guards are owned.
-        let mut seen = SeenPageIds::new();
+        let mut seen = SeenPageIds::new("btree_descent");
         seen.insert(start_page_id)?;
         let mut page_id = next_page_id;
         loop {

@@ -127,6 +127,16 @@ pub enum PagedbError {
     #[error("put_append called with non-monotonic key")]
     AppendNotMonotonic,
 
+    /// `BTree::bulk_load` was handed input whose keys are not strictly
+    /// increasing — descending, or repeating the same key.
+    ///
+    /// The sibling of [`Self::AppendNotMonotonic`]: same invariant, different
+    /// entry point. Bulk load builds the tree bottom-up from the input order
+    /// itself, so unsorted input does not merely misplace a record — it would
+    /// produce a tree whose separators do not describe its leaves.
+    #[error("bulk_load keys must be strictly increasing")]
+    BulkLoadNotMonotonic,
+
     /// The deferred-free backlog exceeds the configured threshold and
     /// active reader pins prevent draining it.
     #[non_exhaustive]
@@ -306,6 +316,33 @@ pub enum CorruptionDetail {
     /// has no terminator. Distinct from a truncated chain: the links
     /// authenticate, they just form a loop.
     OverflowChainCycle { root_page_id: u64, page_id: u64 },
+    /// A linked page structure revisited a page it had already walked, so the
+    /// walk has no terminator.
+    ///
+    /// The overflow-chain form is [`Self::OverflowChainCycle`], which can also
+    /// name the chain's root. This is the general case — a B+ tree root-to-leaf
+    /// descent, a leaf sibling walk, or the durable free-list chain — where
+    /// `structure` says which walk found the loop and `page_id` is the page it
+    /// reached twice. Every link authenticates; they simply form a loop, which
+    /// no honest writer can produce.
+    PageChainCycle {
+        structure: &'static str,
+        page_id: u64,
+    },
+    /// A leaf's persisted right-sibling link disagrees with the leaf its parent
+    /// path says comes next.
+    ///
+    /// Both encode "the next leaf", so both must name it. A disagreement means
+    /// one of them outlived the page it points at — a sibling link left behind
+    /// by a page that was freed and handed to another node, or a parent whose
+    /// child pointer was rewritten without its leaves. `parent_next` is `None`
+    /// when the parent path has no successor at all yet the leaf still claims
+    /// one.
+    LeafSiblingMismatch {
+        leaf_page_id: u64,
+        right_sibling: u64,
+        parent_next: Option<u64>,
+    },
     /// One physical page was reached twice in a single traversal under two
     /// incompatible page kinds.
     ///
@@ -423,6 +460,29 @@ impl PagedbError {
         Self::Corruption(CorruptionDetail::ReservedPageReferenced {
             parent_page_id,
             child_page_id,
+        })
+    }
+
+    /// Canonical constructor for a cyclic linked page structure. `structure`
+    /// names the walk that found the loop — `"btree_descent"`,
+    /// `"leaf_siblings"`, `"free_list"`.
+    #[must_use]
+    pub const fn page_chain_cycle(structure: &'static str, page_id: u64) -> Self {
+        Self::Corruption(CorruptionDetail::PageChainCycle { structure, page_id })
+    }
+
+    /// Canonical constructor for a leaf whose sibling link and parent path
+    /// disagree about which leaf comes next.
+    #[must_use]
+    pub const fn leaf_sibling_mismatch(
+        leaf_page_id: u64,
+        right_sibling: u64,
+        parent_next: Option<u64>,
+    ) -> Self {
+        Self::Corruption(CorruptionDetail::LeafSiblingMismatch {
+            leaf_page_id,
+            right_sibling,
+            parent_next,
         })
     }
 

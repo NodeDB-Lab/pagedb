@@ -486,7 +486,13 @@ fn delete_range_rejects_leaf_sibling_cycle_without_hanging() {
         .recv_timeout(Duration::from_secs(5))
         .expect("delete_range sibling-cycle detection should return before the timeout");
     let error = result.expect_err("leaf sibling cycles must not be accepted");
-    assert!(matches!(error, PagedbError::Corruption(_)));
+    assert!(
+        matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::LeafSiblingMismatch { .. })
+        ),
+        "expected LeafSiblingMismatch, got {error:?}"
+    );
 }
 
 #[test]
@@ -522,7 +528,16 @@ fn get_rejects_internal_child_cycle_without_hanging() {
         .recv_timeout(Duration::from_secs(5))
         .expect("get internal-cycle detection should return before the timeout");
     let error = result.expect_err("internal child cycles must not be accepted");
-    assert!(matches!(error, PagedbError::Corruption(_)));
+    assert!(
+        matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::PageChainCycle {
+                structure: "btree_descent",
+                ..
+            })
+        ),
+        "expected a descent PageChainCycle, got {error:?}"
+    );
 }
 
 #[test]
@@ -558,7 +573,16 @@ fn put_rejects_internal_child_cycle_without_hanging() {
         .recv_timeout(Duration::from_secs(5))
         .expect("put internal-cycle detection should return before the timeout");
     let error = result.expect_err("internal child cycles must not be accepted");
-    assert!(matches!(error, PagedbError::Corruption(_)));
+    assert!(
+        matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::PageChainCycle {
+                structure: "btree_descent",
+                ..
+            })
+        ),
+        "expected a descent PageChainCycle, got {error:?}"
+    );
 }
 
 #[test]
@@ -611,7 +635,8 @@ async fn bulk_load_rejects_non_strict_key_order_without_poisoning_tree() {
             .await
             .expect_err("bulk_load must reject unsorted or duplicate keys");
         assert!(
-            matches!(error, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput)
+            matches!(error, PagedbError::BulkLoadNotMonotonic),
+            "expected BulkLoadNotMonotonic, got {error:?}"
         );
         assert_eq!(tree.root_page_id(), 0);
         assert_eq!(tree.next_page_id(), 4);

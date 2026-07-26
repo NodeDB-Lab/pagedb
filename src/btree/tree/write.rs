@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::Result;
-use crate::errors::{CorruptionDetail, PagedbError};
+use crate::errors::PagedbError;
 use crate::vfs::Vfs;
 
 use crate::btree::leaf::{Leaf, LeafValue};
@@ -49,15 +49,28 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
+    /// Return the pages of a chain that was written for a value the caller
+    /// never got to commit.
+    ///
+    /// Best-effort by design: this runs on an error path, and a failure here
+    /// must not replace the error the caller actually needs to see. It is
+    /// logged rather than swallowed, because the cost of giving up is a page
+    /// leak that nothing else will notice.
     async fn discard_uncommitted_value(&mut self, value: Option<LeafValue>) {
-        if let Some(LeafValue::Overflow { root_page_id, .. }) = value {
-            if let Ok(page_ids) =
-                overflow::collect_chain(&self.pager, self.realm_id, root_page_id).await
-            {
+        let Some(LeafValue::Overflow { root_page_id, .. }) = value else {
+            return;
+        };
+        match overflow::collect_chain(&self.pager, self.realm_id, root_page_id).await {
+            Ok(page_ids) => {
                 for page_id in page_ids {
                     self.free_page(page_id);
                 }
             }
+            Err(error) => tracing::warn!(
+                root_page_id,
+                error = %error,
+                "could not reclaim the overflow chain of an uncommitted value; its pages are leaked"
+            ),
         }
     }
 
@@ -236,7 +249,11 @@ impl<V: Vfs> BTree<V> {
     /// # Errors
     ///
     /// Returns [`PagedbError::AppendNotMonotonic`] if `key` is not strictly
-    /// greater than the previously-appended key in this `BTree` session.
+    /// greater than the previously-appended key in this `BTree` session, or —
+    /// on the first append of a session, when there is no such key yet — not
+    /// strictly greater than the largest key already in the tree. Both are the
+    /// same invariant: the cached rightmost path is only meaningful while every
+    /// append lands to the right of everything before it.
     /// Intended for op-logs, time-series indexes, FTS posting-list builds —
     /// any workload where the embedder can guarantee monotonic-key insert.
     pub async fn put_append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -262,11 +279,12 @@ impl<V: Vfs> BTree<V> {
         }
 
         // Fast path: cached rightmost path is valid → skip descent.
-        let path = if let Some(cached) = self.append_cached_path.take() {
-            cached
-        } else {
-            self.path_to_rightmost_leaf().await?
+        let path = match &self.append_cached_path {
+            Some(cached) => cached.clone(),
+            None => self.path_to_rightmost_leaf().await?,
         };
+        // Checked before the cached path is consumed: a rejected append must
+        // leave the session exactly as it found it, cache included.
         if self.append_last_key.is_none()
             && self
                 .max_key_at_path(&path)
@@ -275,6 +293,7 @@ impl<V: Vfs> BTree<V> {
         {
             return Err(PagedbError::AppendNotMonotonic);
         }
+        self.append_cached_path = None;
         let leaf_value = self.leaf_value_for(value).await?;
         let path_for_retry = path.clone();
         let split = self.put_at_path(path, key, leaf_value).await?;
@@ -394,7 +413,7 @@ impl<V: Vfs> BTree<V> {
         // their sibling links remain zero until flush.
         let mut path = self.path_to_leaf_for_key(start).await?;
         let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
-        let mut seen_leaves = SeenPageIds::new();
+        let mut seen_leaves = SeenPageIds::new("leaf_siblings");
         'outer: loop {
             let leaf_page_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_page_id)?;
@@ -416,9 +435,11 @@ impl<V: Vfs> BTree<V> {
                 {
                     path = parent_next;
                 }
-                _ => {
-                    return Err(PagedbError::corruption(
-                        CorruptionDetail::HeaderUnverifiable,
+                (right_sibling, parent_next) => {
+                    return Err(PagedbError::leaf_sibling_mismatch(
+                        leaf_page_id,
+                        right_sibling,
+                        parent_next.and_then(|path| path.last().copied()),
                     ));
                 }
             }

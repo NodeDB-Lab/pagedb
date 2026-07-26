@@ -37,10 +37,7 @@ impl<V: Vfs> BTree<V> {
 
         for pair in pairs.windows(2) {
             if pair[0].0 >= pair[1].0 {
-                return Err(PagedbError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "bulk_load input keys must be strictly increasing",
-                )));
+                return Err(PagedbError::BulkLoadNotMonotonic);
             }
         }
         for (key, value) in &pairs {
