@@ -13,13 +13,11 @@ use crate::txn::write::SegmentSideEffect;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 
-/// Collect ALL key-value pairs from a tree via full leaf-level scan.
-/// Uses an empty start and a sentinel beyond any possible key.
+/// Collect all key-value pairs from a tree via full leaf-level scan.
 pub(super) async fn collect_all_pairs<V: Vfs + Clone>(
     tree: &BTree<V>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    // [0xFF; 256] is beyond any realistic key in this codebase.
-    tree.collect_range(&[], &[0xFF; 256]).await
+    tree.scan_prefix(&[]).await
 }
 
 /// Collect every catalog row, for rebuilding the catalog tree during a dense

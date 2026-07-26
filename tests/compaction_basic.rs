@@ -120,6 +120,70 @@ async fn compact_truncates_main_db() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn compact_now_preserves_ff_256_user_key() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
+    let high_key = [0xFF; 256];
+    let high_value = b"high-key-value";
+    let ordinary_value = [0x2A; 128];
+
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(&high_key, high_value).await.unwrap();
+        for i in 0u32..240 {
+            txn.put(format!("ordinary-{i:06}").as_bytes(), &ordinary_value)
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for i in 0u32..230 {
+            txn.delete(format!("ordinary-{i:06}").as_bytes())
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+
+    let stats = db.compact_now().await.unwrap();
+    assert!(
+        stats.main_db_pages_reclaimed > 0,
+        "test setup did not enter dense repack"
+    );
+    {
+        let read = db.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(&high_key).await.unwrap().as_deref(),
+            Some(high_value.as_slice()),
+            "high key was lost during dense repack"
+        );
+        assert_eq!(
+            read.get(b"ordinary-000239").await.unwrap().as_deref(),
+            Some(ordinary_value.as_slice()),
+            "ordinary survivor was lost during dense repack"
+        );
+    }
+
+    drop(db);
+    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let read = reopened.begin_read().await.unwrap();
+    assert_eq!(
+        read.get(&high_key).await.unwrap().as_deref(),
+        Some(high_value.as_slice()),
+        "high key was lost after reopen"
+    );
+    assert_eq!(
+        read.get(b"ordinary-000239").await.unwrap().as_deref(),
+        Some(ordinary_value.as_slice()),
+        "ordinary survivor was lost after reopen"
+    );
+}
+
 // ─── Large (overflow-backed) values survive a full repack ─────────────────────
 
 /// Values larger than the inline threshold (`PAGE / 4`) are stored as overflow
