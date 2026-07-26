@@ -17,6 +17,13 @@ pub enum LeafValue {
     Overflow { total_len: u64, root_page_id: u64 },
 }
 
+/// Bytes an overflow reference occupies in an encoded record body: the
+/// sentinel `u16`, then `total_len` and `root_page_id` as `u64`s.
+///
+/// Named so the preflight that decides whether a record can fit and the encoder
+/// that lays it out cannot drift apart.
+pub(crate) const OVERFLOW_REF_ENCODED_SIZE: usize = 2 + 8 + 8;
+
 impl LeafValue {
     /// Number of bytes this value occupies in the encoded record body (after
     /// the key suffix):  2-byte `value_len` field plus the payload.
@@ -24,8 +31,7 @@ impl LeafValue {
     pub fn encoded_size(&self) -> usize {
         match self {
             Self::Inline(v) => 2 + v.len(),
-            // sentinel u16 + total_len u64 + root_page_id u64
-            Self::Overflow { .. } => 2 + 8 + 8,
+            Self::Overflow { .. } => OVERFLOW_REF_ENCODED_SIZE,
         }
     }
 }

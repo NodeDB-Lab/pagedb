@@ -23,15 +23,24 @@ pub struct Internal {
     pub entries: Vec<InternalEntry>,
 }
 
+/// Fixed bytes an internal record costs beyond its key: the `key_len` `u16`
+/// and the `right_child` `u64`.
+///
+/// Named so the sizing used to decide whether a separator fits stays tied to
+/// the layout [`Internal::encode`] actually writes.
+pub(crate) const SEPARATOR_RECORD_OVERHEAD: usize = 2 + 8;
+
+/// Bytes one slot-directory entry costs.
+pub(crate) const SLOT_DIRECTORY_ENTRY_SIZE: usize = 2;
+
 /// Encoded byte cost of one internal separator plus its slot-directory entry.
 pub(crate) fn separator_entry_size(key_len: usize) -> Result<usize> {
     if key_len > u16::MAX as usize {
         return Err(PagedbError::PayloadTooLarge);
     }
-    2usize
-        .checked_add(key_len)
-        .and_then(|size| size.checked_add(8))
-        .and_then(|size| size.checked_add(2))
+    key_len
+        .checked_add(SEPARATOR_RECORD_OVERHEAD)
+        .and_then(|size| size.checked_add(SLOT_DIRECTORY_ENTRY_SIZE))
         .ok_or(PagedbError::PayloadTooLarge)
 }
 
@@ -68,8 +77,12 @@ impl Internal {
         let cap = body.len();
         let prefix_len = 0usize;
         let slot_count = self.entries.len();
-        let record_bytes: usize = self.entries.iter().map(|e| 2 + e.key.len() + 8).sum();
-        let slot_dir_bytes = slot_count * 2;
+        let record_bytes: usize = self
+            .entries
+            .iter()
+            .map(|e| e.key.len() + SEPARATOR_RECORD_OVERHEAD)
+            .sum();
+        let slot_dir_bytes = slot_count * SLOT_DIRECTORY_ENTRY_SIZE;
         if HEADER_LEN + prefix_len + slot_dir_bytes + record_bytes > cap {
             return Err(PagedbError::PayloadTooLarge);
         }
@@ -88,7 +101,7 @@ impl Internal {
         }
         let mut tail = cap;
         for (i, e) in self.entries.iter().enumerate() {
-            let rec_size = 2 + e.key.len() + 8;
+            let rec_size = e.key.len() + SEPARATOR_RECORD_OVERHEAD;
             tail -= rec_size;
             let off = tail;
             write_u16_le(
