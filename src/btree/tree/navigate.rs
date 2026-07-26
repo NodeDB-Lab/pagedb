@@ -7,7 +7,7 @@ use crate::btree::internal::{Internal, InternalAccessor, InternalEntry};
 use crate::btree::node::NodeKind;
 use crate::btree::split::split_internal;
 
-use super::core::BTree;
+use super::core::{BTree, SeenPageIds};
 
 impl<V: Vfs> BTree<V> {
     /// Given an internal node and a child `page_id`, return the `page_id` of the
@@ -195,7 +195,9 @@ impl<V: Vfs> BTree<V> {
     pub(super) async fn path_to_leaf_for_key(&self, key: &[u8]) -> Result<Vec<u64>> {
         let mut path = Vec::new();
         let mut page_id = self.root_page_id;
+        let mut seen = SeenPageIds::new();
         loop {
+            seen.insert(page_id)?;
             path.push(page_id);
             // Fresh leaves (from in-txn splits) live only in `fresh_leaves`
             // until flush — the pager has no copy yet. Short-circuit the
@@ -224,6 +226,7 @@ impl<V: Vfs> BTree<V> {
             // Root is a leaf; no next leaf.
             return Ok(None);
         }
+        let mut seen = SeenPageIds::from_existing(path)?;
         let mut child = path[path.len() - 1];
         for i in (0..path.len() - 1).rev() {
             let (guard, _kind) = self.read_node_guard(path[i]).await?;
@@ -234,6 +237,7 @@ impl<V: Vfs> BTree<V> {
                 let mut new_path: Vec<u64> = path[..=i].to_vec();
                 let mut cur = next_child;
                 loop {
+                    seen.insert(cur)?;
                     new_path.push(cur);
                     // A fresh-from-split leaf has no pager presence yet.
                     if self.fresh_leaves.contains_key(&cur) {
@@ -260,7 +264,9 @@ impl<V: Vfs> BTree<V> {
     pub(super) async fn path_to_rightmost_leaf(&self) -> Result<Vec<u64>> {
         let mut path = Vec::new();
         let mut page_id = self.root_page_id;
+        let mut seen = SeenPageIds::new();
         loop {
+            seen.insert(page_id)?;
             path.push(page_id);
             // Fresh-from-split leaves only live in `fresh_leaves`.
             if self.fresh_leaves.contains_key(&page_id) {

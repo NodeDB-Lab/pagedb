@@ -13,6 +13,8 @@
 //! `next` pointer sits at byte 4 in the root and byte 0 in a chain page — any
 //! chain walk must account for that offset.
 
+use std::collections::BTreeSet;
+
 use crate::errors::PagedbError;
 use crate::pager::Pager;
 use crate::pager::format::data_page::ENVELOPE_OVERHEAD;
@@ -272,8 +274,12 @@ pub async fn release<V: Vfs>(
     if info.refcount <= 1 {
         // Collect entire chain.
         let mut freed = vec![root_page_id];
+        let mut seen = BTreeSet::from([root_page_id]);
         let mut cur = info.next;
         while cur != 0 {
+            if !seen.insert(cur) {
+                return Err(PagedbError::overflow_chain_cycle(root_page_id, cur));
+            }
             let guard = pager
                 .read_main_page(cur, realm_id, PageKind::Overflow)
                 .await?;
@@ -303,22 +309,46 @@ pub async fn read_chain<V: Vfs>(
     root_page_id: u64,
     total_len: u64,
 ) -> Result<Vec<u8>> {
-    let mut out: Vec<u8> = Vec::with_capacity(usize::try_from(total_len).unwrap_or(0));
+    let total_len = usize::try_from(total_len)
+        .ok()
+        .filter(|len| isize::try_from(*len).is_ok())
+        .ok_or_else(|| PagedbError::overflow_body_malformed("chain.total_length"))?;
+    // Durable metadata must not choose an arbitrarily large allocation before
+    // any chain page has been authenticated. Grow only as bytes are verified.
+    let mut out: Vec<u8> = Vec::with_capacity(total_len.min(pager.page_size()));
 
     let info = read_root_page(pager, realm_id, root_page_id).await?;
+    if info.root_data.len() > total_len {
+        return Err(PagedbError::overflow_body_malformed(
+            "chain.assembled_length",
+        ));
+    }
     out.extend_from_slice(&info.root_data);
 
+    let mut seen = BTreeSet::from([root_page_id]);
     let mut next = info.next;
     while next != 0 {
+        if !seen.insert(next) {
+            return Err(PagedbError::overflow_chain_cycle(root_page_id, next));
+        }
         let guard = pager
             .read_main_page(next, realm_id, PageKind::Overflow)
             .await?;
         let body = guard.body();
         let (n, data) = decode_overflow(&body)?;
+        if out
+            .len()
+            .checked_add(data.len())
+            .is_none_or(|assembled| assembled > total_len)
+        {
+            return Err(PagedbError::overflow_body_malformed(
+                "chain.assembled_length",
+            ));
+        }
         out.extend_from_slice(data);
         next = n;
     }
-    if out.len() as u64 != total_len {
+    if out.len() != total_len {
         return Err(PagedbError::overflow_body_malformed(
             "chain.assembled_length",
         ));
@@ -334,9 +364,13 @@ pub async fn collect_chain<V: Vfs>(
     root_page_id: u64,
 ) -> Result<Vec<u64>> {
     let mut out = vec![root_page_id];
+    let mut seen = BTreeSet::from([root_page_id]);
     let info = read_root_page(pager, realm_id, root_page_id).await?;
     let mut next = info.next;
     while next != 0 {
+        if !seen.insert(next) {
+            return Err(PagedbError::overflow_chain_cycle(root_page_id, next));
+        }
         let guard = pager
             .read_main_page(next, realm_id, PageKind::Overflow)
             .await?;
@@ -350,7 +384,37 @@ pub async fn collect_chain<V: Vfs>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::crypto::CipherId;
+    use crate::crypto::kdf::derive_mk;
+    use crate::errors::CorruptionDetail;
+    use crate::pager::PagerConfig;
+    use crate::vfs::memory::MemVfs;
+
     use super::*;
+
+    const TEST_PAGE_SIZE: usize = 4096;
+    const TEST_REALM: RealmId = RealmId::new([0xA4; 16]);
+
+    async fn test_pager() -> Arc<Pager<MemVfs>> {
+        let mk = derive_mk(&[0xA5; 32], &[0u8; 16], 0).unwrap();
+        let cfg = PagerConfig {
+            page_size: TEST_PAGE_SIZE,
+            buffer_pool_pages: 16,
+            segment_cache_pages: 16,
+            cipher_id: CipherId::Aes256Gcm,
+            mk_epoch: 0,
+            main_db_file_id: [0xB4; 16],
+            main_db_path: "/main.db".into(),
+            anchor_budget: 1_000_000,
+            dek_lru_capacity: 16,
+            observer_retry_count: 0,
+            metrics_enabled: true,
+        };
+        Arc::new(Pager::open(MemVfs::new(), mk, cfg).await.unwrap())
+    }
 
     #[test]
     fn round_trip_chain_page() {
@@ -377,5 +441,112 @@ mod tests {
         assert_eq!(overflow_page_capacity(4096), 4044);
         // root: 4096 - 40 - 16 = 4040
         assert_eq!(overflow_root_capacity(4096), 4040);
+    }
+
+    async fn cyclic_chain(pager: &Pager<MemVfs>, root_page_id: u64, chain_page_id: u64) {
+        let mut root_body = vec![0u8; TEST_PAGE_SIZE - ENVELOPE_OVERHEAD];
+        encode_overflow_root(&mut root_body, 1, chain_page_id, b"").unwrap();
+        pager
+            .write_main_page(root_page_id, TEST_REALM, PageKind::OverflowRoot, &root_body)
+            .await
+            .unwrap();
+
+        let mut chain_body = vec![0u8; TEST_PAGE_SIZE - ENVELOPE_OVERHEAD];
+        encode_overflow(&mut chain_body, chain_page_id, b"").unwrap();
+        pager
+            .write_main_page(chain_page_id, TEST_REALM, PageKind::Overflow, &chain_body)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_chain_rejects_absurd_total_len_without_allocation_panic() {
+        let pager = test_pager().await;
+        let root_page_id = 42;
+        let mut body = vec![0u8; TEST_PAGE_SIZE - ENVELOPE_OVERHEAD];
+        encode_overflow_root(&mut body, 1, 0, b"small").unwrap();
+        pager
+            .write_main_page(root_page_id, TEST_REALM, PageKind::OverflowRoot, &body)
+            .await
+            .unwrap();
+
+        let error = read_chain(&pager, TEST_REALM, root_page_id, u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::OverflowBodyMalformed { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_chain_rejects_more_data_than_declared() {
+        let pager = test_pager().await;
+        let root_page_id = 43;
+        let mut body = vec![0u8; TEST_PAGE_SIZE - ENVELOPE_OVERHEAD];
+        encode_overflow_root(&mut body, 1, 0, b"too-long").unwrap();
+        pager
+            .write_main_page(root_page_id, TEST_REALM, PageKind::OverflowRoot, &body)
+            .await
+            .unwrap();
+
+        let error = read_chain(&pager, TEST_REALM, root_page_id, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::OverflowBodyMalformed { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_chain_rejects_cycle_without_hanging() {
+        let pager = test_pager().await;
+        cyclic_chain(&pager, 44, 45).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_chain(&pager, TEST_REALM, 44, 0),
+        )
+        .await
+        .expect("cycle detection should return before the timeout")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::OverflowChainCycle { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_rejects_cycle_without_hanging() {
+        let pager = test_pager().await;
+        cyclic_chain(&pager, 46, 47).await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), release(&pager, TEST_REALM, 46, 48))
+                .await
+                .expect("cycle detection should return before the timeout");
+        let Err(error) = result else {
+            panic!("overflow release cycles must not be accepted");
+        };
+        assert!(matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::OverflowChainCycle { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn collect_chain_rejects_cycle_without_hanging() {
+        let pager = test_pager().await;
+        cyclic_chain(&pager, 49, 50).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_chain(&pager, TEST_REALM, 49),
+        )
+        .await
+        .expect("cycle detection should return before the timeout")
+        .expect_err("overflow collect cycles must not be accepted");
+        assert!(matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::OverflowChainCycle { .. })
+        ));
     }
 }

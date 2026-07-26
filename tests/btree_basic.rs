@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use pagedb::btree::BTree;
 use pagedb::btree::internal::Internal;
 use pagedb::btree::leaf::{Leaf, LeafValue};
 use pagedb::btree::node::body_capacity;
+use pagedb::btree::overflow::encode_overflow;
 use pagedb::crypto::CipherId;
 use pagedb::crypto::kdf::derive_mk;
 use pagedb::errors::CorruptionDetail;
@@ -33,6 +36,45 @@ async fn fresh_pager() -> Arc<Pager<MemVfs>> {
 
 fn fresh_tree(pager: Arc<Pager<MemVfs>>) -> BTree<MemVfs> {
     BTree::open(pager, RealmId::new([1; 16]), 0, 4, PAGE)
+}
+
+async fn tree_with_unreadable_overflow_root(
+    pager: Arc<Pager<MemVfs>>,
+    key: &[u8],
+    leaf_page_id: u64,
+    overflow_root_page_id: u64,
+) -> BTree<MemVfs> {
+    let realm = RealmId::new([1; 16]);
+    let mut leaf = Leaf::new();
+    leaf.upsert(
+        key,
+        LeafValue::Overflow {
+            total_len: (PAGE * 2) as u64,
+            root_page_id: overflow_root_page_id,
+        },
+    );
+    let mut leaf_body = vec![0u8; body_capacity(PAGE)];
+    leaf.encode(&mut leaf_body).unwrap();
+    pager
+        .write_main_page(leaf_page_id, realm, PageKind::BTreeLeaf, &leaf_body)
+        .await
+        .unwrap();
+
+    // Deliberately seal the referenced root under the chain-page kind. The
+    // leaf remains readable, but releasing its old overflow value must fail.
+    let mut overflow_body = vec![0u8; body_capacity(PAGE)];
+    encode_overflow(&mut overflow_body, 0, b"old").unwrap();
+    pager
+        .write_main_page(
+            overflow_root_page_id,
+            realm,
+            PageKind::Overflow,
+            &overflow_body,
+        )
+        .await
+        .unwrap();
+
+    BTree::open(pager, realm, leaf_page_id, overflow_root_page_id + 1, PAGE)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -270,7 +312,10 @@ async fn put_append_after_regular_put_re_descends() {
     // Regular put may target any leaf — invalidates the append cache and
     // resets the monotonic tracker.
     tree.put(b"middle", b"v").await.unwrap();
-    // After invalidation, put_append accepts any key (cache reset).
+    // Cache invalidation forces a fresh rightmost descent; append must still
+    // compare against the tree's actual maximum key.
+    let error = tree.put_append(b"b00", b"v").await.unwrap_err();
+    assert!(matches!(error, PagedbError::AppendNotMonotonic));
     tree.put_append(b"z99", b"v").await.unwrap();
     // Now further appends must be > "z99".
     assert!(tree.put_append(b"z00", b"v").await.is_err());
@@ -404,5 +449,303 @@ async fn malformed_node_body_reports_corruption_instead_of_panicking() {
             ),
             "{label}: expected NodeBodyMalformed, got {error:?}"
         );
+    }
+}
+
+#[test]
+fn delete_range_rejects_leaf_sibling_cycle_without_hanging() {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let pager = fresh_pager().await;
+            let realm = RealmId::new([1; 16]);
+            let leaf_page_id = 31;
+
+            let mut leaf = Leaf::new();
+            leaf.right_sibling = leaf_page_id;
+            leaf.upsert(b"k", LeafValue::Inline(b"v".to_vec()));
+            let mut body = vec![0u8; body_capacity(PAGE)];
+            leaf.encode(&mut body).unwrap();
+            pager
+                .write_main_page(leaf_page_id, realm, PageKind::BTreeLeaf, &body)
+                .await
+                .unwrap();
+
+            let mut tree = BTree::open(pager, realm, leaf_page_id, 32, PAGE);
+            tree.delete_range(b"a", b"z").await.map(|_| ())
+        });
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("delete_range sibling-cycle detection should return before the timeout");
+    let error = result.expect_err("leaf sibling cycles must not be accepted");
+    assert!(matches!(error, PagedbError::Corruption(_)));
+}
+
+#[test]
+fn get_rejects_internal_child_cycle_without_hanging() {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let pager = fresh_pager().await;
+            let realm = RealmId::new([1; 16]);
+            let root_page_id = 41;
+            let internal = Internal {
+                leftmost_child: root_page_id,
+                entries: Vec::new(),
+            };
+            let mut body = vec![0u8; body_capacity(PAGE)];
+            internal.encode(&mut body).unwrap();
+            pager
+                .write_main_page(root_page_id, realm, PageKind::BTreeInternal, &body)
+                .await
+                .unwrap();
+            let tree = BTree::open(pager, realm, root_page_id, 42, PAGE);
+            tree.get(b"k").await.map(|_| ())
+        });
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("get internal-cycle detection should return before the timeout");
+    let error = result.expect_err("internal child cycles must not be accepted");
+    assert!(matches!(error, PagedbError::Corruption(_)));
+}
+
+#[test]
+fn put_rejects_internal_child_cycle_without_hanging() {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let pager = fresh_pager().await;
+            let realm = RealmId::new([1; 16]);
+            let root_page_id = 43;
+            let internal = Internal {
+                leftmost_child: root_page_id,
+                entries: Vec::new(),
+            };
+            let mut body = vec![0u8; body_capacity(PAGE)];
+            internal.encode(&mut body).unwrap();
+            pager
+                .write_main_page(root_page_id, realm, PageKind::BTreeInternal, &body)
+                .await
+                .unwrap();
+            let mut tree = BTree::open(pager, realm, root_page_id, 44, PAGE);
+            tree.put(b"k", b"v").await
+        });
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("put internal-cycle detection should return before the timeout");
+    let error = result.expect_err("internal child cycles must not be accepted");
+    assert!(matches!(error, PagedbError::Corruption(_)));
+}
+
+#[test]
+fn bulk_load_rejects_separator_that_cannot_fit_without_hanging() {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let pager = fresh_pager().await;
+            let mut tree = fresh_tree(pager);
+            let key_len = body_capacity(PAGE) - 32;
+            tree.bulk_load(vec![
+                (vec![b'a'; key_len], Vec::new()),
+                (vec![b'b'; key_len], Vec::new()),
+            ])
+            .await
+        });
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bulk_load separator validation should return before the timeout");
+    let error = result.expect_err("oversize internal separators must be rejected");
+    assert!(matches!(error, PagedbError::PayloadTooLarge));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_load_rejects_non_strict_key_order_without_poisoning_tree() {
+    let cases = [
+        vec![
+            (b"b".to_vec(), b"two".to_vec()),
+            (b"a".to_vec(), b"one".to_vec()),
+        ],
+        vec![
+            (b"a".to_vec(), b"one".to_vec()),
+            (b"a".to_vec(), b"two".to_vec()),
+        ],
+    ];
+
+    for pairs in cases {
+        let pager = fresh_pager().await;
+        let mut tree = fresh_tree(pager);
+        let error = tree
+            .bulk_load(pairs)
+            .await
+            .expect_err("bulk_load must reject unsorted or duplicate keys");
+        assert!(
+            matches!(error, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(tree.root_page_id(), 0);
+        assert_eq!(tree.next_page_id(), 4);
+
+        tree.bulk_load(vec![
+            (b"a".to_vec(), b"one".to_vec()),
+            (b"b".to_vec(), b"two".to_vec()),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            tree.get(b"a").await.unwrap().as_deref(),
+            Some(b"one".as_ref())
+        );
+        assert_eq!(
+            tree.get(b"b").await.unwrap().as_deref(),
+            Some(b"two".as_ref())
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_rejects_oversized_key_without_poisoning_tree() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    tree.put(b"small", b"value").await.unwrap();
+
+    let oversized_key = vec![b'z'; body_capacity(PAGE)];
+    let error = tree
+        .put(&oversized_key, b"bad")
+        .await
+        .expect_err("oversized keys must be rejected at put time");
+    assert!(matches!(error, PagedbError::PayloadTooLarge));
+    assert_eq!(
+        tree.get(b"small").await.unwrap().as_deref(),
+        Some(b"value".as_ref())
+    );
+    assert!(tree.get(&oversized_key).await.unwrap().is_none());
+    tree.put(b"valid", b"good").await.unwrap();
+    tree.flush().await.unwrap();
+    assert_eq!(
+        tree.get(b"valid").await.unwrap().as_deref(),
+        Some(b"good".as_ref())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_append_rejects_oversized_key_without_poisoning_tree() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    tree.put_append(b"small", b"value").await.unwrap();
+
+    let oversized_key = vec![b'z'; body_capacity(PAGE)];
+    let error = tree
+        .put_append(&oversized_key, b"bad")
+        .await
+        .expect_err("append mode must reject oversized keys at put time");
+    assert!(matches!(error, PagedbError::PayloadTooLarge));
+    assert_eq!(
+        tree.get(b"small").await.unwrap().as_deref(),
+        Some(b"value".as_ref())
+    );
+    assert!(tree.get(&oversized_key).await.unwrap().is_none());
+    tree.put_append(b"valid", b"good").await.unwrap();
+    tree.flush().await.unwrap();
+    assert_eq!(
+        tree.get(b"valid").await.unwrap().as_deref(),
+        Some(b"good".as_ref())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_release_failure_does_not_publish_replacement() {
+    let pager = fresh_pager().await;
+    let mut tree = tree_with_unreadable_overflow_root(pager, b"k", 80, 81).await;
+
+    let error = tree
+        .put(b"k", b"new")
+        .await
+        .expect_err("replacing an unreadable overflow value must fail");
+    assert!(matches!(
+        error,
+        PagedbError::ChecksumFailure | PagedbError::Corruption(_) | PagedbError::Io(_)
+    ));
+    match tree.get(b"k").await {
+        Err(PagedbError::ChecksumFailure | PagedbError::Corruption(_) | PagedbError::Io(_)) => {}
+        Ok(Some(value)) => panic!("failed replacement published value {value:?}"),
+        Ok(None) => panic!("failed replacement removed the original key"),
+        Err(error) => panic!("unexpected post-failure read error: {error:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_release_failure_does_not_remove_key() {
+    let pager = fresh_pager().await;
+    let mut tree = tree_with_unreadable_overflow_root(pager, b"k", 90, 91).await;
+
+    let error = tree
+        .delete(b"k")
+        .await
+        .expect_err("deleting an unreadable overflow value must fail");
+    assert!(matches!(
+        error,
+        PagedbError::ChecksumFailure | PagedbError::Corruption(_) | PagedbError::Io(_)
+    ));
+    match tree.get(b"k").await {
+        Err(PagedbError::ChecksumFailure | PagedbError::Corruption(_) | PagedbError::Io(_))
+        | Ok(Some(_)) => {}
+        Ok(None) => panic!("failed delete removed the original key"),
+        Err(error) => panic!("unexpected post-failure read error: {error:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_range_visits_fresh_split_leaves_before_flush() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+
+    for i in 0..2_000u32 {
+        let key = format!("k{i:08}");
+        let value = format!("v-{i:08}-").repeat(8);
+        tree.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+    }
+
+    let deleted = tree.delete_range(b"k00000500", b"k00001500").await.unwrap();
+    assert_eq!(deleted, 1_000);
+
+    for i in 0..2_000u32 {
+        let key = format!("k{i:08}");
+        let got = tree.get(key.as_bytes()).await.unwrap();
+        if (500..1_500).contains(&i) {
+            assert!(got.is_none(), "key {key} should have been deleted");
+        } else {
+            assert!(got.is_some(), "key {key} should remain visible");
+        }
     }
 }

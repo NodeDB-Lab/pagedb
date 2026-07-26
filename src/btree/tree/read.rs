@@ -11,7 +11,7 @@ use crate::btree::leaf::{Leaf, LeafAccessor, LeafValue, LeafValueRef};
 use crate::btree::node::NodeKind;
 use crate::btree::overflow;
 
-use super::core::BTree;
+use super::core::{BTree, SeenPageIds};
 
 impl<V: Vfs> BTree<V> {
     /// Get a value by key. Returns `None` if not found.
@@ -93,8 +93,11 @@ impl<V: Vfs> BTree<V> {
             NodeKind::Internal => InternalAccessor::new(start_guard.body_ref())?.child_for(key),
         };
         // Descend from the first child onward. Subsequent guards are owned.
+        let mut seen = SeenPageIds::new();
+        seen.insert(start_page_id)?;
         let mut page_id = next_page_id;
         loop {
+            seen.insert(page_id)?;
             // Fresh-from-split leaves only live in `fresh_leaves` until
             // flush. If the next child is one, resolve from cache.
             if let Some(leaf) = self.fresh_leaves.get(&page_id) {
