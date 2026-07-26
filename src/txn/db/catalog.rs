@@ -197,7 +197,7 @@ impl<V: Vfs + Clone> Db<V> {
                 let count = *n as usize;
                 // Fast path: if the cached count is known and the post-insert
                 // count is at or below the retain limit, we can skip the
-                // full-tree `collect_range` scan entirely.
+                // full-tree scan entirely.
                 let projected = state
                     .commit_history_count
                     .map(|c| if was_new { c.saturating_add(1) } else { c });
@@ -207,9 +207,7 @@ impl<V: Vfs + Clone> Db<V> {
                         // Materialize and return below.
                     } else {
                         // Over-limit: do the scan + prune.
-                        let start = 0u64.to_be_bytes().to_vec();
-                        let end = u64::MAX.to_be_bytes().to_vec();
-                        let all = hist_tree.collect_range(&start, &end).await?;
+                        let all = hist_tree.collect_all().await?;
                         let mut current = all.len() as u64;
                         if all.len() > count {
                             let to_delete = all.len() - count;
@@ -231,9 +229,7 @@ impl<V: Vfs + Clone> Db<V> {
                     }
                 } else {
                     // No cached count — do the scan to populate it.
-                    let start = 0u64.to_be_bytes().to_vec();
-                    let end = u64::MAX.to_be_bytes().to_vec();
-                    let all = hist_tree.collect_range(&start, &end).await?;
+                    let all = hist_tree.collect_all().await?;
                     let mut current = all.len() as u64;
                     if all.len() > count {
                         let to_delete = all.len() - count;
@@ -259,9 +255,7 @@ impl<V: Vfs + Clone> Db<V> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
                 let threshold = now_secs.saturating_sub(duration.as_secs());
-                let start = 0u64.to_be_bytes().to_vec();
-                let end = u64::MAX.to_be_bytes().to_vec();
-                let all = hist_tree.collect_range(&start, &end).await?;
+                let all = hist_tree.collect_all().await?;
                 let mut current = all.len() as u64;
                 for (k, v) in &all {
                     // Never delete the entry we just inserted.

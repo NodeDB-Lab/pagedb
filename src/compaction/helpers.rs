@@ -13,11 +13,16 @@ use crate::txn::write::SegmentSideEffect;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 
-/// Collect all key-value pairs from a tree via full leaf-level scan.
+/// Collect all key-value pairs from a tree via a full leaf-level scan.
+///
+/// Must stay unbounded: a dense repack rebuilds the tree from exactly what
+/// this returns, so a range scan against any invented maximum key would drop
+/// records at the top of the keyspace and publish a truncated-but-consistent
+/// tree — durable, silent data loss rather than a read error.
 pub(super) async fn collect_all_pairs<V: Vfs + Clone>(
     tree: &BTree<V>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    tree.scan_prefix(&[]).await
+    tree.collect_all().await
 }
 
 /// Collect every catalog row, for rebuilding the catalog tree during a dense
