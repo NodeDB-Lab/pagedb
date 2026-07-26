@@ -17,6 +17,9 @@ use super::txn::WriteTxn;
 pub struct ScratchOffset(u64);
 
 /// Metadata for one ciphertext chunk in the per-txn spill scratch file.
+/// Length of the AEAD tag appended to every spill frame.
+pub(crate) const SPILL_TAG_LEN: usize = 16;
+
 /// Stored in memory only; the tmp file is discarded at commit/abort.
 #[derive(Clone)]
 pub(crate) struct SpillSegmentMeta {
@@ -24,8 +27,8 @@ pub(crate) struct SpillSegmentMeta {
     pub offset: u64,
     /// Length of the original plaintext in bytes.
     pub plaintext_len: u32,
-    /// Length of ciphertext body (without the 16-byte tag) in bytes.
-    /// Total on-disk size for this chunk = `ciphertext_len + 16`.
+    /// Length of ciphertext body (without the AEAD tag) in bytes. Total
+    /// on-disk size for this chunk = `ciphertext_len + SPILL_TAG_LEN`.
     pub ciphertext_len: u32,
     /// The 12-byte nonce used to encrypt this chunk, stored verbatim so we
     /// can reconstruct a `Nonce` on read without an additional lookup.
@@ -106,8 +109,8 @@ impl<V: Vfs + Clone> SpillScope<'_, '_, V> {
             .expect("derived above")
             .encrypt(&nonce, &aad, &mut body)?;
 
-        // ciphertext body + 16-byte tag.
-        let pers_len = body.len() as u64 + 16;
+        // ciphertext body + AEAD tag.
+        let pers_len = body.len() as u64 + SPILL_TAG_LEN as u64;
         let new_total = self.txn.spill_bytes_used.saturating_add(pers_len);
         if new_total > limit {
             return Err(PagedbError::quota(
@@ -124,6 +127,8 @@ impl<V: Vfs + Clone> SpillScope<'_, '_, V> {
         let mut file = self.txn.db.vfs.open(&path, OpenMode::CreateOrOpen).await?;
         let body_offset = self.txn.spill_bytes_used;
         let ciphertext_len = body.len();
+        // Body and tag are one contiguous frame: a handle must never be
+        // returned for a file holding only half of it.
         body.extend_from_slice(&tag);
         write_all_at(&mut file, body_offset, &body).await?;
         file.sync().await?;
@@ -162,15 +167,17 @@ impl<V: Vfs + Clone> SpillScope<'_, '_, V> {
         let mut file = self.txn.db.vfs.open(path, OpenMode::Read).await?;
 
         let body_len = meta.ciphertext_len as usize;
+        // `usize` is 32-bit on wasm32, where a maximal `ciphertext_len` plus
+        // the tag genuinely overflows it.
         let frame_len = body_len
-            .checked_add(16)
+            .checked_add(SPILL_TAG_LEN)
             .ok_or_else(|| PagedbError::arithmetic_overflow("spill frame length"))?;
         let mut frame = vec![0u8; frame_len];
         read_exact_at(&mut file, meta.offset, &mut frame).await?;
+        // The split is exact by construction, so the tail is the whole tag.
         let (body, tag_bytes) = frame.split_at_mut(body_len);
-        let tag: &[u8; 16] = (&*tag_bytes)
-            .try_into()
-            .map_err(|_| PagedbError::ChecksumFailure)?;
+        let mut tag = [0u8; SPILL_TAG_LEN];
+        tag.copy_from_slice(tag_bytes);
 
         let cipher = self.txn.spill_cipher_readonly()?;
         let nonce = Nonce::from_bytes(meta.nonce_bytes);
@@ -187,7 +194,7 @@ impl<V: Vfs + Clone> SpillScope<'_, '_, V> {
             segment_id: self.txn.db.file_id,
         });
 
-        cipher.decrypt(&nonce, &aad, body, tag)?;
+        cipher.decrypt(&nonce, &aad, body, &tag)?;
         frame.truncate(meta.plaintext_len as usize);
         Ok(frame)
     }
