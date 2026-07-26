@@ -741,6 +741,12 @@ impl<V: Vfs> Pager<V> {
             }
             let mut buf = vec![0u8; page_size];
             {
+                // Returned rather than retried, unlike the AEAD failures below.
+                // The transient this loop absorbs is a *torn* read — a
+                // full-length buffer of mixed old and new bytes — which is why
+                // retrying it can succeed. A transfer that ends short or errors
+                // is not that condition, and retrying it would only mask a
+                // one-shot backend fault.
                 let mut f = file_handle.lock().await;
                 read_exact_at(&mut *f, page_offset, &mut buf).await?;
             }

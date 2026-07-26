@@ -42,6 +42,10 @@ fn every_variant_displays() {
         PagedbError::ChecksumFailure,
         PagedbError::corruption(CorruptionDetail::HeaderUnverifiable),
         PagedbError::structural_header_invalid("main.db", "magic"),
+        PagedbError::vfs_contract_violated(
+            "read_at",
+            "reported more bytes than the caller requested",
+        ),
         PagedbError::footer_framing_invalid("magic"),
         PagedbError::node_body_malformed("slot_directory"),
         PagedbError::node_kind_mismatch(Some(7), "leaf", "internal"),

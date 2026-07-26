@@ -91,6 +91,13 @@ pub trait VfsFile: Send {
 }
 
 /// Read until `buf` is full, or fail if the backend stops making progress.
+///
+/// Takes `&mut F` rather than `&F` deliberately. `read_at` only needs `&self`,
+/// but a future holding `&F` across an await is `Send` only when `F: Sync`,
+/// and `VfsFile` does not require `Sync`. `&mut F` keeps the future `Send` for
+/// every backend. Callers that own their handle use this; those that read
+/// through a borrowed handle use [`read_exact_at_borrowed!`], which runs the
+/// same loop in place.
 #[inline]
 pub(crate) async fn read_exact_at<F: VfsFile + ?Sized>(
     file: &mut F,
@@ -106,6 +113,10 @@ pub(crate) async fn read_exact_at<F: VfsFile + ?Sized>(
 }
 
 /// Validate one positional read result and advance its offset.
+///
+/// A backend may legally satisfy a request in several calls, so a short read is
+/// not itself failure. Zero progress is end-of-file; a count above the
+/// remaining buffer is a backend contract violation, not an on-disk defect.
 #[inline]
 pub(crate) fn checked_read_progress(offset: &mut u64, read: usize, remaining: usize) -> Result<()> {
     if read == 0 {
@@ -113,20 +124,11 @@ pub(crate) fn checked_read_progress(offset: &mut u64, read: usize, remaining: us
             std::io::ErrorKind::UnexpectedEof,
         )));
     }
-    if read > remaining {
-        return Err(PagedbError::Io(std::io::Error::other(
-            "read_at overreported bytes",
-        )));
-    }
-    let read_u64 = u64::try_from(read)
-        .map_err(|_| PagedbError::Io(std::io::Error::other("read count overflow")))?;
-    *offset = offset
-        .checked_add(read_u64)
-        .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
-    Ok(())
+    checked_transfer_progress(offset, read, remaining, "read_at", "positional read offset")
 }
 
-/// Write until `buf` is complete, or fail if the backend reports impossible progress.
+/// Write until `buf` is complete, or fail if the backend reports impossible
+/// progress. See [`read_exact_at`] for why this takes `&mut F`.
 #[inline]
 pub(crate) async fn write_all_at<F: VfsFile + ?Sized>(
     file: &mut F,
@@ -140,17 +142,119 @@ pub(crate) async fn write_all_at<F: VfsFile + ?Sized>(
                 std::io::ErrorKind::WriteZero,
             )));
         }
-        if written > buf.len() {
-            return Err(PagedbError::Io(std::io::Error::other(
-                "write_at overreported bytes",
-            )));
-        }
-        let written_u64 = u64::try_from(written)
-            .map_err(|_| PagedbError::Io(std::io::Error::other("write count overflow")))?;
-        offset = offset
-            .checked_add(written_u64)
-            .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
+        checked_transfer_progress(
+            &mut offset,
+            written,
+            buf.len(),
+            "write_at",
+            "positional write offset",
+        )?;
         buf = &buf[written..];
     }
     Ok(())
+}
+
+/// Run [`read_exact_at`]'s loop over a handle the caller only borrows.
+///
+/// A function taking `&F` would be `Send` only under `F: Sync`, which
+/// `VfsFile` does not require and which would spread as a bound through every
+/// segment reader. Expanding in place keeps the borrow inside the caller's own
+/// future, so the rule stays in one place without costing a trait bound.
+///
+/// `$buf` must be a `&mut [u8]`; the result is a `Result<()>` to be `?`-ed.
+macro_rules! read_exact_at_borrowed {
+    ($file:expr, $offset:expr, $buf:expr $(,)?) => {{
+        let mut offset: u64 = $offset;
+        let mut remaining: &mut [u8] = $buf;
+        loop {
+            if remaining.is_empty() {
+                break Ok(());
+            }
+            match $file.read_at(offset, remaining).await {
+                Ok(read) => {
+                    if let Err(error) =
+                        $crate::vfs::checked_read_progress(&mut offset, read, remaining.len())
+                    {
+                        break Err(error);
+                    }
+                    remaining = remaining.split_at_mut(read).1;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    }};
+}
+pub(crate) use read_exact_at_borrowed;
+
+/// Shared progress rule for both directions: reject a count the caller never
+/// asked for, then advance the offset without wrapping.
+#[inline]
+fn checked_transfer_progress(
+    offset: &mut u64,
+    transferred: usize,
+    remaining: usize,
+    operation: &'static str,
+    offset_label: &'static str,
+) -> Result<()> {
+    if transferred > remaining {
+        return Err(PagedbError::vfs_contract_violated(
+            operation,
+            "reported more bytes than the caller requested",
+        ));
+    }
+    let transferred =
+        u64::try_from(transferred).map_err(|_| PagedbError::arithmetic_overflow(offset_label))?;
+    *offset = offset
+        .checked_add(transferred)
+        .ok_or_else(|| PagedbError::arithmetic_overflow(offset_label))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_read_advances_by_exactly_what_was_transferred() {
+        let mut offset = 4096;
+        checked_read_progress(&mut offset, 100, 4096).unwrap();
+        assert_eq!(offset, 4196);
+    }
+
+    #[test]
+    fn zero_progress_is_end_of_file_not_a_contract_violation() {
+        let mut offset = 0;
+        let err = checked_read_progress(&mut offset, 0, 4096).unwrap_err();
+        assert!(
+            matches!(err, PagedbError::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}"
+        );
+        assert_eq!(offset, 0, "a failed transfer must not advance the offset");
+    }
+
+    #[test]
+    fn a_count_above_the_remaining_buffer_is_a_backend_contract_violation() {
+        let mut offset = 0;
+        let err = checked_read_progress(&mut offset, 4097, 4096).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PagedbError::VfsContractViolated {
+                    operation: "read_at",
+                    ..
+                }
+            ),
+            "expected VfsContractViolated, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_offset_that_would_wrap_is_reported_as_overflow() {
+        let mut offset = u64::MAX;
+        let err = checked_read_progress(&mut offset, 1, 4096).unwrap_err();
+        assert!(
+            matches!(err, PagedbError::ArithmeticOverflow { .. }),
+            "expected ArithmeticOverflow, got {err:?}"
+        );
+    }
 }
