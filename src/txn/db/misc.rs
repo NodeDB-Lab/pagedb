@@ -5,6 +5,7 @@ use crate::Result;
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, CatalogRowKind};
 use crate::crypto::SecretKey;
+use crate::errors::PagedbError;
 use crate::observability::DbStats;
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
@@ -12,6 +13,11 @@ use std::sync::atomic::Ordering as AtOrd;
 
 use super::super::mode::DbMode;
 use super::core::Db;
+
+/// Segment catalog rows read per batch while aggregating `stats()`. Rows are a
+/// fixed-width authenticated value, so this is a few KiB resident regardless of
+/// how many segments a realm has linked.
+const SEGMENT_ROW_BATCH: usize = 512;
 
 impl<V: Vfs + Clone> Db<V> {
     /// Return the mode this handle was opened with.
@@ -157,13 +163,36 @@ impl<V: Vfs + Clone> Db<V> {
                 self.page_size,
             );
 
-            let seg_start = vec![CatalogRowKind::Segment as u8];
-            let seg_rows = tree.scan_prefix(&seg_start).await?;
-            let seg_count = u32::try_from(seg_rows.len()).unwrap_or(u32::MAX);
+            // Streamed in bounded batches: how many segments a realm has linked
+            // is the embedder's business, and a metrics call must not size an
+            // allocation by it.
+            let seg_prefix = [CatalogRowKind::Segment as u8];
+            let mut cursor: Vec<u8> = seg_prefix.to_vec();
+            let mut seg_count = 0u32;
             let mut seg_bytes = 0u64;
-            for (_key, value) in &seg_rows {
-                seg_bytes =
-                    seg_bytes.saturating_add(Catalog::decode_segment_meta(value)?.total_bytes);
+            loop {
+                let batch = tree
+                    .collect_prefix_batch_from(&seg_prefix, &cursor, SEGMENT_ROW_BATCH)
+                    .await?;
+                let Some((last_key, _)) = batch.last() else {
+                    break;
+                };
+                cursor.clear();
+                cursor.extend_from_slice(last_key);
+                cursor.push(0);
+                let exhausted = batch.len() < SEGMENT_ROW_BATCH;
+
+                for (_key, value) in &batch {
+                    seg_count = seg_count.saturating_add(1);
+                    seg_bytes = seg_bytes
+                        .checked_add(Catalog::decode_segment_meta(value)?.total_bytes)
+                        .ok_or_else(|| {
+                            PagedbError::arithmetic_overflow("stats.segments_total_bytes")
+                        })?;
+                }
+                if exhausted {
+                    break;
+                }
             }
 
             (seg_count, seg_bytes)
