@@ -15,6 +15,11 @@ use super::core::{
     encode_root_ref,
 };
 
+/// Named-counter rows read per batch while validating them at open. Rows are a
+/// fixed-width authenticated value, so this is a few KiB resident regardless of
+/// how many counters the embedder has named.
+const COUNTER_ROW_BATCH: usize = 512;
+
 impl<V: Vfs + Clone> Db<V> {
     /// The oldest commit id still retained in the commit-history index, or
     /// `None` when history is disabled or the index is empty. Pages reachable
@@ -56,6 +61,9 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Named counters are already atomic with catalog-root publication, so
     /// recovery validates their encoding but never rewrites their values.
+    ///
+    /// Rows are streamed in bounded batches: how many counters an embedder has
+    /// named is its business, and open must not size an allocation by it.
     pub(super) async fn validate_counter_rows(
         &self,
         catalog_root_page_id: u64,
@@ -73,10 +81,28 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id,
             self.page_size,
         );
-        for (_key, value) in tree.scan_prefix(&prefix).await? {
-            Catalog::decode_counter(&value)?;
+        let mut cursor: Vec<u8> = prefix.to_vec();
+        loop {
+            let batch = tree
+                .collect_prefix_batch_from(&prefix, &cursor, COUNTER_ROW_BATCH)
+                .await?;
+            let Some((last_key, _)) = batch.last() else {
+                return Ok(());
+            };
+            cursor.clear();
+            cursor.extend_from_slice(last_key);
+            // The exact successor of `last_key` in the key ordering: resume
+            // strictly past the row just validated without re-reading it.
+            cursor.push(0);
+            let exhausted = batch.len() < COUNTER_ROW_BATCH;
+
+            for (_key, value) in &batch {
+                Catalog::decode_counter(value)?;
+            }
+            if exhausted {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Write per-realm quota caps into the catalog B+ tree and persist the

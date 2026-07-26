@@ -114,6 +114,29 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
+    /// Collect at most `limit` records at or after `start` whose keys still
+    /// carry `prefix`, in ascending key order.
+    ///
+    /// The bounded counterpart to [`Self::scan_prefix`]. Rows sharing a prefix
+    /// sort contiguously, so the first key outside it ends the range — the scan
+    /// stops there rather than reading the rest of the tree.
+    ///
+    /// Resume as with [`Self::collect_batch_from`]: pass the last returned key
+    /// with a `0x00` byte appended. A batch shorter than `limit` means the
+    /// prefix range ended.
+    pub async fn collect_prefix_batch_from(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut batch = self.collect_batch_from(start, limit).await?;
+        if let Some(end) = batch.iter().position(|(key, _)| !key.starts_with(prefix)) {
+            batch.truncate(end);
+        }
+        Ok(batch)
+    }
+
     /// Return the smallest key in the tree, or `None` if the tree is empty.
     /// Descends the leftmost spine only — O(tree height), not O(tree size).
     pub async fn first_key(&self) -> Result<Option<Vec<u8>>> {

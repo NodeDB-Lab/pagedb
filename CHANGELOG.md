@@ -40,6 +40,12 @@ version, since none exists yet.
 - **Online rekey** — rekey the database under a new key with mixed-cipher and
   mixed-epoch page coexistence (no full-file migration).
 - **Handle modes** — `Standalone`, `Follower`, `ReadOnly`, and `Observer`.
+- **Failures report themselves** — an unreadable free-list chain, main file, or
+  segment catalog fails `stats()` instead of reporting zero; compaction never
+  skips a catalog entry whose file it cannot open; segment open distinguishes a
+  missing file from a permission or backend error; and only genuine contention
+  is reported as contention. Persisted named-counter rows are validated at open,
+  and commit-history keys are rejected unless exactly eight bytes.
 
 ### Known limitations
 
