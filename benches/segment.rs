@@ -5,11 +5,14 @@
 
 #![allow(dead_code)] // verify/synthetic/compare placeholder structs
 
+mod common;
+
 use std::cell::RefCell;
 use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce as AesNonce};
+use common::with_rt;
 use fluxbench::prelude::*;
 use fluxbench::{bench, compare, synthetic};
 use tokio::sync::Mutex as AsyncMutex;
@@ -25,14 +28,6 @@ const PAGES_PER_SEG: usize = 128;
 
 thread_local! {
     static DB: RefCell<Option<Arc<AsyncMutex<Db<MemVfs>>>>> = const { RefCell::new(None) };
-    static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-}
-
-fn with_rt<R>(f: impl FnOnce(&tokio::runtime::Runtime) -> R) -> R {
-    RT.with(|rt| f(rt))
 }
 
 fn shared_db() -> Arc<AsyncMutex<Db<MemVfs>>> {

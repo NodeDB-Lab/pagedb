@@ -61,8 +61,8 @@ Measured on native NVMe, AES-NI host, single thread, via `fluxbench`. Reproduce 
 PageDB-owned benches and the isolated cross-engine suite with:
 
 ```bash
-cargo bench --bench compaction
 cargo bench --bench segment
+cargo bench --bench compaction
 cargo bench -p pagedb-engine-comparison --bench btree
 cargo bench -p pagedb-engine-comparison --bench comparison
 ```
