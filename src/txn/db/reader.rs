@@ -33,7 +33,7 @@ impl<V: Vfs + Clone> Db<V> {
         ))
     }
 
-    /// Like [`begin_read`] but marks the reader as non-abortable. The
+    /// Like [`Self::begin_read`] but marks the reader as non-abortable. The
     /// `AbortOldest` stall policy skips non-abortable readers; if all blocking
     /// readers are non-abortable, the policy falls through to `Reject`
     /// semantics for the writer.

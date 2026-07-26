@@ -80,7 +80,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// truncates `main.db` if no reader pins the old high-water range, and
     /// repacks segment files whose garbage ratio exceeds 5%.
     ///
-    /// Returns a [`CompactStats`] summary of what was reclaimed.
+    /// Returns a [`crate::CompactStats`] summary of what was reclaimed.
     pub async fn compact_now(&self) -> Result<crate::compaction::CompactStats> {
         self.ensure_usable()?;
         crate::compaction::compact_now(self).await
@@ -93,8 +93,9 @@ impl<V: Vfs + Clone> Db<V> {
     /// each call, so a crash mid-compaction is safe: call `compact_step` again
     /// after reopening to resume from where it left off.
     ///
-    /// Returns a [`CompactProgress`] describing what was done and whether more
-    /// work remains. Loop until `progress.more_work == false` to compact fully.
+    /// Returns a [`crate::CompactProgress`] describing what was done and
+    /// whether more work remains. Loop until `progress.more_work == false` to
+    /// compact fully.
     pub async fn compact_step(
         &self,
         budget: crate::compaction::CompactBudget,

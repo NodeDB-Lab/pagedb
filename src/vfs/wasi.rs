@@ -4,7 +4,8 @@
 //!
 //! The full implementation is compiled only for `cfg(target_os = "wasi")`.
 //! On every other target a thin shim is compiled instead; the constructor
-//! returns [`PagedbError::Unsupported`] and every method is unreachable.
+//! returns [`crate::PagedbError::Unsupported`] and every method is
+//! unreachable.
 //!
 //! # Locking
 //!

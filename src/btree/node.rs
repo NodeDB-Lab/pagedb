@@ -27,7 +27,7 @@ impl NodeKind {
     }
 
     /// Stable lowercase name, for naming both sides of a kind disagreement in
-    /// [`CorruptionDetail::NodeKindMismatch`].
+    /// [`crate::errors::CorruptionDetail::NodeKindMismatch`].
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -123,7 +123,8 @@ pub fn read_header(body: &[u8]) -> Result<NodeHeader> {
 /// entry are attacker- or bug-controlled `u16`s that the decoders and the
 /// zero-copy accessors use directly as slice indices. Without this pass a
 /// malformed-but-authenticated page panics the library (an out-of-range slice
-/// index) instead of surfacing as [`CorruptionDetail::NodeBodyMalformed`],
+/// index) instead of surfacing as
+/// [`crate::errors::CorruptionDetail::NodeBodyMalformed`],
 /// which is a strictly worse failure than the one it would report.
 ///
 /// Every constructor that turns raw bytes into a node runs this first, so the

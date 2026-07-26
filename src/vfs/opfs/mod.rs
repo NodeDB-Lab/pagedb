@@ -4,7 +4,9 @@
 //!
 //! The embedder must serve `opfs_worker.js` at a URL the browser can load as
 //! a dedicated Web Worker. The JS source is embedded in this crate and
-//! accessible via [`OPFS_WORKER_JS`]. A minimal bootstrap:
+//! accessible via the `OPFS_WORKER_JS` constant, which — like the rest of the
+//! backend — exists only under the compile gating described below, so it does
+//! not appear in documentation built for a native target. A minimal bootstrap:
 //!
 //! ```js
 //! // Write OPFS_WORKER_JS to a blob URL or serve it statically, then:
