@@ -25,6 +25,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lib]
 
 [dependencies]
+# Production black-box recorder — corruption/invariant reports with a
+# breadcrumb flight recorder. Optional + behind `diagnostics` (see [features]);
+# the real `diag` impl is additionally gated off wasm32 so OPFS builds stay lean.
+faultbox = { version = "0.1.0", optional = true }
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
@@ -107,7 +111,11 @@ web-sys = { version = "0.3", optional = true, features = [
 io-uring = "0.7"
 
 [features]
-default = []
+default = ["diagnostics"]
+# Emit black-box reports (corruption, read-verify failures) and operation
+# breadcrumbs via the `faultbox` crate. Inert until the host application calls
+# `faultbox::init`; a no-op on wasm32 regardless.
+diagnostics = ["dep:faultbox"]
 compression = ["dep:lz4_flex"]
 opfs = [
     "dep:wasm-bindgen",
@@ -141,6 +149,11 @@ path = "src/bin/pagedb-fsck.rs"
 # resolve its RocksDB, redb, or SQLite dependencies.
 [[bench]]
 name = "segment"
+harness = false
+test = false
+
+[[bench]]
+name = "compaction"
 harness = false
 test = false
 

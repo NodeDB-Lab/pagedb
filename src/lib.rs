@@ -14,6 +14,7 @@ pub mod btree;
 pub mod catalog;
 pub mod compaction;
 pub mod crypto;
+pub mod diag;
 pub mod errors;
 #[doc(hidden)]
 pub mod hex;
