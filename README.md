@@ -55,6 +55,32 @@ pagedb's answer: **one substrate, two surfaces.** Engines that want their own fo
 └────────────────────────────────────────────────────────────┘
 ```
 
+## Integrity inspection
+
+`pagedb-fsck` opens an existing store in frozen read-only mode. Add `--deep` to
+run a full authenticated structural walk:
+
+```bash
+cargo run --bin pagedb-fsck -- <path> --deep \
+  --realm 00000000000000000000000000000000 <64-hex-character-kek>
+```
+
+The KEK may instead come from `PAGEDB_KEK` and defaults to all zeros. The realm
+defaults to all ones; nodedb-lite stores use the all-zero realm shown above.
+Add `--page-size` for a store created at anything other than 4096 bytes, and
+`--help` for the full grammar. Inspection disables commit-history retention and
+does not rewrite authoritative `main.db` or segment bytes.
+
+Arguments are validated before the store is touched, and each failure class
+gets its own exit code so a caller can tell them apart:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Opened cleanly; with `--deep`, the report was clean |
+| 1 | An integrity problem was found |
+| 2 | The command line was invalid; the store was never opened |
+| 3 | The store could not be opened, or the report could not be written |
+
 ## Benchmarks
 
 Measured on native NVMe, AES-NI host, single thread, via `fluxbench`. Reproduce the
