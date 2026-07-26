@@ -262,9 +262,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
                         != Some(footer_page_id)
             };
             if invalid_layout {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::HeaderUnverifiable,
-                ));
+                return Err(PagedbError::segment_geometry_invalid("rekey.index_layout"));
             }
             index_start_page = source_index_start;
             index_page_count = source_index_count;

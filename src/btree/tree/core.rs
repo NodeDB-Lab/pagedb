@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::errors::{CorruptionDetail, PagedbError};
+use crate::errors::PagedbError;
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::{PageGuard, Pager};
 use crate::vfs::Vfs;
@@ -253,8 +253,13 @@ impl<V: Vfs> BTree<V> {
             _ => return Err(PagedbError::IllegalPageKind),
         };
         if decoded_kind != expected_kind {
-            return Err(PagedbError::corruption(
-                CorruptionDetail::HeaderUnverifiable,
+            // The envelope is authenticated and the body is not, so name both
+            // and the page: this is a mis-routed page, not damaged content, and
+            // an operator chasing it needs to know which side to trust.
+            return Err(PagedbError::node_kind_mismatch(
+                Some(page_id),
+                expected_kind.name(),
+                decoded_kind.name(),
             ));
         }
         Ok((guard, decoded_kind))

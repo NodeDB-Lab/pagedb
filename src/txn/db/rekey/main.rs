@@ -32,9 +32,7 @@ impl<V: Vfs + Clone> Db<V> {
             return Err(PagedbError::Unsupported);
         }
         if new_mk_epoch == 0 || new_mk_epoch <= self.mk_epoch.load(Ordering::SeqCst) {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::rekey_state_invalid("rekey.target_mk_epoch"));
         }
 
         let source_epoch = self.mk_epoch.load(Ordering::SeqCst);
@@ -93,9 +91,10 @@ impl<V: Vfs + Clone> Db<V> {
 
     pub(in crate::txn::db) async fn resume_rekey_intent(&self) -> Result<()> {
         let mut state = self.writer.lock().await;
-        let intent = self.load_rekey_intent(&state).await?.ok_or_else(|| {
-            PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
-        })?;
+        let intent = self
+            .load_rekey_intent(&state)
+            .await?
+            .ok_or_else(|| PagedbError::rekey_state_invalid("rekey.intent_missing"))?;
         self.resume_rekey_locked(&mut state, intent).await
     }
 
@@ -322,9 +321,7 @@ impl<V: Vfs + Clone> Db<V> {
         self.migrate_rekey_segments(state, intent, target_header_key)
             .await?;
         if self.rekey_segments_pending(state, intent).await? {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::rekey_state_invalid("rekey.segments_pending"));
         }
         self.clear_rekey_intent_locked(state, intent.target_mk_epoch, target_header_key)
             .await?;

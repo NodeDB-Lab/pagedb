@@ -104,9 +104,8 @@ pub async fn stage_snapshot_segments(
 
     for name in &entries {
         // Each name in seg/ is 32 hex chars encoding the 16-byte segment id.
-        let segment_id = crate::hex::parse_hex::<16>(name).ok_or_else(|| {
-            PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
-        })?;
+        let segment_id = crate::hex::parse_hex::<16>(name)
+            .ok_or_else(|| PagedbError::snapshot_artifact_invalid("segment_file_name"))?;
         let src_file = seg_src.join(name);
         let dst_file = staging_dir.join(name);
         let mut sf = fs::File::open(&src_file).await.map_err(PagedbError::Io)?;

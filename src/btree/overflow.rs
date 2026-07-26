@@ -71,8 +71,8 @@ pub fn encode_overflow(body: &mut [u8], next: u64, data: &[u8]) -> Result<()> {
 /// Decode an overflow chain page body (non-root). Returns `(next, data_slice)`.
 pub fn decode_overflow(body: &[u8]) -> Result<(u64, &[u8])> {
     if body.len() < OVERFLOW_HEADER_LEN {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::overflow_body_malformed(
+            "chain_page.header_length",
         ));
     }
     let mut n = [0u8; 8];
@@ -82,8 +82,8 @@ pub fn decode_overflow(body: &[u8]) -> Result<(u64, &[u8])> {
     l.copy_from_slice(&body[8..12]);
     let data_len = u32::from_le_bytes(l) as usize;
     if 12 + data_len > body.len() {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::overflow_body_malformed(
+            "chain_page.data_length",
         ));
     }
     Ok((next, &body[12..12 + data_len]))
@@ -112,9 +112,7 @@ fn encode_overflow_root(body: &mut [u8], refcount: u32, next: u64, data: &[u8]) 
 /// Decode an overflow root page body. Returns `(refcount, next, data_slice)`.
 fn decode_overflow_root(body: &[u8]) -> Result<(u32, u64, &[u8])> {
     if body.len() < OVERFLOW_ROOT_HEADER_LEN {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::overflow_body_malformed("root.header_length"));
     }
     let mut r = [0u8; 4];
     r.copy_from_slice(&body[0..4]);
@@ -126,9 +124,7 @@ fn decode_overflow_root(body: &[u8]) -> Result<(u32, u64, &[u8])> {
     l.copy_from_slice(&body[12..16]);
     let data_len = u32::from_le_bytes(l) as usize;
     if 16 + data_len > body.len() {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::overflow_body_malformed("root.data_length"));
     }
     Ok((refcount, next, &body[16..16 + data_len]))
 }
@@ -323,8 +319,8 @@ pub async fn read_chain<V: Vfs>(
         next = n;
     }
     if out.len() as u64 != total_len {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::overflow_body_malformed(
+            "chain.assembled_length",
         ));
     }
     Ok(out)

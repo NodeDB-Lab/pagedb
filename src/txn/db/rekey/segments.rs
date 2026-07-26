@@ -115,9 +115,7 @@ impl<V: Vfs + Clone> Db<V> {
                     let (kind, body) = reader.read_authenticated_page(page_id).await?;
                     let copied_page_id = writer.append_rekey_page(kind, &body).await?;
                     if copied_page_id != page_id {
-                        return Err(PagedbError::corruption(
-                            crate::errors::CorruptionDetail::HeaderUnverifiable,
-                        ));
+                        return Err(PagedbError::rekey_state_invalid("rekey.page_id_ordering"));
                     }
                 }
                 let replacement = writer.seal().await?;
@@ -129,8 +127,8 @@ impl<V: Vfs + Clone> Db<V> {
                     || replacement.segment_kind != source.meta.segment_kind
                     || replacement.evictable != source.meta.evictable
                 {
-                    return Err(PagedbError::corruption(
-                        crate::errors::CorruptionDetail::HeaderUnverifiable,
+                    return Err(PagedbError::rekey_state_invalid(
+                        "rekey.replacement_metadata",
                     ));
                 }
                 self.write_rekey_progress(
@@ -181,9 +179,7 @@ impl<V: Vfs + Clone> Db<V> {
                 .await?;
             return Ok(());
         }
-        Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ))
+        Err(PagedbError::rekey_state_invalid("rekey.segment_progress"))
     }
 
     async fn finish_orphaned_rekey_progress(
@@ -352,8 +348,8 @@ impl<V: Vfs + Clone> Db<V> {
         let mut out = BTreeMap::new();
         for (key, value) in rows {
             if key.len() != 17 {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::HeaderUnverifiable,
+                return Err(PagedbError::rekey_state_invalid(
+                    "rekey.segment_progress.key",
                 ));
             }
             let mut source_id = [0u8; 16];

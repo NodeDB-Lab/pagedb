@@ -41,6 +41,13 @@ fn every_variant_displays() {
     let cases: Vec<PagedbError> = vec![
         PagedbError::ChecksumFailure,
         PagedbError::corruption(CorruptionDetail::HeaderUnverifiable),
+        PagedbError::structural_header_invalid("main.db", "magic"),
+        PagedbError::footer_framing_invalid("magic"),
+        PagedbError::node_body_malformed("slot_directory"),
+        PagedbError::node_kind_mismatch(Some(7), "leaf", "internal"),
+        PagedbError::overflow_body_malformed("root.data_length"),
+        PagedbError::journal_record_malformed("record.header"),
+        PagedbError::snapshot_artifact_invalid("manifest.magic"),
         PagedbError::corruption(CorruptionDetail::ForeignSegment {
             realm_id: realm,
             name: "x".into(),

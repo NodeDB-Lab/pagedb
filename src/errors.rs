@@ -193,7 +193,9 @@ pub enum CorruptionDetail {
     SegmentMetadataMismatch { field: &'static str },
     /// Segment file geometry cannot safely locate its authenticated footer.
     SegmentGeometryInvalid { field: &'static str },
-    /// Authenticated catalog row bytes do not form a valid segment key/value pair.
+    /// Authenticated catalog-tree row bytes do not form a valid key/value pair
+    /// for the row's table — segment routing, rekey state, counters, quotas, or
+    /// commit-history metadata.
     CatalogRowInvalid { field: &'static str },
     /// Catalog references a segment whose file is absent from both `seg/` and `seg/.staging/`.
     SegmentMissing {
@@ -219,8 +221,55 @@ pub enum CorruptionDetail {
         realm_id: RealmId,
         segment_id: [u8; 16],
     },
-    /// main.db A/B header HK-MAC failed on both copies.
+    /// No copy of the main.db A/B structural header could be verified, so the
+    /// database has no trustworthy root to open from.
+    ///
+    /// Reserved for the unrecoverable *both copies failed* case. A single copy
+    /// that fails its framing or HK-MAC — which the surviving copy may still
+    /// rescue — is [`Self::StructuralHeaderInvalid`].
     HeaderUnverifiable,
+    /// One structural header copy is unusable: its magic, a reserved field, its
+    /// zero tail, or its HK-MAC did not hold.
+    ///
+    /// `header` names which header (`"main.db"` or `"segment"`) and `field`
+    /// what failed. Recoverable in principle — the caller may have another
+    /// copy — unlike [`Self::HeaderUnverifiable`].
+    StructuralHeaderInvalid {
+        header: &'static str,
+        field: &'static str,
+    },
+    /// A segment footer's cleartext framing cannot be trusted to locate the
+    /// authenticated footer at all.
+    ///
+    /// Raised before segment identity is known; once it is,
+    /// [`Self::FooterUnverifiable`] carries the realm, name, and id.
+    FooterFramingInvalid { field: &'static str },
+    /// An authenticated B+ tree node body is not structurally valid.
+    ///
+    /// The bytes are what some holder of the key wrote, but not what a correct
+    /// writer would have written: a length, a slot-directory entry, or a
+    /// discriminant that the decoders and zero-copy accessors would otherwise
+    /// use directly as a slice index is out of range.
+    NodeBodyMalformed { field: &'static str },
+    /// A B+ tree node is not the kind the reader expected.
+    ///
+    /// `page_id` is present when the disagreement is between a page's
+    /// *authenticated* envelope kind and the kind its own body claims — a
+    /// mis-tagged page, which is a corruption of routing rather than of
+    /// content — and absent when a decoder was simply handed the other node
+    /// kind.
+    NodeKindMismatch {
+        page_id: Option<u64>,
+        expected: &'static str,
+        found: &'static str,
+    },
+    /// An authenticated overflow page body is not structurally valid, or a
+    /// chain's assembled length disagrees with the total its root declared.
+    OverflowBodyMalformed { field: &'static str },
+    /// An apply-journal record cannot be decoded from its authenticated bytes.
+    JournalRecordMalformed { field: &'static str },
+    /// A snapshot manifest, or an entry in a snapshot directory, is unusable.
+    SnapshotArtifactInvalid { field: &'static str },
     /// A live B+ tree or overflow pointer targets a reserved page (0..=3).
     /// Pages 0 and 1 are the A/B structural headers and 2..=3 the apply-journal;
     /// no live tree pointer may reach them, so this is a wild pointer or a
@@ -277,6 +326,58 @@ impl PagedbError {
     #[must_use]
     pub const fn catalog_row_invalid(field: &'static str) -> Self {
         Self::Corruption(CorruptionDetail::CatalogRowInvalid { field })
+    }
+
+    /// Canonical constructor for one unusable structural header copy.
+    #[must_use]
+    pub const fn structural_header_invalid(header: &'static str, field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::StructuralHeaderInvalid { header, field })
+    }
+
+    /// Canonical constructor for unusable segment-footer cleartext framing.
+    #[must_use]
+    pub const fn footer_framing_invalid(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::FooterFramingInvalid { field })
+    }
+
+    /// Canonical constructor for a structurally invalid B+ tree node body.
+    #[must_use]
+    pub const fn node_body_malformed(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::NodeBodyMalformed { field })
+    }
+
+    /// Canonical constructor for a node that is not the expected kind. Pass
+    /// `Some(page_id)` when the authenticated envelope kind and the body
+    /// disagree, `None` when a decoder was handed the other node kind.
+    #[must_use]
+    pub const fn node_kind_mismatch(
+        page_id: Option<u64>,
+        expected: &'static str,
+        found: &'static str,
+    ) -> Self {
+        Self::Corruption(CorruptionDetail::NodeKindMismatch {
+            page_id,
+            expected,
+            found,
+        })
+    }
+
+    /// Canonical constructor for a structurally invalid overflow page or chain.
+    #[must_use]
+    pub const fn overflow_body_malformed(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::OverflowBodyMalformed { field })
+    }
+
+    /// Canonical constructor for an undecodable apply-journal record.
+    #[must_use]
+    pub const fn journal_record_malformed(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::JournalRecordMalformed { field })
+    }
+
+    /// Canonical constructor for an unusable snapshot manifest or directory entry.
+    #[must_use]
+    pub const fn snapshot_artifact_invalid(field: &'static str) -> Self {
+        Self::Corruption(CorruptionDetail::SnapshotArtifactInvalid { field })
     }
 
     /// Canonical constructor for a live tree pointer into a reserved page.

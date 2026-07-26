@@ -51,9 +51,7 @@ impl Leaf {
     pub fn decode(body: &[u8]) -> Result<Self> {
         let h: NodeHeader = validate_node_body(body)?;
         if h.kind != NodeKind::Leaf {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::node_kind_mismatch(None, "leaf", "internal"));
         }
         let prefix_len = h.prefix_len as usize;
         let prefix_bytes = body[HEADER_LEN..HEADER_LEN + prefix_len].to_vec();
@@ -270,9 +268,7 @@ impl<'a> LeafAccessor<'a> {
     pub fn new(body: &'a [u8]) -> Result<Self> {
         let h = validate_node_body(body)?;
         if h.kind != NodeKind::Leaf {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::node_kind_mismatch(None, "leaf", "internal"));
         }
         Ok(Self {
             body,

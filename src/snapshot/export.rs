@@ -104,15 +104,11 @@ pub fn decode_manifest(
     hk_key: &[u8; 32],
 ) -> Result<SnapshotManifest> {
     if &buf[..8] != MAGIC {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::snapshot_artifact_invalid("manifest.magic"));
     }
     let expected_mac = compute_manifest_mac(&buf[..224], hk_key);
     if buf[224..240] != expected_mac {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::snapshot_artifact_invalid("manifest.hk_mac"));
     }
     let version = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
     let kind = buf[12];
@@ -380,9 +376,7 @@ pub async fn open_manifest(manifest_path: &Path, kek: &[u8; 32]) -> Result<Snaps
     let mut buf = [0u8; MANIFEST_RESERVED_SIZE];
     let n = f.read(&mut buf).await.map_err(PagedbError::Io)?;
     if n < MANIFEST_RESERVED_SIZE {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::snapshot_artifact_invalid("manifest.length"));
     }
     // Extract kek_salt from buf[53..69] and mk_epoch from buf[45..53] to
     // derive the HK key needed to verify the MAC.

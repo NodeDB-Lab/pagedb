@@ -484,9 +484,7 @@ pub(crate) fn encode_commit_meta(m: &CommitHistoryMeta) -> Vec<u8> {
 
 pub(crate) fn decode_commit_meta(bytes: &[u8]) -> Result<CommitHistoryMeta> {
     if bytes.len() < 40 {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::catalog_row_invalid("commit_history.meta"));
     }
     let read_u64 = |b: &[u8], off: usize| {
         let mut a = [0u8; 8];

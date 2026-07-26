@@ -36,9 +36,7 @@ pub(crate) fn intent_proof(
 
 pub(crate) fn validate_intent(intent: &RekeyIntent) -> Result<()> {
     if intent.target_mk_epoch == 0 || intent.target_mk_epoch <= intent.source_mk_epoch {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::rekey_state_invalid("rekey.target_mk_epoch"));
     }
     crate::crypto::CipherId::from_byte(intent.source_cipher_id)?;
     crate::crypto::CipherId::from_byte(intent.target_cipher_id)?;
@@ -73,9 +71,7 @@ pub(crate) fn migrate_legacy(
     kek_salt: &[u8; 16],
 ) -> Result<RekeyIntent> {
     if legacy.target_mk_epoch == 0 || legacy.target_mk_epoch <= source_mk_epoch {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::rekey_state_invalid("rekey.target_mk_epoch"));
     }
     crate::crypto::CipherId::from_byte(cipher_id)?;
     Ok(RekeyIntent {

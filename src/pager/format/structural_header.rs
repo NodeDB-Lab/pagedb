@@ -159,7 +159,7 @@ pub fn encode_main_db_header(
     Ok(buf)
 }
 
-/// Decode and verify a main.db A/B header. Returns `Corruption{HeaderUnverifiable}`
+/// Decode and verify a main.db A/B header. Returns `Corruption{StructuralHeaderInvalid}`
 /// on MAC failure or non-zero tail.
 pub fn decode_main_db_header(
     bytes: &[u8],
@@ -170,27 +170,25 @@ pub fn decode_main_db_header(
         return Err(PagedbError::Unsupported);
     }
     if bytes[..8] != MAGIC_MAIN {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::structural_header_invalid("main.db", "magic"));
     }
     // Bytes 161..168 are reserved and must be zero.
     if !bytes[161..168].iter().all(|b| *b == 0) {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::structural_header_invalid(
+            "main.db",
+            "reserved_bytes",
         ));
     }
     // Bytes 185..page_size-MAC_LEN are the unused tail and must be zero.
     if !bytes[185..page_size - MAC_LEN].iter().all(|b| *b == 0) {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::structural_header_invalid(
+            "main.db",
+            "unused_tail",
         ));
     }
     let expected = mac_hk(hk, &bytes[..page_size - MAC_LEN])?;
     if !constant_time_eq(&expected, &bytes[page_size - MAC_LEN..]) {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::structural_header_invalid("main.db", "hk_mac"));
     }
     let mut o = 8; // past magic
     let format_version = u16_le(&bytes[o..o + 2]);
@@ -318,21 +316,18 @@ pub fn decode_segment_header(
         return Err(PagedbError::Unsupported);
     }
     if bytes[..8] != MAGIC_SEGMENT {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::structural_header_invalid("segment", "magic"));
     }
     let tail = &bytes[70..page_size - MAC_LEN];
     if !tail.iter().all(|b| *b == 0) {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::structural_header_invalid(
+            "segment",
+            "unused_tail",
         ));
     }
     let expected = mac_hk(hk, &bytes[..page_size - MAC_LEN])?;
     if !constant_time_eq(&expected, &bytes[page_size - MAC_LEN..]) {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::structural_header_invalid("segment", "hk_mac"));
     }
     let mut o = 8;
     let format_version = u16_le(&bytes[o..o + 2]);

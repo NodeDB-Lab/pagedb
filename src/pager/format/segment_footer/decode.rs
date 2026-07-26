@@ -42,9 +42,7 @@ fn parse_cleartext(bytes: &[u8], page_size: usize) -> Result<ParsedFooter> {
         return Err(PagedbError::Unsupported);
     }
     if bytes[..8] != MAGIC {
-        return Err(PagedbError::corruption(
-            CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::footer_framing_invalid("magic"));
     }
     let format_version = u16_le(&bytes[8..10]);
     let (fields_end, cleartext_end, max_manifest) = match format_version {
@@ -133,8 +131,8 @@ fn authenticate_cleartext(
         || parsed.manifest_offset != expected_offset
         || parsed.manifest_len > parsed.max_manifest
     {
-        return Err(PagedbError::corruption(
-            CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::footer_framing_invalid(
+            "manifest_offset_or_length",
         ));
     }
     Ok(())
@@ -162,9 +160,7 @@ fn assemble_fields(
         .checked_add(MANIFEST_TAG_LEN)
         .ok_or_else(|| PagedbError::arithmetic_overflow("footer manifest tag end"))?;
     if tag_end > bytes.len() {
-        return Err(PagedbError::corruption(
-            CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::footer_framing_invalid("manifest_tag_end"));
     }
     Ok((fields, ciphertext_end, tag_end))
 }
@@ -197,9 +193,7 @@ fn authenticate_manifest(
             })
         })?;
     if bytes[tag_end..].iter().any(|byte| *byte != 0) {
-        return Err(PagedbError::corruption(
-            CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::footer_framing_invalid("trailing_bytes"));
     }
     Ok(manifest)
 }

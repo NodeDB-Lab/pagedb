@@ -27,9 +27,7 @@ impl Internal {
     pub fn decode(body: &[u8]) -> Result<Self> {
         let h: NodeHeader = validate_node_body(body)?;
         if h.kind != NodeKind::Internal {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::node_kind_mismatch(None, "internal", "leaf"));
         }
         let prefix_len = h.prefix_len as usize;
         let mut entries = Vec::with_capacity(h.slot_count as usize);
@@ -167,9 +165,7 @@ impl<'a> InternalAccessor<'a> {
     pub fn new(body: &'a [u8]) -> Result<Self> {
         let h = validate_node_body(body)?;
         if h.kind != NodeKind::Internal {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::node_kind_mismatch(None, "internal", "leaf"));
         }
         // Internal nodes always encode with prefix_len = 0 today; if that ever
         // changes, this accessor needs the same prefix handling as LeafAccessor.
