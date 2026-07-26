@@ -379,3 +379,125 @@ async fn mixed_epoch_pages_readable() {
     }
     drop(rx2);
 }
+
+/// An existing reader keeps its pinned logical snapshot even after rekey
+/// rewrites durable main-db pages and clean cache entries are evicted.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_preserves_preexisting_main_reader_snapshot_after_cache_evict() {
+    let (_vfs, db) = fresh_db().await;
+    let old_large_value = vec![0xA5; PAGE];
+    {
+        let mut tx = db.begin_write().await.unwrap();
+        tx.put(b"versioned", b"before").await.unwrap();
+        tx.put(b"large", &old_large_value).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let reader = db.begin_read().await.unwrap();
+    {
+        let mut tx = db.begin_write().await.unwrap();
+        tx.put(b"versioned", b"after").await.unwrap();
+        tx.put(b"large", b"replacement").await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    db.rekey_db(KEK0, 1).await.unwrap();
+    db.evict_main_pages(REALM);
+
+    assert_eq!(
+        reader.get(b"versioned").await.unwrap().as_deref(),
+        Some(b"before".as_slice())
+    );
+    assert_eq!(
+        reader.get(b"large").await.unwrap().as_deref(),
+        Some(old_large_value.as_slice())
+    );
+}
+
+/// Rekey must re-encrypt the durable free-list chain and every reusable page
+/// it names; otherwise physical integrity checks cannot authenticate those
+/// pages after the source epoch is retired.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_preserves_durable_free_list_across_reopen() {
+    let vfs = MemVfs::new();
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    let db = Db::open_internal_with_options(vfs.clone(), KEK0, PAGE, REALM, options.clone())
+        .await
+        .unwrap();
+    let mut insert = db.begin_write().await.unwrap();
+    for index in 0..300_u32 {
+        insert
+            .put(format!("free-{index:05}").as_bytes(), &[0x7A; 128])
+            .await
+            .unwrap();
+    }
+    insert.commit().await.unwrap();
+    let mut delete = db.begin_write().await.unwrap();
+    for index in 0..250_u32 {
+        delete
+            .delete(format!("free-{index:05}").as_bytes())
+            .await
+            .unwrap();
+    }
+    delete.commit().await.unwrap();
+    assert!(db.stats().await.unwrap().free_list_pending_entries > 0);
+
+    db.rekey_db(KEK0, 1).await.unwrap();
+    drop(db);
+
+    let reopened = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    assert!(reopened.stats().await.unwrap().free_list_pending_entries > 0);
+    let report = pagedb::recovery::deep_walk::run_deep_walk(&reopened)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "free-list rekey report: {report:?}");
+}
+
+/// Epochs are monotonic. Rejecting the current or an older epoch must leave
+/// the live store usable and must not persist a rekey intent.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_rejects_non_advancing_epoch() {
+    let (vfs, db) = fresh_db().await;
+    {
+        let mut tx = db.begin_write().await.unwrap();
+        tx.put(b"stable", b"value").await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    assert!(matches!(
+        db.rekey_db(KEK0, 0).await,
+        Err(PagedbError::RekeyStateInvalid { .. })
+    ));
+    assert_eq!(
+        db.begin_read()
+            .await
+            .unwrap()
+            .get(b"stable")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"value".as_slice())
+    );
+
+    db.rekey_db(KEK0, 2).await.unwrap();
+    assert!(matches!(
+        db.rekey_db(KEK0, 1).await,
+        Err(PagedbError::RekeyStateInvalid { .. })
+    ));
+    drop(db);
+
+    let reopened = Db::open_existing(vfs, KEK0, PAGE, REALM).await.unwrap();
+    assert_eq!(
+        reopened
+            .begin_read()
+            .await
+            .unwrap()
+            .get(b"stable")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"value".as_slice())
+    );
+}
