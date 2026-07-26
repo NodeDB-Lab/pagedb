@@ -1,6 +1,7 @@
 //! Maintenance walks: rekey under a new epoch and reachable-page collection.
 
 use crate::Result;
+use crate::errors::PagedbError;
 use crate::pager::format::page_kind::PageKind;
 use crate::vfs::Vfs;
 
@@ -114,47 +115,42 @@ impl<V: Vfs> BTree<V> {
             return Ok(());
         }
         let mut stack: Vec<u64> = vec![self.root_page_id];
+
         while let Some(page_id) = stack.pop() {
             if !out.insert(page_id) {
                 // Already visited.
                 continue;
             }
-            let (is_leaf, body_bytes) = {
-                match self.pager.read_main_node(page_id, self.realm_id).await {
-                    Ok((g, _page_kind)) => {
-                        let body = g.body();
-                        let header = read_header(&body)?;
-                        let is_leaf = header.kind == NodeKind::Leaf;
-                        (is_leaf, body.to_vec())
-                    }
-                    Err(_) => continue, // unreadable — best effort
-                }
-            };
 
-            if is_leaf {
-                let Ok(leaf) = Leaf::decode(&body_bytes) else {
-                    continue;
-                };
-                for (_k, v) in &leaf.records {
-                    if let LeafValue::Overflow {
-                        root_page_id: ov_root,
-                        ..
-                    } = v
-                    {
-                        self.collect_overflow_chain(*ov_root, out).await;
+            let (guard, kind) = self.read_node_guard(page_id).await?;
+            match kind {
+                NodeKind::Leaf => {
+                    let leaf = Leaf::decode(guard.body_ref())?;
+                    let overflow_roots: Vec<u64> = leaf
+                        .records
+                        .iter()
+                        .filter_map(|(_, value)| match value {
+                            LeafValue::Overflow { root_page_id, .. } => Some(*root_page_id),
+                            LeafValue::Inline(_) => None,
+                        })
+                        .collect();
+                    drop(guard);
+
+                    for overflow_root in overflow_roots {
+                        self.collect_overflow_chain(overflow_root, out).await?;
                     }
                 }
-            } else {
-                // Internal node: push child page IDs.
-                let Ok(internal) = internal::Internal::decode(&body_bytes) else {
-                    continue;
-                };
-                if internal.leftmost_child != 0 {
-                    stack.push(internal.leftmost_child);
-                }
-                for entry in &internal.entries {
-                    if entry.right_child != 0 {
-                        stack.push(entry.right_child);
+                NodeKind::Internal => {
+                    let internal = internal::Internal::decode(guard.body_ref())?;
+                    drop(guard);
+
+                    if internal.leftmost_child != 0 {
+                        stack.push(internal.leftmost_child);
+                    }
+                    for entry in &internal.entries {
+                        if entry.right_child != 0 {
+                            stack.push(entry.right_child);
+                        }
                     }
                 }
             }
@@ -163,50 +159,48 @@ impl<V: Vfs> BTree<V> {
     }
 
     /// Walk an overflow chain starting at `root` and insert all page IDs into
-    /// `out`. Best-effort: stops on any read failure.
-    ///
-    /// The `next` pointer lives at different offsets by page type: the root
-    /// (`OverflowRoot`) is laid out `refcount[4] || next[8] || …`, so its next is
-    /// at byte 4; a chain page (`Overflow`) is laid out `next[8] || …`, so its
-    /// next is at byte 0. Reading byte 0 uniformly would decode the root's
-    /// `refcount` (1 for a single-owner value) as the next page id — spuriously
-    /// chaining to reserved page 1.
-    async fn collect_overflow_chain(&self, root: u64, out: &mut std::collections::BTreeSet<u64>) {
-        let mut chain_id = root;
-        let mut first = true;
-        while chain_id != 0 {
-            if !out.insert(chain_id) {
-                break;
-            }
-            let (kind, next_off) = if first {
-                (PageKind::OverflowRoot, 4usize) // root: next after refcount[4]
-            } else {
-                (PageKind::Overflow, 0usize) // chain page: next at byte 0
-            };
-            first = false;
-            let Ok(g) = self
-                .pager
-                .read_main_page(chain_id, self.realm_id, kind)
-                .await
-            else {
-                break;
-            };
-            let body = g.body();
-            if body.len() < next_off + 8 {
-                break;
-            }
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&body[next_off..next_off + 8]);
-            chain_id = u64::from_le_bytes(b);
+    /// `out`. This is authoritative for reachability collection, so malformed
+    /// pages or missing links propagate as corruption instead of being omitted.
+    async fn collect_overflow_chain(
+        &self,
+        root: u64,
+        out: &mut std::collections::BTreeSet<u64>,
+    ) -> Result<()> {
+        if root == 0 || !out.insert(root) {
+            return Ok(());
         }
+
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(root);
+        let info = overflow::read_root_page(&self.pager, self.realm_id, root).await?;
+        let mut chain_id = info.next;
+
+        while chain_id != 0 {
+            if !seen.insert(chain_id) {
+                return Err(PagedbError::corruption(
+                    crate::errors::CorruptionDetail::HeaderUnverifiable,
+                ));
+            }
+
+            let guard = self
+                .pager
+                .read_main_page(chain_id, self.realm_id, PageKind::Overflow)
+                .await?;
+            let body = guard.body();
+            let (next, _) = overflow::decode_overflow(&body)?;
+            out.insert(chain_id);
+            chain_id = next;
+        }
+
+        Ok(())
     }
 
     /// Strict structural walk from the root: return a description of the FIRST
     /// dangling pointer — an internal child that is reserved / Free / unreadable
     /// as a node, or a leaf `Overflow` root that is reserved or unreadable.
-    /// `None` = structurally intact. Unlike best-effort `collect_all_page_ids`,
-    /// any anomaly is a violation, so the per-commit invariant can pinpoint the
-    /// exact commit that introduces a use-after-free.
+    /// `None` = structurally intact. It returns the first anomaly so the
+    /// per-commit invariant can pinpoint the exact commit that introduces a
+    /// use-after-free.
     pub async fn find_dangling(&self) -> Option<String> {
         if self.root_page_id == 0 {
             return None;
