@@ -824,7 +824,7 @@ impl<V: Vfs> Pager<V> {
         // Black box: capture a structured corruption report (and, once per
         // process, a snapshot of the store for offline `pagedb-fsck`) so this
         // is debuggable from production without reproduction. Inert unless the
-        // host app called `blackbox::init`.
+        // host app called `faultbox::init`.
         crate::diag::page_read_verify_failed(
             &self.cfg.main_db_path,
             page_id,

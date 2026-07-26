@@ -28,7 +28,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Production black-box recorder — corruption/invariant reports with a
 # breadcrumb flight recorder. Optional + behind `diagnostics` (see [features]);
 # the real `diag` impl is additionally gated off wasm32 so OPFS builds stay lean.
-blackbox = { path = "../blackbox", optional = true }
+faultbox = { path = "../faultbox", optional = true }
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
@@ -113,9 +113,9 @@ io-uring = "0.7"
 [features]
 default = ["diagnostics"]
 # Emit black-box reports (corruption, read-verify failures) and operation
-# breadcrumbs via the `blackbox` crate. Inert until the host application calls
-# `blackbox::init`; a no-op on wasm32 regardless.
-diagnostics = ["dep:blackbox"]
+# breadcrumbs via the `faultbox` crate. Inert until the host application calls
+# `faultbox::init`; a no-op on wasm32 regardless.
+diagnostics = ["dep:faultbox"]
 compression = ["dep:lz4_flex"]
 opfs = [
     "dep:wasm-bindgen",

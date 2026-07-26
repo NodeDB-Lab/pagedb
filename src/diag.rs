@@ -2,7 +2,7 @@
 
 //! Black-box diagnostics wiring.
 //!
-//! Thin, always-callable shims over the `blackbox` recorder: breadcrumbs on the
+//! Thin, always-callable shims over the `faultbox` recorder: breadcrumbs on the
 //! significant operations (commit, reopen) and a structured corruption report
 //! at the page read-verify failure site — the exact place a freed-page
 //! use-after-free surfaces as an AEAD/MAC failure.
@@ -10,7 +10,7 @@
 //! The real implementation is compiled only under the `diagnostics` feature and
 //! off wasm32; otherwise every entry point is a no-op with the same signature,
 //! so call sites never need `cfg`. Reports are inert until the host application
-//! calls [`blackbox::init`], so a library emitting these costs nothing on its
+//! calls [`faultbox::init`], so a library emitting these costs nothing on its
 //! own.
 
 #[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
@@ -20,13 +20,13 @@ mod imp {
     /// Breadcrumb: a store was (re)opened — marks epoch boundaries in the trail,
     /// the dimension along which freed-page use-after-free surfaces.
     pub fn reopened(latest_commit: u64) {
-        blackbox::breadcrumb!(Info, "pagedb.reopen", "opened store", { "latest_commit": latest_commit });
+        faultbox::breadcrumb!(Info, "pagedb.reopen", "opened store", { "latest_commit": latest_commit });
     }
 
     /// Breadcrumb: a commit was published, with the number of pages it freed —
     /// the operations most implicated in page recycling.
     pub fn committed(commit_id: u64, freed_pages: usize) {
-        blackbox::breadcrumb!(Debug, "pagedb.commit", "committed", {
+        faultbox::breadcrumb!(Debug, "pagedb.commit", "committed", {
             "commit_id": commit_id,
             "freed_pages": freed_pages,
         });
@@ -35,7 +35,7 @@ mod imp {
     /// Breadcrumb: a sentinel lock (writer, frozen-reader, or observer) was
     /// acquired at open — marks who holds exclusivity over a store.
     pub fn lock_acquired(mode: &str, path: &str) {
-        blackbox::breadcrumb!(Info, "pagedb.lock_acquired", "sentinel lock acquired", {
+        faultbox::breadcrumb!(Info, "pagedb.lock_acquired", "sentinel lock acquired", {
             "mode": mode,
             "path": path,
         });
@@ -45,7 +45,7 @@ mod imp {
     /// open lost the race, so the failure has a trail even though it never
     /// touched the store.
     pub fn lock_rejected(mode: &str, path: &str, reason: &str) {
-        blackbox::breadcrumb!(Info, "pagedb.lock_rejected", "sentinel lock rejected", {
+        faultbox::breadcrumb!(Info, "pagedb.lock_rejected", "sentinel lock rejected", {
             "mode": mode,
             "path": path,
             "reason": reason,
@@ -54,7 +54,7 @@ mod imp {
 
     /// Breadcrumb: dirty pages were flushed and fsynced to durable storage.
     pub fn flushed(bytes: u64) {
-        blackbox::breadcrumb!(Debug, "pagedb.flushed", "flushed to disk", {
+        faultbox::breadcrumb!(Debug, "pagedb.flushed", "flushed to disk", {
             "bytes": bytes,
         });
     }
@@ -69,7 +69,7 @@ mod imp {
         main_db_path: String,
     }
 
-    impl blackbox::DomainContext for PageReadVerifyFailure {
+    impl faultbox::DomainContext for PageReadVerifyFailure {
         fn domain_kind(&self) -> &'static str {
             "pagedb.page_read_verify_failure"
         }
@@ -78,8 +78,8 @@ mod imp {
             // instances of one structural bug collapse together.
             format!("file={};binding={}", self.file, self.binding)
         }
-        fn to_json(&self) -> blackbox::serde_json::Value {
-            blackbox::serde_json::json!({
+        fn to_json(&self) -> faultbox::serde_json::Value {
+            faultbox::serde_json::json!({
                 "page_id": self.page_id,
                 "file": self.file,
                 "binding": self.binding,
@@ -111,8 +111,8 @@ mod imp {
             realm_hex: crate::hex::to_hex_lower(&realm.0),
             main_db_path: main_db_path.to_owned(),
         };
-        let _ = blackbox::Capture::new(
-            blackbox::EventKind::Corruption,
+        let _ = faultbox::Capture::new(
+            faultbox::EventKind::Corruption,
             "page AEAD/MAC verification failed on read",
         )
         .domain(&ctx)

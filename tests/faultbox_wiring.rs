@@ -12,11 +12,11 @@ use pagedb::{CipherId, Db, PagedbError, RealmId};
 const PAGE: usize = 4096;
 
 #[tokio::test(flavor = "current_thread")]
-async fn read_verify_failure_emits_blackbox_corruption_report() {
+async fn read_verify_failure_emits_faultbox_corruption_report() {
     let reports = tempfile::tempdir().unwrap();
     // The host app owns init; here the test plays that role.
-    blackbox::init(
-        blackbox::Config::new("pagedb", env!("CARGO_PKG_VERSION"), reports.path())
+    faultbox::init(
+        faultbox::Config::new("pagedb", env!("CARGO_PKG_VERSION"), reports.path())
             .install_panic_hook(false),
     );
 
