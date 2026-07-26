@@ -637,6 +637,50 @@ mod tests {
     }
 
     #[test]
+    fn a_logical_path_normalizes_its_separators_and_leading_slash() {
+        for spelling in ["/seg/abc", "seg/abc", "seg\\abc", "/seg/abc/"] {
+            assert_eq!(canonical_native_path(spelling).unwrap(), "/seg/abc");
+        }
+        assert_eq!(canonical_native_path("").unwrap(), "/");
+        assert_eq!(canonical_native_path("/").unwrap(), "/");
+    }
+
+    #[test]
+    fn a_parent_or_current_directory_component_never_resolves() {
+        for escape in ["../escaped", "a/../../escaped", "./a", "a//b", "a/./b"] {
+            assert!(
+                canonical_native_path(escape).is_err(),
+                "{escape:?} must not canonicalize"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drive_letter_component_is_rejected_wherever_it_appears() {
+        // Rejected on every target, not just the one that gives it meaning.
+        // A platform prefix is only recognised in leading position, so a drive
+        // letter deeper in the path parses as an ordinary name — and pushing it
+        // would replace the root outright rather than extend it.
+        for drive in ["C:", "a/C:/b", "C:/escaped", "a/C:"] {
+            assert!(
+                canonical_native_path(drive).is_err(),
+                "{drive:?} must not canonicalize"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolved_path_always_stays_under_its_root() {
+        let root = std::path::Path::new("/srv/pagedb");
+        assert_eq!(
+            resolve_native_path(root, "seg/abc").unwrap(),
+            root.join("seg").join("abc")
+        );
+        assert!(resolve_native_path(root, "../escaped").is_err());
+        assert!(resolve_native_path(root, "a/C:/b").is_err());
+    }
+
+    #[test]
     fn readfile_len_accepts_u32_max() {
         assert_eq!(checked_readfile_len(u32::MAX as usize).unwrap(), u32::MAX);
     }
@@ -656,7 +700,16 @@ mod tests {
     #[test]
     fn read_count_rejects_overreported_completion() {
         let err = checked_read_count(11, 10).unwrap_err();
-        assert!(matches!(err, crate::errors::PagedbError::Io(_)));
+        assert!(
+            matches!(
+                err,
+                crate::errors::PagedbError::VfsContractViolated {
+                    operation: "read_at",
+                    ..
+                }
+            ),
+            "expected VfsContractViolated, got {err:?}"
+        );
     }
 
     #[test]
@@ -796,7 +849,16 @@ mod tests {
     fn write_progress_rejects_overreported_count() {
         let mut offset = 7;
         let err = checked_write_progress(&mut offset, 11, 10).unwrap_err();
-        assert!(matches!(err, crate::errors::PagedbError::Io(_)));
+        assert!(
+            matches!(
+                err,
+                crate::errors::PagedbError::VfsContractViolated {
+                    operation: "write_at",
+                    ..
+                }
+            ),
+            "expected VfsContractViolated, got {err:?}"
+        );
         assert_eq!(offset, 7, "failed progress must not advance offset");
     }
 
