@@ -269,6 +269,16 @@ impl PageCache {
         self.dirty.contains(&key)
     }
 
+    /// How many entries are currently dirty, across every file.
+    ///
+    /// Dirty entries are never evicted, so this is the part of the cache that
+    /// can push it past its configured capacity. Callers that seal pages in a
+    /// long loop watch this to decide when they must flush.
+    #[must_use]
+    pub fn dirty_len(&self) -> usize {
+        self.dirty.len()
+    }
+
     /// Sorted iterator over the dirty page ids for one file, ascending by
     /// `page_id`. Used by the Pager to flush in physical-id order.
     #[must_use]

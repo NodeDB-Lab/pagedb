@@ -501,3 +501,108 @@ async fn rekey_rejects_non_advancing_epoch() {
         Some(b"value".as_slice())
     );
 }
+
+/// A catalog too large to fit one page must be re-sealed in full.
+///
+/// The catalog is the one reader-visible root that cannot be re-sealed before
+/// the target header is published — it carries the intent that admits recovery
+/// from a stale header. Only the pages a rekey happens to write through get
+/// re-sealed by that write, so a catalog spanning several pages is where a
+/// missing catalog traversal shows up: everything off the written path stays
+/// sealed under an epoch that retirement then destroys.
+fn counter_name(index: u32) -> String {
+    // Long names on purpose: the catalog must span more pages than any single
+    // copy-on-write path through it touches.
+    format!("catalog-counter-{index:05}-{}", "n".repeat(200))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_reseals_a_catalog_larger_than_one_page() {
+    let vfs = MemVfs::new();
+    // Retention disabled on purpose: with history retained, the newest retained
+    // row names the live catalog root, so the retained-root walk re-seals the
+    // catalog incidentally and hides whether the rekey covers it on its own.
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    let db = Db::open_internal_with_options(vfs.clone(), KEK0, PAGE, REALM, options.clone())
+        .await
+        .unwrap();
+
+    // Enough counter rows to push the catalog tree past a single page.
+    {
+        let mut tx = db.begin_write().await.unwrap();
+        for index in 0..400_u32 {
+            let mut counter = tx.counter(&counter_name(index)).unwrap();
+            counter.set(u64::from(index) + 1).await.unwrap();
+            drop(counter);
+        }
+        tx.commit().await.unwrap();
+    }
+    let catalog_pages_before = db.stats().await.unwrap().main_db_next_page_id;
+    assert!(
+        catalog_pages_before > 8,
+        "test setup must build a multi-page catalog, got {catalog_pages_before} pages"
+    );
+
+    db.rekey_db(KEK0, 1).await.unwrap();
+    drop(db);
+
+    let reopened = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    let report = pagedb::recovery::deep_walk::run_deep_walk(&reopened)
+        .await
+        .unwrap();
+    assert!(
+        report.is_clean(),
+        "multi-page catalog rekey report: {report:?}"
+    );
+
+    // Every counter must still decode under the target epoch.
+    let mut tx = reopened.begin_write().await.unwrap();
+    for index in [0_u32, 199, 399] {
+        let counter = tx.counter(&counter_name(index)).unwrap();
+        assert_eq!(counter.get().await.unwrap(), u64::from(index) + 1);
+        drop(counter);
+    }
+    tx.commit().await.unwrap();
+}
+
+/// Rekey must not abandon the pages its own catalog transitions supersede.
+///
+/// Each durable stage rewrites the catalog copy-on-write. Without routing the
+/// superseded pages onto the free list they are unreachable from every root and
+/// absent from the free list — a permanent leak that grows with every rekey,
+/// and one the source epoch's retirement makes unauthenticatable.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_leaves_no_leaked_pages() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK0, PAGE, REALM)
+        .await
+        .unwrap();
+    {
+        let mut tx = db.begin_write().await.unwrap();
+        for index in 0..200_u32 {
+            tx.put(format!("leak-{index:05}").as_bytes(), &[0x5C; 96])
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    for epoch in 1..=3_u64 {
+        db.rekey_db(KEK0, epoch).await.unwrap();
+    }
+    drop(db);
+
+    let reopened = Db::open_existing(vfs, KEK0, PAGE, REALM).await.unwrap();
+    let report = pagedb::recovery::deep_walk::run_deep_walk(&reopened)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "repeated rekey report: {report:?}");
+    assert!(
+        report.orphan_page_ids.is_empty(),
+        "rekey leaked {} pages: {:?}",
+        report.orphan_page_ids.len(),
+        report.orphan_page_ids
+    );
+}
