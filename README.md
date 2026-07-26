@@ -79,9 +79,14 @@ PageDB-owned benches and the isolated cross-engine suite with:
 ```bash
 cargo bench --bench segment
 cargo bench --bench compaction
+cargo bench --bench authenticated_node_read
 cargo bench -p pagedb-engine-comparison --bench btree
 cargo bench -p pagedb-engine-comparison --bench comparison
 ```
+
+`authenticated_node_read` evicts the main-page cache before each lookup through
+a multi-level tree, measuring cold authenticated leaf/internal kind discovery
+without resolving or compiling an external database engine.
 
 The comparison suite is a non-default workspace package under
 [`benchmarks/engine-comparison`](./benchmarks/engine-comparison). Normal
