@@ -1,5 +1,7 @@
 //! Maintenance walks: rekey under a new epoch and reachable-page collection.
 
+use std::collections::BTreeMap;
+
 use crate::Result;
 use crate::errors::PagedbError;
 use crate::pager::format::page_kind::PageKind;
@@ -21,20 +23,46 @@ impl<V: Vfs> BTree<V> {
     ///
     /// Returns the count of pages touched.
     pub async fn rekey_walk(&self) -> Result<u64> {
+        self.rekey_walk_unique(&mut BTreeMap::new()).await
+    }
+
+    /// Rekey this tree while sharing traversal state with other live roots.
+    ///
+    /// Retained snapshots commonly share most of their pages. A caller walking
+    /// several roots supplies one page-kind map so each physical page is
+    /// authenticated and rewritten exactly once without hiding a cross-kind
+    /// alias.
+    pub(crate) async fn rekey_walk_unique(
+        &self,
+        visited: &mut BTreeMap<u64, PageKind>,
+    ) -> Result<u64> {
         if self.root_page_id == 0 {
             return Ok(0);
         }
-        let mut stack: Vec<u64> = vec![self.root_page_id];
+        let mut stack: Vec<(u64, u64)> = vec![(0, self.root_page_id)];
         let mut count: u64 = 0;
-        while let Some(page_id) = stack.pop() {
+        while let Some((parent_page_id, page_id)) = stack.pop() {
+            if is_reserved(page_id) {
+                return Err(PagedbError::reserved_page_referenced(
+                    parent_page_id,
+                    page_id,
+                ));
+            }
+            if let Some(kind) = visited.get(&page_id) {
+                match kind {
+                    PageKind::BTreeLeaf | PageKind::BTreeInternal => continue,
+                    _ => return Err(PagedbError::IllegalPageKind),
+                }
+            }
             // Determine kind by reading the node under its own header kind byte.
-            let (is_leaf, body_bytes) = {
-                let (g, _page_kind) = self.pager.read_main_node(page_id, self.realm_id).await?;
+            let (is_leaf, page_kind, body_bytes) = {
+                let (g, page_kind) = self.pager.read_main_node(page_id, self.realm_id).await?;
                 let body = g.body();
                 let header = read_header(&body)?;
                 let is_leaf = header.kind == NodeKind::Leaf;
-                (is_leaf, body.to_vec())
+                (is_leaf, page_kind, body.to_vec())
             };
+            visited.insert(page_id, page_kind);
 
             if is_leaf {
                 // Collect overflow chains referenced by this leaf.
@@ -45,37 +73,9 @@ impl<V: Vfs> BTree<V> {
                         ..
                     } = v
                     {
-                        // Rewrite the root page (`PageKind::OverflowRoot`).
-                        let root_info =
-                            overflow::read_root_page(&self.pager, self.realm_id, *ov_root).await?;
-                        self.pager
-                            .rewrite_page_under_current_epoch(
-                                *ov_root,
-                                self.realm_id,
-                                PageKind::OverflowRoot,
-                            )
+                        count += self
+                            .rekey_overflow_unique(page_id, *ov_root, visited)
                             .await?;
-                        count += 1;
-                        // Walk and rewrite chain pages (always PageKind::Overflow).
-                        let mut next = root_info.next;
-                        while next != 0 {
-                            let ov_guard = self
-                                .pager
-                                .read_main_page(next, self.realm_id, PageKind::Overflow)
-                                .await?;
-                            let ov_body = ov_guard.body();
-                            let (ov_next, _) = overflow::decode_overflow(&ov_body)?;
-                            drop(ov_guard);
-                            self.pager
-                                .rewrite_page_under_current_epoch(
-                                    next,
-                                    self.realm_id,
-                                    PageKind::Overflow,
-                                )
-                                .await?;
-                            count += 1;
-                            next = ov_next;
-                        }
                     }
                 }
                 // Rewrite the leaf page.
@@ -86,9 +86,13 @@ impl<V: Vfs> BTree<V> {
             } else {
                 // Internal node: push children onto stack.
                 let internal = internal::Internal::decode(&body_bytes)?;
-                stack.push(internal.leftmost_child);
+                if internal.leftmost_child != 0 {
+                    stack.push((page_id, internal.leftmost_child));
+                }
                 for entry in &internal.entries {
-                    stack.push(entry.right_child);
+                    if entry.right_child != 0 {
+                        stack.push((page_id, entry.right_child));
+                    }
                 }
                 // Rewrite the internal page.
                 self.pager
@@ -100,6 +104,55 @@ impl<V: Vfs> BTree<V> {
                     .await?;
                 count += 1;
             }
+        }
+        Ok(count)
+    }
+
+    async fn rekey_overflow_unique(
+        &self,
+        leaf_page_id: u64,
+        root: u64,
+        visited: &mut BTreeMap<u64, PageKind>,
+    ) -> Result<u64> {
+        if is_reserved(root) {
+            return Err(PagedbError::reserved_page_referenced(leaf_page_id, root));
+        }
+        if let Some(kind) = visited.get(&root) {
+            return match kind {
+                PageKind::OverflowRoot => Ok(0),
+                _ => Err(PagedbError::IllegalPageKind),
+            };
+        }
+        visited.insert(root, PageKind::OverflowRoot);
+
+        let root_info = overflow::read_root_page(&self.pager, self.realm_id, root).await?;
+        self.pager
+            .rewrite_page_under_current_epoch(root, self.realm_id, PageKind::OverflowRoot)
+            .await?;
+        let mut count = 1;
+        let mut next = root_info.next;
+        while next != 0 {
+            if is_reserved(next) {
+                return Err(PagedbError::reserved_page_referenced(root, next));
+            }
+            if let Some(kind) = visited.get(&next) {
+                return match kind {
+                    PageKind::Overflow => Err(PagedbError::overflow_chain_cycle(root, next)),
+                    _ => Err(PagedbError::IllegalPageKind),
+                };
+            }
+            visited.insert(next, PageKind::Overflow);
+            let guard = self
+                .pager
+                .read_main_page(next, self.realm_id, PageKind::Overflow)
+                .await?;
+            let (following, _) = overflow::decode_overflow(guard.body_ref())?;
+            drop(guard);
+            self.pager
+                .rewrite_page_under_current_epoch(next, self.realm_id, PageKind::Overflow)
+                .await?;
+            count += 1;
+            next = following;
         }
         Ok(count)
     }
