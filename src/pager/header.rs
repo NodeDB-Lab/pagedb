@@ -82,6 +82,28 @@ pub async fn bootstrap_header<V: Vfs>(
 /// Open an existing main.db, return the active header fields and which slot
 /// they came from.
 ///
+/// Read one header slot into `buf`, treating an incomplete slot as an
+/// unverifiable one rather than as a fatal error.
+///
+/// The A/B protocol survives one unusable slot by design, and a file truncated
+/// mid-slot is exactly that case: the surviving copy must still open the
+/// database. `buf` keeps whatever prefix was transferred, so the caller's
+/// ordinary decode rejects it on the magic or HK-MAC check like any other
+/// damaged slot. Every other backend error propagates unchanged — only
+/// end-of-file is absence.
+pub(crate) async fn read_header_slot<F: VfsFile + ?Sized>(
+    file: &mut F,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<()> {
+    match read_exact_at(file, offset, buf).await {
+        Err(PagedbError::Io(ref error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// Reads both slots; verifies each via HK-MAC; picks the one with the
 /// greater `seq`. If only one verifies, it wins. If neither verifies, returns
 /// `Corruption(HeaderUnverifiable)` — unrecoverable from inside the header
@@ -95,10 +117,10 @@ pub async fn open_header<V: Vfs>(
     let mut f = vfs.open(path, OpenMode::ReadWrite).await?;
     let mut buf_a = vec![0u8; page_size];
     let mut buf_b = vec![0u8; page_size];
-    read_exact_at(&mut f, 0, &mut buf_a).await?;
+    read_header_slot(&mut f, 0, &mut buf_a).await?;
     let page_size_u64 = u64::try_from(page_size)
         .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
-    read_exact_at(&mut f, page_size_u64, &mut buf_b).await?;
+    read_header_slot(&mut f, page_size_u64, &mut buf_b).await?;
     let a = decode_main_db_header(&buf_a, hk, page_size).ok();
     let b = decode_main_db_header(&buf_b, hk, page_size).ok();
     match (a, b) {

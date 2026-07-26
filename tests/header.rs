@@ -259,3 +259,55 @@ async fn open_picks_higher_seq_when_both_verify() {
     assert_eq!(slot, ActiveSlot::B);
     assert_eq!(got.counter_anchor, 9000);
 }
+
+/// A file truncated mid-slot must still open on the surviving copy.
+///
+/// The A/B protocol exists so that one unusable slot is survivable. Reading a
+/// slot short is the same condition as a slot that fails its HK-MAC: absent,
+/// not fatal. Rejecting the open outright would throw away the intact header
+/// sitting in the other slot.
+#[tokio::test(flavor = "current_thread")]
+async fn open_survives_a_file_truncated_inside_the_inactive_slot() {
+    let vfs = MemVfs::new();
+    let hk = hk();
+    bootstrap_header(&vfs, "/main.db", &hk, &sample(1, 12, 4242), 4096)
+        .await
+        .unwrap();
+
+    // Slot A is intact; slot B is cut in half.
+    let mut f = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+    f.truncate(4096 + 2048).await.unwrap();
+    f.sync().await.unwrap();
+    drop(f);
+
+    let (got, slot) = open_header(&vfs, "/main.db", &hk, 4096)
+        .await
+        .expect("the intact slot must still open the database");
+    assert_eq!(slot, ActiveSlot::A);
+    assert_eq!(got.seq, 1);
+    assert_eq!(got.counter_anchor, 4242);
+}
+
+/// With neither slot readable, the header layer still reports corruption
+/// rather than leaking a raw end-of-file error.
+#[tokio::test(flavor = "current_thread")]
+async fn open_reports_corruption_when_truncation_takes_both_slots() {
+    let vfs = MemVfs::new();
+    let hk = hk();
+    bootstrap_header(&vfs, "/main.db", &hk, &sample(1, 12, 0), 4096)
+        .await
+        .unwrap();
+
+    let mut f = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+    f.truncate(0).await.unwrap();
+    f.sync().await.unwrap();
+    drop(f);
+
+    let err = open_header(&vfs, "/main.db", &hk, 4096)
+        .await
+        .expect_err("a file with no readable slot must not open");
+    assert!(
+        matches!(err, PagedbError::Corruption(_)),
+        "expected Corruption, got {err:?}"
+    );
+}

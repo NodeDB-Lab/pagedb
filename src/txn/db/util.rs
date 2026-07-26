@@ -4,7 +4,8 @@
 use crate::Result;
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::errors::PagedbError;
-use crate::vfs::{Vfs, read_exact_at};
+use crate::pager::header::read_header_slot;
+use crate::vfs::Vfs;
 
 pub(super) fn page_size_log2(page_size: usize) -> Result<u8> {
     match page_size {
@@ -42,10 +43,10 @@ pub(super) async fn peek_restore_mode<V: Vfs + Clone>(
     let mut f = vfs.open("/main.db", OpenMode::Read).await?;
     let mut buf_a = vec![0u8; page_size];
     let mut buf_b = vec![0u8; page_size];
-    read_exact_at(&mut f, 0, &mut buf_a).await?;
+    read_header_slot(&mut f, 0, &mut buf_a).await?;
     let page_size_u64 = u64::try_from(page_size)
         .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
-    read_exact_at(&mut f, page_size_u64, &mut buf_b).await?;
+    read_header_slot(&mut f, page_size_u64, &mut buf_b).await?;
     drop(f);
 
     for buf in [&buf_a, &buf_b] {

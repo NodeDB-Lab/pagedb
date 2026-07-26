@@ -10,9 +10,10 @@ use crate::crypto::{CipherId, SecretKey};
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
 use crate::pager::header::ActiveSlot;
+use crate::pager::header::read_header_slot;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::pager::{Pager, PagerConfig};
-use crate::vfs::{Vfs, read_exact_at};
+use crate::vfs::Vfs;
 use crate::{RealmId, Result};
 
 use super::super::super::mode::DbMode;
@@ -107,10 +108,10 @@ impl<V: Vfs + Clone> Db<V> {
         let mut f = vfs.open(&main_db_path, file_mode).await?;
         let mut buf_a = vec![0u8; page_size];
         let mut buf_b = vec![0u8; page_size];
-        read_exact_at(&mut f, 0, &mut buf_a).await?;
+        read_header_slot(&mut f, 0, &mut buf_a).await?;
         let page_size_u64 = u64::try_from(page_size)
             .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
-        read_exact_at(&mut f, page_size_u64, &mut buf_b).await?;
+        read_header_slot(&mut f, page_size_u64, &mut buf_b).await?;
         drop(f);
 
         let try_decode = |buf: &[u8]| -> Option<(MainDbHeaderFields, bool)> {
