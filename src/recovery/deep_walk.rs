@@ -331,9 +331,8 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
         catalog_next,
         page_size,
     );
-    let seg_start = vec![0x01u8]; // CatalogRowKind::Segment
-    let seg_end = vec![0x02u8];
-    let catalog_rows = match cat_tree.collect_range(&seg_start, &seg_end).await {
+    let seg_prefix = [crate::catalog::codec::CatalogRowKind::Segment as u8];
+    let catalog_rows = match cat_tree.scan_prefix(&seg_prefix).await {
         Ok(rows) => rows,
         Err(e) => {
             report.page_issues.push(PageIssue {

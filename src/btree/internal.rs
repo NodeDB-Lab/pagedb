@@ -4,8 +4,8 @@ use crate::Result;
 use crate::errors::PagedbError;
 
 use super::node::{
-    HEADER_LEN, NodeHeader, NodeKind, body_capacity, read_header, read_u16_le, read_u64_le,
-    slot_offset, write_header, write_slot_offset, write_u16_le,
+    HEADER_LEN, NodeHeader, NodeKind, body_capacity, read_u16_le, read_u64_le, slot_offset,
+    validate_node_body, write_header, write_slot_offset, write_u16_le,
 };
 
 /// A separator key with the child `page_id` to its right.
@@ -25,7 +25,7 @@ pub struct Internal {
 
 impl Internal {
     pub fn decode(body: &[u8]) -> Result<Self> {
-        let h: NodeHeader = read_header(body)?;
+        let h: NodeHeader = validate_node_body(body)?;
         if h.kind != NodeKind::Internal {
             return Err(PagedbError::corruption(
                 crate::errors::CorruptionDetail::HeaderUnverifiable,
@@ -165,7 +165,7 @@ pub struct InternalAccessor<'a> {
 
 impl<'a> InternalAccessor<'a> {
     pub fn new(body: &'a [u8]) -> Result<Self> {
-        let h = read_header(body)?;
+        let h = validate_node_body(body)?;
         if h.kind != NodeKind::Internal {
             return Err(PagedbError::corruption(
                 crate::errors::CorruptionDetail::HeaderUnverifiable,
