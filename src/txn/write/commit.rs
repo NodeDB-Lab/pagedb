@@ -57,17 +57,13 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // Note: span is not entered via `.entered()` to keep this async fn's
         // future `Send`. Use `tracing::instrument` or enter in sync sections only.
         let new_commit_id = self.guard.latest_commit_id + 1;
-        let precommit_history_state =
-            std::env::var_os("PAGEDB_INVARIANT_CHECKS")
-                .is_some()
-                .then(|| {
-                    (
-                        self.guard.next_page_id,
-                        self.guard.commit_history_root_page_id,
-                        self.guard.commit_history_root_version,
-                        self.guard.commit_history_count,
-                    )
-                });
+        // `Some` is both the enablement signal for the opt-in invariant and the
+        // means of undoing what materialization is about to advance — the check
+        // is never reachable without the rollback it needs. Presence of the
+        // variable enables it, including a non-Unicode value.
+        let invariant_rollback = std::env::var_os("PAGEDB_INVARIANT_CHECKS")
+            .is_some()
+            .then(|| InvariantRollback::capture(&self.guard));
 
         // ── Materialize all trees first ──────────────────────────────────────
         // Done before accounting freed pages so every copy-on-write spine free
@@ -180,27 +176,27 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // caller observes as failed. Check every live tree, including commit
         // history, and keep the strict dangling-pointer walk that detects pages
         // freed in an earlier commit.
-        if let Some(precommit_history_state) = precommit_history_state {
+        if let Some(rollback) = invariant_rollback {
             let freed = entries.iter().map(|&(_, page_id)| page_id).collect();
+            let roots = [
+                ("data", new_root),
+                ("catalog", new_catalog_root),
+                ("commit-history", self.guard.commit_history_root_page_id),
+            ];
             if let Err(violation) = assert_freed_pages_unreachable(
                 self.db,
-                [
-                    new_root,
-                    new_catalog_root,
-                    self.guard.commit_history_root_page_id,
-                ],
+                roots,
                 self.guard.next_page_id,
                 &freed,
                 new_commit_id,
             )
             .await
             {
-                (
-                    self.guard.next_page_id,
-                    self.guard.commit_history_root_page_id,
-                    self.guard.commit_history_root_version,
-                    self.guard.commit_history_count,
-                ) = precommit_history_state;
+                // Unwind to exactly the state the still-durable header
+                // describes, so the next writer bump-allocates over the pages
+                // this candidate abandoned instead of leaking their ids.
+                // `Drop` discards the dirty pages themselves.
+                rollback.restore(&mut self.guard);
                 panic!("{violation}");
             }
         }
@@ -330,6 +326,41 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
     }
 }
 
+/// The writer fields a candidate commit advances before the opt-in invariant
+/// runs, captured so a rejected candidate can be unwound.
+///
+/// These four are exactly what tree materialization and
+/// `write_commit_history_entry` assign. Everything else the pre-invariant
+/// stretch of `commit` touches is either transaction-local (dies with the
+/// `WriteTxn`) or rebuilt from the durable free-list by the next
+/// `begin_write` — the shared allocator caches among them — so it needs no
+/// rollback of its own.
+#[derive(Clone, Copy)]
+struct InvariantRollback {
+    next_page_id: u64,
+    commit_history_root_page_id: u64,
+    commit_history_root_version: u64,
+    commit_history_count: Option<u64>,
+}
+
+impl InvariantRollback {
+    fn capture(state: &super::super::db::WriterState) -> Self {
+        Self {
+            next_page_id: state.next_page_id,
+            commit_history_root_page_id: state.commit_history_root_page_id,
+            commit_history_root_version: state.commit_history_root_version,
+            commit_history_count: state.commit_history_count,
+        }
+    }
+
+    fn restore(self, state: &mut super::super::db::WriterState) {
+        state.next_page_id = self.next_page_id;
+        state.commit_history_root_page_id = self.commit_history_root_page_id;
+        state.commit_history_root_version = self.commit_history_root_version;
+        state.commit_history_count = self.commit_history_count;
+    }
+}
+
 #[derive(Debug)]
 enum FreedPageInvariantViolation {
     Dangling {
@@ -382,19 +413,26 @@ impl std::fmt::Display for FreedPageInvariantViolation {
     }
 }
 
+/// Reject a candidate commit that would free a page still reachable from any
+/// of its live trees, or whose live trees cannot be authenticated and decoded.
+///
+/// Each root is walked twice, and the two walks are not redundant.
+/// `find_dangling` selects a node's decoder from the node body's own header
+/// byte and reports the first bad *pointer* with its parent, which is what
+/// localizes a use-after-free. `collect_all_page_ids` selects the decoder from
+/// the *authenticated* envelope kind, so it also catches a page whose envelope
+/// and body disagree — invisible to the first walk — and its error must be
+/// propagated rather than dropped, or the freed-set check below would pass
+/// merely because the reachable set came back short.
 async fn assert_freed_pages_unreachable<V: Vfs + Clone>(
     db: &super::super::db::Db<V>,
-    roots: [u64; 3],
+    roots: [(&'static str, u64); 3],
     next_page_id: u64,
     freed: &HashSet<u64>,
     commit_id: u64,
 ) -> std::result::Result<(), FreedPageInvariantViolation> {
     let mut reachable = std::collections::BTreeSet::new();
-    for (tree_name, root) in ["data", "catalog", "commit-history"]
-        .into_iter()
-        .zip(roots)
-        .filter(|(_, root)| *root != 0)
-    {
+    for (tree_name, root) in roots.into_iter().filter(|(_, root)| *root != 0) {
         let tree = crate::btree::BTree::open(
             db.pager.clone(),
             db.realm_id,
@@ -457,14 +495,17 @@ mod tests {
 
     use super::*;
     use crate::OpenOptions;
+    use crate::pager::PageKind;
     use crate::vfs::memory::MemVfs;
+
+    const REALM: crate::RealmId = crate::RealmId::new([3u8; 16]);
 
     async fn populated_db() -> crate::Db<MemVfs> {
         let db = crate::Db::open_internal_with_options(
             MemVfs::new(),
             [7u8; 32],
             4096,
-            crate::RealmId::new([3u8; 16]),
+            REALM,
             OpenOptions::default(),
         )
         .await
@@ -486,7 +527,11 @@ mod tests {
 
         let violation = assert_freed_pages_unreachable(
             &db,
-            [0, 0, history_root],
+            [
+                ("data", 0),
+                ("catalog", 0),
+                ("commit-history", history_root),
+            ],
             next_page_id,
             &HashSet::from([history_root]),
             2,
@@ -508,7 +553,11 @@ mod tests {
 
         let violation = assert_freed_pages_unreachable(
             &db,
-            [unreadable_root, 0, 0],
+            [
+                ("data", unreadable_root),
+                ("catalog", 0),
+                ("commit-history", 0),
+            ],
             unreadable_root + 1,
             &HashSet::new(),
             2,
@@ -525,9 +574,71 @@ mod tests {
         ));
     }
 
+    /// The two walks are complementary, not redundant, and the invariant has to
+    /// fail closed when only the second one objects.
+    ///
+    /// `find_dangling` picks a node's decoder from the body's own header byte;
+    /// `collect_all_page_ids` picks it from the authenticated envelope kind. A
+    /// page whose envelope says internal while its body is a valid leaf
+    /// therefore satisfies the first walk and fails the second. Dropping that
+    /// error would leave a short reachable set that the freed-page check would
+    /// then clear vacuously.
+    #[tokio::test(flavor = "current_thread")]
+    async fn invariant_rejects_a_root_whose_authenticated_kind_contradicts_its_body() {
+        let db = populated_db().await;
+        let (data_root, next_page_id) = {
+            let state = db.writer.lock().await;
+            (state.root_page_id, state.next_page_id)
+        };
+
+        // Re-persist the real leaf root's bytes under the internal-node
+        // envelope kind. Copying a live page keeps the body structurally valid,
+        // so the disagreement is purely the authenticated kind.
+        let (guard, kind) = db.pager.read_main_node(data_root, REALM).await.unwrap();
+        assert_eq!(kind, PageKind::BTreeLeaf, "the fixture root must be a leaf");
+        let body = guard.body_ref().to_vec();
+        drop(guard);
+        let forged = next_page_id;
+        db.pager
+            .write_main_page(forged, REALM, PageKind::BTreeInternal, &body)
+            .await
+            .unwrap();
+        db.pager.flush_main(REALM).await.unwrap();
+        db.pager.reset_main_pages();
+
+        let tree =
+            crate::btree::BTree::open(db.pager.clone(), REALM, forged, forged + 1, db.page_size);
+        assert!(
+            tree.find_dangling().await.is_none(),
+            "the strict pointer walk is expected to miss a kind disagreement; \
+             if it now catches it, this test no longer covers the traversal path"
+        );
+
+        let violation = assert_freed_pages_unreachable(
+            &db,
+            [("data", forged), ("catalog", 0), ("commit-history", 0)],
+            forged + 1,
+            &HashSet::new(),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                violation,
+                FreedPageInvariantViolation::Traversal {
+                    tree_name: "data",
+                    root,
+                    ..
+                } if root == forged
+            ),
+            "expected a traversal violation, got {violation:?}"
+        );
+    }
+
     #[test]
     fn invariant_failure_precedes_durable_publication() {
-        let status = Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
                 "--exact",
@@ -535,9 +646,22 @@ mod tests {
                 "--nocapture",
             ])
             .env("PAGEDB_INVARIANT_CHECKS", "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "invariant subprocess failed: {status}");
+        let report = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        // libtest exits 0 when a filter matches nothing, so a successful status
+        // on its own would keep reporting green if this path ever drifted —
+        // renaming the child, the module, or the file would silently delete the
+        // regression. Require evidence that the child actually ran.
+        assert!(
+            report.contains("1 passed"),
+            "the child helper did not run; the filter no longer names it:\n{report}"
+        );
+        assert!(
+            output.status.success(),
+            "invariant subprocess failed:\n{report}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
