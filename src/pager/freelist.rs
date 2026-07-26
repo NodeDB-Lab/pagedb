@@ -50,11 +50,7 @@ pub async fn read_chain<V: Vfs + Clone>(
     let mut page = head;
     while page != 0 {
         if !seen.insert(page) {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::CatalogRowInvalid {
-                    field: "freelist chain contains a cycle",
-                },
-            ));
+            return Err(PagedbError::page_chain_cycle("free_list", page));
         }
         let guard = pager.read_main_page(page, realm_id, PageKind::Free).await?;
         let body = guard.body_ref();
@@ -238,6 +234,15 @@ mod tests {
             .await
             .expect("cycle detection should return before timeout")
             .expect_err("free-list cycles must be corruption");
-        assert!(matches!(error, PagedbError::Corruption(_)));
+        assert!(
+            matches!(
+                error,
+                PagedbError::Corruption(crate::errors::CorruptionDetail::PageChainCycle {
+                    structure: "free_list",
+                    page_id: 10,
+                })
+            ),
+            "expected a free-list PageChainCycle naming page 10, got {error:?}"
+        );
     }
 }

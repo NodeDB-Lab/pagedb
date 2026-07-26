@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::errors::{CorruptionDetail, PagedbError};
+use crate::errors::PagedbError;
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::{PageGuard, Pager};
 use crate::vfs::Vfs;
@@ -14,9 +14,15 @@ use crate::btree::leaf::Leaf;
 use crate::btree::node::{NodeKind, body_capacity, read_header};
 use crate::btree::overflow;
 
+/// Encoded size a value of `value_len` bytes will occupy in a leaf record,
+/// computed before the value is built.
+///
+/// The preflight counterpart to [`LeafValue::encoded_size`], and it must agree
+/// with it — both sides read the same constant rather than restating the
+/// layout.
 fn stored_leaf_value_encoded_size(value_len: usize, page_size: usize) -> Result<usize> {
     if value_len > overflow::inline_value_threshold(page_size) {
-        Ok(2 + 8 + 8)
+        Ok(crate::btree::leaf::OVERFLOW_REF_ENCODED_SIZE)
     } else {
         2usize
             .checked_add(value_len)
@@ -24,8 +30,13 @@ fn stored_leaf_value_encoded_size(value_len: usize, page_size: usize) -> Result<
     }
 }
 
-pub(super) fn malformed_btree_topology() -> PagedbError {
-    PagedbError::corruption(CorruptionDetail::HeaderUnverifiable)
+/// A descent reached a page twice, or followed a zero child pointer.
+///
+/// Both mean the pointer graph has no terminator, which no honest writer can
+/// produce. Named for the walk rather than reported as a generic header
+/// failure, so `fsck` can say which page repeated and in which structure.
+pub(super) fn malformed_btree_topology(structure: &'static str, page_id: u64) -> PagedbError {
+    PagedbError::page_chain_cycle(structure, page_id)
 }
 
 // Keep common shallow descents stack-only and small; deeper trees spill into
@@ -35,22 +46,25 @@ const INLINE_SEEN_PAGE_IDS: usize = 4;
 /// Duplicate-page detector for B-tree descents. Shallow trees stay on the
 /// inline array; deeper trees preserve exact detection through the overflow set.
 pub(super) struct SeenPageIds {
+    /// Which walk this is, so a rejection can name the structure it was in.
+    structure: &'static str,
     inline: [u64; INLINE_SEEN_PAGE_IDS],
     len: usize,
     overflow: Option<BTreeSet<u64>>,
 }
 
 impl SeenPageIds {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(structure: &'static str) -> Self {
         Self {
+            structure,
             inline: [0; INLINE_SEEN_PAGE_IDS],
             len: 0,
             overflow: None,
         }
     }
 
-    pub(super) fn from_existing(path: &[u64]) -> Result<Self> {
-        let mut seen = Self::new();
+    pub(super) fn from_existing(structure: &'static str, path: &[u64]) -> Result<Self> {
+        let mut seen = Self::new(structure);
         for &page_id in path {
             seen.insert(page_id)?;
         }
@@ -59,7 +73,7 @@ impl SeenPageIds {
 
     pub(super) fn insert(&mut self, page_id: u64) -> Result<()> {
         if page_id == 0 || !self.insert_inner(page_id) {
-            return Err(malformed_btree_topology());
+            return Err(malformed_btree_topology(self.structure, page_id));
         }
         Ok(())
     }

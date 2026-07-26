@@ -195,7 +195,7 @@ impl<V: Vfs> BTree<V> {
     pub(super) async fn path_to_leaf_for_key(&self, key: &[u8]) -> Result<Vec<u64>> {
         let mut path = Vec::new();
         let mut page_id = self.root_page_id;
-        let mut seen = SeenPageIds::new();
+        let mut seen = SeenPageIds::new("btree_descent");
         loop {
             seen.insert(page_id)?;
             path.push(page_id);
@@ -226,7 +226,7 @@ impl<V: Vfs> BTree<V> {
             // Root is a leaf; no next leaf.
             return Ok(None);
         }
-        let mut seen = SeenPageIds::from_existing(path)?;
+        let mut seen = SeenPageIds::from_existing("btree_descent", path)?;
         let mut child = path[path.len() - 1];
         for i in (0..path.len() - 1).rev() {
             let (guard, _kind) = self.read_node_guard(path[i]).await?;
@@ -264,7 +264,7 @@ impl<V: Vfs> BTree<V> {
     pub(super) async fn path_to_rightmost_leaf(&self) -> Result<Vec<u64>> {
         let mut path = Vec::new();
         let mut page_id = self.root_page_id;
-        let mut seen = SeenPageIds::new();
+        let mut seen = SeenPageIds::new("btree_descent");
         loop {
             seen.insert(page_id)?;
             path.push(page_id);
