@@ -155,6 +155,27 @@ fn compute_manifest_mac(data: &[u8], hk_key: &[u8; 32]) -> [u8; 16] {
     out
 }
 
+async fn ensure_empty_destination(path: &Path) -> Result<()> {
+    match fs::read_dir(path).await {
+        Ok(mut entries) => {
+            if entries
+                .next_entry()
+                .await
+                .map_err(PagedbError::Io)?
+                .is_some()
+            {
+                return Err(PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("snapshot destination is not empty: {}", path.display()),
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(PagedbError::Io(error)),
+    }
+    Ok(())
+}
+
 /// Copy all bytes from a tokio file to a destination path, returning bytes written.
 async fn copy_file_to(src_path: &Path, dst_path: &Path) -> Result<u64> {
     let mut src = fs::File::open(src_path).await.map_err(PagedbError::Io)?;
@@ -170,6 +191,7 @@ async fn copy_file_to(src_path: &Path, dst_path: &Path) -> Result<u64> {
         total += n as u64;
     }
     dst.flush().await.map_err(PagedbError::Io)?;
+    dst.sync_all().await.map_err(PagedbError::Io)?;
     Ok(total)
 }
 
@@ -184,7 +206,10 @@ pub async fn snapshot_full(
     manifest: &SnapshotManifest,
     hk_key: &[u8; 32],
     segment_ids: &[[u8; 16]],
+    highest_required_main_page: u64,
 ) -> Result<SnapshotStats> {
+    ensure_empty_destination(dst_path).await?;
+
     // Create destination directory layout.
     fs::create_dir_all(dst_path)
         .await
@@ -204,6 +229,7 @@ pub async fn snapshot_full(
         .await
         .map_err(PagedbError::Io)?;
     mf.flush().await.map_err(PagedbError::Io)?;
+    mf.sync_all().await.map_err(PagedbError::Io)?;
     let mut total_bytes: u64 = MANIFEST_RESERVED_SIZE as u64;
 
     // Copy main.db.
@@ -214,6 +240,20 @@ pub async fn snapshot_full(
 
     // Count pages from file size.
     let page_size = u64::from(manifest.page_size);
+    let highest_required_page = highest_required_main_page.max(1).max(
+        manifest
+            .target_active_root_page_id
+            .max(manifest.target_catalog_root_page_id),
+    );
+    let required_main_bytes = highest_required_page
+        .checked_add(1)
+        .and_then(|page_count| page_count.checked_mul(page_size))
+        .ok_or_else(|| PagedbError::snapshot_artifact_invalid("main.db.length"))?;
+    if main_bytes < required_main_bytes {
+        return Err(PagedbError::Io(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof,
+        )));
+    }
     let pages_written = main_bytes.checked_div(page_size).unwrap_or(0);
 
     // Copy segment files.
@@ -222,11 +262,8 @@ pub async fn snapshot_full(
         let hex = crate::hex::to_hex_lower(seg_id);
         let seg_src = src_db_root.join("seg").join(&hex);
         let seg_dst_file = seg_dst.join(&hex);
-        if let Ok(n) = copy_file_to(&seg_src, &seg_dst_file).await {
-            total_bytes += n;
-            segments_written += 1;
-        }
-        // Err(_): file may have been tombstoned between list and copy; skip.
+        total_bytes += copy_file_to(&seg_src, &seg_dst_file).await?;
+        segments_written += 1;
     }
 
     Ok(SnapshotStats {
@@ -245,16 +282,15 @@ pub async fn snapshot_full(
 /// The header byte at offset 12 of a data page is the first byte of the
 /// 6-byte nonce, not the `commit_id`. The specification says: "compare
 /// `commit_id` stored in each data-page header (offset 12 per Format A)".
-/// However, Format A layout has: `cipher_id`[0], `page_kind`[1], flags[2..4],
-/// `mk_epoch`[4..12], nonce[12..18]. There is no per-page `commit_id` in the
+/// However, Format A layout has: `cipher_id[0]`, `page_kind[1]`, `flags[2..4]`,
+/// `mk_epoch[4..12]`, `nonce[12..18]`. There is no per-page `commit_id` in the
 /// ciphertext header. The correct approach is to emit all pages from the
 /// current root that are at `page_id` >= `base_next_page_id` (newly allocated
 /// after base commit), or use the data pages the `BTree` walks.
 ///
-/// We use a practical simplification: emit all pages reachable from the
-/// current root whose `page_id` >= `base_next_page_id` (pages allocated after
-/// the base snapshot's `next_page_id`). This is conservative but correct: it
-/// never emits fewer pages than needed.
+/// The caller walks both authenticated snapshots and supplies the exact set of
+/// target-reachable pages that were not reachable from the base. Reused page
+/// IDs below the base allocation cursor are rejected before this writer runs.
 pub async fn snapshot_incremental(
     src_db_root: &Path,
     dst_path: &Path,
@@ -264,6 +300,8 @@ pub async fn snapshot_incremental(
     base_next_page_id: u64,
     changed_page_ids: &[u64],
 ) -> Result<SnapshotStats> {
+    ensure_empty_destination(dst_path).await?;
+
     fs::create_dir_all(dst_path)
         .await
         .map_err(PagedbError::Io)?;
@@ -282,6 +320,7 @@ pub async fn snapshot_incremental(
         .await
         .map_err(PagedbError::Io)?;
     mf.flush().await.map_err(PagedbError::Io)?;
+    mf.sync_all().await.map_err(PagedbError::Io)?;
     let mut total_bytes: u64 = MANIFEST_RESERVED_SIZE as u64;
 
     // Write pages.delta: (page_id u64 BE, page_bytes) for each changed page.
@@ -314,13 +353,10 @@ pub async fn snapshot_incremental(
             .seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(PagedbError::Io)?;
-        let n = main_file
-            .read(&mut page_buf)
+        main_file
+            .read_exact(&mut page_buf)
             .await
             .map_err(PagedbError::Io)?;
-        if n < page_size {
-            continue; // sparse / beyond EOF
-        }
         delta_file
             .write_all(&page_id.to_be_bytes())
             .await
@@ -333,6 +369,7 @@ pub async fn snapshot_incremental(
         pages_written += 1;
     }
     delta_file.flush().await.map_err(PagedbError::Io)?;
+    delta_file.sync_all().await.map_err(PagedbError::Io)?;
     let _ = base_next_page_id; // used by caller to compute changed_page_ids
 
     // Copy new/changed segment files.
@@ -341,10 +378,8 @@ pub async fn snapshot_incremental(
         let hex = crate::hex::to_hex_lower(seg_id);
         let seg_src = src_db_root.join("seg").join(&hex);
         let seg_dst_file = seg_dst.join(&hex);
-        if let Ok(n) = copy_file_to(&seg_src, &seg_dst_file).await {
-            total_bytes += n;
-            segments_written += 1;
-        }
+        total_bytes += copy_file_to(&seg_src, &seg_dst_file).await?;
+        segments_written += 1;
     }
 
     Ok(SnapshotStats {
@@ -373,11 +408,11 @@ pub async fn open_manifest(manifest_path: &Path, kek: &[u8; 32]) -> Result<Snaps
     let mut f = fs::File::open(manifest_path)
         .await
         .map_err(PagedbError::Io)?;
-    let mut buf = [0u8; MANIFEST_RESERVED_SIZE];
-    let n = f.read(&mut buf).await.map_err(PagedbError::Io)?;
-    if n < MANIFEST_RESERVED_SIZE {
+    if f.metadata().await.map_err(PagedbError::Io)?.len() != MANIFEST_RESERVED_SIZE as u64 {
         return Err(PagedbError::snapshot_artifact_invalid("manifest.length"));
     }
+    let mut buf = [0u8; MANIFEST_RESERVED_SIZE];
+    f.read_exact(&mut buf).await.map_err(PagedbError::Io)?;
     // Extract kek_salt from buf[53..69] and mk_epoch from buf[45..53] to
     // derive the HK key needed to verify the MAC.
     let mut kek_salt = [0u8; 16];

@@ -3,13 +3,21 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::Result;
 use crate::errors::PagedbError;
+
+/// Pages consumed from one `pages.delta` stream during an incremental apply.
+pub struct AppliedDeltaPages {
+    /// Number of page records written to `main.db`.
+    pub pages_applied: u64,
+    /// Page IDs supplied by this exact delta stream.
+    pub page_ids: BTreeSet<u64>,
+}
 
 /// Apply an incremental snapshot directory (`src_path`) to the Follower's
 /// `main.db` file at `main_db_path` (absolute filesystem path). Returns stats.
@@ -20,13 +28,68 @@ pub async fn apply_delta_pages(
     src_path: &Path,
     dst_main_db_path: &Path,
     page_size: usize,
-) -> Result<u64> {
+    protected_page_ids: &BTreeSet<u64>,
+    base_allocation_floor: u64,
+    target_next_page_id: u64,
+) -> Result<AppliedDeltaPages> {
     let delta_path = src_path.join("pages.delta");
     let mut delta = match fs::File::open(&delta_path).await {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AppliedDeltaPages {
+                pages_applied: 0,
+                page_ids: BTreeSet::new(),
+            });
+        }
         Err(e) => return Err(PagedbError::Io(e)),
     };
+
+    let page_size_u64 = u64::try_from(page_size)
+        .map_err(|_| PagedbError::snapshot_artifact_invalid("pages.delta.page_size"))?;
+    let record_size = 8u64
+        .checked_add(page_size_u64)
+        .ok_or_else(|| PagedbError::snapshot_artifact_invalid("pages.delta.record_size"))?;
+    let delta_len = delta.metadata().await.map_err(PagedbError::Io)?.len();
+    if delta_len % record_size != 0 {
+        return Err(PagedbError::snapshot_artifact_invalid("pages.delta.length"));
+    }
+
+    // Validate every record before opening main.db for writes. A malformed
+    // record late in the stream must not leave a valid prefix written into the
+    // follower's future page range.
+    let record_count = delta_len / record_size;
+    let mut page_ids = BTreeSet::new();
+    let mut id_buf = [0u8; 8];
+    let page_skip = i64::try_from(page_size)
+        .map_err(|_| PagedbError::snapshot_artifact_invalid("pages.delta.page_size"))?;
+    for _ in 0..record_count {
+        delta
+            .read_exact(&mut id_buf)
+            .await
+            .map_err(PagedbError::Io)?;
+        let page_id = u64::from_be_bytes(id_buf);
+        if page_id < base_allocation_floor
+            || page_id >= target_next_page_id
+            || protected_page_ids.contains(&page_id)
+        {
+            return Err(PagedbError::snapshot_artifact_invalid(
+                "pages.delta.page_id",
+            ));
+        }
+        if !page_ids.insert(page_id) {
+            return Err(PagedbError::snapshot_artifact_invalid(
+                "pages.delta.duplicate_page_id",
+            ));
+        }
+        delta
+            .seek(std::io::SeekFrom::Current(page_skip))
+            .await
+            .map_err(PagedbError::Io)?;
+    }
+    delta
+        .seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(PagedbError::Io)?;
 
     let mut dst = fs::OpenOptions::new()
         .read(true)
@@ -34,40 +97,34 @@ pub async fn apply_delta_pages(
         .open(dst_main_db_path)
         .await
         .map_err(PagedbError::Io)?;
-
-    let mut pages_applied: u64 = 0;
-    let mut id_buf = [0u8; 8];
     let mut page_buf = vec![0u8; page_size];
-
-    loop {
-        // Read page_id (8 bytes BE).
-        match delta.read_exact(&mut id_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(PagedbError::Io(e)),
-        }
+    for _ in 0..record_count {
+        delta
+            .read_exact(&mut id_buf)
+            .await
+            .map_err(PagedbError::Io)?;
         let page_id = u64::from_be_bytes(id_buf);
-
-        // Read page bytes.
-        match delta.read_exact(&mut page_buf).await {
-            Ok(_) => {}
-            Err(e) => return Err(PagedbError::Io(e)),
-        }
+        delta
+            .read_exact(&mut page_buf)
+            .await
+            .map_err(PagedbError::Io)?;
 
         // Write page to main.db at the correct offset.
         let offset = page_id
-            .checked_mul(page_size as u64)
-            .ok_or_else(|| PagedbError::Io(std::io::Error::other("page offset overflow")))?;
+            .checked_mul(page_size_u64)
+            .ok_or_else(|| PagedbError::snapshot_artifact_invalid("pages.delta.page_offset"))?;
         dst.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(PagedbError::Io)?;
         dst.write_all(&page_buf).await.map_err(PagedbError::Io)?;
-        pages_applied += 1;
     }
 
     dst.flush().await.map_err(PagedbError::Io)?;
     dst.sync_all().await.map_err(PagedbError::Io)?;
-    Ok(pages_applied)
+    Ok(AppliedDeltaPages {
+        pages_applied: record_count,
+        page_ids,
+    })
 }
 
 /// Verify that the snapshot's segment directory has exactly the count claimed
@@ -90,9 +147,20 @@ pub(crate) async fn validate_snapshot_segment_count(src_path: &Path, expected: u
 pub async fn stage_snapshot_segments(
     src_path: &Path,
     dst_seg_root: &Path,
+    expected_segment_ids: &BTreeSet<[u8; 16]>,
 ) -> Result<Vec<[u8; 16]>> {
     let entries = snapshot_segment_entries(src_path).await?;
     let seg_src = src_path.join("seg");
+    let actual_segment_ids: BTreeSet<[u8; 16]> = entries
+        .iter()
+        .map(|name| {
+            crate::hex::parse_hex::<16>(name)
+                .ok_or_else(|| PagedbError::snapshot_artifact_invalid("segment_file_name"))
+        })
+        .collect::<Result<_>>()?;
+    if &actual_segment_ids != expected_segment_ids {
+        return Err(PagedbError::snapshot_artifact_invalid("segments"));
+    }
 
     let staging_dir = dst_seg_root.join(".staging");
     fs::create_dir_all(&staging_dir)
@@ -103,7 +171,6 @@ pub async fn stage_snapshot_segments(
     let mut copy_buf = vec![0u8; 64 * 1024];
 
     for name in &entries {
-        // Each name in seg/ is 32 hex chars encoding the 16-byte segment id.
         let segment_id = crate::hex::parse_hex::<16>(name)
             .ok_or_else(|| PagedbError::snapshot_artifact_invalid("segment_file_name"))?;
         let src_file = seg_src.join(name);
