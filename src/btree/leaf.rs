@@ -2,6 +2,7 @@
 
 use crate::Result;
 use crate::errors::PagedbError;
+use crate::pager::page_space::is_reserved;
 
 use super::node::{
     HEADER_LEN, NodeHeader, NodeKind, OVERFLOW_SENTINEL, body_capacity, read_u16_le, read_u64_le,
@@ -157,7 +158,7 @@ impl Leaf {
                     root_page_id,
                 } => {
                     assert!(
-                        *root_page_id >= 4,
+                        !is_reserved(*root_page_id),
                         "encoding leaf record with wild overflow root_page_id={root_page_id} \
                          (reserved page — use-after-free / stale value)"
                     );

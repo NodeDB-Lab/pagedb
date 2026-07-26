@@ -221,6 +221,18 @@ pub enum CorruptionDetail {
     },
     /// main.db A/B header HK-MAC failed on both copies.
     HeaderUnverifiable,
+    /// A live B+ tree or overflow pointer targets a reserved page (0..=3).
+    /// Pages 0 and 1 are the A/B structural headers and 2..=3 the apply-journal;
+    /// no live tree pointer may reach them, so this is a wild pointer or a
+    /// use-after-free that handed a reserved page back to an allocation.
+    ReservedPageReferenced {
+        parent_page_id: u64,
+        child_page_id: u64,
+    },
+    /// An overflow chain revisited a page it had already walked, so the chain
+    /// has no terminator. Distinct from a truncated chain: the links
+    /// authenticate, they just form a loop.
+    OverflowChainCycle { root_page_id: u64, page_id: u64 },
 }
 
 /// Quota failure reason, distinguishing which resource was exhausted.
@@ -265,6 +277,24 @@ impl PagedbError {
     #[must_use]
     pub const fn catalog_row_invalid(field: &'static str) -> Self {
         Self::Corruption(CorruptionDetail::CatalogRowInvalid { field })
+    }
+
+    /// Canonical constructor for a live tree pointer into a reserved page.
+    #[must_use]
+    pub const fn reserved_page_referenced(parent_page_id: u64, child_page_id: u64) -> Self {
+        Self::Corruption(CorruptionDetail::ReservedPageReferenced {
+            parent_page_id,
+            child_page_id,
+        })
+    }
+
+    /// Canonical constructor for a cyclic overflow chain.
+    #[must_use]
+    pub const fn overflow_chain_cycle(root_page_id: u64, page_id: u64) -> Self {
+        Self::Corruption(CorruptionDetail::OverflowChainCycle {
+            root_page_id,
+            page_id,
+        })
     }
 
     /// Canonical constructor for an incremental snapshot that cannot be
