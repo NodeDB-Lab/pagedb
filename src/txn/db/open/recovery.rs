@@ -72,5 +72,8 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         .await?;
     }
 
+    db.validate_counter_rows(catalog_root_page_id, next_page_id)
+        .await?;
+
     Ok(())
 }

@@ -44,12 +44,39 @@ impl<V: Vfs + Clone> Db<V> {
         let Some(key) = hist.first_key().await? else {
             return Ok(None);
         };
-        if key.len() < 8 {
-            return Ok(None);
+        if key.len() != 8 {
+            return Err(PagedbError::catalog_row_invalid("commit_history.key"));
         }
         let mut b = [0u8; 8];
         b.copy_from_slice(&key[..8]);
         Ok(Some(u64::from_be_bytes(b)))
+    }
+
+    /// Authenticate and decode every persisted named-counter row during open.
+    ///
+    /// Named counters are already atomic with catalog-root publication, so
+    /// recovery validates their encoding but never rewrites their values.
+    pub(super) async fn validate_counter_rows(
+        &self,
+        catalog_root_page_id: u64,
+        next_page_id: u64,
+    ) -> Result<()> {
+        if catalog_root_page_id == 0 {
+            return Ok(());
+        }
+
+        let prefix = [crate::catalog::codec::CatalogRowKind::Counter as u8];
+        let tree = BTree::open(
+            self.pager.clone(),
+            self.realm_id,
+            catalog_root_page_id,
+            next_page_id,
+            self.page_size,
+        );
+        for (_key, value) in tree.scan_prefix(&prefix).await? {
+            Catalog::decode_counter(&value)?;
+        }
+        Ok(())
     }
 
     /// Write per-realm quota caps into the catalog B+ tree and persist the
@@ -305,5 +332,75 @@ impl<V: Vfs + Clone> Db<V> {
         state.next_page_id = new_next;
 
         Ok(freed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::vfs::memory::MemVfs;
+    use crate::{Db, PagedbError, RealmId};
+
+    use super::*;
+
+    const PAGE: usize = 4096;
+    const REALM: RealmId = RealmId::new([0xA7; 16]);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn counter_recovery_surfaces_malformed_counter_row() {
+        let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
+            .await
+            .unwrap();
+        {
+            let mut txn = db.begin_write().await.unwrap();
+            let mut counter = txn.counter("bad-counter").unwrap();
+            counter.set(5).await.unwrap();
+            drop(counter);
+            txn.commit().await.unwrap();
+        }
+
+        let (catalog_root, next_page_id) = {
+            let state = db.writer.lock().await;
+            (state.catalog_root_page_id, state.next_page_id)
+        };
+        let mut tree = BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            catalog_root,
+            next_page_id,
+            db.page_size,
+        );
+        tree.put(&Catalog::counter_key(&[0xFF]).unwrap(), b"bad")
+            .await
+            .unwrap();
+        tree.flush().await.unwrap();
+
+        let err = db
+            .validate_counter_rows(tree.root_page_id(), tree.next_page_id())
+            .await
+            .expect_err("malformed counter row must surface during recovery validation");
+        assert!(matches!(err, PagedbError::Corruption(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oldest_retained_history_commit_surfaces_malformed_history_key() {
+        for malformed_key in [b"x".as_slice(), b"123456789".as_slice()] {
+            let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
+                .await
+                .unwrap();
+            let next_page_id = db.writer.lock().await.next_page_id;
+            let mut history =
+                BTree::open(db.pager.clone(), db.realm_id, 0, next_page_id, db.page_size);
+            history
+                .put(malformed_key, b"malformed history")
+                .await
+                .unwrap();
+            history.flush().await.unwrap();
+
+            let err = db
+                .oldest_retained_history_commit(history.root_page_id(), history.next_page_id())
+                .await
+                .expect_err("malformed history key must surface");
+            assert!(matches!(err, PagedbError::Corruption(_)));
+        }
     }
 }

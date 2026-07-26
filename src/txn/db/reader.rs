@@ -262,17 +262,18 @@ impl<V: Vfs + Clone> Db<V> {
                 false,
             ))
         } else {
-            // Find the oldest available: scan the whole history tree. An
-            // exclusive `u64::MAX` upper bound would hide the newest commit
-            // once ids reach the top of the range.
-            let oldest = tree.collect_all().await?.into_iter().next().map_or(
-                CommitId(latest_commit_id),
-                |(k, _)| {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&k[..8]);
-                    CommitId(u64::from_be_bytes(b))
-                },
-            );
+            // Only the leftmost key is needed. This avoids scanning retained
+            // history while still validating its fixed-width key encoding.
+            let oldest = if let Some(key) = tree.first_key().await? {
+                if key.len() != 8 {
+                    return Err(PagedbError::catalog_row_invalid("commit_history.key"));
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&key[..8]);
+                CommitId(u64::from_be_bytes(bytes))
+            } else {
+                CommitId(latest_commit_id)
+            };
             Err(PagedbError::CommitGone {
                 commit,
                 oldest_available: oldest,
@@ -285,16 +286,50 @@ impl<V: Vfs + Clone> Db<V> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::btree::BTree;
     use crate::catalog::codec::SegmentKind;
+    use crate::errors::PagedbError;
     use crate::segment::types::SegmentPageKind;
     use crate::vfs::memory::MemVfs;
-    use crate::{Db, RealmId};
+    use crate::{CommitId, Db, RealmId};
 
     use super::super::core::VisibilityTestHook;
 
     const PAGE: usize = 4096;
     const KEK: [u8; 32] = [0xD1; 32];
     const REALM: RealmId = RealmId::new([0xD2; 16]);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn begin_read_at_surfaces_malformed_oldest_history_key() {
+        for malformed_key in [b"x".as_slice(), b"123456789".as_slice()] {
+            let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
+                .await
+                .unwrap();
+            let next_page_id = db.writer.lock().await.next_page_id;
+            let mut history =
+                BTree::open(db.pager.clone(), db.realm_id, 0, next_page_id, db.page_size);
+            history
+                .put(malformed_key, b"malformed history")
+                .await
+                .unwrap();
+            history.flush().await.unwrap();
+            {
+                let mut state = db.writer.lock().await;
+                state.commit_history_root_page_id = history.root_page_id();
+                state.next_page_id = state.next_page_id.max(history.next_page_id());
+                db.publish_snapshot(&state);
+            }
+
+            let err = match db.begin_read_at(CommitId::new(42)).await {
+                Ok(read) => {
+                    drop(read);
+                    panic!("malformed oldest history key must not produce a reader");
+                }
+                Err(err) => err,
+            };
+            assert!(matches!(err, PagedbError::Corruption(_)));
+        }
+    }
 
     async fn linked_segment(db: &Db<MemVfs>, name: &str, bytes: &[u8]) {
         let mut writer = db

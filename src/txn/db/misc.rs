@@ -160,11 +160,11 @@ impl<V: Vfs + Clone> Db<V> {
             let seg_start = vec![CatalogRowKind::Segment as u8];
             let seg_rows = tree.scan_prefix(&seg_start).await?;
             let seg_count = u32::try_from(seg_rows.len()).unwrap_or(u32::MAX);
-            let seg_bytes: u64 = seg_rows
-                .iter()
-                .filter_map(|(_k, v)| Catalog::decode_segment_meta(v).ok())
-                .map(|m| m.total_bytes)
-                .sum();
+            let mut seg_bytes = 0u64;
+            for (_key, value) in &seg_rows {
+                seg_bytes =
+                    seg_bytes.saturating_add(Catalog::decode_segment_meta(value)?.total_bytes);
+            }
 
             (seg_count, seg_bytes)
         };
@@ -187,5 +187,68 @@ impl<V: Vfs + Clone> Db<V> {
             free_list_pending_entries,
             spill_bytes_in_use: self.spill_bytes_in_use.load(AtOrd::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::btree::BTree;
+    use crate::catalog::codec::Catalog;
+    use crate::vfs::memory::MemVfs;
+    use crate::{Db, PagedbError, RealmId, SegmentKind, SegmentPageKind};
+
+    const PAGE: usize = 4096;
+    const REALM: RealmId = RealmId::new([0xA5; 16]);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stats_surfaces_malformed_segment_catalog_row() {
+        let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
+            .await
+            .unwrap();
+        let mut segment = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        segment
+            .append_page(SegmentPageKind::Data, b"stats")
+            .await
+            .unwrap();
+        let meta = segment.seal().await.unwrap();
+        {
+            let mut txn = db.begin_write().await.unwrap();
+            txn.link_segment("good", &meta).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let (catalog_root, next_page_id) = {
+            let state = db.writer.lock().await;
+            (state.catalog_root_page_id, state.next_page_id)
+        };
+        let mut tree = BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            catalog_root,
+            next_page_id,
+            db.page_size,
+        );
+        tree.put(
+            &Catalog::segment_key(REALM, b"bad").unwrap(),
+            b"not a segment meta",
+        )
+        .await
+        .unwrap();
+        tree.flush().await.unwrap();
+        {
+            let mut state = db.writer.lock().await;
+            state.catalog_root_page_id = tree.root_page_id();
+            state.next_page_id = state.next_page_id.max(tree.next_page_id());
+            db.publish_snapshot(&state);
+        }
+
+        let err = db
+            .stats()
+            .await
+            .expect_err("malformed segment metadata must surface");
+        assert!(matches!(err, PagedbError::Corruption(_)));
     }
 }
