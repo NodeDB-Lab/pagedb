@@ -1,6 +1,6 @@
 //! Main-database rekey transition and durable intent publication.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 
 use subtle::ConstantTimeEq;
@@ -11,9 +11,10 @@ use crate::catalog::codec::{Catalog, RekeyIntent, RekeyStage, RekeyStateRow};
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::{CipherId, DerivedKey, MasterKey, SecretKey};
 use crate::errors::PagedbError;
+use crate::pager::PageKind;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
-use crate::vfs::Vfs;
+use crate::vfs::{OpenMode, Vfs, VfsFile};
 
 #[cfg(test)]
 use super::super::core::RekeyTestFault;
@@ -26,6 +27,30 @@ use super::intent::{intent_proof, migrate_legacy, validate_intent_for_current_ci
 /// Rows are 40 bytes, so this is a few KiB resident regardless of how deep
 /// retention runs.
 const HISTORY_ROOT_BATCH: usize = 512;
+
+async fn read_main_page_kind<F: VfsFile>(file: &F, offset: u64) -> Result<Option<PageKind>> {
+    let mut envelope = [0u8; 2];
+    let mut filled = 0;
+    while filled < envelope.len() {
+        let read = file
+            .read_at(offset + filled as u64, &mut envelope[filled..])
+            .await?;
+        if read == 0 {
+            return Err(PagedbError::Io(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            )));
+        }
+        filled += read;
+    }
+    if envelope == [0, 0] {
+        return Ok(None);
+    }
+    let kind = PageKind::from_byte(envelope[1])?;
+    if !kind.is_main_db() {
+        return Err(PagedbError::IllegalPageKind);
+    }
+    Ok(Some(kind))
+}
 
 impl<V: Vfs + Clone> Db<V> {
     /// Rekey the reachable main database and every catalog-linked immutable
@@ -219,23 +244,8 @@ impl<V: Vfs + Clone> Db<V> {
             self.rewrite_retained_history_roots(state, &mut rewritten)
                 .await?;
         }
-        if state.free_list_root_page_id != 0 {
-            let (_, chain_pages) = crate::pager::freelist::read_chain(
-                &self.pager,
-                self.realm_id,
-                state.free_list_root_page_id,
-            )
+        self.rewrite_free_list_pages(state.free_list_root_page_id)
             .await?;
-            for page_id in chain_pages {
-                self.pager
-                    .rewrite_page_under_current_epoch(
-                        page_id,
-                        self.realm_id,
-                        crate::pager::PageKind::Free,
-                    )
-                    .await?;
-            }
-        }
         // Keep the catalog path carrying the intent source-readable until
         // target-header publication. This is the durable admission anchor
         // for an ordinary open that can verify only the stale A/B side.
@@ -245,6 +255,70 @@ impl<V: Vfs + Clone> Db<V> {
         intent.stage = RekeyStage::MainPagesTargetReadable;
         #[cfg(test)]
         self.interrupt_rekey_if_requested(RekeyTestFault::MainPagesTargetReadable)?;
+        Ok(())
+    }
+
+    /// Re-encrypt both the durable free-list chain and every reusable page it
+    /// names. Rewriting only the chain would leave those pages sealed under
+    /// the retired epoch, so a later allocation could not authenticate them.
+    async fn rewrite_free_list_pages(&self, root_page_id: u64) -> Result<()> {
+        if root_page_id == 0 {
+            return Ok(());
+        }
+
+        let (entries, chain_pages) =
+            crate::pager::freelist::read_chain(&self.pager, self.realm_id, root_page_id).await?;
+        let mut reusable_pages = entries
+            .into_iter()
+            .map(|(_, page_id)| page_id)
+            .collect::<BTreeSet<_>>();
+
+        for page_id in chain_pages {
+            self.pager
+                .rewrite_page_under_current_epoch(
+                    page_id,
+                    self.realm_id,
+                    crate::pager::PageKind::Free,
+                )
+                .await?;
+            reusable_pages.remove(&page_id);
+        }
+        if reusable_pages.is_empty() {
+            return Ok(());
+        }
+
+        let file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
+        for page_id in reusable_pages {
+            let offset = page_id
+                .checked_mul(self.page_size as u64)
+                .ok_or_else(|| PagedbError::arithmetic_overflow("free-list page offset"))?;
+            let Some(kind) = read_main_page_kind(&file, offset).await? else {
+                continue;
+            };
+            self.pager
+                .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Re-encrypt pages superseded by copy-on-write catalog transitions after
+    /// the target-authenticated header is durable. No live root discovers
+    /// these residual pages, but physical integrity scans still authenticate
+    /// every non-zero page and the source epoch is retired on success.
+    async fn rewrite_rekey_residual_main_pages(&self, state: &WriterState) -> Result<()> {
+        let file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
+        for page_id in 4..state.next_page_id {
+            let offset = page_id
+                .checked_mul(self.page_size as u64)
+                .ok_or_else(|| PagedbError::arithmetic_overflow("main-db page offset"))?;
+            let Some(kind) = read_main_page_kind(&file, offset).await? else {
+                continue;
+            };
+            self.pager
+                .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
+                .await?;
+        }
         Ok(())
     }
 
@@ -353,6 +427,8 @@ impl<V: Vfs + Clone> Db<V> {
         target_header_key: &DerivedKey,
     ) -> Result<()> {
         if matches!(intent.stage, RekeyStage::HeaderTargetPublished) {
+            self.rewrite_rekey_residual_main_pages(state).await?;
+            self.pager.flush_main(self.realm_id).await?;
             intent.stage = RekeyStage::MainDone;
             self.write_rekey_intent_locked(
                 state,
