@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::errors::PagedbError;
-use crate::vfs::traits::VfsFile;
+use crate::vfs::traits::{
+    VfsFile, checked_opfs_byte_count, checked_opfs_file_size, checked_opfs_js_range, write_all_at,
+};
 use crate::vfs::types::{ReadReq, WriteReq};
 
 use super::protocol::{ErrKind, OpfsOp, OpfsResult};
@@ -48,6 +50,7 @@ impl Drop for OpfsFile {
 impl VfsFile for OpfsFile {
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let len = buf.len();
+        checked_opfs_js_range(offset, len)?;
         let result = self
             .vfs
             .dispatch(OpfsOp::Read {
@@ -57,8 +60,14 @@ impl VfsFile for OpfsFile {
             })
             .await?;
         match result {
-            OpfsResult::Data { bytes } => {
-                let n = bytes.len().min(buf.len());
+            OpfsResult::Data { bytes, count } => {
+                let n = checked_opfs_byte_count("read", count, buf.len())?;
+                if bytes.len() != n {
+                    return Err(PagedbError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "OPFS read payload length did not match its byte count",
+                    )));
+                }
                 buf[..n].copy_from_slice(&bytes[..n]);
                 Ok(n)
             }
@@ -68,6 +77,9 @@ impl VfsFile for OpfsFile {
     }
 
     async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> Result<()> {
+        for req in reqs.iter() {
+            checked_opfs_js_range(req.offset, req.buf.len())?;
+        }
         for req in reqs.iter_mut() {
             let n = self.read_at(req.offset, req.buf).await?;
             // Zero-fill past the returned bytes (all-or-nothing contract).
@@ -84,6 +96,7 @@ impl VfsFile for OpfsFile {
         }
         let data = buf.to_vec();
         let len = data.len();
+        checked_opfs_js_range(offset, len)?;
         let result = self
             .vfs
             .dispatch(OpfsOp::Write {
@@ -93,7 +106,7 @@ impl VfsFile for OpfsFile {
             })
             .await?;
         match result {
-            OpfsResult::Ok => Ok(len),
+            OpfsResult::Written { count } => checked_opfs_byte_count("write", count, len),
             OpfsResult::Err { reason, kind } => Err(map_err(&reason, kind)),
             _ => Err(PagedbError::Unsupported),
         }
@@ -104,7 +117,10 @@ impl VfsFile for OpfsFile {
             return Err(PagedbError::ReadOnly);
         }
         for req in reqs {
-            self.write_at(req.offset, req.buf).await?;
+            checked_opfs_js_range(req.offset, req.buf.len())?;
+        }
+        for req in reqs {
+            write_all_at(self, req.offset, req.buf).await?;
         }
         Ok(())
     }
@@ -127,6 +143,7 @@ impl VfsFile for OpfsFile {
         if self.read_only {
             return Err(PagedbError::ReadOnly);
         }
+        checked_opfs_js_range(len, 0)?;
         let result = self
             .vfs
             .dispatch(OpfsOp::Truncate {
@@ -149,7 +166,7 @@ impl VfsFile for OpfsFile {
             })
             .await?;
         match result {
-            OpfsResult::Size { len } => Ok(len),
+            OpfsResult::Size { len } => checked_opfs_file_size(len),
             OpfsResult::Err { reason, kind } => Err(map_err(&reason, kind)),
             _ => Err(PagedbError::Unsupported),
         }

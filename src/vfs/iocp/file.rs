@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::errors::PagedbError;
-use crate::vfs::traits::VfsFile;
+use crate::vfs::traits::{
+    OverlappedStart, VfsFile, checked_overlapped_read_start, checked_overlapped_start,
+    checked_read_count, checked_readfile_len, checked_signed_file_len, checked_write_progress,
+};
 use crate::vfs::types::{ReadReq, WriteReq};
 
 use super::port::{Port, PortInner};
@@ -51,6 +54,14 @@ impl IocpFile {
         self.file.as_raw_handle() as HANDLE
     }
 
+    fn writefile_len(len: usize) -> Result<u32> {
+        u32::try_from(len).map_err(|_| {
+            PagedbError::Io(std::io::Error::other(
+                "buffer too large for u32 in WriteFile",
+            ))
+        })
+    }
+
     /// Submit one overlapped read or write at `offset`. The closure performs
     /// the `ReadFile` / `WriteFile` syscall against `&mut OVERLAPPED`. Caller
     /// must hold the port mutex.
@@ -61,6 +72,34 @@ impl IocpFile {
     /// must return `0` (failure) or non-zero (immediate completion); on
     /// `ERROR_IO_PENDING` we wait via `Port::dequeue`.
     unsafe fn submit_overlapped<F>(port: &Port, offset: u64, op: F) -> std::io::Result<u32>
+    where
+        F: FnOnce(&mut OVERLAPPED) -> i32,
+    {
+        // SAFETY: caller forwards the same safety contract as
+        // `submit_overlapped_impl`.
+        unsafe { Self::submit_overlapped_impl(port, offset, false, op) }
+    }
+
+    /// Submit one overlapped read at `offset`; EOF is reported as zero bytes.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::submit_overlapped`].
+    unsafe fn submit_read_overlapped<F>(port: &Port, offset: u64, op: F) -> std::io::Result<u32>
+    where
+        F: FnOnce(&mut OVERLAPPED) -> i32,
+    {
+        // SAFETY: caller forwards the same safety contract as
+        // `submit_overlapped_impl`.
+        unsafe { Self::submit_overlapped_impl(port, offset, true, op) }
+    }
+
+    unsafe fn submit_overlapped_impl<F>(
+        port: &Port,
+        offset: u64,
+        eof_is_empty_read: bool,
+        op: F,
+    ) -> std::io::Result<u32>
     where
         F: FnOnce(&mut OVERLAPPED) -> i32,
     {
@@ -76,30 +115,46 @@ impl IocpFile {
         }
 
         let rc = op(&mut overlapped);
-        if rc != 0 {
-            // Immediate synchronous completion. `OVERLAPPED.InternalHigh`
-            // holds the byte count on success.
-            #[allow(clippy::cast_possible_truncation)]
-            return Ok(overlapped.InternalHigh as u32);
+        let err_code = if rc == 0 {
+            // SAFETY: GetLastError immediately after a failed Win32 call is
+            // the documented pattern.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        } else {
+            0
+        };
+        let start = if eof_is_empty_read {
+            checked_overlapped_read_start(rc, err_code, ERROR_IO_PENDING, ERROR_HANDLE_EOF)
+        } else {
+            checked_overlapped_start(rc, err_code, ERROR_IO_PENDING)
         }
-        // SAFETY: GetLastError immediately after a failed Win32 call is the
-        // documented pattern.
-        let err_code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        if err_code != ERROR_IO_PENDING {
-            return Err(std::io::Error::from_raw_os_error(err_code as i32));
+        .map_err(|error| match error {
+            PagedbError::Io(io) => io,
+            other => std::io::Error::other(other.to_string()),
+        })?;
+        if start == OverlappedStart::EmptyRead {
+            return Ok(0);
         }
-        // I/O is in flight against the port — wait for its completion.
+
+        // Associated handles queue a completion packet even when the
+        // overlapped call succeeds immediately, so every non-EOF start must
+        // drain its matching packet before the stack-allocated OVERLAPPED dies.
         // SAFETY: caller holds the port lock; `overlapped` lives on this
         // stack frame and is the only outstanding request.
-        let (bytes, _key, _ov) = unsafe { port.dequeue() }.or_else(|e| {
+        let (bytes, _key, completed) = unsafe { port.dequeue() }.or_else(|error| {
             // ERROR_HANDLE_EOF on read is "read past EOF" — surface as
             // 0 bytes transferred, like POSIX read() at EOF.
-            if e.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
                 Ok((0u32, 0usize, std::ptr::null_mut::<OVERLAPPED>()))
             } else {
-                Err(e)
+                Err(error)
             }
         })?;
+        let expected = (&raw mut overlapped).cast::<OVERLAPPED>();
+        if !completed.is_null() && completed != expected {
+            return Err(std::io::Error::other(
+                "IOCP completion did not match the submitted OVERLAPPED",
+            ));
+        }
         Ok(bytes)
     }
 }
@@ -116,11 +171,7 @@ impl VfsFile for IocpFile {
             return Ok(0);
         }
         let handle = self.handle();
-        let len = u32::try_from(buf.len()).map_err(|_| {
-            PagedbError::Io(std::io::Error::other(
-                "buffer too large for u32 in ReadFile",
-            ))
-        })?;
+        let len = checked_readfile_len(buf.len())?;
         let port = Port {
             inner: Arc::clone(&self.port),
         };
@@ -129,13 +180,12 @@ impl VfsFile for IocpFile {
         // SAFETY: `buf` slice outlives this fn frame; the closure is invoked
         // synchronously before `submit_overlapped` returns.
         let bytes = unsafe {
-            IocpFile::submit_overlapped(&port, offset, |ov| {
-                let mut bytes_read: u32 = 0;
-                ReadFile(handle, buf_ptr.cast(), len, &mut bytes_read, ov)
+            IocpFile::submit_read_overlapped(&port, offset, |ov| {
+                ReadFile(handle, buf_ptr.cast(), len, std::ptr::null_mut(), ov)
             })
         }
         .map_err(PagedbError::Io)?;
-        Ok(bytes as usize)
+        checked_read_count(bytes as usize, buf.len())
     }
 
     async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> Result<()> {
@@ -147,27 +197,26 @@ impl VfsFile for IocpFile {
         // Issue ops sequentially under one lock acquisition so the batch is
         // observed atomically with respect to other concurrent users of the
         // port.
+        let lengths: Vec<u32> = reqs
+            .iter()
+            .map(|req| checked_readfile_len(req.buf.len()))
+            .collect::<Result<_>>()?;
         let handle = self.handle();
         let port = Port {
             inner: Arc::clone(&self.port),
         };
         let _guard = port.lock();
-        for req in reqs.iter_mut() {
-            let len = u32::try_from(req.buf.len()).map_err(|_| {
-                PagedbError::Io(std::io::Error::other(
-                    "buffer too large for u32 in ReadFile",
-                ))
-            })?;
+        for (req, len) in reqs.iter_mut().zip(lengths) {
             let buf_ptr = req.buf.as_mut_ptr();
             // SAFETY: `req.buf` outlives this frame; closure is synchronous
             // within `submit_overlapped`.
             let bytes = unsafe {
-                IocpFile::submit_overlapped(&port, req.offset, |ov| {
-                    let mut bytes_read: u32 = 0;
-                    ReadFile(handle, buf_ptr.cast(), len, &mut bytes_read, ov)
+                IocpFile::submit_read_overlapped(&port, req.offset, |ov| {
+                    ReadFile(handle, buf_ptr.cast(), len, std::ptr::null_mut(), ov)
                 })
             }
             .map_err(PagedbError::Io)? as usize;
+            let bytes = checked_read_count(bytes, req.buf.len())?;
             // Zero tail past EOF — matches MemVfs / TokioVfs / Iouring.
             for b in &mut req.buf[bytes..] {
                 *b = 0;
@@ -184,11 +233,7 @@ impl VfsFile for IocpFile {
             return Ok(0);
         }
         let handle = self.handle();
-        let len = u32::try_from(buf.len()).map_err(|_| {
-            PagedbError::Io(std::io::Error::other(
-                "buffer too large for u32 in WriteFile",
-            ))
-        })?;
+        let len = Self::writefile_len(buf.len())?;
         let port = Port {
             inner: Arc::clone(&self.port),
         };
@@ -197,8 +242,7 @@ impl VfsFile for IocpFile {
         // SAFETY: `buf` slice outlives this frame; closure runs synchronously.
         let bytes = unsafe {
             IocpFile::submit_overlapped(&port, offset, |ov| {
-                let mut bytes_written: u32 = 0;
-                WriteFile(handle, buf_ptr, len, &mut bytes_written, ov)
+                WriteFile(handle, buf_ptr, len, std::ptr::null_mut(), ov)
             })
         }
         .map_err(PagedbError::Io)?;
@@ -212,26 +256,36 @@ impl VfsFile for IocpFile {
         if reqs.is_empty() {
             return Ok(());
         }
+        for req in reqs {
+            Self::writefile_len(req.buf.len())?;
+        }
         let handle = self.handle();
         let port = Port {
             inner: Arc::clone(&self.port),
         };
         let _guard = port.lock();
         for req in reqs {
-            let len = u32::try_from(req.buf.len()).map_err(|_| {
-                PagedbError::Io(std::io::Error::other(
-                    "buffer too large for u32 in WriteFile",
-                ))
-            })?;
-            let buf_ptr = req.buf.as_ptr();
-            // SAFETY: `req.buf` outlives this frame; closure is synchronous.
-            unsafe {
-                IocpFile::submit_overlapped(&port, req.offset, |ov| {
-                    let mut bytes_written: u32 = 0;
-                    WriteFile(handle, buf_ptr, len, &mut bytes_written, ov)
-                })
+            let mut offset = req.offset;
+            let mut remaining = req.buf;
+            while !remaining.is_empty() {
+                let len = Self::writefile_len(remaining.len())?;
+                let buf_ptr = remaining.as_ptr();
+                // SAFETY: `remaining` is a subslice of `req.buf` and outlives
+                // this synchronous submission/completion wait.
+                let written = unsafe {
+                    IocpFile::submit_overlapped(&port, offset, |ov| {
+                        WriteFile(handle, buf_ptr, len, std::ptr::null_mut(), ov)
+                    })
+                }
+                .map_err(PagedbError::Io)?;
+                let written = usize::try_from(written).map_err(|_| {
+                    PagedbError::Io(std::io::Error::other(
+                        "WriteFile reported byte count that does not fit in usize",
+                    ))
+                })?;
+                let consumed = checked_write_progress(&mut offset, written, remaining.len())?;
+                remaining = &remaining[consumed..];
             }
-            .map_err(PagedbError::Io)?;
         }
         Ok(())
     }
@@ -255,10 +309,10 @@ impl VfsFile for IocpFile {
         // SetFilePointerEx then SetEndOfFile. We don't care about the file
         // pointer for subsequent I/O (all our ops are positional/overlapped),
         // so we just seek to `len` and set EOF there.
+        let len = checked_signed_file_len(len, "SetFilePointerEx")?;
         // SAFETY: `handle` is valid; output ptr is null because we don't need
-        // the new position back.
-        #[allow(clippy::cast_possible_wrap)]
-        let rc = unsafe { SetFilePointerEx(handle, len as i64, std::ptr::null_mut(), FILE_BEGIN) };
+        // the new position back. `len` was validated before the syscall.
+        let rc = unsafe { SetFilePointerEx(handle, len, std::ptr::null_mut(), FILE_BEGIN) };
         if rc == 0 {
             return Err(PagedbError::Io(std::io::Error::last_os_error()));
         }

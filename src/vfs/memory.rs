@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use crate::Result;
 use crate::errors::PagedbError;
 
-use super::traits::{Vfs, VfsFile};
+use super::traits::{Vfs, VfsFile, canonical_native_path};
 use super::types::{OpenMode, ReadReq, WriteReq};
 
 /// Shared inode storage. A path entry in `MemVfs::files` points to one of
@@ -107,6 +107,7 @@ impl Vfs for MemVfs {
     type LockHandle = MemLockHandle;
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
+        let path = &canonical_native_path(path)?;
         let mut files = self.inner.files.lock();
         let exists = files.contains_key(path);
         let (inode, writable) = match (mode, exists) {
@@ -132,23 +133,27 @@ impl Vfs for MemVfs {
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
+        let path = &canonical_native_path(path)?;
         let mut files = self.inner.files.lock();
         files.remove(path);
         Ok(())
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let from = &canonical_native_path(from)?;
+        let to = canonical_native_path(to)?;
         let mut files = self.inner.files.lock();
         let Some(inode) = files.remove(from) else {
             return Err(PagedbError::Io(std::io::Error::from(
                 std::io::ErrorKind::NotFound,
             )));
         };
-        files.insert(to.to_string(), inode);
+        files.insert(to, inode);
         Ok(())
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
+        let path = canonical_native_path(path)?;
         let prefix = if path.ends_with('/') {
             path.to_string()
         } else {
@@ -165,18 +170,22 @@ impl Vfs for MemVfs {
         Ok(out)
     }
 
-    async fn mkdir_all(&self, _path: &str) -> Result<()> {
-        // In-memory backend has no persistent directory entries; mkdir is a no-op.
+    async fn mkdir_all(&self, path: &str) -> Result<()> {
+        // No persistent directory entries to create, but the path still has to
+        // be a legal one — silently accepting what every other backend rejects
+        // is how a test suite stops catching path bugs.
+        canonical_native_path(path)?;
         Ok(())
     }
 
-    async fn sync_dir(&self, _path: &str) -> Result<()> {
-        // In-memory backend has no durability semantics; sync_dir is a no-op.
+    async fn sync_dir(&self, path: &str) -> Result<()> {
+        // No durability semantics, but the same path contract applies.
+        canonical_native_path(path)?;
         Ok(())
     }
 
     async fn lock_exclusive(&self, path: &str) -> Result<Self::LockHandle> {
-        let lock_ref = self.lookup_or_create_lock(path);
+        let lock_ref = self.lookup_or_create_lock(&canonical_native_path(path)?);
         let mut state = lock_ref.state.lock();
         match *state {
             LockState::Free => {
@@ -192,7 +201,7 @@ impl Vfs for MemVfs {
     }
 
     async fn lock_shared(&self, path: &str) -> Result<Self::LockHandle> {
-        let lock_ref = self.lookup_or_create_lock(path);
+        let lock_ref = self.lookup_or_create_lock(&canonical_native_path(path)?);
         let mut state = lock_ref.state.lock();
         let next = match *state {
             LockState::Free => LockState::Shared(1),
@@ -251,7 +260,9 @@ impl VfsFile for MemFile {
         let mut inode = self.inode.lock();
         let offset = usize::try_from(offset)
             .map_err(|_| PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;
-        let end = offset + buf.len();
+        let end = offset.checked_add(buf.len()).ok_or_else(|| {
+            PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        })?;
         if end > inode.data.len() {
             inode.data.resize(end, 0);
         }
@@ -264,14 +275,23 @@ impl VfsFile for MemFile {
             return Err(PagedbError::ReadOnly);
         }
         let mut inode = self.inode.lock();
+        let mut ranges = Vec::with_capacity(reqs.len());
         for req in reqs {
             let offset = usize::try_from(req.offset).map_err(|_| {
                 PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
             })?;
-            let end = offset + req.buf.len();
-            if end > inode.data.len() {
-                inode.data.resize(end, 0);
-            }
+            let end = offset.checked_add(req.buf.len()).ok_or_else(|| {
+                PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            })?;
+            ranges.push((offset, end));
+        }
+
+        let max_end = ranges.iter().map(|(_, end)| *end).max().unwrap_or(0);
+        if max_end > inode.data.len() {
+            inode.data.resize(max_end, 0);
+        }
+
+        for (req, (offset, end)) in reqs.iter().zip(ranges) {
             inode.data[offset..end].copy_from_slice(req.buf);
         }
         Ok(())

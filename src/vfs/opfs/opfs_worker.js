@@ -128,8 +128,11 @@ function opRead({ handle_id, offset, len }) {
         const buf = new ArrayBuffer(len);
         const view = new Uint8Array(buf);
         const read = h.read(view, { at: Number(offset) });
+        if (!Number.isSafeInteger(read) || read < 0 || read > len) {
+            return errResult("OPFS read returned an invalid byte count", "io");
+        }
         const bytes = Array.from(new Uint8Array(buf, 0, read));
-        return { type: "data", bytes };
+        return { type: "data", bytes, count: read };
     } catch (e) {
         return errResult(e.message || String(e), classifyError(e));
     }
@@ -140,8 +143,8 @@ function opWrite({ handle_id, offset, data }) {
     if (!h) return errResult("handle not found: " + handle_id, "notFound");
     try {
         const view = new Uint8Array(data);
-        h.write(view, { at: Number(offset) });
-        return ok();
+        const written = h.write(view, { at: Number(offset) });
+        return { type: "written", count: written };
     } catch (e) {
         return errResult(e.message || String(e), classifyError(e));
     }
