@@ -7,7 +7,7 @@ use crate::crypto::kdf::derive_spill_key;
 use crate::crypto::nonce::Nonce;
 use crate::errors::{PagedbError, QuotaKind};
 use crate::vfs::types::OpenMode;
-use crate::vfs::{Vfs, VfsFile};
+use crate::vfs::{Vfs, VfsFile, read_exact_at, write_all_at};
 
 use super::txn::WriteTxn;
 
@@ -123,13 +123,14 @@ impl<V: Vfs + Clone> SpillScope<'_, '_, V> {
 
         let mut file = self.txn.db.vfs.open(&path, OpenMode::CreateOrOpen).await?;
         let body_offset = self.txn.spill_bytes_used;
-        let tag_offset = body_offset + body.len() as u64;
-        file.write_at(body_offset, &body).await?;
-        file.write_at(tag_offset, &tag).await?;
+        let ciphertext_len = body.len();
+        body.extend_from_slice(&tag);
+        write_all_at(&mut file, body_offset, &body).await?;
         file.sync().await?;
 
         let plaintext_len = u32::try_from(bytes.len()).map_err(|_| PagedbError::PayloadTooLarge)?;
-        let ciphertext_len = u32::try_from(body.len()).map_err(|_| PagedbError::PayloadTooLarge)?;
+        let ciphertext_len =
+            u32::try_from(ciphertext_len).map_err(|_| PagedbError::PayloadTooLarge)?;
 
         self.txn.spill_segments.push(SpillSegmentMeta {
             offset: body_offset,
@@ -158,14 +159,18 @@ impl<V: Vfs + Clone> SpillScope<'_, '_, V> {
             .clone();
         let path = self.txn.spill_path.as_ref().ok_or(PagedbError::NotFound)?;
 
-        let file = self.txn.db.vfs.open(path, OpenMode::Read).await?;
+        let mut file = self.txn.db.vfs.open(path, OpenMode::Read).await?;
 
         let body_len = meta.ciphertext_len as usize;
-        let mut body = vec![0u8; body_len];
-        let mut tag = [0u8; 16];
-        file.read_at(meta.offset, &mut body).await?;
-        file.read_at(meta.offset + body_len as u64, &mut tag)
-            .await?;
+        let frame_len = body_len
+            .checked_add(16)
+            .ok_or_else(|| PagedbError::arithmetic_overflow("spill frame length"))?;
+        let mut frame = vec![0u8; frame_len];
+        read_exact_at(&mut file, meta.offset, &mut frame).await?;
+        let (body, tag_bytes) = frame.split_at_mut(body_len);
+        let tag: &[u8; 16] = (&*tag_bytes)
+            .try_into()
+            .map_err(|_| PagedbError::ChecksumFailure)?;
 
         let cipher = self.txn.spill_cipher_readonly()?;
         let nonce = Nonce::from_bytes(meta.nonce_bytes);
@@ -182,9 +187,9 @@ impl<V: Vfs + Clone> SpillScope<'_, '_, V> {
             segment_id: self.txn.db.file_id,
         });
 
-        cipher.decrypt(&nonce, &aad, &mut body, &tag)?;
-        body.truncate(meta.plaintext_len as usize);
-        Ok(body)
+        cipher.decrypt(&nonce, &aad, body, tag)?;
+        frame.truncate(meta.plaintext_len as usize);
+        Ok(frame)
     }
 }
 

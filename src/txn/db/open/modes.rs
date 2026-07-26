@@ -257,18 +257,26 @@ impl<V: Vfs + Clone> Db<V> {
             .vfs
             .lock_exclusive(FROZEN_READERS_LOCK_PATH)
             .await
-            .map_err(|_| {
-                crate::diag::lock_rejected("follower", FROZEN_READERS_LOCK_PATH, "readers_present");
-                PagedbError::ReadersPresent
+            .map_err(|error| {
+                map_lock_contention(error, || {
+                    crate::diag::lock_rejected(
+                        "follower",
+                        FROZEN_READERS_LOCK_PATH,
+                        "readers_present",
+                    );
+                    PagedbError::ReadersPresent
+                })
             })?;
         drop(frozen_probe);
         let writer_lock = self
             .vfs
             .lock_exclusive(WRITER_LOCK_PATH)
             .await
-            .map_err(|_| {
-                crate::diag::lock_rejected("follower", WRITER_LOCK_PATH, "already_open");
-                PagedbError::AlreadyOpen
+            .map_err(|error| {
+                map_lock_contention(error, || {
+                    crate::diag::lock_rejected("follower", WRITER_LOCK_PATH, "already_open");
+                    PagedbError::AlreadyOpen
+                })
             })?;
         drop(acquisition);
         crate::diag::lock_acquired("follower", WRITER_LOCK_PATH);
@@ -301,22 +309,33 @@ pub(super) async fn acquire_interlocking_mode_lock<V: Vfs>(
             let frozen_probe =
                 vfs.lock_exclusive(FROZEN_READERS_LOCK_PATH)
                     .await
-                    .map_err(|_| {
-                        crate::diag::lock_rejected(
-                            "writer",
-                            FROZEN_READERS_LOCK_PATH,
-                            "readers_present",
-                        );
-                        PagedbError::ReadersPresent
+                    .map_err(|error| {
+                        map_lock_contention(error, || {
+                            crate::diag::lock_rejected(
+                                "writer",
+                                FROZEN_READERS_LOCK_PATH,
+                                "readers_present",
+                            );
+                            PagedbError::ReadersPresent
+                        })
                     })?;
             drop(frozen_probe);
             acquire_long_lived_lock(vfs, LongLivedLock::Writer, locks).await
         }
         LongLivedLock::FrozenReader => {
-            let writer_probe = vfs.lock_exclusive(WRITER_LOCK_PATH).await.map_err(|_| {
-                crate::diag::lock_rejected("frozen_reader", WRITER_LOCK_PATH, "writer_present");
-                PagedbError::WriterPresent
-            })?;
+            let writer_probe = vfs
+                .lock_exclusive(WRITER_LOCK_PATH)
+                .await
+                .map_err(|error| {
+                    map_lock_contention(error, || {
+                        crate::diag::lock_rejected(
+                            "frozen_reader",
+                            WRITER_LOCK_PATH,
+                            "writer_present",
+                        );
+                        PagedbError::WriterPresent
+                    })
+                })?;
             drop(writer_probe);
             acquire_long_lived_lock(vfs, LongLivedLock::FrozenReader, locks).await
         }
@@ -332,27 +351,50 @@ async fn acquire_long_lived_lock<V: Vfs>(
     locks: &mut Vec<V::LockHandle>,
 ) -> Result<()> {
     let handle = match lock {
-        LongLivedLock::Writer => vfs.lock_exclusive(WRITER_LOCK_PATH).await.map_err(|_| {
-            crate::diag::lock_rejected("writer", WRITER_LOCK_PATH, "already_open");
-            PagedbError::AlreadyOpen
-        })?,
+        LongLivedLock::Writer => vfs
+            .lock_exclusive(WRITER_LOCK_PATH)
+            .await
+            .map_err(|error| {
+                map_lock_contention(error, || {
+                    crate::diag::lock_rejected("writer", WRITER_LOCK_PATH, "already_open");
+                    PagedbError::AlreadyOpen
+                })
+            })?,
         LongLivedLock::FrozenReader => {
             vfs.lock_shared(FROZEN_READERS_LOCK_PATH)
                 .await
-                .map_err(|_| {
-                    crate::diag::lock_rejected(
-                        "frozen_reader",
-                        FROZEN_READERS_LOCK_PATH,
-                        "already_locked",
-                    );
-                    PagedbError::AlreadyLocked
+                .map_err(|error| {
+                    map_lock_contention(error, || {
+                        crate::diag::lock_rejected(
+                            "frozen_reader",
+                            FROZEN_READERS_LOCK_PATH,
+                            "already_locked",
+                        );
+                        PagedbError::AlreadyLocked
+                    })
                 })?
         }
-        LongLivedLock::Observer => vfs.lock_shared(OBSERVERS_LOCK_PATH).await.map_err(|_| {
-            crate::diag::lock_rejected("observer", OBSERVERS_LOCK_PATH, "already_locked");
-            PagedbError::AlreadyLocked
-        })?,
+        LongLivedLock::Observer => vfs
+            .lock_shared(OBSERVERS_LOCK_PATH)
+            .await
+            .map_err(|error| {
+                map_lock_contention(error, || {
+                    crate::diag::lock_rejected("observer", OBSERVERS_LOCK_PATH, "already_locked");
+                    PagedbError::AlreadyLocked
+                })
+            })?,
     };
     locks.push(handle);
     Ok(())
+}
+
+fn map_lock_contention(
+    error: PagedbError,
+    on_contention: impl FnOnce() -> PagedbError,
+) -> PagedbError {
+    if matches!(error, PagedbError::AlreadyLocked) {
+        on_contention()
+    } else {
+        error
+    }
 }

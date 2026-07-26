@@ -11,7 +11,7 @@ use crate::pager::format::structural_header::{
     MainDbHeaderFields, decode_main_db_header, encode_main_db_header,
 };
 use crate::vfs::types::OpenMode;
-use crate::vfs::{Vfs, VfsFile};
+use crate::vfs::{Vfs, VfsFile, read_exact_at, write_all_at};
 
 /// Which header slot is the authoritative current header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ pub async fn bootstrap_header<V: Vfs>(
     let bytes = encode_main_db_header(initial, hk, page_size)?;
     let mut f = vfs.open(path, OpenMode::CreateNew).await?;
     // Slot A at offset 0.
-    f.write_at(0, &bytes).await?;
+    write_all_at(&mut f, 0, &bytes).await?;
     // Slot B at offset page_size — write a zero-filled page so the slot is
     // materialised on disk. Decode of a zero buffer fails the magic check
     // and returns `Corruption(HeaderUnverifiable)`, which `open_header`
@@ -65,7 +65,7 @@ pub async fn bootstrap_header<V: Vfs>(
     let zero = vec![0u8; page_size];
     let page_size_u64 = u64::try_from(page_size)
         .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
-    f.write_at(page_size_u64, &zero).await?;
+    write_all_at(&mut f, page_size_u64, &zero).await?;
     f.sync().await?;
     // Make the directory entry for the newly created file durable so a
     // power loss immediately after creation does not lose the file.
@@ -92,13 +92,13 @@ pub async fn open_header<V: Vfs>(
     hk: &DerivedKey,
     page_size: usize,
 ) -> Result<(MainDbHeaderFields, ActiveSlot)> {
-    let f = vfs.open(path, OpenMode::ReadWrite).await?;
+    let mut f = vfs.open(path, OpenMode::ReadWrite).await?;
     let mut buf_a = vec![0u8; page_size];
     let mut buf_b = vec![0u8; page_size];
-    let _ = f.read_at(0, &mut buf_a).await?;
+    read_exact_at(&mut f, 0, &mut buf_a).await?;
     let page_size_u64 = u64::try_from(page_size)
         .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
-    let _ = f.read_at(page_size_u64, &mut buf_b).await?;
+    read_exact_at(&mut f, page_size_u64, &mut buf_b).await?;
     let a = decode_main_db_header(&buf_a, hk, page_size).ok();
     let b = decode_main_db_header(&buf_b, hk, page_size).ok();
     match (a, b) {
@@ -139,7 +139,7 @@ pub async fn commit_header<V: Vfs>(
         .ok()
         .map(|s| next.page_id().saturating_mul(s))
         .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset arithmetic overflow")))?;
-    f.write_at(offset, &bytes).await?;
+    write_all_at(&mut f, offset, &bytes).await?;
     f.sync().await?;
     // No `sync_dir` here: a header rewrite is a data write to an existing,
     // already-durable inode (main.db). Architecture §883 requires `sync_dir`

@@ -14,7 +14,7 @@ use crate::pager::Pager;
 use crate::pager::format::data_page::{body, extract_page_header_ids, open_data_page};
 use crate::pager::format::page_kind::PageKind;
 use crate::vfs::types::OpenMode;
-use crate::vfs::{Vfs, VfsFile};
+use crate::vfs::{Vfs, VfsFile, checked_read_progress};
 
 use super::authenticated_metadata::{
     ExtentIndexDecodeContext, authenticate_segment_metadata, decode_extent_index,
@@ -67,11 +67,14 @@ impl<V: Vfs + Clone> SegmentReader<V> {
     ) -> Result<Self> {
         let page_size = pager.page_size();
         let live = live_path(&catalog_meta.segment_id);
-        let file = pager
-            .vfs()
-            .open(&live, OpenMode::Read)
-            .await
-            .map_err(|_| PagedbError::NotFound)?;
+        let file = match pager.vfs().open(&live, OpenMode::Read).await {
+            Ok(file) => file,
+            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PagedbError::NotFound);
+            }
+            Err(PagedbError::NotFound) => return Err(PagedbError::NotFound),
+            Err(error) => return Err(error),
+        };
         Self::finish_open(
             pager,
             catalog_meta,
@@ -225,9 +228,12 @@ impl<V: Vfs + Clone> SegmentReader<V> {
             .checked_mul(page_size)
             .ok_or_else(|| PagedbError::arithmetic_overflow("segment page offset"))?;
         let mut buf = vec![0u8; self.page_size];
-        let n = self.file.read_at(offset, &mut buf).await?;
-        if n < self.page_size {
-            return Err(PagedbError::NotFound);
+        let mut read_offset = offset;
+        let mut remaining = &mut buf[..];
+        while !remaining.is_empty() {
+            let read = self.file.read_at(read_offset, remaining).await?;
+            checked_read_progress(&mut read_offset, read, remaining.len())?;
+            remaining = remaining.split_at_mut(read).1;
         }
 
         // Try each segment page kind; AAD binding rejects wrong ones.

@@ -23,7 +23,7 @@ use crate::pager::format::data_page::{
 use crate::pager::format::page_kind::PageKind;
 use crate::txn::db::rekey::EpochKeyring;
 use crate::vfs::types::{OpenMode, WriteReq};
-use crate::vfs::{Vfs, VfsFile};
+use crate::vfs::{Vfs, VfsFile, read_exact_at};
 use crate::{RealmId, Result};
 use rayon::prelude::*;
 
@@ -741,13 +741,8 @@ impl<V: Vfs> Pager<V> {
             }
             let mut buf = vec![0u8; page_size];
             {
-                let f = file_handle.lock().await;
-                let n = f.read_at(page_offset, &mut buf).await?;
-                if n < page_size {
-                    for b in &mut buf[n..] {
-                        *b = 0;
-                    }
-                }
+                let mut f = file_handle.lock().await;
+                read_exact_at(&mut *f, page_offset, &mut buf).await?;
             }
 
             // Extract the cipher_id and mk_epoch recorded in this specific page's

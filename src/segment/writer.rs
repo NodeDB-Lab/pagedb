@@ -16,7 +16,7 @@ use crate::pager::format::segment_footer::{
 };
 use crate::pager::format::structural_header::{SegmentHeaderFields, encode_segment_header};
 use crate::vfs::types::OpenMode;
-use crate::vfs::{Vfs, VfsFile};
+use crate::vfs::{Vfs, VfsFile, write_all_at};
 use crate::{RealmId, Result};
 use tracing;
 
@@ -89,7 +89,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             flags: 0,
         };
         let header_bytes = encode_segment_header(&header_fields, &hk, page_size)?;
-        file.write_at(0, &header_bytes).await?;
+        write_all_at(&mut file, 0, &header_bytes).await?;
 
         let total_bytes = u64::try_from(page_size)
             .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
@@ -185,7 +185,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let offset = page_id
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
-        self.file.write_at(offset, &buf).await?;
+        write_all_at(&mut self.file, offset, &buf).await?;
         self.next_page_id += 1;
         self.total_bytes = self.total_bytes.saturating_add(self.page_size as u64);
         Ok(page_id)
@@ -327,7 +327,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
                 let offset = page_id
                     .checked_mul(self.page_size as u64)
                     .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
-                self.file.write_at(offset, &buf).await?;
+                write_all_at(&mut self.file, offset, &buf).await?;
                 self.next_page_id += 1;
                 self.total_bytes = self.total_bytes.saturating_add(self.page_size as u64);
             }
@@ -362,7 +362,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let offset = footer_page_id
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
-        self.file.write_at(offset, &footer_bytes).await?;
+        write_all_at(&mut self.file, offset, &footer_bytes).await?;
         self.file.sync().await?;
         self.pager.vfs().sync_dir("seg/.staging").await?;
 

@@ -3,6 +3,7 @@
 use std::future::Future;
 
 use crate::Result;
+use crate::errors::PagedbError;
 
 use super::types::{OpenMode, ReadReq, WriteReq};
 
@@ -87,4 +88,69 @@ pub trait VfsFile: Send {
     fn len(&self) -> impl Future<Output = Result<u64>> + Send;
     fn is_empty(&self) -> impl Future<Output = Result<bool>> + Send;
     fn supports_direct_io(&self) -> bool;
+}
+
+/// Read until `buf` is full, or fail if the backend stops making progress.
+#[inline]
+pub(crate) async fn read_exact_at<F: VfsFile + ?Sized>(
+    file: &mut F,
+    mut offset: u64,
+    mut buf: &mut [u8],
+) -> Result<()> {
+    while !buf.is_empty() {
+        let read = file.read_at(offset, buf).await?;
+        checked_read_progress(&mut offset, read, buf.len())?;
+        buf = buf.split_at_mut(read).1;
+    }
+    Ok(())
+}
+
+/// Validate one positional read result and advance its offset.
+#[inline]
+pub(crate) fn checked_read_progress(offset: &mut u64, read: usize, remaining: usize) -> Result<()> {
+    if read == 0 {
+        return Err(PagedbError::Io(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof,
+        )));
+    }
+    if read > remaining {
+        return Err(PagedbError::Io(std::io::Error::other(
+            "read_at overreported bytes",
+        )));
+    }
+    let read_u64 = u64::try_from(read)
+        .map_err(|_| PagedbError::Io(std::io::Error::other("read count overflow")))?;
+    *offset = offset
+        .checked_add(read_u64)
+        .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
+    Ok(())
+}
+
+/// Write until `buf` is complete, or fail if the backend reports impossible progress.
+#[inline]
+pub(crate) async fn write_all_at<F: VfsFile + ?Sized>(
+    file: &mut F,
+    mut offset: u64,
+    mut buf: &[u8],
+) -> Result<()> {
+    while !buf.is_empty() {
+        let written = file.write_at(offset, buf).await?;
+        if written == 0 {
+            return Err(PagedbError::Io(std::io::Error::from(
+                std::io::ErrorKind::WriteZero,
+            )));
+        }
+        if written > buf.len() {
+            return Err(PagedbError::Io(std::io::Error::other(
+                "write_at overreported bytes",
+            )));
+        }
+        let written_u64 = u64::try_from(written)
+            .map_err(|_| PagedbError::Io(std::io::Error::other("write count overflow")))?;
+        offset = offset
+            .checked_add(written_u64)
+            .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
+        buf = &buf[written..];
+    }
+    Ok(())
 }

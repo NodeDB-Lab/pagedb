@@ -84,10 +84,12 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
     let all_segments = list_all_segments_inner(&db.pager, db.realm_id, &state).await?;
     for meta in all_segments {
         let live = crate::segment::writer::live_path(&meta.segment_id);
-        let file_size = match db.vfs.open(&live, crate::vfs::types::OpenMode::Read).await {
-            Ok(f) => f.len().await.unwrap_or(meta.total_bytes),
-            Err(_) => continue,
-        };
+        let file_size = db
+            .vfs
+            .open(&live, crate::vfs::types::OpenMode::Read)
+            .await?
+            .len()
+            .await?;
         // Skip segments with < 5% garbage.
         let threshold = meta.total_bytes.saturating_add(meta.total_bytes / 20);
         if file_size <= threshold {
