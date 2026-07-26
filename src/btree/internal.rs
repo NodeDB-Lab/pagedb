@@ -23,6 +23,26 @@ pub struct Internal {
     pub entries: Vec<InternalEntry>,
 }
 
+/// Encoded byte cost of one internal separator plus its slot-directory entry.
+pub(crate) fn separator_entry_size(key_len: usize) -> Result<usize> {
+    if key_len > u16::MAX as usize {
+        return Err(PagedbError::PayloadTooLarge);
+    }
+    2usize
+        .checked_add(key_len)
+        .and_then(|size| size.checked_add(8))
+        .and_then(|size| size.checked_add(2))
+        .ok_or(PagedbError::PayloadTooLarge)
+}
+
+#[must_use]
+pub(crate) fn separator_fits(key_len: usize, page_size: usize) -> bool {
+    separator_entry_size(key_len)
+        .ok()
+        .and_then(|entry_size| HEADER_LEN.checked_add(entry_size))
+        .is_some_and(|needed| needed <= body_capacity(page_size))
+}
+
 impl Internal {
     pub fn decode(body: &[u8]) -> Result<Self> {
         let h: NodeHeader = validate_node_body(body)?;

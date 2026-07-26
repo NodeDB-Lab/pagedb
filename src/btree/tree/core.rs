@@ -1,17 +1,88 @@
 //! `BTree` — the `CoW` shadow-paging B+ tree.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::{PageGuard, Pager};
 use crate::vfs::Vfs;
 use crate::{RealmId, Result};
 
-use crate::btree::internal::Internal;
+use crate::btree::internal::{self, Internal};
 use crate::btree::leaf::Leaf;
 use crate::btree::node::{NodeKind, body_capacity, read_header};
+use crate::btree::overflow;
+
+fn stored_leaf_value_encoded_size(value_len: usize, page_size: usize) -> Result<usize> {
+    if value_len > overflow::inline_value_threshold(page_size) {
+        Ok(2 + 8 + 8)
+    } else {
+        2usize
+            .checked_add(value_len)
+            .ok_or(PagedbError::PayloadTooLarge)
+    }
+}
+
+pub(super) fn malformed_btree_topology() -> PagedbError {
+    PagedbError::corruption(CorruptionDetail::HeaderUnverifiable)
+}
+
+// Keep common shallow descents stack-only and small; deeper trees spill into
+// the exact set instead of weakening cycle detection.
+const INLINE_SEEN_PAGE_IDS: usize = 4;
+
+/// Duplicate-page detector for B-tree descents. Shallow trees stay on the
+/// inline array; deeper trees preserve exact detection through the overflow set.
+pub(super) struct SeenPageIds {
+    inline: [u64; INLINE_SEEN_PAGE_IDS],
+    len: usize,
+    overflow: Option<BTreeSet<u64>>,
+}
+
+impl SeenPageIds {
+    pub(super) fn new() -> Self {
+        Self {
+            inline: [0; INLINE_SEEN_PAGE_IDS],
+            len: 0,
+            overflow: None,
+        }
+    }
+
+    pub(super) fn from_existing(path: &[u64]) -> Result<Self> {
+        let mut seen = Self::new();
+        for &page_id in path {
+            seen.insert(page_id)?;
+        }
+        Ok(seen)
+    }
+
+    pub(super) fn insert(&mut self, page_id: u64) -> Result<()> {
+        if page_id == 0 || !self.insert_inner(page_id) {
+            return Err(malformed_btree_topology());
+        }
+        Ok(())
+    }
+
+    fn insert_inner(&mut self, page_id: u64) -> bool {
+        if let Some(overflow) = &mut self.overflow {
+            return overflow.insert(page_id);
+        }
+        if self.inline[..self.len].contains(&page_id) {
+            return false;
+        }
+        if self.len < INLINE_SEEN_PAGE_IDS {
+            self.inline[self.len] = page_id;
+            self.len += 1;
+            return true;
+        }
+        let mut overflow = BTreeSet::new();
+        overflow.extend(self.inline);
+        let inserted = overflow.insert(page_id);
+        self.overflow = Some(overflow);
+        inserted
+    }
+}
 
 /// `CoW` B+ tree backed by the Pager. Single writer per instance; concurrent
 /// reads through `&self`.
@@ -227,9 +298,14 @@ impl<V: Vfs> BTree<V> {
         self.freed.push(page_id);
     }
 
-    pub(super) async fn read_node_kind(&self, page_id: u64) -> Result<NodeKind> {
-        let (_g, kind) = self.read_node_guard(page_id).await?;
-        Ok(kind)
+    pub(super) fn validate_insert_record_fits(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let value_encoded_size = stored_leaf_value_encoded_size(value.len(), self.page_size)?;
+        if !Leaf::single_record_fits_encoded(key.len(), value_encoded_size, self.page_size)
+            || !internal::separator_fits(key.len(), self.page_size)
+        {
+            return Err(PagedbError::PayloadTooLarge);
+        }
+        Ok(())
     }
 
     /// Read a B+ tree node page without knowing its kind in advance. The pager

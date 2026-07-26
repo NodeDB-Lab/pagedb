@@ -237,6 +237,24 @@ impl Leaf {
         let slot_dir_bytes = records.len() * 2;
         HEADER_LEN + prefix_len + slot_dir_bytes + record_bytes <= cap
     }
+
+    /// Whether one key/value record fits in an otherwise-empty leaf.
+    #[must_use]
+    pub(crate) fn single_record_fits_encoded(
+        key_len: usize,
+        value_encoded_size: usize,
+        page_size: usize,
+    ) -> bool {
+        if key_len > u16::MAX as usize {
+            return false;
+        }
+        HEADER_LEN
+            .checked_add(key_len)
+            .and_then(|size| size.checked_add(2))
+            .and_then(|size| size.checked_add(2))
+            .and_then(|size| size.checked_add(value_encoded_size))
+            .is_some_and(|needed| needed <= body_capacity(page_size))
+    }
 }
 
 impl Default for Leaf {

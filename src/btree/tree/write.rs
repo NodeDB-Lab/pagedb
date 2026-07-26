@@ -3,34 +3,103 @@
 use std::sync::Arc;
 
 use crate::Result;
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
 use crate::vfs::Vfs;
 
 use crate::btree::leaf::{Leaf, LeafValue};
-use crate::btree::node::NodeKind;
 use crate::btree::overflow;
 use crate::btree::split::split_leaf;
 
-use super::core::BTree;
+use super::core::{BTree, SeenPageIds};
 
 impl<V: Vfs> BTree<V> {
+    fn invalidate_append_state(&mut self) {
+        self.append_cached_path = None;
+        self.append_last_key = None;
+    }
+
+    fn cached_leaf_mut(&mut self, page_id: u64, leaf_is_fresh: bool) -> &mut Leaf {
+        if leaf_is_fresh {
+            self.fresh_leaves
+                .get_mut(&page_id)
+                .expect("fresh_leaves contains key")
+        } else {
+            self.dirty_leaves
+                .get_mut(&page_id)
+                .expect("ensure_leaf_dirty populated")
+        }
+    }
+
+    fn apply_release_result(
+        &mut self,
+        old_root: u64,
+        unused_cow_page: u64,
+        release_result: overflow::ReleaseResult,
+    ) {
+        match release_result {
+            overflow::ReleaseResult::Freed { freed_pages } => {
+                for page_id in freed_pages {
+                    self.free_page(page_id);
+                }
+                self.free_page(unused_cow_page);
+            }
+            overflow::ReleaseResult::Decremented {
+                new_root_page_id: _,
+            } => self.free_page(old_root),
+        }
+    }
+
+    async fn discard_uncommitted_value(&mut self, value: Option<LeafValue>) {
+        if let Some(LeafValue::Overflow { root_page_id, .. }) = value {
+            if let Ok(page_ids) =
+                overflow::collect_chain(&self.pager, self.realm_id, root_page_id).await
+            {
+                for page_id in page_ids {
+                    self.free_page(page_id);
+                }
+            }
+        }
+    }
+
+    async fn max_key_at_path(&self, path: &[u64]) -> Result<Option<Vec<u8>>> {
+        let leaf_page_id = *path.last().expect("non-empty path");
+        if let Some(leaf) = self.fresh_leaves.get(&leaf_page_id) {
+            return Ok(leaf.records.last().map(|(key, _)| key.clone()));
+        }
+        if let Some(leaf) = self.dirty_leaves.get(&leaf_page_id) {
+            return Ok(leaf.records.last().map(|(key, _)| key.clone()));
+        }
+        Ok(self
+            .decode_leaf_from_pager(leaf_page_id)
+            .await?
+            .records
+            .last()
+            .map(|(key, _)| key.clone()))
+    }
+
+    async fn leaf_value_for(&mut self, value: &[u8]) -> Result<LeafValue> {
+        if value.len() > overflow::inline_value_threshold(self.page_size) {
+            let realm = self.realm_id;
+            let page_size = self.page_size;
+            let pager = Arc::clone(&self.pager);
+            let root_page_id = overflow::write_chain(&pager, realm, value, page_size, &mut || {
+                self.allocate_page()
+            })
+            .await?;
+            Ok(LeafValue::Overflow {
+                total_len: value.len() as u64,
+                root_page_id,
+            })
+        } else {
+            Ok(LeafValue::Inline(value.to_vec()))
+        }
+    }
+
     /// Insert or overwrite a key-value pair.
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        // Build the leaf value — inline if small enough, overflow chain otherwise.
-        let leaf_value = if value.len() > overflow::inline_value_threshold(self.page_size) {
-            let realm = self.realm_id;
-            let ps = self.page_size;
-            let pager = Arc::clone(&self.pager);
-            let root_id =
-                overflow::write_chain(&pager, realm, value, ps, &mut || self.allocate_page())
-                    .await?;
-            LeafValue::Overflow {
-                total_len: value.len() as u64,
-                root_page_id: root_id,
-            }
-        } else {
-            LeafValue::Inline(value.to_vec())
-        };
+        self.invalidate_append_state();
+        self.validate_insert_record_fits(key, value)?;
+        let leaf_value = self.leaf_value_for(value).await?;
 
         if self.root_page_id == 0 {
             let new_root = self.allocate_page();
@@ -49,10 +118,6 @@ impl<V: Vfs> BTree<V> {
         // Descend to find the leaf page_id. Returns the path; we'll fetch the
         // leaf via the dirty-cache-aware helper below.
         let path = self.path_to_leaf_for_key(key).await?;
-        // Regular `put` invalidates the append cache — caller may have
-        // mutated keys that aren't in monotonic order vs the cache.
-        self.append_cached_path = None;
-        self.append_last_key = None;
         let _split = self.put_at_path(path, key, leaf_value).await?;
         Ok(())
     }
@@ -86,40 +151,36 @@ impl<V: Vfs> BTree<V> {
             self.ensure_leaf_dirty(leaf_page_id, &path).await?;
         }
 
-        let leaf: &mut Leaf = if leaf_is_fresh {
-            self.fresh_leaves
-                .get_mut(&leaf_page_id)
-                .expect("fresh_leaves contains key")
-        } else {
-            self.dirty_leaves
-                .get_mut(&leaf_page_id)
-                .expect("ensure_leaf_dirty populated")
-        };
+        let page_size = self.page_size;
+        let leaf = self.cached_leaf_mut(leaf_page_id, leaf_is_fresh);
 
         let monotonic = leaf.records.last().is_some_and(|(k, _)| key > k.as_slice())
             && !leaf.records.iter().any(|(k, _)| k.as_slice() == key);
 
         let (_is_new, old_value) = leaf.upsert(key, leaf_value);
-        let fits = leaf.fits(self.page_size);
+        let fits = leaf.fits(page_size);
 
         // Free old overflow chain if a record was replaced (refcount-aware).
-        if let Some(LeafValue::Overflow {
-            root_page_id: old_root,
-            ..
-        }) = old_value
+        if let Some(
+            old_value @ LeafValue::Overflow {
+                root_page_id: old_root,
+                ..
+            },
+        ) = old_value
         {
             let new_cow_page = self.allocate_page();
-            match overflow::release(&self.pager, self.realm_id, old_root, new_cow_page).await? {
-                overflow::ReleaseResult::Freed { freed_pages } => {
-                    for pid in freed_pages {
-                        self.free_page(pid);
-                    }
-                    self.free_page(new_cow_page);
+            match overflow::release(&self.pager, self.realm_id, old_root, new_cow_page).await {
+                Ok(release_result) => {
+                    self.apply_release_result(old_root, new_cow_page, release_result);
                 }
-                overflow::ReleaseResult::Decremented {
-                    new_root_page_id: _,
-                } => {
-                    self.free_page(old_root);
+                Err(error) => {
+                    self.free_page(new_cow_page);
+                    let attempted_value = self
+                        .cached_leaf_mut(leaf_page_id, leaf_is_fresh)
+                        .upsert(key, old_value)
+                        .1;
+                    self.discard_uncommitted_value(attempted_value).await;
+                    return Err(error);
                 }
             }
         }
@@ -185,32 +246,20 @@ impl<V: Vfs> BTree<V> {
                 return Err(PagedbError::AppendNotMonotonic);
             }
         }
+        self.validate_insert_record_fits(key, value)?;
 
-        // Empty tree: delegate to the regular `put` path, which initializes
-        // the root and writes the first leaf. After it returns, seed the
-        // append cache with the new key.
+        // Initialize directly: regular put invalidates append state by design.
         if self.root_page_id == 0 {
-            self.put(key, value).await?;
+            let leaf_value = self.leaf_value_for(value).await?;
+            let new_root = self.allocate_page();
+            let mut leaf = Leaf::new();
+            leaf.upsert(key, leaf_value);
+            self.write_leaf(new_root, &leaf).await?;
+            self.root_page_id = new_root;
             self.append_last_key = Some(key.to_vec());
-            // The cached path needs a real descent on the next call.
+            self.append_cached_path = Some(vec![new_root]);
             return Ok(());
         }
-
-        // Build the leaf value (inline or overflow).
-        let leaf_value = if value.len() > self.page_size / 4 {
-            let realm = self.realm_id;
-            let ps = self.page_size;
-            let pager = Arc::clone(&self.pager);
-            let root_id =
-                overflow::write_chain(&pager, realm, value, ps, &mut || self.allocate_page())
-                    .await?;
-            LeafValue::Overflow {
-                total_len: value.len() as u64,
-                root_page_id: root_id,
-            }
-        } else {
-            LeafValue::Inline(value.to_vec())
-        };
 
         // Fast path: cached rightmost path is valid → skip descent.
         let path = if let Some(cached) = self.append_cached_path.take() {
@@ -218,6 +267,15 @@ impl<V: Vfs> BTree<V> {
         } else {
             self.path_to_rightmost_leaf().await?
         };
+        if self.append_last_key.is_none()
+            && self
+                .max_key_at_path(&path)
+                .await?
+                .is_some_and(|max_key| key <= max_key.as_slice())
+        {
+            return Err(PagedbError::AppendNotMonotonic);
+        }
+        let leaf_value = self.leaf_value_for(value).await?;
         let path_for_retry = path.clone();
         let split = self.put_at_path(path, key, leaf_value).await?;
         self.append_last_key = Some(key.to_vec());
@@ -258,8 +316,7 @@ impl<V: Vfs> BTree<V> {
         // `delete` may have removed the previously-appended max, so the
         // monotonic invariant on `put_append` can no longer be enforced
         // against `append_last_key`. Reset the append state.
-        self.append_cached_path = None;
-        self.append_last_key = None;
+        self.invalidate_append_state();
         if self.root_page_id == 0 {
             return Ok(false);
         }
@@ -269,35 +326,27 @@ impl<V: Vfs> BTree<V> {
         if !leaf_is_fresh {
             self.ensure_leaf_dirty(leaf_page_id, &path).await?;
         }
-        let removed = if leaf_is_fresh {
-            self.fresh_leaves
-                .get_mut(&leaf_page_id)
-                .expect("fresh contains key")
-                .remove(key)
-        } else {
-            self.dirty_leaves
-                .get_mut(&leaf_page_id)
-                .expect("dirty after ensure")
-                .remove(key)
-        };
+        let removed = self
+            .cached_leaf_mut(leaf_page_id, leaf_is_fresh)
+            .remove(key);
         match removed {
             None => return Ok(false),
-            Some(LeafValue::Overflow {
-                root_page_id: old_root,
-                ..
-            }) => {
+            Some(
+                old_value @ LeafValue::Overflow {
+                    root_page_id: old_root,
+                    ..
+                },
+            ) => {
                 let new_cow_page = self.allocate_page();
-                match overflow::release(&self.pager, self.realm_id, old_root, new_cow_page).await? {
-                    overflow::ReleaseResult::Freed { freed_pages } => {
-                        for pid in freed_pages {
-                            self.free_page(pid);
-                        }
-                        self.free_page(new_cow_page);
+                match overflow::release(&self.pager, self.realm_id, old_root, new_cow_page).await {
+                    Ok(release_result) => {
+                        self.apply_release_result(old_root, new_cow_page, release_result);
                     }
-                    overflow::ReleaseResult::Decremented {
-                        new_root_page_id: _,
-                    } => {
-                        self.free_page(old_root);
+                    Err(error) => {
+                        self.free_page(new_cow_page);
+                        self.cached_leaf_mut(leaf_page_id, leaf_is_fresh)
+                            .upsert(key, old_value);
+                        return Err(error);
                     }
                 }
             }
@@ -341,23 +390,15 @@ impl<V: Vfs> BTree<V> {
         if self.root_page_id == 0 {
             return Ok(0);
         }
-        // Collect all keys in range (keys only, no values needed).
-        let mut page_id = self.root_page_id;
-        loop {
-            if self.fresh_leaves.contains_key(&page_id) {
-                break;
-            }
-            let kind = self.read_node_kind(page_id).await?;
-            if kind == NodeKind::Leaf {
-                break;
-            }
-            let internal = self.read_internal(page_id).await?;
-            page_id = internal.child_for(start);
-        }
+        // Parent paths are authoritative for fresh same-session split leaves;
+        // their sibling links remain zero until flush.
+        let mut path = self.path_to_leaf_for_key(start).await?;
         let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
-        let mut next = page_id;
-        'outer: while next != 0 {
-            let leaf = self.read_leaf(next).await?;
+        let mut seen_leaves = SeenPageIds::new();
+        'outer: loop {
+            let leaf_page_id = *path.last().expect("non-empty path");
+            seen_leaves.insert(leaf_page_id)?;
+            let leaf = self.read_leaf(leaf_page_id).await?;
             for (k, _) in &leaf.records {
                 if k.as_slice() >= end {
                     break 'outer;
@@ -366,7 +407,21 @@ impl<V: Vfs> BTree<V> {
                     keys_to_delete.push(k.clone());
                 }
             }
-            next = leaf.right_sibling;
+            let next_path = self.next_leaf_after(&path).await?;
+            match (leaf.right_sibling, next_path) {
+                (0, Some(parent_next)) => path = parent_next,
+                (0, None) => break,
+                (right_sibling, Some(parent_next))
+                    if parent_next.last().copied() == Some(right_sibling) =>
+                {
+                    path = parent_next;
+                }
+                _ => {
+                    return Err(PagedbError::corruption(
+                        CorruptionDetail::HeaderUnverifiable,
+                    ));
+                }
+            }
         }
         let count = keys_to_delete.len() as u64;
         for key in keys_to_delete {

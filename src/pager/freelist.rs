@@ -46,8 +46,16 @@ pub async fn read_chain<V: Vfs + Clone>(
 ) -> Result<(Vec<(u64, u64)>, Vec<u64>)> {
     let mut entries = Vec::new();
     let mut chain_pages = Vec::new();
+    let mut seen = HashSet::new();
     let mut page = head;
     while page != 0 {
+        if !seen.insert(page) {
+            return Err(PagedbError::corruption(
+                crate::errors::CorruptionDetail::CatalogRowInvalid {
+                    field: "freelist chain contains a cycle",
+                },
+            ));
+        }
         let guard = pager.read_main_page(page, realm_id, PageKind::Free).await?;
         let body = guard.body_ref();
         let mut next_b = [0u8; 8];
@@ -181,4 +189,55 @@ pub async fn write_chain<V: Vfs + Clone>(
         written += chunk.len();
     }
     Ok(chain_pages[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::crypto::CipherId;
+    use crate::crypto::kdf::derive_mk;
+    use crate::pager::PagerConfig;
+    use crate::vfs::memory::MemVfs;
+
+    use super::*;
+
+    const PAGE: usize = 4096;
+    const REALM: RealmId = RealmId::new([0xF1; 16]);
+
+    async fn test_pager() -> Arc<Pager<MemVfs>> {
+        let mk = derive_mk(&[0xF2; 32], &[0u8; 16], 0).unwrap();
+        let config = PagerConfig {
+            page_size: PAGE,
+            buffer_pool_pages: 16,
+            segment_cache_pages: 16,
+            cipher_id: CipherId::Aes256Gcm,
+            mk_epoch: 0,
+            main_db_file_id: [0xF3; 16],
+            main_db_path: "/main.db".into(),
+            anchor_budget: 1_000_000,
+            dek_lru_capacity: 16,
+            observer_retry_count: 0,
+            metrics_enabled: true,
+        };
+        Arc::new(Pager::open(MemVfs::new(), mk, config).await.unwrap())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_chain_rejects_cycle_without_hanging() {
+        let pager = test_pager().await;
+        let mut body = vec![0u8; body_capacity(PAGE)];
+        body[0..8].copy_from_slice(&10u64.to_le_bytes());
+        pager
+            .write_main_page(10, REALM, PageKind::Free, &body)
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), read_chain(&pager, REALM, 10))
+            .await
+            .expect("cycle detection should return before timeout")
+            .expect_err("free-list cycles must be corruption");
+        assert!(matches!(error, PagedbError::Corruption(_)));
+    }
 }

@@ -6,6 +6,7 @@ use crate::Result;
 use crate::errors::PagedbError;
 use crate::vfs::Vfs;
 
+use crate::btree::internal;
 use crate::btree::leaf::{Leaf, LeafValue};
 use crate::btree::node;
 use crate::btree::overflow;
@@ -32,6 +33,18 @@ impl<V: Vfs> BTree<V> {
         }
         if pairs.is_empty() {
             return Ok(());
+        }
+
+        for pair in pairs.windows(2) {
+            if pair[0].0 >= pair[1].0 {
+                return Err(PagedbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "bulk_load input keys must be strictly increasing",
+                )));
+            }
+        }
+        for (key, value) in &pairs {
+            self.validate_insert_record_fits(key, value)?;
         }
 
         // Resolve each value to its stored form, spilling values past the inline
@@ -130,12 +143,18 @@ impl<V: Vfs> BTree<V> {
                 let mut used = node::HEADER_LEN;
                 for item in remaining.iter().skip(1) {
                     let sep_key = &item.1;
-                    let entry_bytes = 2 + sep_key.len() + 8 + 2; // record + slot
-                    if used + entry_bytes > body_cap {
+                    let entry_bytes = internal::separator_entry_size(sep_key.len())?;
+                    if used
+                        .checked_add(entry_bytes)
+                        .is_none_or(|needed| needed > body_cap)
+                    {
                         break;
                     }
                     used += entry_bytes;
                     count += 1;
+                }
+                if count == 1 && remaining.len() > 1 {
+                    return Err(PagedbError::PayloadTooLarge);
                 }
                 let chunk = &remaining[..count];
                 remaining = &remaining[count..];
