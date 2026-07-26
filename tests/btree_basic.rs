@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
 use pagedb::btree::BTree;
+use pagedb::btree::internal::Internal;
+use pagedb::btree::leaf::{Leaf, LeafValue};
+use pagedb::btree::node::body_capacity;
 use pagedb::crypto::CipherId;
 use pagedb::crypto::kdf::derive_mk;
-use pagedb::pager::{Pager, PagerConfig};
+use pagedb::errors::CorruptionDetail;
+use pagedb::pager::{PageKind, Pager, PagerConfig};
 use pagedb::vfs::memory::MemVfs;
 use pagedb::{PagedbError, RealmId};
 
@@ -238,4 +242,48 @@ async fn put_append_after_regular_put_re_descends() {
     // Now further appends must be > "z99".
     assert!(tree.put_append(b"z00", b"v").await.is_err());
     tree.put_append(b"zzz", b"v").await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_node_rejects_authenticated_envelope_body_kind_mismatch() {
+    let pager = fresh_pager().await;
+    let realm = RealmId::new([1; 16]);
+
+    let mut leaf = Leaf::new();
+    leaf.upsert(b"k", LeafValue::Inline(b"v".to_vec()));
+    let mut leaf_body = vec![0u8; body_capacity(PAGE)];
+    leaf.encode(&mut leaf_body).unwrap();
+
+    let child_leaf_page_id = 62;
+    pager
+        .write_main_page(child_leaf_page_id, realm, PageKind::BTreeLeaf, &leaf_body)
+        .await
+        .unwrap();
+
+    let internal = Internal {
+        leftmost_child: child_leaf_page_id,
+        entries: Vec::new(),
+    };
+    let mut internal_body = vec![0u8; body_capacity(PAGE)];
+    internal.encode(&mut internal_body).unwrap();
+
+    for (page_id, envelope_kind, body) in [
+        (61, PageKind::BTreeLeaf, internal_body.as_slice()),
+        (64, PageKind::BTreeInternal, leaf_body.as_slice()),
+    ] {
+        pager
+            .write_main_page(page_id, realm, envelope_kind, body)
+            .await
+            .unwrap();
+        let tree = BTree::open(pager.clone(), realm, page_id, 65, PAGE);
+        let error = tree
+            .get(b"k")
+            .await
+            .expect_err("authenticated envelope and decoded node kinds must agree");
+
+        assert!(matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::HeaderUnverifiable)
+        ));
+    }
 }
