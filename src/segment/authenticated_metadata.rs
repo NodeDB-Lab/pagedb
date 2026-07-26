@@ -11,8 +11,7 @@ use crate::pager::format::data_page::{body, extract_page_header_ids, open_data_p
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::format::segment_footer::{SegmentFooterFields, decode_segment_footer};
 use crate::pager::format::structural_header::{SegmentHeaderFields, decode_segment_header};
-use crate::vfs::Vfs;
-use crate::vfs::VfsFile;
+use crate::vfs::{Vfs, VfsFile, checked_read_progress};
 
 use super::types::{EXTENT_INDEX_ENTRY_LEN, ExtentIndexEntry};
 use super::writer::{live_path, staging_path};
@@ -85,17 +84,23 @@ pub(crate) async fn authenticate_segment_metadata<V: Vfs + Clone>(
     let master_key = pager.mk_for(meta.mk_epoch, cipher_id)?;
     let hk = derive_hk(&master_key)?;
     let mut header_bytes = vec![0u8; page_size];
-    let header_read = file.read_at(0, &mut header_bytes).await?;
-    if header_read != page_size {
-        return Err(PagedbError::segment_geometry_invalid("header_read"));
+    let mut header_offset = 0;
+    let mut header_remaining = &mut header_bytes[..];
+    while !header_remaining.is_empty() {
+        let read = file.read_at(header_offset, header_remaining).await?;
+        checked_read_progress(&mut header_offset, read, header_remaining.len())?;
+        header_remaining = header_remaining.split_at_mut(read).1;
     }
     let header = decode_segment_header(&header_bytes, &hk, page_size)?;
     validate_header(&header, meta, parent_file_id, page_size)?;
 
     let mut footer_bytes = vec![0u8; page_size];
-    let footer_read = file.read_at(footer_offset, &mut footer_bytes).await?;
-    if footer_read != page_size {
-        return Err(PagedbError::segment_geometry_invalid("footer_read"));
+    let mut next_footer_offset = footer_offset;
+    let mut footer_remaining = &mut footer_bytes[..];
+    while !footer_remaining.is_empty() {
+        let read = file.read_at(next_footer_offset, footer_remaining).await?;
+        checked_read_progress(&mut next_footer_offset, read, footer_remaining.len())?;
+        footer_remaining = footer_remaining.split_at_mut(read).1;
     }
     let (footer, manifest) = {
         let mut lru = pager.dek_lru().lock();
@@ -332,8 +337,12 @@ async fn collect_and_decode_index_page<V: Vfs + Clone>(
         .checked_mul(page_size_u64)
         .ok_or_else(|| PagedbError::segment_geometry_invalid("index.offset"))?;
     let mut page = vec![0u8; context.page_size];
-    if context.file.read_at(offset, &mut page).await? != context.page_size {
-        return Err(PagedbError::segment_geometry_invalid("index.read"));
+    let mut read_offset = offset;
+    let mut remaining = &mut page[..];
+    while !remaining.is_empty() {
+        let read = context.file.read_at(read_offset, remaining).await?;
+        checked_read_progress(&mut read_offset, read, remaining.len())?;
+        remaining = remaining.split_at_mut(read).1;
     }
     let (cipher_id, mk_epoch) = extract_page_header_ids(&page)?;
     if cipher_id != context.cipher_id {

@@ -112,20 +112,17 @@ impl<V: Vfs + Clone> Db<V> {
         let latest_commit_id = snapshot.commit_id;
 
         // Durable free-list depth (chain rooted at the header's free_list_root).
-        let free_list_pending_entries =
-            crate::pager::freelist::read_chain(&self.pager, self.realm_id, free_list_root)
-                .await
-                .map_or(0, |(entries, _)| entries.len() as u64);
+        let (free_list_entries, _) =
+            crate::pager::freelist::read_chain(&self.pager, self.realm_id, free_list_root).await?;
+        let free_list_pending_entries = free_list_entries.len() as u64;
 
         // Main database file size.
-        let main_db_bytes = match self
+        let main_db_bytes = self
             .vfs
             .open(&self.main_db_path, crate::vfs::types::OpenMode::Read)
-            .await
-        {
-            Ok(f) => f.len().await.unwrap_or(0),
-            Err(_) => 0,
-        };
+            .await?
+            .len()
+            .await?;
 
         // Buffer pool stats from cache.
         let buffer_pool_pages = { self.pager.inner.buffer_pool.lock().len() as u64 };
@@ -161,7 +158,7 @@ impl<V: Vfs + Clone> Db<V> {
             );
 
             let seg_start = vec![CatalogRowKind::Segment as u8];
-            let seg_rows = tree.scan_prefix(&seg_start).await.unwrap_or_default();
+            let seg_rows = tree.scan_prefix(&seg_start).await?;
             let seg_count = u32::try_from(seg_rows.len()).unwrap_or(u32::MAX);
             let seg_bytes: u64 = seg_rows
                 .iter()
