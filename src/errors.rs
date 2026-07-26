@@ -169,6 +169,19 @@ pub enum PagedbError {
     #[error("recorded rekey replacement segment {replacement_segment_id:?} is missing or invalid")]
     RekeyReplacementMissing { replacement_segment_id: [u8; 16] },
 
+    /// A VFS backend reported positional-I/O progress that cannot be true —
+    /// more bytes transferred than the caller's remaining buffer.
+    ///
+    /// Not corruption: nothing on disk is known to be wrong. The backend broke
+    /// the [`VfsFile`](crate::vfs::VfsFile) contract, so the reported count
+    /// cannot be reasoned about at all and the transfer stops instead of
+    /// advancing by a length it cannot trust.
+    #[error("vfs backend violated the {operation} contract: {detail}")]
+    VfsContractViolated {
+        operation: &'static str,
+        detail: &'static str,
+    },
+
     #[error("unsupported by backend")]
     Unsupported,
 
@@ -471,6 +484,13 @@ impl PagedbError {
     #[must_use]
     pub const fn arithmetic_overflow(operation: &'static str) -> Self {
         Self::ArithmeticOverflow { operation }
+    }
+
+    /// Canonical constructor for a VFS backend that broke the positional-I/O
+    /// contract.
+    #[must_use]
+    pub const fn vfs_contract_violated(operation: &'static str, detail: &'static str) -> Self {
+        Self::VfsContractViolated { operation, detail }
     }
 
     /// Canonical constructor for a rekey admission that needs both KEKs.

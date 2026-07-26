@@ -39,7 +39,9 @@ pub use iouring::{IouringFile, IouringVfs};
 #[cfg(feature = "opfs")]
 pub use opfs::OpfsVfs;
 pub use traits::{Vfs, VfsFile};
-pub(crate) use traits::{checked_read_progress, read_exact_at, write_all_at};
+pub(crate) use traits::{
+    checked_read_progress, read_exact_at, read_exact_at_borrowed, write_all_at,
+};
 pub use types::{OpenMode, ReadReq, WriteReq};
 pub use wasi::WasiVfs;
 
