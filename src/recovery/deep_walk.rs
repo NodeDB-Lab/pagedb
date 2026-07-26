@@ -5,10 +5,11 @@
 //! `DeepWalkReport` rather than printing directly so callers can choose output
 //! format.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::Result;
 use crate::btree::BTree;
+use crate::btree::internal::Internal;
 use crate::catalog::codec::{Catalog, SegmentMeta};
 use crate::crypto::aad::{Aad, AadFields, MAIN_DB_SEGMENT_ID};
 use crate::pager::Pager;
@@ -165,7 +166,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     let realm_id = db.realm_id;
 
     // Collect the set of page IDs reachable from all live roots.
-    let mut reachable = collect_reachable_pages(db).await;
+    let mut reachable = collect_reachable_pages(db, &mut report).await;
 
     // Walk and validate the durable free-list chain. Reading it verifies each
     // chain page's AEAD; a corrupt chain surfaces as a page issue. Validate the
@@ -314,24 +315,6 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
         }
 
         report.pages_examined += 1;
-    }
-
-    // ------------------------------------------------------------------ //
-    // 1b. Structural descent: every internal-node child pointer must resolve
-    // to a valid B+ tree node. A pointer to a Free/non-node page is a
-    // use-after-free dangling pointer — the page's own AEAD still verifies
-    // (under its recycled kind), so the physical page-walk above cannot catch
-    // it; only a keyed descent that authenticates each child *as a node* can.
-    // ------------------------------------------------------------------ //
-    let (data_root, hist_root) = {
-        let state = db.writer.lock().await;
-        (state.root_page_id, state.commit_history_root_page_id)
-    };
-    for root in [data_root, catalog_root, hist_root]
-        .into_iter()
-        .filter(|&r| r != 0)
-    {
-        check_dangling_child_pointers(db, root, next_page_id, &mut report).await;
     }
 
     // ------------------------------------------------------------------ //
@@ -516,7 +499,10 @@ async fn check_segment<V: Vfs + Clone>(
 /// Collect the set of all page IDs reachable from the main B+ tree root,
 /// the catalog root, the commit-history root, and the free-list root.
 /// Pages 0..=3 (reserved) are always considered reachable.
-async fn collect_reachable_pages<V: Vfs + Clone>(db: &Db<V>) -> BTreeSet<u64> {
+async fn collect_reachable_pages<V: Vfs + Clone>(
+    db: &Db<V>,
+    report: &mut DeepWalkReport,
+) -> BTreeSet<u64> {
     let mut reachable: BTreeSet<u64> = BTreeSet::new();
     // Reserved pages.
     for pid in 0u64..4 {
@@ -533,90 +519,269 @@ async fn collect_reachable_pages<V: Vfs + Clone>(db: &Db<V>) -> BTreeSet<u64> {
         )
     };
 
-    for tree_root in [root, cat_root, hist_root]
-        .iter()
-        .copied()
-        .filter(|&r| r != 0)
+    for (tree_name, tree_root) in [
+        ("main tree", root),
+        ("catalog tree", cat_root),
+        ("commit-history tree", hist_root),
+    ]
+    .into_iter()
+    .filter(|&(_name, root)| root != 0)
     {
         let tree = BTree::open(db.pager.clone(), db.realm_id, tree_root, next, db.page_size);
-        let _ = tree.collect_all_page_ids(&mut reachable).await;
+        if let Err(error) = tree.collect_all_page_ids(&mut reachable).await {
+            report.page_issues.push(PageIssue {
+                page_id: tree_root,
+                description: format!("{tree_name} reachability walk failed: {error}"),
+            });
+            diagnose_dangling_child_pointers(db, tree_name, tree_root, next, report).await;
+        }
     }
 
     reachable
 }
 
-/// Descend `root` breadth-first, authenticating every internal-node child
-/// pointer *as a B+ tree node*. Any pointer to a page that is out of range or
-/// does not read back as a leaf/internal node (e.g. a recycled `Free` page) is
-/// a use-after-free dangling pointer; it is appended to `report.page_issues`.
-async fn check_dangling_child_pointers<V: Vfs + Clone>(
+/// Add parent/child context after the authoritative reachability walk fails.
+///
+/// Healthy trees are not traversed twice. On corruption, this bounded pass
+/// authenticates each referenced page as a B+ tree node so a recycled child
+/// can be distinguished from a malformed root-level walk.
+async fn diagnose_dangling_child_pointers<V: Vfs + Clone>(
     db: &Db<V>,
+    tree_name: &str,
     root: u64,
     next_page_id: u64,
     report: &mut DeepWalkReport,
 ) {
-    use crate::btree::internal::Internal;
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::from([(root, None)]);
+    let mut budget = next_page_id.saturating_mul(2).saturating_add(16);
 
-    let mut visited: BTreeSet<u64> = BTreeSet::new();
-    let mut queue: Vec<u64> = vec![root];
-    // Bound the walk defensively so a corrupt cyclic tree cannot spin forever.
-    let mut budget: u64 = next_page_id.saturating_mul(2).saturating_add(16);
-
-    while let Some(page_id) = queue.pop() {
+    while let Some((page_id, parent)) = queue.pop_front() {
         if budget == 0 {
-            break;
+            report.page_issues.push(PageIssue {
+                page_id: root,
+                description: format!(
+                    "{tree_name} dangling-child diagnostic exhausted its traversal budget"
+                ),
+            });
+            return;
         }
         budget -= 1;
         if !visited.insert(page_id) {
             continue;
         }
-        // The physical page-walk above already reports unreadable pages.
-        let Ok((guard, kind)) = db.pager.read_main_node(page_id, db.realm_id).await else {
-            continue;
+
+        let (guard, authenticated_kind) = match db.pager.read_main_node(page_id, db.realm_id).await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                if let Some(parent_page_id) = parent {
+                    report.page_issues.push(PageIssue {
+                        page_id,
+                        description: format!(
+                            "dangling child pointer: {tree_name} internal node \
+                             {parent_page_id} references page {page_id}, which is not a valid \
+                             B+ tree node: {error}"
+                        ),
+                    });
+                }
+                continue;
+            }
         };
-        if kind != PageKind::BTreeInternal {
-            continue; // leaf: nothing to descend
-        }
-        let Ok(internal) = Internal::decode(guard.body_ref()) else {
+        if authenticated_kind == PageKind::BTreeLeaf {
             continue;
+        }
+
+        let internal = match Internal::decode(guard.body_ref()) {
+            Ok(internal) => internal,
+            Err(error) => {
+                report.page_issues.push(PageIssue {
+                    page_id,
+                    description: format!(
+                        "{tree_name} internal node {page_id} could not be decoded: {error}"
+                    ),
+                });
+                continue;
+            }
         };
         drop(guard);
-        let children = std::iter::once(internal.leftmost_child)
-            .chain(internal.entries.iter().map(|e| e.right_child));
-        for child in children {
+
+        for child in std::iter::once(internal.leftmost_child)
+            .chain(internal.entries.iter().map(|entry| entry.right_child))
+        {
             if child == 0 {
                 continue;
             }
             if child >= next_page_id {
                 report.page_issues.push(PageIssue {
-                    page_id,
+                    page_id: child,
                     description: format!(
-                        "internal node child pointer → {child} is past next_page_id ({next_page_id})"
+                        "dangling child pointer: {tree_name} internal node {page_id} references \
+                         page {child}, past next_page_id {next_page_id}"
                     ),
                 });
                 continue;
             }
-            if db.pager.read_main_node(child, db.realm_id).await.is_ok() {
-                queue.push(child);
-            } else {
-                // The child page does not authenticate as a btree node — a
-                // freed/recycled page still referenced by this parent.
-                let mut buf = vec![0u8; db.page_size];
-                let kind_byte = if let Ok(f) = db.vfs.open(&db.main_db_path, OpenMode::Read).await {
-                    let _ = f.read_at(child * db.page_size as u64, &mut buf).await;
-                    buf.get(1).copied().unwrap_or(0)
-                } else {
-                    0
-                };
-                report.page_issues.push(PageIssue {
-                    page_id: child,
-                    description: format!(
-                        "dangling child pointer: internal node {page_id} references page \
-                         {child}, which is not a valid btree node (on-disk kind byte \
-                         0x{kind_byte:02x}) — use-after-free"
-                    ),
-                });
-            }
+            queue.push_back((child, Some(page_id)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::OpenOptions;
+    use crate::btree::internal::Internal;
+    use crate::btree::leaf::{Leaf, LeafValue};
+    use crate::btree::node::body_capacity;
+    use crate::btree::overflow;
+    use crate::pager::format::data_page::ENVELOPE_OVERHEAD;
+    use crate::vfs::memory::MemVfs;
+
+    const PAGE: usize = 4096;
+    const REALM: crate::RealmId = crate::RealmId::new([0xD3; 16]);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deep_walk_reports_aead_valid_malformed_live_btree_root() {
+        let db = Db::open_internal_with_options(
+            MemVfs::new(),
+            [9u8; 32],
+            PAGE,
+            REALM,
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(b"live-root", b"value").await.unwrap();
+        txn.commit().await.unwrap();
+
+        let root_page_id = db.writer.lock().await.root_page_id;
+        let mut malformed_body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
+        malformed_body[0] = 0xFF;
+        db.pager
+            .write_main_page(root_page_id, REALM, PageKind::BTreeLeaf, &malformed_body)
+            .await
+            .unwrap();
+        db.pager.flush_main(REALM).await.unwrap();
+        db.pager.reset_main_pages();
+
+        let report = run_deep_walk(&db).await.unwrap();
+        assert!(
+            report.page_issues.iter().any(|issue| {
+                issue.page_id == root_page_id
+                    && issue.description.contains("reachability walk failed")
+            }),
+            "deep walk must surface the authoritative tree traversal failure: {report:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deep_walk_reports_a_cycle_in_a_live_overflow_chain() {
+        let db = Db::open_internal_with_options(
+            MemVfs::new(),
+            [9u8; 32],
+            PAGE,
+            REALM,
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(b"overflow", &vec![0xA5; 9_000]).await.unwrap();
+        txn.commit().await.unwrap();
+
+        let root_page_id = db.writer.lock().await.root_page_id;
+        let (root_guard, _) = db.pager.read_main_node(root_page_id, REALM).await.unwrap();
+        let leaf = Leaf::decode(root_guard.body_ref()).unwrap();
+        let overflow_root_page_id = match &leaf.records[0].1 {
+            LeafValue::Overflow { root_page_id, .. } => *root_page_id,
+            LeafValue::Inline(_) => panic!("expected overflow value"),
+        };
+        drop(root_guard);
+
+        let root_info = overflow::read_root_page(&db.pager, REALM, overflow_root_page_id)
+            .await
+            .unwrap();
+        assert_ne!(root_info.next, 0);
+        let chain_guard = db
+            .pager
+            .read_main_page(root_info.next, REALM, PageKind::Overflow)
+            .await
+            .unwrap();
+        let chain_body = chain_guard.body();
+        let (_, chain_data) = overflow::decode_overflow(&chain_body).unwrap();
+        let chain_data = chain_data.to_vec();
+        drop(chain_guard);
+
+        let mut cyclic_body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
+        overflow::encode_overflow(&mut cyclic_body, root_info.next, &chain_data).unwrap();
+        db.pager
+            .write_main_page(root_info.next, REALM, PageKind::Overflow, &cyclic_body)
+            .await
+            .unwrap();
+        db.pager.flush_main(REALM).await.unwrap();
+        db.pager.reset_main_pages();
+
+        let report = run_deep_walk(&db).await.unwrap();
+        assert!(
+            report.page_issues.iter().any(|issue| {
+                issue.page_id == root_page_id
+                    && issue.description.contains("reachability walk failed")
+            }),
+            "deep walk must fail closed on an overflow cycle: {report:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deep_walk_identifies_the_dangling_child_page() {
+        let db = Db::open_internal_with_options(
+            MemVfs::new(),
+            [9u8; 32],
+            PAGE,
+            REALM,
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
+        let root_page_id = 4;
+        let recycled_child_page_id = 5;
+
+        let internal = Internal {
+            leftmost_child: recycled_child_page_id,
+            entries: Vec::new(),
+        };
+        let mut internal_body = vec![0u8; body_capacity(PAGE)];
+        internal.encode(&mut internal_body).unwrap();
+        db.pager
+            .write_main_page(root_page_id, REALM, PageKind::BTreeInternal, &internal_body)
+            .await
+            .unwrap();
+        db.pager
+            .write_main_page(
+                recycled_child_page_id,
+                REALM,
+                PageKind::Free,
+                &vec![0u8; body_capacity(PAGE)],
+            )
+            .await
+            .unwrap();
+        db.pager.flush_main(REALM).await.unwrap();
+        db.pager.reset_main_pages();
+        {
+            let mut state = db.writer.lock().await;
+            state.root_page_id = root_page_id;
+            state.next_page_id = recycled_child_page_id + 1;
+        }
+
+        let report = run_deep_walk(&db).await.unwrap();
+        assert!(
+            report.page_issues.iter().any(|issue| {
+                issue.page_id == recycled_child_page_id
+                    && issue.description.contains("dangling child pointer")
+                    && issue.description.contains(&root_page_id.to_string())
+            }),
+            "deep walk must identify the recycled child and its parent: {report:?}"
+        );
     }
 }
