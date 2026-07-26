@@ -68,6 +68,52 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
+    /// Collect at most `limit` records at or after `start`, in ascending key
+    /// order.
+    ///
+    /// The bounded counterpart to [`Self::collect_all`], for callers that must
+    /// traverse a whole tree without holding it in memory at once. Like
+    /// `collect_all` it has no upper key bound, for the same reason: no
+    /// concrete maximum key is outside the valid domain, so a bounded "scan to
+    /// the end" would silently drop records at the top of the keyspace.
+    ///
+    /// Resume by passing the last returned key with a `0x00` byte appended.
+    /// That is the immediate successor in the key ordering — no key can sort
+    /// strictly between `k` and `k ‖ 0x00` — so paging this way never skips a
+    /// record and never returns one twice. A short batch means the tree ended.
+    pub async fn collect_batch_from(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if self.root_page_id == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut path = self.path_to_leaf_for_key(start).await?;
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(limit);
+        loop {
+            let leaf_id = *path.last().expect("non-empty path");
+            let leaf = self.read_leaf(leaf_id).await?;
+            for (k, v) in &leaf.records {
+                if k.as_slice() < start {
+                    continue;
+                }
+                if out.len() == limit {
+                    return Ok(out);
+                }
+                let val = self.resolve_leaf_value(v).await?;
+                out.push((k.clone(), val));
+            }
+            if out.len() == limit {
+                return Ok(out);
+            }
+            match self.next_leaf_after(&path).await? {
+                Some(next_path) => path = next_path,
+                None => return Ok(out),
+            }
+        }
+    }
+
     /// Return the smallest key in the tree, or `None` if the tree is empty.
     /// Descends the leftmost spine only — O(tree height), not O(tree size).
     pub async fn first_key(&self) -> Result<Option<Vec<u8>>> {
