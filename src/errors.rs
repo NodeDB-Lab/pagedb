@@ -282,6 +282,19 @@ pub enum CorruptionDetail {
     /// has no terminator. Distinct from a truncated chain: the links
     /// authenticate, they just form a loop.
     OverflowChainCycle { root_page_id: u64, page_id: u64 },
+    /// One physical page was reached twice in a single traversal under two
+    /// incompatible page kinds.
+    ///
+    /// Distinct from [`Self::NodeKindMismatch`], which is a disagreement inside
+    /// one page. Here every read authenticates and every body decodes: two live
+    /// references simply claim the same page for different roles, so at least
+    /// one of them points at a page that was freed and handed to another
+    /// object while still linked.
+    PageKindAliased {
+        page_id: u64,
+        walked_as: &'static str,
+        referenced_as: &'static str,
+    },
 }
 
 /// Quota failure reason, distinguishing which resource was exhausted.
@@ -395,6 +408,21 @@ impl PagedbError {
         Self::Corruption(CorruptionDetail::OverflowChainCycle {
             root_page_id,
             page_id,
+        })
+    }
+
+    /// Canonical constructor for one page claimed by two incompatible
+    /// references in a single traversal.
+    #[must_use]
+    pub const fn page_kind_aliased(
+        page_id: u64,
+        walked_as: &'static str,
+        referenced_as: &'static str,
+    ) -> Self {
+        Self::Corruption(CorruptionDetail::PageKindAliased {
+            page_id,
+            walked_as,
+            referenced_as,
         })
     }
 

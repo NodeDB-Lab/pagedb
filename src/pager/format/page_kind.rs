@@ -56,6 +56,29 @@ impl PageKind {
         self as u8
     }
 
+    /// Stable lowercase name, for naming a page's role in an error that a
+    /// human reads — both sides of a
+    /// [`CorruptionDetail::PageKindAliased`](crate::errors::CorruptionDetail::PageKindAliased),
+    /// for instance. Part of the diagnostic surface, not the format: the
+    /// discriminant byte is what persists.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BTreeInternal => "btree_internal",
+            Self::BTreeLeaf => "btree_leaf",
+            Self::Free => "free",
+            Self::Spill => "spill",
+            Self::Overflow => "overflow",
+            Self::Counter => "counter",
+            Self::Catalog => "catalog",
+            Self::ApplyJournal => "apply_journal",
+            Self::OverflowRoot => "overflow_root",
+            Self::SegmentData => "segment_data",
+            Self::SegmentIndex => "segment_index",
+            Self::SegmentOverflow => "segment_overflow",
+        }
+    }
+
     /// True iff this kind is legal in a `main.db` Format A page.
     #[must_use]
     pub fn is_main_db(self) -> bool {
@@ -115,6 +138,28 @@ mod tests {
                 Err(PagedbError::IllegalPageKind)
             ));
         }
+    }
+
+    /// Two kinds sharing a name would make an alias error name the same role on
+    /// both sides and read as a contradiction of itself.
+    #[test]
+    fn names_are_distinct_across_every_kind() {
+        let kinds = [
+            PageKind::BTreeInternal,
+            PageKind::BTreeLeaf,
+            PageKind::Free,
+            PageKind::Spill,
+            PageKind::Overflow,
+            PageKind::Counter,
+            PageKind::Catalog,
+            PageKind::ApplyJournal,
+            PageKind::OverflowRoot,
+            PageKind::SegmentData,
+            PageKind::SegmentIndex,
+            PageKind::SegmentOverflow,
+        ];
+        let names: std::collections::BTreeSet<&str> = kinds.iter().map(|k| k.name()).collect();
+        assert_eq!(names.len(), kinds.len(), "page kind names must be unique");
     }
 
     #[test]

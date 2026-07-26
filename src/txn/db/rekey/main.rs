@@ -22,6 +22,11 @@ use super::super::core::{
 };
 use super::intent::{intent_proof, migrate_legacy, validate_intent_for_current_cipher};
 
+/// Commit-history rows read per batch while rekeying the roots they name.
+/// Rows are 40 bytes, so this is a few KiB resident regardless of how deep
+/// retention runs.
+const HISTORY_ROOT_BATCH: usize = 512;
+
 impl<V: Vfs + Clone> Db<V> {
     /// Rekey the reachable main database and every catalog-linked immutable
     /// segment under `new_mk_epoch`.
@@ -194,6 +199,13 @@ impl<V: Vfs + Clone> Db<V> {
         // target header was published.
         self.pager
             .set_active_mk_epoch(target_master_key.clone(), intent.target_mk_epoch);
+        // One traversal set spans every root below. Retained snapshots share
+        // most of their pages by construction, so this is what keeps the walk
+        // proportional to unique reachable pages instead of to the number of
+        // retained commits. It is bounded by the page count of the live
+        // database, strictly below the dirty-page set the same walk is already
+        // accumulating in the buffer pool for the single `flush_main` at the
+        // end — a page id and kind against a whole decrypted page.
         let mut rewritten = BTreeMap::new();
         let main_tree = BTree::open(
             self.pager.clone(),
@@ -203,45 +215,9 @@ impl<V: Vfs + Clone> Db<V> {
             self.page_size,
         );
         main_tree.rekey_walk_unique(&mut rewritten).await?;
-        let retained_history = if state.commit_history_root_page_id != 0 {
-            let history_tree = BTree::open(
-                self.pager.clone(),
-                self.realm_id,
-                state.commit_history_root_page_id,
-                state.next_page_id,
-                self.page_size,
-            );
-            let entries = history_tree.collect_all().await?;
-            history_tree.rekey_walk_unique(&mut rewritten).await?;
-            entries
-                .into_iter()
-                .map(|(_, value)| decode_commit_meta(&value))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        for historical in retained_history {
-            for root_page_id in [
-                historical.active_root_page_id,
-                historical.catalog_root_page_id,
-            ] {
-                if root_page_id == 0 {
-                    continue;
-                }
-                BTree::open(
-                    self.pager.clone(),
-                    self.realm_id,
-                    root_page_id,
-                    historical.next_page_id,
-                    self.page_size,
-                )
-                .rekey_walk_unique(&mut rewritten)
+        if state.commit_history_root_page_id != 0 {
+            self.rewrite_retained_history_roots(state, &mut rewritten)
                 .await?;
-            }
-            // Historical readers traverse only retained data and catalog
-            // roots. The recorded free-list root is writer-only metadata whose
-            // superseded chain pages may already have been recycled. Only the
-            // current header's live chain below is safe to follow.
         }
         if state.free_list_root_page_id != 0 {
             let (_, chain_pages) = crate::pager::freelist::read_chain(
@@ -270,6 +246,84 @@ impl<V: Vfs + Clone> Db<V> {
         #[cfg(test)]
         self.interrupt_rekey_if_requested(RekeyTestFault::MainPagesTargetReadable)?;
         Ok(())
+    }
+
+    /// Rewrite the commit-history index and every reader-visible root its
+    /// retained rows still name.
+    ///
+    /// `begin_read_at` resolves a commit through this index and then opens the
+    /// data and catalog roots recorded in the row. Copy-on-write means those
+    /// roots are usually unreachable from the current header, so a rekey that
+    /// walked only the current header would return `Ok(())`, retire the source
+    /// epoch, and leave every retained snapshot naming pages that no live key
+    /// can open. Rewriting them is part of the success contract, not extra
+    /// safety: failing here is correct, because completing after a partial walk
+    /// recreates exactly that defect.
+    ///
+    /// The row's own `next_page_id` bounds each historical tree. Using the
+    /// current allocator bound instead would silently widen an old tree's
+    /// addressable page space beyond what its metadata claims.
+    async fn rewrite_retained_history_roots(
+        &self,
+        state: &WriterState,
+        rewritten: &mut BTreeMap<u64, crate::pager::PageKind>,
+    ) -> Result<()> {
+        let history_tree = BTree::open(
+            self.pager.clone(),
+            self.realm_id,
+            state.commit_history_root_page_id,
+            state.next_page_id,
+            self.page_size,
+        );
+        history_tree.rekey_walk_unique(rewritten).await?;
+
+        // Retention can be unbounded, so the rows are streamed in fixed-size
+        // batches rather than collected: the resident cost is one batch, not
+        // one entry per retained commit. Rewriting the index first means each
+        // batch is read back through the pages this walk has already re-sealed.
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let batch = history_tree
+                .collect_batch_from(&cursor, HISTORY_ROOT_BATCH)
+                .await?;
+            let Some((last_key, _)) = batch.last() else {
+                return Ok(());
+            };
+            cursor.clear();
+            cursor.extend_from_slice(last_key);
+            cursor.push(0);
+            let exhausted = batch.len() < HISTORY_ROOT_BATCH;
+
+            for (_, value) in &batch {
+                let historical = decode_commit_meta(value)?;
+                // Only the data and catalog roots are reader-visible. The row's
+                // free-list root is writer-only metadata whose superseded chain
+                // pages a later commit may already have recycled; following it
+                // would reinterpret a live page as `PageKind::Free`, so only the
+                // current header's live chain is safe to walk.
+                for root_page_id in [
+                    historical.active_root_page_id,
+                    historical.catalog_root_page_id,
+                ] {
+                    if root_page_id == 0 {
+                        continue;
+                    }
+                    BTree::open(
+                        self.pager.clone(),
+                        self.realm_id,
+                        root_page_id,
+                        historical.next_page_id,
+                        self.page_size,
+                    )
+                    .rekey_walk_unique(rewritten)
+                    .await?;
+                }
+            }
+
+            if exhausted {
+                return Ok(());
+            }
+        }
     }
 
     async fn publish_rekey_target_header(
