@@ -168,7 +168,7 @@ impl<V: Vfs + Clone> Db<V> {
             &kek
         } else {
             counterpart_kek.as_ref().ok_or_else(|| {
-                PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
+                PagedbError::structural_header_invalid("main.db", "counterpart_kek_unavailable")
             })?
         };
         let mk = derive_mk(header_kek.as_bytes(), &kek_salt, mk_epoch)?;

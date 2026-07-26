@@ -1,7 +1,7 @@
 //! Node layout shared by leaf and internal pages.
 
 use crate::Result;
-use crate::errors::{CorruptionDetail, PagedbError};
+use crate::errors::PagedbError;
 use crate::pager::format::data_page::ENVELOPE_OVERHEAD;
 
 /// `node_kind` byte value at offset 0 of the node body.
@@ -17,15 +17,23 @@ impl NodeKind {
         match b {
             0x00 => Ok(Self::Internal),
             0x01 => Ok(Self::Leaf),
-            _ => Err(PagedbError::corruption(
-                CorruptionDetail::HeaderUnverifiable,
-            )),
+            _ => Err(PagedbError::node_body_malformed("node_kind_byte")),
         }
     }
 
     #[must_use]
     pub fn as_byte(self) -> u8 {
         self as u8
+    }
+
+    /// Stable lowercase name, for naming both sides of a kind disagreement in
+    /// [`CorruptionDetail::NodeKindMismatch`].
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Leaf => "leaf",
+        }
     }
 }
 
@@ -91,9 +99,7 @@ pub struct NodeHeader {
 
 pub fn read_header(body: &[u8]) -> Result<NodeHeader> {
     if body.len() < HEADER_LEN {
-        return Err(PagedbError::corruption(
-            CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::node_body_malformed("header_length"));
     }
     let kind = NodeKind::from_byte(body[OFF_NODE_KIND])?;
     let slot_count = read_u16_le(body, OFF_SLOT_COUNT);
@@ -117,7 +123,7 @@ pub fn read_header(body: &[u8]) -> Result<NodeHeader> {
 /// entry are attacker- or bug-controlled `u16`s that the decoders and the
 /// zero-copy accessors use directly as slice indices. Without this pass a
 /// malformed-but-authenticated page panics the library (an out-of-range slice
-/// index) instead of surfacing as [`CorruptionDetail::HeaderUnverifiable`],
+/// index) instead of surfacing as [`CorruptionDetail::NodeBodyMalformed`],
 /// which is a strictly worse failure than the one it would report.
 ///
 /// Every constructor that turns raw bytes into a node runs this first, so the
@@ -186,7 +192,7 @@ fn field_end(body: &[u8], start: usize, len: usize) -> Result<usize> {
 }
 
 fn malformed() -> PagedbError {
-    PagedbError::corruption(CorruptionDetail::HeaderUnverifiable)
+    PagedbError::node_body_malformed("slot_directory")
 }
 
 pub fn write_header(
@@ -209,6 +215,7 @@ pub fn write_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::CorruptionDetail;
 
     const CAP: usize = 4056;
 
@@ -217,10 +224,10 @@ mod tests {
             matches!(
                 validate_node_body(body),
                 Err(PagedbError::Corruption(
-                    CorruptionDetail::HeaderUnverifiable
+                    CorruptionDetail::NodeBodyMalformed { .. }
                 ))
             ),
-            "{label}: expected HeaderUnverifiable"
+            "{label}: expected NodeBodyMalformed"
         );
     }
 

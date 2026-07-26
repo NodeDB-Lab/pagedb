@@ -316,7 +316,10 @@ async fn read_node_rejects_authenticated_envelope_body_kind_mismatch() {
 
         assert!(matches!(
             error,
-            PagedbError::Corruption(CorruptionDetail::HeaderUnverifiable)
+            PagedbError::Corruption(CorruptionDetail::NodeKindMismatch {
+                page_id: Some(_),
+                ..
+            })
         ));
     }
 }
@@ -397,9 +400,9 @@ async fn malformed_node_body_reports_corruption_instead_of_panicking() {
         assert!(
             matches!(
                 error,
-                PagedbError::Corruption(CorruptionDetail::HeaderUnverifiable)
+                PagedbError::Corruption(CorruptionDetail::NodeBodyMalformed { .. })
             ),
-            "{label}: expected HeaderUnverifiable, got {error:?}"
+            "{label}: expected NodeBodyMalformed, got {error:?}"
         );
     }
 }

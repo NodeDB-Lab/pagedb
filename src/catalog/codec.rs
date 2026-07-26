@@ -57,9 +57,7 @@ impl RekeyStage {
             3 => Ok(Self::HeaderTargetPublished),
             4 => Ok(Self::MainDone),
             5 => Ok(Self::SegmentsPending),
-            _ => Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            )),
+            _ => Err(PagedbError::catalog_row_invalid("rekey.stage")),
         }
     }
 }
@@ -111,8 +109,8 @@ impl RekeySegmentProgressState {
     fn from_byte(byte: u8) -> Result<Self> {
         match byte {
             1 => Ok(Self::Sealed),
-            _ => Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
+            _ => Err(PagedbError::catalog_row_invalid(
+                "rekey.segment_progress.state",
             )),
         }
     }
@@ -257,12 +255,13 @@ impl Catalog {
     /// positional progress is deliberately preserved only for diagnostics.
     pub fn decode_rekey_state(bytes: &[u8]) -> Result<RekeyStateRow> {
         if bytes.len() == LEGACY_REKEY_STATE_LEN {
-            let target_mk_epoch = u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| {
-                PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
-            })?);
+            let target_mk_epoch =
+                u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| {
+                    PagedbError::catalog_row_invalid("rekey.legacy.target_mk_epoch")
+                })?);
             if target_mk_epoch == 0 {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::HeaderUnverifiable,
+                return Err(PagedbError::catalog_row_invalid(
+                    "rekey.legacy.target_mk_epoch",
                 ));
             }
             return Ok(RekeyStateRow::Legacy(LegacyRekeyState {
@@ -271,15 +270,13 @@ impl Catalog {
                     0 => false,
                     1 => true,
                     _ => {
-                        return Err(PagedbError::corruption(
-                            crate::errors::CorruptionDetail::HeaderUnverifiable,
+                        return Err(PagedbError::catalog_row_invalid(
+                            "rekey.legacy.main_db_done",
                         ));
                     }
                 },
                 discarded_segments_index: u32::from_le_bytes(bytes[9..13].try_into().map_err(
-                    |_| {
-                        PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
-                    },
+                    |_| PagedbError::catalog_row_invalid("rekey.legacy.discarded_segments_index"),
                 )?),
             }));
         }
@@ -289,28 +286,26 @@ impl Catalog {
             || bytes[22..24].iter().any(|byte| *byte != 0)
             || bytes[56..].iter().any(|byte| *byte != 0)
         {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::catalog_row_invalid("rekey.framing"));
         }
-        let source_mk_epoch = u64::from_le_bytes(bytes[4..12].try_into().map_err(|_| {
-            PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
-        })?);
-        let target_mk_epoch = u64::from_le_bytes(bytes[12..20].try_into().map_err(|_| {
-            PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
-        })?);
+        let source_mk_epoch = u64::from_le_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| PagedbError::catalog_row_invalid("rekey.source_mk_epoch"))?,
+        );
+        let target_mk_epoch = u64::from_le_bytes(
+            bytes[12..20]
+                .try_into()
+                .map_err(|_| PagedbError::catalog_row_invalid("rekey.target_mk_epoch"))?,
+        );
         if target_mk_epoch == 0 || target_mk_epoch <= source_mk_epoch {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::catalog_row_invalid("rekey.epoch_ordering"));
         }
         let same_kek = match bytes[2] {
             0 => false,
             1 => true,
             _ => {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::HeaderUnverifiable,
-                ));
+                return Err(PagedbError::catalog_row_invalid("rekey.same_kek"));
             }
         };
         crate::crypto::CipherId::from_byte(bytes[20])?;
@@ -352,8 +347,8 @@ impl Catalog {
             || bytes[0] != 1
             || bytes[2..4].iter().any(|byte| *byte != 0)
         {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
+            return Err(PagedbError::catalog_row_invalid(
+                "rekey.segment_progress.framing",
             ));
         }
         let mut replacement_segment_id = [0u8; 16];
@@ -385,9 +380,7 @@ impl Catalog {
     /// Decode a counter value from an 8-byte little-endian slice.
     pub fn decode_counter(bytes: &[u8]) -> Result<u64> {
         if bytes.len() != 8 {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::catalog_row_invalid("counter.value"));
         }
         let mut b = [0u8; 8];
         b.copy_from_slice(bytes);
@@ -420,9 +413,7 @@ impl Catalog {
 
     pub fn decode_realm_quotas(bytes: &[u8]) -> Result<RealmQuotas> {
         if bytes.len() != REALM_QUOTAS_LEN {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::catalog_row_invalid("realm_quotas.length"));
         }
         let mask = bytes[0];
         let read = |off: usize| -> u64 {
@@ -490,9 +481,7 @@ impl Catalog {
 
     pub fn decode_segment_meta(bytes: &[u8]) -> Result<SegmentMeta> {
         if bytes.len() != SEGMENT_META_LEN {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::catalog_row_invalid("segment_meta.length"));
         }
         let segment_id = {
             let mut b = [0u8; 16];
@@ -547,9 +536,7 @@ impl Catalog {
             0 => Evictable::Authoritative,
             1 => Evictable::Replaceable,
             _ => {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::HeaderUnverifiable,
-                ));
+                return Err(PagedbError::catalog_row_invalid("segment_meta.evictable"));
             }
         };
         Ok(SegmentMeta {

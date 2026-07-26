@@ -140,9 +140,7 @@ fn page_count_for(record_byte_len: usize, page_size: usize) -> usize {
 /// Decode a record from the in-order concatenation of every sidecar page body.
 pub fn decode_journal_stream(stream: &[u8]) -> Result<ApplyJournalRecord> {
     if stream.len() < STREAM_PREFIX_LEN {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::journal_record_malformed("stream.prefix"));
     }
     let mut p4 = [0u8; 4];
     p4.copy_from_slice(&stream[..STREAM_PREFIX_LEN]);
@@ -150,9 +148,7 @@ pub fn decode_journal_stream(stream: &[u8]) -> Result<ApplyJournalRecord> {
     let end = STREAM_PREFIX_LEN
         .checked_add(stream_len)
         .filter(|e| *e <= stream.len())
-        .ok_or_else(|| {
-            PagedbError::corruption(crate::errors::CorruptionDetail::HeaderUnverifiable)
-        })?;
+        .ok_or_else(|| PagedbError::journal_record_malformed("stream.length"))?;
     decode_record(&stream[STREAM_PREFIX_LEN..end])
 }
 
@@ -160,9 +156,7 @@ pub fn decode_journal_stream(stream: &[u8]) -> Result<ApplyJournalRecord> {
 /// Returns `Err(Corruption)` if the data is malformed.
 pub fn decode_record(buf: &[u8]) -> Result<ApplyJournalRecord> {
     if buf.len() < 12 {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::journal_record_malformed("record.header"));
     }
     let mut off = 0;
     let mut b8 = [0u8; 8];
@@ -177,24 +171,18 @@ pub fn decode_record(buf: &[u8]) -> Result<ApplyJournalRecord> {
     // Every action consumes at least one kind byte plus a 16-byte segment id.
     // Reject hostile counts before they can drive a giant allocation.
     if action_count > buf.len().saturating_sub(off) / 17 {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
-        ));
+        return Err(PagedbError::journal_record_malformed("action.count"));
     }
 
     let mut actions = Vec::with_capacity(action_count);
     for _ in 0..action_count {
         if off >= buf.len() {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::journal_record_malformed("action.kind"));
         }
         let kind = buf[off];
         off += 1;
         if off + 16 > buf.len() {
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::HeaderUnverifiable,
-            ));
+            return Err(PagedbError::journal_record_malformed("action.segment_id"));
         }
         let mut segment_id = [0u8; 16];
         segment_id.copy_from_slice(&buf[off..off + 16]);
@@ -203,8 +191,8 @@ pub fn decode_record(buf: &[u8]) -> Result<ApplyJournalRecord> {
             0x01 => actions.push(JournalAction::Promote { segment_id }),
             0x02 => {
                 if off + 8 > buf.len() {
-                    return Err(PagedbError::corruption(
-                        crate::errors::CorruptionDetail::HeaderUnverifiable,
+                    return Err(PagedbError::journal_record_malformed(
+                        "action.tombstone_commit_id",
                     ));
                 }
                 b8.copy_from_slice(&buf[off..off + 8]);
@@ -216,16 +204,14 @@ pub fn decode_record(buf: &[u8]) -> Result<ApplyJournalRecord> {
                 });
             }
             _ => {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::HeaderUnverifiable,
-                ));
+                return Err(PagedbError::journal_record_malformed("action.unknown_kind"));
             }
         }
     }
 
     if off != buf.len() {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::journal_record_malformed(
+            "record.trailing_bytes",
         ));
     }
 
@@ -277,8 +263,8 @@ pub async fn replay_apply_journal<V: Vfs + Clone>(
     drop(first);
 
     if stream.len() < STREAM_PREFIX_LEN {
-        return Err(PagedbError::corruption(
-            crate::errors::CorruptionDetail::HeaderUnverifiable,
+        return Err(PagedbError::journal_record_malformed(
+            "sidecar.stream_prefix",
         ));
     }
     let mut p4 = [0u8; 4];
