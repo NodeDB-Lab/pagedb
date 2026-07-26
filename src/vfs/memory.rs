@@ -125,7 +125,7 @@ impl Vfs for MemVfs {
             }
             (OpenMode::CreateNew | OpenMode::CreateOrOpen, false) => {
                 let inode = Arc::new(Mutex::new(MemInode { data: Vec::new() }));
-                files.insert(path.to_string(), inode.clone());
+                files.insert(path.clone(), inode.clone());
                 (inode, true)
             }
         };
@@ -155,7 +155,7 @@ impl Vfs for MemVfs {
     async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let path = canonical_native_path(path)?;
         let prefix = if path.ends_with('/') {
-            path.to_string()
+            path.clone()
         } else {
             format!("{path}/")
         };

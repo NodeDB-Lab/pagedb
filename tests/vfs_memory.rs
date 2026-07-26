@@ -208,3 +208,51 @@ async fn read_mode_handle_cannot_write() {
     let err = g.write_at(0, b"nope").await.err().unwrap();
     assert!(matches!(err, PagedbError::ReadOnly));
 }
+
+/// The in-memory backend is the one nearly every test runs on, so it has to
+/// honour the same logical-path contract as the native backends. Spellings that
+/// name one file must occupy one lock domain here too, or the suite stops being
+/// able to catch path aliasing at all.
+#[tokio::test(flavor = "current_thread")]
+async fn equivalent_spellings_share_one_lock_domain() {
+    let vfs = MemVfs::new();
+    let held = vfs.lock_exclusive("/db.lock").await.unwrap();
+    for alias in ["db.lock", "/db.lock", "db.lock/"] {
+        assert!(
+            matches!(
+                vfs.lock_exclusive(alias).await,
+                Err(pagedb::PagedbError::AlreadyLocked)
+            ),
+            "{alias:?} must contend with the held lock"
+        );
+    }
+    drop(held);
+    vfs.lock_exclusive("db.lock").await.unwrap();
+}
+
+/// Equivalent spellings must also name one file.
+#[tokio::test(flavor = "current_thread")]
+async fn equivalent_spellings_name_one_file() {
+    let vfs = MemVfs::new();
+    let mut f = vfs.open("seg/one", OpenMode::CreateNew).await.unwrap();
+    f.write_at(0, b"payload").await.unwrap();
+    drop(f);
+
+    let mut buf = [0u8; 7];
+    let g = vfs.open("/seg/one", OpenMode::Read).await.unwrap();
+    assert_eq!(g.read_at(0, &mut buf).await.unwrap(), 7);
+    assert_eq!(&buf, b"payload");
+    assert_eq!(vfs.list_dir("/seg").await.unwrap(), vec!["one".to_string()]);
+}
+
+/// A path that escapes the root is rejected by the in-memory backend as well.
+#[tokio::test(flavor = "current_thread")]
+async fn a_path_that_escapes_the_root_is_rejected() {
+    let vfs = MemVfs::new();
+    for escape in ["../escaped", "a/../../escaped", "a/C:/b"] {
+        assert!(
+            vfs.open(escape, OpenMode::CreateNew).await.is_err(),
+            "{escape:?} must not open"
+        );
+    }
+}
