@@ -4,6 +4,7 @@
 //! file, verifying AEAD tags, structural invariants, orphan pages, and
 //! catalog–disk consistency.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::ExitCode;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13,37 +14,99 @@ use pagedb::vfs::tokio_backend::TokioVfs;
 #[cfg(not(target_arch = "wasm32"))]
 use pagedb::{Db, RealmId, run_deep_walk};
 
+#[cfg(not(target_arch = "wasm32"))]
+struct CliArgs {
+    path: String,
+    deep: bool,
+    realm_hex: Option<String>,
+    kek_hex: Option<String>,
+}
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     // pagedb-fsck is a native-only tool; it is not functional on wasm32.
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn usage() {
+    eprintln!("usage: pagedb-fsck <path> [--deep] [--realm <hex16>] [<hex-kek>]");
+    eprintln!("(KEK may also be set via PAGEDB_KEK; defaults to zeros.");
+    eprintln!(" --realm defaults to all-ones; nodedb-lite stores use all-zeros.)");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let Some(path) = args.get(1) else {
+        return Err("database path is required".to_string());
+    };
+    if path.starts_with("--") {
+        return Err(format!("unknown option {path}"));
+    }
+
+    let mut deep = false;
+    let mut realm_hex = None;
+    let mut kek_hex = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--deep" => {
+                if deep {
+                    return Err("duplicate --deep".to_string());
+                }
+                deep = true;
+                index += 1;
+            }
+            "--realm" => {
+                if realm_hex.is_some() {
+                    return Err("duplicate --realm".to_string());
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| "--realm requires a 32-character hex value".to_string())?;
+                realm_hex = Some(value.clone());
+                index += 2;
+            }
+            option if option.starts_with("--") => {
+                return Err(format!("unknown option {option}"));
+            }
+            value => {
+                if kek_hex.is_some() {
+                    return Err("multiple KEK values supplied".to_string());
+                }
+                kek_hex = Some(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    Ok(CliArgs {
+        path: path.clone(),
+        deep,
+        realm_hex,
+        kek_hex,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: pagedb-fsck <path> [--deep] [--realm <hex16>] [<hex-kek>]");
-        eprintln!("(KEK may also be set via PAGEDB_KEK env var; defaults to zeros.");
-        eprintln!(" --realm defaults to all-ones; nodedb-lite stores use all-zeros.)");
-        return ExitCode::from(2);
-    }
-    let path = &args[1];
-
-    // Parse optional flags and positional KEK.
-    let mut deep = false;
-    let mut kek_hex: Option<String> = None;
-    let mut realm_hex: Option<String> = None;
-    let mut it = args.iter().skip(2);
-    while let Some(arg) = it.next() {
-        if arg == "--deep" {
-            deep = true;
-        } else if arg == "--realm" {
-            realm_hex = it.next().cloned();
-        } else if kek_hex.is_none() {
-            kek_hex = Some(arg.clone());
+    let parsed = match parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("pagedb-fsck: {error}");
+            usage();
+            return ExitCode::from(2);
         }
-    }
+    };
+    let CliArgs {
+        path,
+        deep,
+        realm_hex,
+        mut kek_hex,
+    } = parsed;
+
     if kek_hex.is_none() {
         kek_hex = std::env::var("PAGEDB_KEK").ok();
     }
