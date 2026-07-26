@@ -67,9 +67,19 @@ cargo run --bin pagedb-fsck -- <path> --deep \
 
 The KEK may instead come from `PAGEDB_KEK` and defaults to all zeros. The realm
 defaults to all ones; nodedb-lite stores use the all-zero realm shown above.
-Argument parsing rejects duplicate flags, unknown options, missing realm
-values, and multiple positional KEKs. Inspection disables commit-history
-retention and does not rewrite authoritative `main.db` or segment bytes.
+Add `--page-size` for a store created at anything other than 4096 bytes, and
+`--help` for the full grammar. Inspection disables commit-history retention and
+does not rewrite authoritative `main.db` or segment bytes.
+
+Arguments are validated before the store is touched, and each failure class
+gets its own exit code so a caller can tell them apart:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Opened cleanly; with `--deep`, the report was clean |
+| 1 | An integrity problem was found |
+| 2 | The command line was invalid; the store was never opened |
+| 3 | The store could not be opened, or the report could not be written |
 
 ## Benchmarks
 
