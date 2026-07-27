@@ -20,6 +20,11 @@ use super::core::{
 /// how many counters the embedder has named.
 const COUNTER_ROW_BATCH: usize = 512;
 
+/// Commit-history rows read per batch while pruning by age. A key is 8 bytes
+/// and a row 40, so this is a few tens of KiB resident regardless of how deep
+/// retention has run.
+const HISTORY_PRUNE_BATCH: usize = 512;
+
 impl<V: Vfs + Clone> Db<V> {
     /// The oldest commit id still retained in the commit-history index, or
     /// `None` when history is disabled or the index is empty. Pages reachable
@@ -308,29 +313,61 @@ impl<V: Vfs + Clone> Db<V> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
                 let threshold = now_secs.saturating_sub(duration.as_secs());
-                let all = hist_tree.collect_all().await?;
-                let mut current = all.len() as u64;
-                for (k, v) in &all {
-                    // Never delete the entry we just inserted.
-                    if k == &key {
-                        continue;
-                    }
-                    let meta_v = decode_commit_meta(v)?;
-                    if meta_v.unix_seconds < threshold {
+                // History keys are the commit id big-endian, so lexicographic
+                // key order is commit order and the prunable rows are always a
+                // prefix of the oldest ones. Streaming that prefix in
+                // fixed-size batches holds one batch resident instead of one
+                // entry per retained commit — retention can be arbitrarily
+                // deep, and this runs on every commit. The first row that must
+                // be kept ends the walk: every row after it is a later commit,
+                // so it is neither older than the threshold nor below the
+                // reader floor.
+                let mut deleted: u64 = 0;
+                let mut cursor: Vec<u8> = Vec::new();
+                'prune: loop {
+                    let batch = hist_tree
+                        .collect_batch_from(&cursor, HISTORY_PRUNE_BATCH)
+                        .await?;
+                    let Some((last_key, _)) = batch.last() else {
+                        break;
+                    };
+                    cursor.clear();
+                    cursor.extend_from_slice(last_key);
+                    // The exact successor of `last_key` in the key ordering:
+                    // resume strictly past the row just examined.
+                    cursor.push(0);
+                    let exhausted = batch.len() < HISTORY_PRUNE_BATCH;
+
+                    for (k, v) in &batch {
+                        // Never delete the entry we just inserted.
+                        if k == &key {
+                            break 'prune;
+                        }
+                        if k.len() != 8 {
+                            return Err(PagedbError::catalog_row_invalid("commit_history.key"));
+                        }
                         let mut b = [0u8; 8];
                         b.copy_from_slice(&k[..8]);
                         let cid = u64::from_be_bytes(b);
-                        if let Some(min) = min_pinned {
-                            if cid >= min {
-                                continue;
-                            }
+                        if min_pinned.is_some_and(|min| cid >= min) {
+                            break 'prune;
+                        }
+                        if decode_commit_meta(v)?.unix_seconds >= threshold {
+                            break 'prune;
                         }
                         if hist_tree.delete(k).await? {
-                            current = current.saturating_sub(1);
+                            deleted = deleted.saturating_add(1);
                         }
                     }
+
+                    if exhausted {
+                        break;
+                    }
                 }
-                state.commit_history_count = Some(current);
+                let projected = state
+                    .commit_history_count
+                    .map(|c| if was_new { c.saturating_add(1) } else { c });
+                state.commit_history_count = projected.map(|c| c.saturating_sub(deleted));
             }
             crate::options::RetainPolicy::Disabled => {
                 // Unreachable: `WriteTxn::commit` skips this call entirely
