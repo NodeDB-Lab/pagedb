@@ -177,6 +177,17 @@ pub struct Db<V: Vfs + Clone> {
     /// Each txn gets `txn_seq.fetch_add(1, Relaxed)` (first txn gets 1 since
     /// we start at 0 and add-then-use the pre-increment value + 1).
     pub(crate) txn_seq: AtomicU64,
+    /// Random per-open identity mixed into every spill key derivation. The
+    /// counter above restarts at 1 on each open and also supplies the spill
+    /// nonce, so this is what stops two opens of one store from encrypting
+    /// different scratch under the same key at the same nonce.
+    pub(crate) spill_epoch: [u8; 16],
+    /// Scratch paths belonging to write transactions that were dropped without
+    /// `commit` or `abort`. `Drop` cannot await the VFS removal, so it records
+    /// the exact path here and the next `begin_write` — which holds the writer
+    /// lock and can await — removes it. Anything still listed when the handle
+    /// closes is swept by the next open.
+    pub(crate) orphaned_spill_paths: parking_lot::Mutex<Vec<String>>,
     /// The mode this handle was opened with (Standalone, Follower, `ReadOnly`, Observer).
     pub(crate) mode: DbMode,
     /// Set of reader `entry_id`s that have been aborted by `AbortOldest` stall

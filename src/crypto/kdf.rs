@@ -57,14 +57,35 @@ pub fn derive_hk(mk: &MasterKey) -> Result<DerivedKey> {
 
 /// Derive a transient per-WriteTxn spill key from the master key.
 ///
-/// `info` = `"pagedb/spill/" ‖ file_id[16] ‖ txn_seq.to_le_bytes()[8]` (13 + 16 + 8 = 37 bytes).
-/// The key is transient: the tmp file it protects is discarded at commit/abort.
-pub fn derive_spill_key(mk: &MasterKey, file_id: &[u8; 16], txn_seq: u64) -> Result<DerivedKey> {
+/// `info` = `"pagedb/spill/" ‖ file_id[16] ‖ spill_epoch[16] ‖ txn_seq.to_le_bytes()[8]`
+/// (13 + 16 + 16 + 8 = 53 bytes).
+///
+/// `spill_epoch` is fresh per open handle. `file_id` and the master key are
+/// durable and `txn_seq` restarts at 1 on every open, so those three alone
+/// would repeat the same key across two opens of one store — and the spill
+/// nonce, built from that same restarting sequence, would repeat with it. The
+/// epoch is what keeps each open's spill key distinct, and therefore what makes
+/// the sequence a sound nonce source without a durable anchor.
+///
+/// Nothing reads a spill file written by an earlier open, so there is no
+/// durability cost to a per-open key: the scratch a crash leaves behind is
+/// swept at the next open, never decrypted.
+pub fn derive_spill_key(
+    mk: &MasterKey,
+    file_id: &[u8; 16],
+    spill_epoch: &[u8; 16],
+    txn_seq: u64,
+) -> Result<DerivedKey> {
     const PREFIX: &[u8] = b"pagedb/spill/";
-    let mut info = [0u8; PREFIX.len() + 16 + 8];
-    info[..PREFIX.len()].copy_from_slice(PREFIX);
-    info[PREFIX.len()..PREFIX.len() + 16].copy_from_slice(file_id);
-    info[PREFIX.len() + 16..].copy_from_slice(&txn_seq.to_le_bytes());
+    let mut info = [0u8; PREFIX.len() + 16 + 16 + 8];
+    let mut off = 0;
+    info[off..off + PREFIX.len()].copy_from_slice(PREFIX);
+    off += PREFIX.len();
+    info[off..off + 16].copy_from_slice(file_id);
+    off += 16;
+    info[off..off + 16].copy_from_slice(spill_epoch);
+    off += 16;
+    info[off..off + 8].copy_from_slice(&txn_seq.to_le_bytes());
     expand(mk.as_bytes(), &info)
 }
 
@@ -111,6 +132,36 @@ mod tests {
         let kek = fixed_kek();
         let a = derive_mk(&kek, &[0xAB; 16], 7).unwrap();
         let b = derive_mk(&kek, &[0xCD; 16], 7).unwrap();
+        assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn spill_key_isolates_per_open_at_the_same_sequence() {
+        // The transaction sequence restarts at 1 on every open and also builds
+        // the spill nonce, so two opens of one store must not share a key at
+        // one sequence.
+        let mk = derive_mk(&fixed_kek(), &[0; 16], 0).unwrap();
+        let file_id = [0x5A; 16];
+        let a = derive_spill_key(&mk, &file_id, &[0x01; 16], 1).unwrap();
+        let b = derive_spill_key(&mk, &file_id, &[0x02; 16], 1).unwrap();
+        assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn spill_key_isolates_per_sequence_within_one_open() {
+        let mk = derive_mk(&fixed_kek(), &[0; 16], 0).unwrap();
+        let epoch = [0x01; 16];
+        let a = derive_spill_key(&mk, &[0x5A; 16], &epoch, 1).unwrap();
+        let b = derive_spill_key(&mk, &[0x5A; 16], &epoch, 2).unwrap();
+        assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn spill_key_isolates_per_store() {
+        let mk = derive_mk(&fixed_kek(), &[0; 16], 0).unwrap();
+        let epoch = [0x01; 16];
+        let a = derive_spill_key(&mk, &[0x5A; 16], &epoch, 1).unwrap();
+        let b = derive_spill_key(&mk, &[0xA5; 16], &epoch, 1).unwrap();
         assert_ne!(a.as_bytes(), b.as_bytes());
     }
 

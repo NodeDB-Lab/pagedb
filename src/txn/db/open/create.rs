@@ -42,7 +42,7 @@ struct FreshDbState<V: Vfs + Clone> {
 }
 
 impl<V: Vfs + Clone> Db<V> {
-    fn assemble_fresh(state: FreshDbState<V>) -> Self {
+    fn assemble_fresh(state: FreshDbState<V>) -> Result<Self> {
         let FreshDbState {
             pager,
             realm_id,
@@ -83,7 +83,7 @@ impl<V: Vfs + Clone> Db<V> {
                 seq: initial.seq,
             },
         );
-        Self {
+        Ok(Self {
             pager: Arc::new(pager),
             realm_id,
             page_size,
@@ -109,6 +109,8 @@ impl<V: Vfs + Clone> Db<V> {
             mmap_bytes_in_use: Arc::new(AtomicU64::new(0)),
             spill_bytes_in_use: AtomicU64::new(0),
             txn_seq: AtomicU64::new(0),
+            spill_epoch: crate::crypto::random::spill_epoch()?,
+            orphaned_spill_paths: parking_lot::Mutex::new(Vec::new()),
             mode: DbMode::Standalone,
             aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
             sentinel_locks: Vec::new(),
@@ -132,7 +134,7 @@ impl<V: Vfs + Clone> Db<V> {
             visibility_test_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             rekey_test_fault: parking_lot::Mutex::new(None),
-        }
+        })
     }
 
     /// Bootstrap a fresh database. Creates `main.db`, writes an initial A/B
@@ -278,7 +280,7 @@ impl<V: Vfs + Clone> Db<V> {
         let vfs_for_pager = V::clone(&*vfs_arc);
         let pager = Pager::open(vfs_for_pager, mk, cfg).await?;
 
-        Ok(Self::assemble_fresh(FreshDbState {
+        Self::assemble_fresh(FreshDbState {
             pager,
             realm_id: realm,
             page_size,
@@ -291,6 +293,6 @@ impl<V: Vfs + Clone> Db<V> {
             file_id,
             kek_salt,
             initial,
-        }))
+        })
     }
 }

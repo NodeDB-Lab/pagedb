@@ -39,17 +39,22 @@ pub(crate) struct SpillSegmentMeta {
 /// storage in a per-transaction tmp file.
 ///
 /// The tmp file lives at `tmp/scratch-<txn_seq>`. It is created lazily on the
-/// first `append` call and removed at `commit` or `abort` (best-effort).
+/// first `append` call and removed at `commit` or `abort`. A transaction
+/// dropped without either records its path for the next `begin_write` to
+/// remove, and whatever a crash leaves behind is swept at the next open.
 ///
 /// Nonce scheme: `txn_seq_le6 ‖ segment_index_le6`.
 /// - First 6 bytes: the low 6 bytes of `txn_seq` in little-endian order.
 /// - Last 6 bytes: the low 6 bytes of the per-append segment index in
 ///   little-endian order.
 ///
-/// This guarantees uniqueness across all appends within a txn and across
-/// independent txns (different `txn_seq`), without requiring a durable
-/// nonce anchor (the tmp file is discarded before any subsequent txn can
-/// reuse the same `txn_seq`).
+/// Uniqueness under one key comes from `txn_seq` being strictly increasing
+/// within an open handle and `segment_index` within a transaction. It does not
+/// come from the file being deleted: `txn_seq` restarts at 1 on every open, so
+/// deletion alone would leave two opens writing one nonce. The spill key is
+/// instead derived per open, from a random epoch this handle generates and
+/// never persists, so a repeated sequence lands under a different key and no
+/// durable nonce anchor is needed.
 pub struct SpillScope<'scope, 'db, V: Vfs + Clone> {
     pub(super) txn: &'scope mut WriteTxn<'db, V>,
 }
@@ -212,7 +217,12 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     pub(crate) fn ensure_spill_cipher(&mut self) -> Result<&Cipher> {
         if self.spill_cipher.is_none() {
             let pager_mk = self.db.pager.mk()?;
-            let key = derive_spill_key(&pager_mk, &self.db.file_id, self.txn_seq)?;
+            let key = derive_spill_key(
+                &pager_mk,
+                &self.db.file_id,
+                &self.db.spill_epoch,
+                self.txn_seq,
+            )?;
             self.spill_cipher = Some(Cipher::new_aes_gcm(&key));
         }
         self.spill_cipher.as_ref().ok_or(PagedbError::NotFound)
@@ -238,10 +248,10 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// Build the per-append nonce deterministically from `(txn_seq, segment_index)`.
     ///
     /// Layout: `txn_seq_le6 ‖ segment_index_le6` (6 + 6 = 12 bytes).
-    /// Uniqueness: nonces are unique per-txn (distinct `segment_index`) and
-    /// across txns (distinct `txn_seq` in first 6 bytes). No durable anchor
-    /// is needed because the tmp file is discarded before any key reuse
-    /// could matter.
+    /// Uniqueness within one key: distinct `segment_index` within a
+    /// transaction, distinct `txn_seq` across the transactions of one open
+    /// handle. `txn_seq` repeats across opens, which is why the key is scoped
+    /// to an open rather than to the store; see the type-level docs.
     pub(crate) fn next_spill_nonce(&self, segment_index: u64) -> Nonce {
         let mut bytes = [0u8; 12];
         let seq_le = self.txn_seq.to_le_bytes();
