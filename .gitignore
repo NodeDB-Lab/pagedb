@@ -97,3 +97,6 @@ dmypy.json
 .cargo/
 .pi
 .agents
+
+# Session scratch (prep files) — never committed
+.claude/prep/
