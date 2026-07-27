@@ -40,7 +40,8 @@ impl<V: Vfs + Clone> Db<V> {
             .applies_incremental_snapshots()
     }
 
-    /// Drop every cached page of `realm` so the next read goes to storage.
+    /// Drop unpinned clean cached pages of `realm` so the next read goes to
+    /// storage, leaving dirty and pinned entries untouched.
     ///
     /// Compiled only for the crate's own tests: nothing an embedder does is
     /// supposed to depend on whether a page is warm, and publishing the lever
@@ -48,7 +49,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// outside the crate reopens the handle instead.
     #[cfg(test)]
     pub(crate) fn evict_main_pages(&self, realm: crate::RealmId) {
-        self.pager.discard_dirty_main(realm);
+        self.pager.evict_clean_main_pages(realm);
     }
 
     /// Current size of `main.db` in bytes, read from the file rather than from

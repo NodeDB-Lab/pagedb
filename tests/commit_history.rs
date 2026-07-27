@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CommitId, Db, OpenOptions, PagedbError, RealmId, RetainPolicy};
+use pagedb::{CommitId, Db, OpenOptions, PagedbError, RealmId, RealmQuotas, RetainPolicy};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [7u8; 32];
@@ -138,6 +138,38 @@ async fn history_persists_across_reopen() {
     db2.begin_read_at(cid3)
         .await
         .unwrap_or_else(|e| panic!("expected commit {cid3:?} to survive reopen, got {e:?}"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn quota_update_preserves_history_across_reopen() {
+    let vfs = MemVfs::new();
+    let opts = OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded);
+
+    let first_commit = {
+        let db = Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, opts.clone())
+            .await
+            .unwrap();
+        let ids = write_n(&db, 2).await;
+        db.set_realm_quotas(REALM, RealmQuotas::default())
+            .await
+            .unwrap();
+        db.begin_read_at(ids[0])
+            .await
+            .expect("quota publication must preserve live retained history");
+        ids[0]
+    };
+
+    let reopened = Db::open_existing_with_options(vfs, KEK, PAGE, REALM, opts)
+        .await
+        .unwrap();
+    let historical = reopened
+        .begin_read_at(first_commit)
+        .await
+        .expect("quota publication must preserve retained history after reopen");
+    assert_eq!(
+        historical.get(b"k").await.unwrap().as_deref(),
+        Some(0_u64.to_le_bytes().as_slice())
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

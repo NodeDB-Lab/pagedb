@@ -151,8 +151,8 @@ impl<V: Vfs + Clone> Db<V> {
             counter_anchor,
             commit_id: state.latest_commit_id,
             catalog_root: catalog_root_bytes,
-            commit_history_root_page_id: 0,
-            commit_history_root_version: 0,
+            commit_history_root_page_id: state.commit_history_root_page_id,
+            commit_history_root_version: state.commit_history_root_version,
             free_list_root_page_id: state.free_list_root_page_id,
             next_page_id: new_next,
         })?;

@@ -153,9 +153,10 @@ impl PageCache {
     }
 
     fn evict_one(&mut self) -> Option<(FileKey, u64)> {
-        // Walk the hand at most `capacity * 2` steps to bound worst case
-        // (every entry either visited or unevictable triggers a wrap).
-        let max_steps = self.capacity.saturating_mul(2).max(1);
+        // Two passes are sufficient to clear visited bits and then evict.
+        // Use the live list length rather than the configured capacity because
+        // pinned or dirty pages can temporarily grow the cache past capacity.
+        let max_steps = self.map.len().saturating_mul(2).max(1);
         let mut cur = self.hand.or(self.tail);
         for _ in 0..max_steps {
             let Some(idx) = cur else {
@@ -293,6 +294,33 @@ impl PageCache {
             self.dirty.remove(&key);
         }
     }
+
+    /// Drop every unpinned clean entry for `file`, leaving dirty entries
+    /// available for a later flush and pinned entries available to readers.
+    pub fn clear_clean_file(&mut self, file: FileKey) {
+        let keys: Vec<(FileKey, u64)> = self
+            .map
+            .keys()
+            .filter(|(f, _)| *f == file)
+            .copied()
+            .collect();
+        for key in keys {
+            if self.pins.get(&key).copied().unwrap_or(0) > 0 || self.dirty.contains(&key) {
+                continue;
+            }
+            if let Some(idx) = self.map.remove(&key) {
+                let (prev, next) = {
+                    let node = self.slab[idx].as_ref().expect("indexed node alive");
+                    (node.prev, node.next)
+                };
+                if self.hand == Some(idx) {
+                    self.hand = next;
+                }
+                self.unlink_node(idx, prev, next);
+                self.free_node(idx);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,6 +397,20 @@ mod tests {
     }
 
     #[test]
+    fn clear_clean_file_preserves_dirty_entries() {
+        let mut c = PageCache::with_capacity(4);
+        c.insert((FileKey::Main, 1), page(1));
+        c.insert((FileKey::Main, 2), page(2));
+        c.mark_dirty((FileKey::Main, 2));
+
+        c.clear_clean_file(FileKey::Main);
+
+        assert!(c.get((FileKey::Main, 1)).is_none());
+        assert!(c.get((FileKey::Main, 2)).is_some());
+        assert!(c.is_dirty((FileKey::Main, 2)));
+    }
+
+    #[test]
     fn dirty_iter_is_sorted_ascending() {
         let mut c = PageCache::with_capacity(16);
         for p in [50, 25, 100, 75] {
@@ -395,5 +437,28 @@ mod tests {
         c.insert((FileKey::Main, 2), page(2));
         c.insert((FileKey::Main, 3), page(3));
         assert_eq!(c.slab.len(), 2, "slab reuses freed slot");
+    }
+
+    #[test]
+    fn overgrown_cache_still_finds_clean_victim() {
+        let mut c = PageCache::with_capacity(2);
+
+        for id in 1u8..=4 {
+            let key = (FileKey::Main, u64::from(id));
+            c.insert(key, page(id));
+            c.pin(key);
+        }
+        c.insert((FileKey::Main, 5), page(5));
+        assert_eq!(c.len(), 5, "pinned pages may force temporary growth");
+
+        let evicted = c.insert((FileKey::Main, 6), page(6));
+        assert_eq!(
+            evicted,
+            Some((FileKey::Main, 5)),
+            "eviction must scan the full over-capacity list for a clean victim"
+        );
+        assert_eq!(c.len(), 5);
+        assert!(c.get((FileKey::Main, 5)).is_none());
+        assert!(c.get((FileKey::Main, 6)).is_some());
     }
 }
