@@ -47,11 +47,31 @@ pub(super) async fn collect_catalog_split<V: Vfs + Clone>(
     collect_all_pairs(&tree).await
 }
 
-pub(super) async fn list_all_segments_inner<V: Vfs + Clone>(
+/// Catalog segment rows read per batch while compaction walks them. A row is a
+/// fixed-width authenticated value plus a name capped at
+/// `MAX_SEGMENT_NAME_LEN`, so one batch is a few hundred KiB resident however
+/// many segments the catalog holds.
+pub(super) const SEGMENT_ROW_BATCH: usize = 256;
+
+/// Read one bounded batch of catalog segment rows at or after `cursor`, as
+/// `(row key, decoded meta)` pairs.
+///
+/// Segment repack replaces a row's value under its own key, so key order is
+/// stable across the mutations and a caller resumes on `key ‖ 0x00` — the exact
+/// successor in the key ordering. The tree is opened per call from the live
+/// writer state because each replacement commits a new catalog root. Holding one
+/// batch is what keeps compaction's resident cost fixed instead of one
+/// `SegmentMeta` per linked segment.
+///
+/// The row key carries the embedder name, so a caller that needs the name to
+/// relink a replacement already has it here and never searches the catalog by
+/// segment identity.
+pub(super) async fn segment_rows_from<V: Vfs + Clone>(
     pager: &Arc<crate::pager::Pager<V>>,
     realm_id: crate::RealmId,
     state: &WriterState,
-) -> Result<Vec<SegmentMeta>> {
+    cursor: &[u8],
+) -> Result<Vec<(Vec<u8>, SegmentMeta)>> {
     if state.catalog_root_page_id == 0 {
         return Ok(Vec::new());
     }
@@ -62,41 +82,16 @@ pub(super) async fn list_all_segments_inner<V: Vfs + Clone>(
         state.next_page_id,
         pager.page_size(),
     );
-    let start = vec![CatalogRowKind::Segment as u8];
-    let rows = tree.scan_prefix(&start).await?;
+    let prefix = [CatalogRowKind::Segment as u8];
+    let rows = tree
+        .collect_prefix_batch_from(&prefix, cursor, SEGMENT_ROW_BATCH)
+        .await?;
     let mut out = Vec::with_capacity(rows.len());
-    for (_k, v) in rows {
-        let meta = Catalog::decode_segment_meta(&v)?;
-        out.push(meta);
+    for (key, value) in rows {
+        let meta = Catalog::decode_segment_meta(&value)?;
+        out.push((key, meta));
     }
     Ok(out)
-}
-
-pub(super) async fn find_segment_name_inner<V: Vfs + Clone>(
-    pager: &Arc<crate::pager::Pager<V>>,
-    realm_id: crate::RealmId,
-    state: &WriterState,
-    segment_id: &[u8; 16],
-) -> Result<String> {
-    if state.catalog_root_page_id == 0 {
-        return Err(PagedbError::NotFound);
-    }
-    let tree = BTree::open(
-        pager.clone(),
-        realm_id,
-        state.catalog_root_page_id,
-        state.next_page_id,
-        pager.page_size(),
-    );
-    let start = vec![CatalogRowKind::Segment as u8];
-    let rows = tree.scan_prefix(&start).await?;
-    for (k, v) in rows {
-        let meta = Catalog::decode_segment_meta(&v)?;
-        if meta.segment_id == *segment_id && k.len() > 17 {
-            return Ok(String::from_utf8_lossy(&k[17..]).into_owned());
-        }
-    }
-    Err(PagedbError::NotFound)
 }
 
 pub(super) async fn replace_segment_compact<V: Vfs + Clone>(

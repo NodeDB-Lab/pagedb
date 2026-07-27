@@ -15,6 +15,12 @@ use crate::vfs::Vfs;
 use crate::vfs::types::OpenMode;
 use crate::{RealmId, Result};
 
+/// Catalog segment rows read per batch while reconciling them at open. A row is
+/// a fixed-width authenticated value plus a name capped at
+/// `MAX_SEGMENT_NAME_LEN`, so one batch is a few hundred KiB resident no matter
+/// how many segments the store has linked.
+const SEGMENT_ROW_BATCH: usize = 256;
+
 /// Authenticate catalog-referenced segment files without mutating persistent
 /// state. Returns `Unsupported` when completing publication or orphan cleanup
 /// would be required.
@@ -95,52 +101,47 @@ async fn verify_catalog_entries<V: Vfs + Clone>(
         next_page_id,
         page_size,
     );
-    let rows = tree.scan_prefix(&[CatalogRowKind::Segment as u8]).await?;
-    let mut expected = Vec::with_capacity(rows.len());
-    let mut catalog_entries = Vec::with_capacity(rows.len());
 
-    // Validate every authenticated catalog key/value pair before touching the
-    // filesystem. In particular, repair must never promote or sweep a file
-    // when a later row is malformed.
-    for (key, value) in rows {
-        let meta = Catalog::decode_segment_meta(&value)?;
-        let name = Catalog::validate_segment_key(&key, &meta)?;
-        expected.push(meta.segment_id);
-        catalog_entries.push((meta, String::from_utf8_lossy(name).into_owned()));
-    }
-
+    // Rows are streamed in bounded batches: how many segments an embedder has
+    // linked is its business, and open must not size an allocation by it. What
+    // survives the walk is one 16-byte identity per catalog row, which the
+    // orphan reconciliation below genuinely needs to classify the files on
+    // disk, plus the still-staged files a crash left mid-publication — transient
+    // publication state, not a function of how much is stored.
+    //
+    // Every persistent mutation — promotion here, the caller's orphan sweep —
+    // still happens only after the whole catalog has streamed and validated, so
+    // a malformed row anywhere aborts before anything on disk moves. Opening and
+    // authenticating a file inside the walk changes nothing on disk.
+    let prefix = [CatalogRowKind::Segment as u8];
+    let mut cursor: Vec<u8> = prefix.to_vec();
+    let mut expected: Vec<[u8; 16]> = Vec::new();
     let mut staged_promotions = Vec::new();
-    for (meta, name) in &catalog_entries {
-        let live = format!("seg/{}", crate::hex::to_hex_lower(&meta.segment_id));
-        match vfs.open(&live, OpenMode::Read).await {
-            Ok(file) => {
-                validate_expected_path(meta, &live, ExpectedSegmentPath::Live)?;
-                authenticate_segment_metadata(&pager, &file, meta, parent_file_id, page_size)
-                    .await?;
+    loop {
+        let batch = tree
+            .collect_prefix_batch_from(&prefix, &cursor, SEGMENT_ROW_BATCH)
+            .await?;
+        let Some((last_key, _)) = batch.last() else {
+            break;
+        };
+        cursor.clear();
+        cursor.extend_from_slice(last_key);
+        // The exact successor of `last_key` in the key ordering: resume strictly
+        // past the row just reconciled without re-reading it.
+        cursor.push(0);
+        let exhausted = batch.len() < SEGMENT_ROW_BATCH;
+
+        for (key, value) in &batch {
+            let (segment_id, promotion) =
+                authenticate_row(vfs, &pager, key, value, parent_file_id, page_size).await?;
+            expected.push(segment_id);
+            if let Some(promotion) = promotion {
+                staged_promotions.push(promotion);
             }
-            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let staging = format!(
-                    "seg/.staging/{}",
-                    crate::hex::to_hex_lower(&meta.segment_id)
-                );
-                let file = match vfs.open(&staging, OpenMode::Read).await {
-                    Ok(file) => file,
-                    Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(PagedbError::corruption(CorruptionDetail::SegmentMissing {
-                            realm_id: meta.realm_id,
-                            name: name.clone(),
-                            segment_id: meta.segment_id,
-                        }));
-                    }
-                    Err(error) => return Err(error),
-                };
-                validate_expected_path(meta, &staging, ExpectedSegmentPath::Staging)?;
-                authenticate_segment_metadata(&pager, &file, meta, parent_file_id, page_size)
-                    .await?;
-                drop(file);
-                staged_promotions.push((staging, live));
-            }
-            Err(error) => return Err(error),
+        }
+
+        if exhausted {
+            break;
         }
     }
 
@@ -152,6 +153,56 @@ async fn verify_catalog_entries<V: Vfs + Clone>(
         vfs.sync_dir("seg").await?;
     }
     Ok(expected)
+}
+
+/// Validate one catalog segment row and authenticate the file it names against
+/// its persisted routing metadata.
+///
+/// Returns the row's segment identity and, when the live file is absent but an
+/// authenticated staged one exists, the `(staging, live)` rename that would
+/// complete its publication. Nothing on disk is mutated here — the caller
+/// applies promotions only once the whole catalog has streamed and validated.
+async fn authenticate_row<V: Vfs + Clone>(
+    vfs: &V,
+    pager: &Arc<Pager<V>>,
+    key: &[u8],
+    value: &[u8],
+    parent_file_id: [u8; 16],
+    page_size: usize,
+) -> Result<([u8; 16], Option<(String, String)>)> {
+    let meta = Catalog::decode_segment_meta(value)?;
+    let name = Catalog::validate_segment_key(key, &meta)?;
+
+    let live = format!("seg/{}", crate::hex::to_hex_lower(&meta.segment_id));
+    match vfs.open(&live, OpenMode::Read).await {
+        Ok(file) => {
+            validate_expected_path(&meta, &live, ExpectedSegmentPath::Live)?;
+            authenticate_segment_metadata(pager, &file, &meta, parent_file_id, page_size).await?;
+            Ok((meta.segment_id, None))
+        }
+        Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let staging = format!(
+                "seg/.staging/{}",
+                crate::hex::to_hex_lower(&meta.segment_id)
+            );
+            let file = match vfs.open(&staging, OpenMode::Read).await {
+                Ok(file) => file,
+                Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(PagedbError::corruption(CorruptionDetail::SegmentMissing {
+                        realm_id: meta.realm_id,
+                        name: String::from_utf8_lossy(name).into_owned(),
+                        segment_id: meta.segment_id,
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
+            validate_expected_path(&meta, &staging, ExpectedSegmentPath::Staging)?;
+            authenticate_segment_metadata(pager, &file, &meta, parent_file_id, page_size).await?;
+            drop(file);
+            Ok((meta.segment_id, Some((staging, live))))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn has_orphans<V: Vfs>(vfs: &V, expected: &[[u8; 16]]) -> Result<bool> {

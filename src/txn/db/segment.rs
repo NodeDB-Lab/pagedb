@@ -14,6 +14,12 @@ use crate::{RealmId, Result};
 
 use super::core::{Db, PendingTombstone};
 
+/// Catalog segment rows read per batch while testing a reader snapshot for a
+/// pin. A row is a fixed-width authenticated value plus a name capped at
+/// `MAX_SEGMENT_NAME_LEN`, so one batch is a few hundred KiB resident however
+/// many segments the snapshot names.
+const READER_PIN_ROW_BATCH: usize = 256;
+
 /// Result of reconciling post-header segment effects. A deferred tombstone is
 /// safe to publish because the old live file is extra data not referenced by
 /// the new catalog; its journal or pending-GC entry must remain for retry.
@@ -83,6 +89,11 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Return `true` if any currently tracked reader's catalog snapshot
     /// contains `segment_id`.
+    ///
+    /// Each snapshot's segment rows are streamed in bounded batches and the
+    /// walk stops at the first match, so the resident cost is one batch plus
+    /// one root pair per live reader — never one `SegmentMeta` per catalog
+    /// entry, which this runs over once per reader on every tombstone.
     pub(crate) async fn segment_id_is_reader_pinned(&self, segment_id: [u8; 16]) -> Result<bool> {
         let snapshots = {
             let readers = self.tracked_readers.lock();
@@ -102,11 +113,30 @@ impl<V: Vfs + Clone> Db<V> {
                 next,
                 self.page_size,
             );
-            let rows = tree.scan_prefix(&[CatalogRowKind::Segment as u8]).await?;
-            for (_, v) in rows {
-                let meta = Catalog::decode_segment_meta(&v)?;
-                if meta.segment_id == segment_id {
-                    return Ok(true);
+            let prefix = [CatalogRowKind::Segment as u8];
+            let mut cursor: Vec<u8> = prefix.to_vec();
+            loop {
+                let batch = tree
+                    .collect_prefix_batch_from(&prefix, &cursor, READER_PIN_ROW_BATCH)
+                    .await?;
+                let Some((last_key, _)) = batch.last() else {
+                    break;
+                };
+                cursor.clear();
+                cursor.extend_from_slice(last_key);
+                // The exact successor of `last_key` in the key ordering: resume
+                // strictly past the row just examined.
+                cursor.push(0);
+                let exhausted = batch.len() < READER_PIN_ROW_BATCH;
+
+                for (_, value) in &batch {
+                    if Catalog::decode_segment_meta(value)?.segment_id == segment_id {
+                        return Ok(true);
+                    }
+                }
+
+                if exhausted {
+                    break;
                 }
             }
         }

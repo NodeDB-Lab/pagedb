@@ -7,14 +7,15 @@
 //! 3. Repacks segment files whose garbage ratio exceeds 5%.
 
 use crate::Result;
+use crate::catalog::codec::{Catalog, CatalogRowKind, SegmentMeta};
 use crate::errors::PagedbError;
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentPageKind;
 use crate::segment::writer::SegmentWriter;
-use crate::txn::db::Db;
+use crate::txn::db::{Db, WriterState};
 use crate::vfs::{Vfs, VfsFile};
 
-use super::helpers::{find_segment_name_inner, list_all_segments_inner, replace_segment_compact};
+use super::helpers::{SEGMENT_ROW_BATCH, replace_segment_compact, segment_rows_from};
 use super::types::CompactStats;
 
 /// Full online compaction. See module-level docs for the staged flow.
@@ -81,66 +82,104 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
     }
 
     // ── 3. Repack segments ────────────────────────────────────────────────────
-    let all_segments = list_all_segments_inner(&db.pager, db.realm_id, &state).await?;
-    for meta in all_segments {
-        let live = crate::segment::writer::live_path(&meta.segment_id);
-        let file_size = db
-            .vfs
-            .open(&live, crate::vfs::types::OpenMode::Read)
-            .await?
-            .len()
-            .await?;
-        // Skip segments with < 5% garbage.
-        let threshold = meta.total_bytes.saturating_add(meta.total_bytes / 20);
-        if file_size <= threshold {
-            continue;
+    // The catalog is streamed in bounded batches rather than listed: a repack
+    // must not size an allocation by how many segments the embedder has linked.
+    // Each replacement rewrites the row under its own key, so the cursor stays
+    // valid across the mutation and resumes on `key ‖ 0x00`.
+    let segment_prefix = [CatalogRowKind::Segment as u8];
+    let mut cursor: Vec<u8> = segment_prefix.to_vec();
+    loop {
+        let batch = segment_rows_from(&db.pager, db.realm_id, &state, &cursor).await?;
+        let Some((last_key, _)) = batch.last() else {
+            break;
+        };
+        cursor.clear();
+        cursor.extend_from_slice(last_key);
+        cursor.push(0);
+        let exhausted = batch.len() < SEGMENT_ROW_BATCH;
+
+        for (key, meta) in batch {
+            repack_one_segment(db, &mut state, &visibility_guard, &key, &meta, &mut result).await?;
         }
 
-        let mmap_limit = u64::try_from(db.options.mmap_view_scratch_bytes).unwrap_or(u64::MAX);
-        let reader = SegmentReader::open_internal(
-            db.pager.clone(),
-            meta.clone(),
-            db.mmap_bytes_in_use.clone(),
-            mmap_limit,
-        )
-        .await?;
-        db.vfs.mkdir_all("seg/.staging").await?;
-        let new_segment_id = crate::crypto::random::segment_id()?;
-        let mut writer = SegmentWriter::create_internal(
-            db.pager.clone(),
-            meta.realm_id,
-            new_segment_id,
-            db.file_id,
-            meta.segment_kind,
-        )
-        .await?;
-
-        for page_id in 1..meta.page_count.saturating_sub(1) {
-            match reader.read_page(page_id).await {
-                Ok(page_bytes) => {
-                    writer
-                        .append_page(SegmentPageKind::Data, &page_bytes)
-                        .await?;
-                }
-                Err(PagedbError::NotFound) => {}
-                Err(e) => return Err(e),
-            }
+        if exhausted {
+            break;
         }
-
-        let new_meta = writer.seal().await?;
-        let seg_name =
-            find_segment_name_inner(&db.pager, db.realm_id, &state, &meta.segment_id).await?;
-        replace_segment_compact(
-            db,
-            &mut state,
-            &visibility_guard,
-            &seg_name,
-            &meta.segment_id,
-            &new_meta,
-        )
-        .await?;
-        result.segments_repacked += 1;
     }
 
     Ok(result)
+}
+
+/// Repack one catalog-linked segment when its file carries more than 5% garbage,
+/// republishing the replacement under the row's own name.
+async fn repack_one_segment<V: Vfs + Clone>(
+    db: &Db<V>,
+    state: &mut WriterState,
+    visibility_guard: &tokio::sync::RwLockWriteGuard<'_, ()>,
+    key: &[u8],
+    meta: &SegmentMeta,
+    result: &mut CompactStats,
+) -> Result<()> {
+    let live = crate::segment::writer::live_path(&meta.segment_id);
+    let file_size = db
+        .vfs
+        .open(&live, crate::vfs::types::OpenMode::Read)
+        .await?
+        .len()
+        .await?;
+    // Skip segments with < 5% garbage.
+    let threshold = meta.total_bytes.saturating_add(meta.total_bytes / 20);
+    if file_size <= threshold {
+        return Ok(());
+    }
+
+    // The row key is `[kind] || realm_id || name`, so the name the replacement
+    // must be relinked under comes straight from the row that carried this
+    // meta. Validating it against the meta rejects a malformed key before the
+    // repack republishes anything.
+    let seg_name = String::from_utf8_lossy(Catalog::validate_segment_key(key, meta)?).into_owned();
+
+    let mmap_limit = u64::try_from(db.options.mmap_view_scratch_bytes).unwrap_or(u64::MAX);
+    let reader = SegmentReader::open_internal(
+        db.pager.clone(),
+        meta.clone(),
+        db.mmap_bytes_in_use.clone(),
+        mmap_limit,
+    )
+    .await?;
+    db.vfs.mkdir_all("seg/.staging").await?;
+    let new_segment_id = crate::crypto::random::segment_id()?;
+    let mut writer = SegmentWriter::create_internal(
+        db.pager.clone(),
+        meta.realm_id,
+        new_segment_id,
+        db.file_id,
+        meta.segment_kind,
+    )
+    .await?;
+
+    for page_id in 1..meta.page_count.saturating_sub(1) {
+        match reader.read_page(page_id).await {
+            Ok(page_bytes) => {
+                writer
+                    .append_page(SegmentPageKind::Data, &page_bytes)
+                    .await?;
+            }
+            Err(PagedbError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let new_meta = writer.seal().await?;
+    replace_segment_compact(
+        db,
+        state,
+        visibility_guard,
+        &seg_name,
+        &meta.segment_id,
+        &new_meta,
+    )
+    .await?;
+    result.segments_repacked += 1;
+    Ok(())
 }
