@@ -3,7 +3,27 @@
 use crate::Result;
 use crate::vfs::Vfs;
 
-use super::core::BTree;
+use super::core::{BTree, SeenPageIds};
+
+/// Duplicate-leaf detector spanning one whole forward scan.
+///
+/// Every scan below is a loop over `next_leaf_after`, and that function builds
+/// a fresh descent guard per call, seeded only from the path it was handed. So
+/// it can prove one *step* does not revisit a page, and cannot see the scan as
+/// a whole revisiting a leaf it already yielded.
+///
+/// That gap is reachable from a single authenticated internal node, because
+/// the leaf successor is parent-mediated and resolves a child by its first
+/// occurrence: a node whose `leftmost_child` is `A` and whose entries are
+/// `[k1 → B, k2 → A]` answers "after A comes B" and "after B comes A". Each
+/// step is individually acyclic and each page authenticates; the scan simply
+/// alternates forever. Only a guard that lives as long as the scan ends it.
+///
+/// A healthy tree visits each leaf exactly once in key order, so this never
+/// fires on a well-formed scan.
+fn scan_guard() -> SeenPageIds {
+    SeenPageIds::new("btree_scan")
+}
 
 impl<V: Vfs> BTree<V> {
     /// Forward range scan: `start` inclusive, `end` exclusive.
@@ -18,9 +38,11 @@ impl<V: Vfs> BTree<V> {
             return Ok(Vec::new());
         }
         let mut path = self.path_to_leaf_for_key(start).await?;
+        let mut seen_leaves = scan_guard();
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         loop {
             let leaf_id = *path.last().expect("non-empty path");
+            seen_leaves.insert(leaf_id)?;
             let leaf = self.read_leaf(leaf_id).await?;
             for (k, v) in &leaf.records {
                 if k.as_slice() >= end {
@@ -53,9 +75,11 @@ impl<V: Vfs> BTree<V> {
         // The empty key sorts below every stored key, so the descent lands on
         // the leftmost leaf.
         let mut path = self.path_to_leaf_for_key(&[]).await?;
+        let mut seen_leaves = scan_guard();
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         loop {
             let leaf_id = *path.last().expect("non-empty path");
+            seen_leaves.insert(leaf_id)?;
             let leaf = self.read_leaf(leaf_id).await?;
             for (k, v) in &leaf.records {
                 let val = self.resolve_leaf_value(v).await?;
@@ -90,9 +114,11 @@ impl<V: Vfs> BTree<V> {
             return Ok(Vec::new());
         }
         let mut path = self.path_to_leaf_for_key(start).await?;
+        let mut seen_leaves = scan_guard();
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(limit);
         loop {
             let leaf_id = *path.last().expect("non-empty path");
+            seen_leaves.insert(leaf_id)?;
             let leaf = self.read_leaf(leaf_id).await?;
             for (k, v) in &leaf.records {
                 if k.as_slice() < start {
@@ -166,9 +192,11 @@ impl<V: Vfs> BTree<V> {
             return Ok(Vec::new());
         }
         let mut path = self.path_to_leaf_for_key(prefix).await?;
+        let mut seen_leaves = scan_guard();
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         loop {
             let leaf_id = *path.last().expect("non-empty path");
+            seen_leaves.insert(leaf_id)?;
             let leaf = self.read_leaf(leaf_id).await?;
             let mut past_prefix = false;
             for (k, v) in &leaf.records {

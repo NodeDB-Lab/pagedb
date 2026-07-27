@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use pagedb::btree::BTree;
-use pagedb::btree::internal::Internal;
+use pagedb::btree::internal::{Internal, InternalEntry};
 use pagedb::btree::leaf::{Leaf, LeafValue};
 use pagedb::btree::node::body_capacity;
 use pagedb::btree::overflow::encode_overflow;
@@ -582,6 +582,81 @@ fn put_rejects_internal_child_cycle_without_hanging() {
             })
         ),
         "expected a descent PageChainCycle, got {error:?}"
+    );
+}
+
+/// A forward scan's leaf successor is parent-mediated, and a child is resolved
+/// by its *first* occurrence in the parent. An internal node that lists one
+/// child twice therefore answers "after A comes B" and "after B comes A", and
+/// every individual step is acyclic — the cycle only exists across steps. The
+/// per-descent guards inside `next_leaf_after` are rebuilt on each call and
+/// cannot see it, so the scan needs a guard of its own.
+#[test]
+fn collect_all_rejects_alternating_leaf_successors_without_hanging() {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let pager = fresh_pager().await;
+            let realm = RealmId::new([1; 16]);
+            let (root_page_id, left_leaf, right_leaf) = (71u64, 72u64, 73u64);
+
+            for (page_id, key) in [(left_leaf, b"a"), (right_leaf, b"b")] {
+                let mut leaf = Leaf::new();
+                leaf.upsert(key, LeafValue::Inline(b"v".to_vec()));
+                let mut body = vec![0u8; body_capacity(PAGE)];
+                leaf.encode(&mut body).unwrap();
+                pager
+                    .write_main_page(page_id, realm, PageKind::BTreeLeaf, &body)
+                    .await
+                    .unwrap();
+            }
+
+            // `left_leaf` appears twice: as the leftmost child and again as the
+            // child to the right of `right_leaf`.
+            let internal = Internal {
+                leftmost_child: left_leaf,
+                entries: vec![
+                    InternalEntry {
+                        key: b"b".to_vec(),
+                        right_child: right_leaf,
+                    },
+                    InternalEntry {
+                        key: b"c".to_vec(),
+                        right_child: left_leaf,
+                    },
+                ],
+            };
+            let mut body = vec![0u8; body_capacity(PAGE)];
+            internal.encode(&mut body).unwrap();
+            pager
+                .write_main_page(root_page_id, realm, PageKind::BTreeInternal, &body)
+                .await
+                .unwrap();
+
+            let tree = BTree::open(pager, realm, root_page_id, 74, PAGE);
+            tree.collect_all().await.map(|_| ())
+        });
+        let _ = tx.send(result);
+    });
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scan leaf-revisit detection should return before the timeout");
+    let error = result.expect_err("a scan that revisits a leaf must not be accepted");
+    assert!(
+        matches!(
+            error,
+            PagedbError::Corruption(CorruptionDetail::PageChainCycle {
+                structure: "btree_scan",
+                ..
+            })
+        ),
+        "expected a scan PageChainCycle, got {error:?}"
     );
 }
 
