@@ -3654,3 +3654,414 @@ async fn chained_incremental_applies_keep_the_follower_able_to_advance() {
     std::fs::remove_dir_all(&delta_two_dir).ok();
     std::fs::remove_dir_all(&dst_dir).ok();
 }
+
+/// The follower keeps its own free-list chain and commit-history tree across
+/// an apply, and those pages are invisible to the producer, which can neither
+/// predict nor avoid them. When the producer's allocator later recycles one of
+/// those same ids into its own live tree, the resulting delta ships that id by
+/// number and `apply_delta_pages` refuses it outright as `SnapshotBasePageReused`
+/// -- fail-closed, before `main.db` is ever opened for writing. That refusal is
+/// not a bug to work around; it is the contract. This proves the refusal is
+/// both precise (the exact error variant, not any old error) and side-effect
+/// free (the follower's commit, its key/value state, and its page graph are
+/// bit-for-bit what they were before the doomed apply was attempted), and that
+/// the documented remedy -- a full snapshot instead of a delta -- still works.
+#[tokio::test(flavor = "current_thread")]
+async fn an_inapplicable_delta_is_refused_without_touching_the_follower() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dir = tempdir();
+    let full_snap_dir = tempdir();
+    let full_dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+
+    // A large working set, so deletes free interior pages, not just one leaf.
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..512 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[0xAA; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    source.snapshot_to(&snap_dir).await.unwrap();
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let base = source.latest_commit();
+
+    // Record the follower's full state before the doomed apply so the
+    // "nothing changed" assertions below have something concrete to compare
+    // against, rather than just "it still looks fine".
+    let pre_apply_commit = follower.latest_commit();
+    let pre_apply_values: Vec<(String, Option<Vec<u8>>)> = {
+        let rtxn = follower.begin_read().await.unwrap();
+        let mut values = Vec::with_capacity(512);
+        for i in 0u32..512 {
+            let key = format!("k{i:05}");
+            let value = rtxn.get(key.as_bytes()).await.unwrap();
+            values.push((key, value));
+        }
+        values
+    };
+
+    // Free half the working set -- interior pages go onto the source's
+    // durable free list.
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..256 {
+            write.delete(format!("k{i:05}").as_bytes()).await.unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    // Re-insert, forcing the allocator to draw the just-freed ids back off the
+    // free list -- among them, with overwhelming likelihood given 512 keys
+    // reused down to 256 ids, some id the follower is holding for its own
+    // chain or commit-history pages.
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..256 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[0xBB; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    let target = source.latest_commit();
+    source
+        .snapshot_incremental_to(base, &delta_dir)
+        .await
+        .expect("exporting the delta itself must succeed; the guard lives on the apply side");
+
+    let err = follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect_err("a delta that reuses a follower-private page id must be refused, not applied");
+    assert!(
+        matches!(err, PagedbError::SnapshotBasePageReused { .. }),
+        "expected PagedbError::SnapshotBasePageReused, got a different error: {err:?}"
+    );
+
+    // The load-bearing assertions: the rejection must be a pure no-op on the
+    // follower. Nothing about its commit, its data, or its page graph may have
+    // moved, because the write path bails before `main.db` is opened.
+    assert_eq!(
+        follower.latest_commit(),
+        pre_apply_commit,
+        "a refused apply must not advance the follower's commit"
+    );
+    {
+        let rtxn = follower.begin_read().await.unwrap();
+        for (key, expected) in &pre_apply_values {
+            assert_eq!(
+                &rtxn.get(key.as_bytes()).await.unwrap(),
+                expected,
+                "key {key} must read back exactly as it did before the refused apply"
+            );
+        }
+    }
+    let report = run_deep_walk(&follower).await.unwrap();
+    assert!(
+        report.orphan_page_ids.is_empty(),
+        "a refused apply must not leave orphan pages, got {:?}",
+        report.orphan_page_ids
+    );
+    assert!(
+        report.is_clean(),
+        "a refused apply must leave the follower's deep-walk report clean: {report:?}"
+    );
+
+    // The documented remedy: fall back to a full snapshot instead of a delta.
+    source.snapshot_to(&full_snap_dir).await.unwrap();
+    let full_restored =
+        Db::<TokioVfs>::restore_from(&full_snap_dir, &full_dst_dir, OpenOptions::default(), KEK)
+            .await
+            .unwrap();
+    let full_follower = full_restored.promote_to_follower().await.unwrap();
+    assert_eq!(full_follower.latest_commit(), target);
+    {
+        let rtxn = full_follower.begin_read().await.unwrap();
+        for i in 0u32..256 {
+            assert_eq!(
+                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                Some(vec![0xBBu8; 128]),
+                "full-snapshot remedy: refilled key k{i:05} must reflect the source's current state"
+            );
+        }
+        for i in 256u32..512 {
+            assert_eq!(
+                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                Some(vec![0xAAu8; 128]),
+                "full-snapshot remedy: untouched key k{i:05} must reflect the source's current state"
+            );
+        }
+    }
+    let full_report = run_deep_walk(&full_follower).await.unwrap();
+    assert!(
+        full_report.orphan_page_ids.is_empty(),
+        "full-snapshot remedy follower must have no orphan pages, got {:?}",
+        full_report.orphan_page_ids
+    );
+    assert!(
+        full_report.is_clean(),
+        "full-snapshot remedy follower must deep-walk clean: {full_report:?}"
+    );
+
+    drop(full_follower);
+    drop(follower);
+    drop(source);
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&full_snap_dir).ok();
+    std::fs::remove_dir_all(&full_dst_dir).ok();
+}
+
+/// This is a genuine architectural limit, not a defect to be papered over:
+/// `protected_page_ids` is the follower's whole published base page set, and
+/// `apply_delta_pages` writes pages before the header swap, so once the
+/// producer recycles ANY id the follower's base still holds, that delta can
+/// never be applied -- overwriting it first would destroy the base with no
+/// valid header left to recover from on a crash. Ordinary churn (delete some
+/// keys, refill, overwrite the rest -- CoW recycles pages on overwrite exactly
+/// as deletes do, so there is no churn shape that reliably dodges this) will
+/// eventually recycle such an id. A real replication client must therefore
+/// treat `SnapshotBasePageReused` as an expected outcome of chaining deltas,
+/// not a bug: fall back to a full snapshot and keep going. This test drives 12
+/// rounds of that ordinary churn and, on every round, accepts exactly two
+/// outcomes -- clean apply, or refusal-plus-full-snapshot-remedy -- and fails
+/// loudly on anything else.
+#[tokio::test(flavor = "current_thread")]
+async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snapshot() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+
+    // A large working set, so deletes free interior pages, not just one leaf.
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..512 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[0xAA; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    source.snapshot_to(&snap_dir).await.unwrap();
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let mut follower = restored.promote_to_follower().await.unwrap();
+
+    let mut delta_target = source.latest_commit();
+    let mut cleanup_dirs = vec![src_dir.clone(), snap_dir.clone(), dst_dir.clone()];
+    let mut ok_rounds = 0u32;
+    let mut refused_rounds = 0u32;
+
+    for round in 0u32..12 {
+        let round_base = delta_target;
+
+        // Pre-round follower state, needed only if this round's delta gets
+        // refused -- the refusal must be a pure no-op.
+        let pre_round_commit = follower.latest_commit();
+        let pre_round_values: Vec<(String, Option<Vec<u8>>)> = {
+            let rtxn = follower.begin_read().await.unwrap();
+            let mut values = Vec::with_capacity(512);
+            for i in 0u32..512 {
+                let key = format!("k{i:05}");
+                let value = rtxn.get(key.as_bytes()).await.unwrap();
+                values.push((key, value));
+            }
+            values
+        };
+
+        // Ordinary churn: free half the working set, refill it with this
+        // round's generation, and overwrite the surviving half in place. Both
+        // the refill and the in-place overwrite draw on/recycle freed pages,
+        // which is exactly the condition that can hit a follower-held id.
+        {
+            let mut write = source.begin_write().await.unwrap();
+            for i in 0u32..256 {
+                write.delete(format!("k{i:05}").as_bytes()).await.unwrap();
+            }
+            write.commit().await.unwrap();
+        }
+        {
+            let mut write = source.begin_write().await.unwrap();
+            for i in 0u32..256 {
+                write
+                    .put(format!("k{i:05}").as_bytes(), &[round as u8; 128])
+                    .await
+                    .unwrap();
+            }
+            write.commit().await.unwrap();
+        }
+        {
+            let mut write = source.begin_write().await.unwrap();
+            for i in 256u32..512 {
+                write
+                    .put(format!("k{i:05}").as_bytes(), &[round as u8; 128])
+                    .await
+                    .unwrap();
+            }
+            write.commit().await.unwrap();
+        }
+
+        delta_target = source.latest_commit();
+        let delta_dir = tempdir();
+        cleanup_dirs.push(delta_dir.clone());
+        source
+            .snapshot_incremental_to(round_base, &delta_dir)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: incremental export must succeed: {e:?}"));
+
+        match follower.apply_incremental(&delta_dir).await {
+            Ok(_) => {
+                ok_rounds += 1;
+                assert_eq!(
+                    follower.latest_commit(),
+                    delta_target,
+                    "round {round}: a successful apply must land on the delta's target commit"
+                );
+                let report = run_deep_walk(&follower).await.unwrap();
+                assert!(
+                    report.orphan_page_ids.is_empty(),
+                    "round {round}: a successful apply must leave no orphan pages, got {:?}",
+                    report.orphan_page_ids
+                );
+                assert!(
+                    report.is_clean(),
+                    "round {round}: a successful apply must leave a clean deep-walk report: {report:?}"
+                );
+                let rtxn = follower.begin_read().await.unwrap();
+                for i in 0u32..512 {
+                    assert_eq!(
+                        rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                        Some(vec![round as u8; 128]),
+                        "round {round}: key k{i:05} should reflect this round's generation after a successful apply"
+                    );
+                }
+            }
+            Err(PagedbError::SnapshotBasePageReused { .. }) => {
+                refused_rounds += 1;
+
+                // The refusal must be a pure no-op on the follower that was
+                // asked to apply the delta.
+                assert_eq!(
+                    follower.latest_commit(),
+                    pre_round_commit,
+                    "round {round}: a refused apply must not advance the follower's commit"
+                );
+                {
+                    let rtxn = follower.begin_read().await.unwrap();
+                    for (key, expected) in &pre_round_values {
+                        assert_eq!(
+                            &rtxn.get(key.as_bytes()).await.unwrap(),
+                            expected,
+                            "round {round}: key {key} must read back exactly as before the refused apply"
+                        );
+                    }
+                }
+                let report = run_deep_walk(&follower).await.unwrap();
+                assert!(
+                    report.orphan_page_ids.is_empty(),
+                    "round {round}: a refused apply must not leave orphan pages, got {:?}",
+                    report.orphan_page_ids
+                );
+                assert!(
+                    report.is_clean(),
+                    "round {round}: a refused apply must leave a clean deep-walk report: {report:?}"
+                );
+
+                // The documented remedy: fall back to a full snapshot and keep
+                // going with a brand-new follower built from it.
+                let full_snap_dir = tempdir();
+                let full_dst_dir = tempdir();
+                cleanup_dirs.push(full_snap_dir.clone());
+                cleanup_dirs.push(full_dst_dir.clone());
+
+                source
+                    .snapshot_to(&full_snap_dir)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("round {round}: full-snapshot remedy export must succeed: {e:?}")
+                    });
+                let full_restored = Db::<TokioVfs>::restore_from(
+                    &full_snap_dir,
+                    &full_dst_dir,
+                    OpenOptions::default(),
+                    KEK,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("round {round}: full-snapshot remedy restore must succeed: {e:?}")
+                });
+                let new_follower = full_restored
+                    .promote_to_follower()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("round {round}: full-snapshot remedy promotion must succeed: {e:?}")
+                    });
+
+                assert_eq!(
+                    new_follower.latest_commit(),
+                    delta_target,
+                    "round {round}: the remedy follower must land on the source's current commit"
+                );
+                let report = run_deep_walk(&new_follower).await.unwrap();
+                assert!(
+                    report.orphan_page_ids.is_empty(),
+                    "round {round}: the remedy follower must have no orphan pages, got {:?}",
+                    report.orphan_page_ids
+                );
+                assert!(
+                    report.is_clean(),
+                    "round {round}: the remedy follower must deep-walk clean: {report:?}"
+                );
+                let rtxn = new_follower.begin_read().await.unwrap();
+                for i in 0u32..512 {
+                    assert_eq!(
+                        rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                        Some(vec![round as u8; 128]),
+                        "round {round}: key k{i:05} should reflect this round's generation on the remedy follower"
+                    );
+                }
+                drop(rtxn);
+
+                drop(follower);
+                follower = new_follower;
+            }
+            Err(other) => panic!(
+                "round {round}: unexpected error, only Ok or SnapshotBasePageReused are acceptable outcomes of chaining a delta: {other:?}"
+            ),
+        }
+    }
+
+    assert!(
+        ok_rounds > 0,
+        "the loop never exercised the clean-apply branch, so it cannot prove that path works"
+    );
+    assert!(
+        refused_rounds > 0,
+        "the loop never exercised the refusal-and-remedy branch, so it cannot prove that path works"
+    );
+
+    drop(follower);
+    drop(source);
+    for dir in cleanup_dirs {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
