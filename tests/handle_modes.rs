@@ -251,7 +251,11 @@ async fn read_only_handle_promotes_to_follower_through_the_supported_transition(
     assert!(follower.can_apply_incremental());
     assert!(matches!(
         follower.begin_write().await,
-        Err(PagedbError::ReadOnly)
+        Err(PagedbError::WrongMode {
+            operation: "begin_write",
+            required: DbMode::Standalone,
+            actual: DbMode::Follower,
+        })
     ));
 }
 
@@ -335,7 +339,14 @@ async fn read_only_segment_creation_is_rejected_before_filesystem_mutation() {
         .err()
         .unwrap();
 
-    assert!(matches!(err, PagedbError::ReadOnly));
+    assert!(matches!(
+        err,
+        PagedbError::WrongMode {
+            operation: "create_segment",
+            required: DbMode::Standalone,
+            actual: DbMode::ReadOnly,
+        }
+    ));
     let (staging_exists_after, staging_entries_after) = staging_directory_snapshot(&vfs).await;
     assert_eq!(staging_exists_after, staging_exists_before);
     assert_eq!(staging_entries_after, staging_entries_before);
@@ -371,7 +382,14 @@ async fn observer_segment_creation_is_rejected_before_filesystem_mutation() {
         .err()
         .unwrap();
 
-    assert!(matches!(err, PagedbError::ReadOnly));
+    assert!(matches!(
+        err,
+        PagedbError::WrongMode {
+            operation: "create_segment",
+            required: DbMode::Standalone,
+            actual: DbMode::Observer,
+        }
+    ));
     let (staging_exists_after, staging_entries_after) = staging_directory_snapshot(&vfs).await;
     assert_eq!(staging_exists_after, staging_exists_before);
     assert_eq!(staging_entries_after, staging_entries_before);
@@ -403,7 +421,7 @@ async fn lock_released_on_drop_lets_second_open_succeed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn promote_to_follower_stub_returns_unsupported() {
+async fn promote_to_follower_from_standalone_is_refused_as_a_wrong_mode() {
     let vfs = MemVfs::new();
     let db = Db::open(
         vfs,
@@ -415,5 +433,12 @@ async fn promote_to_follower_stub_returns_unsupported() {
     .await
     .unwrap();
     let err = db.promote_to_follower().await.err().unwrap();
-    assert!(matches!(err, PagedbError::Unsupported));
+    assert!(matches!(
+        err,
+        PagedbError::WrongMode {
+            operation: "promote_to_follower",
+            required: DbMode::ReadOnly,
+            actual: DbMode::Standalone,
+        }
+    ));
 }

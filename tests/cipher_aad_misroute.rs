@@ -1,13 +1,19 @@
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CipherId, Db, PagedbError, RealmId};
+use pagedb::{CipherId, CorruptionDetail, Db, OpenOptions, PagedbError, RealmId};
 
 const PAGE: usize = 4096;
 
 async fn round_trip_under_cipher(cipher: CipherId) {
     let vfs = MemVfs::new();
-    let db = Db::open_internal_with_cipher(vfs, [9u8; 32], PAGE, RealmId::new([1; 16]), cipher)
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default().with_cipher(cipher),
+    )
+    .await
+    .unwrap();
     let mut w = db.begin_write().await.unwrap();
     w.put(b"k", b"v").await.unwrap();
     w.commit().await.unwrap();
@@ -35,12 +41,12 @@ async fn cross_realm_fails_under(cipher: CipherId) {
     // The B+ tree root was AAD'd under realm_a; realm_b's read triggers tag failure.
     let vfs = MemVfs::new();
     {
-        let db_a = Db::open_internal_with_cipher(
+        let db_a = Db::open(
             vfs.clone(),
             [9u8; 32],
             PAGE,
             RealmId::new([1; 16]),
-            cipher,
+            OpenOptions::default().with_cipher(cipher),
         )
         .await
         .unwrap();
@@ -48,12 +54,24 @@ async fn cross_realm_fails_under(cipher: CipherId) {
         w.put(b"k", b"v").await.unwrap();
         w.commit().await.unwrap();
     }
-    let db_b = Db::open_existing(vfs, [9u8; 32], PAGE, RealmId::new([2; 16]))
-        .await
-        .unwrap();
+    let db_b = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([2; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let r = db_b.begin_read().await.unwrap();
     let err = r.get(b"k").await.err().unwrap();
-    assert!(matches!(err, PagedbError::ChecksumFailure));
+    assert!(
+        matches!(
+            err,
+            PagedbError::Corruption(CorruptionDetail::PageUnverifiable { .. })
+        ),
+        "a misrouted realm must fail authentication and name the page: {err:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

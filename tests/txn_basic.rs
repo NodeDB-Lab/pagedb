@@ -1,12 +1,18 @@
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CommitId, Db, PagedbError, ReaderStallPolicy, RealmId};
+use pagedb::{CommitId, Db, OpenOptions, PagedbError, ReaderStallPolicy, RealmId};
 
 const PAGE: usize = 4096;
 
 async fn open_db() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap()
+    Db::open(
+        MemVfs::new(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -107,13 +113,12 @@ async fn begin_read_at_current_succeeds() {
 async fn begin_read_at_past_returns_commit_gone() {
     // With Count(2), writing 3 commits prunes commit 1; begin_read_at(1) must
     // return CommitGone.
-    use pagedb::options::{OpenOptions, RetainPolicy};
+    use pagedb::options::RetainPolicy;
     use pagedb::vfs::memory::MemVfs;
     let opts = OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(2));
-    let db =
-        Db::open_internal_with_options(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]), opts)
-            .await
-            .unwrap();
+    let db = Db::open(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]), opts)
+        .await
+        .unwrap();
     for _ in 0..3u32 {
         let mut w = db.begin_write().await.unwrap();
         w.put(b"k", b"v").await.unwrap();

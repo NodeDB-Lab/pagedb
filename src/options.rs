@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use crate::crypto::CipherId;
+
 /// Controls how many historical commit entries the commit-history index retains.
 ///
 /// Pruning runs on every `WriteTxn::commit()`, but active readers always pin
@@ -60,6 +62,7 @@ impl Default for RetainPolicy {
 /// | `commit_history_retain` | `Count(1024)` |
 /// | `reader_stall_threshold_pages` | 100_000 |
 /// | `observer_retry_count` | 3 |
+/// | `cipher` | `Aes256Gcm` |
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
@@ -110,6 +113,15 @@ pub struct OpenOptions {
     /// extra header writes on large operations, and a crash re-opens having
     /// skipped at most one budget's worth of counter values. Default: 1024.
     pub anchor_budget: u64,
+
+    /// Cipher for a database this open *creates*.
+    ///
+    /// Ignored when the database already exists: every encrypted byte carries
+    /// its own `cipher_id`, and an existing store is always read under the
+    /// cipher its pages were written with, never under this setting. Choosing
+    /// it here is therefore a one-time decision made at bootstrap — which is
+    /// also why it is an open option rather than a runtime switch.
+    pub cipher: CipherId,
 }
 
 impl Default for OpenOptions {
@@ -124,6 +136,7 @@ impl Default for OpenOptions {
             observer_retry_count: 3,
             metrics_enabled: true,
             anchor_budget: crate::crypto::nonce::DEFAULT_ANCHOR_BUDGET,
+            cipher: CipherId::Aes256Gcm,
         }
     }
 }
@@ -193,6 +206,14 @@ impl OpenOptions {
     #[must_use]
     pub fn with_anchor_budget(mut self, v: u64) -> Self {
         self.anchor_budget = v;
+        self
+    }
+
+    /// Select the cipher used to create a new database. Has no effect on an
+    /// open that finds an existing store.
+    #[must_use]
+    pub fn with_cipher(mut self, v: CipherId) -> Self {
+        self.cipher = v;
         self
     }
 }

@@ -23,7 +23,7 @@ const BUDGET: u64 = 8;
 #[tokio::test(flavor = "current_thread")]
 async fn one_transaction_may_write_more_pages_than_the_anchor_budget() {
     let options = OpenOptions::default().with_anchor_budget(BUDGET);
-    let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, options)
+    let db = Db::open(MemVfs::new(), KEK, PAGE, REALM, options)
         .await
         .unwrap();
 

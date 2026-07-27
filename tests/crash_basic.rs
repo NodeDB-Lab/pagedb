@@ -1,6 +1,6 @@
 use pagedb::vfs::memory::MemVfs;
 use pagedb::vfs::{OpenMode, Vfs};
-use pagedb::{Db, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, OpenOptions, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 
@@ -12,9 +12,15 @@ async fn unlinked_sealed_staging_swept_on_open() {
     let vfs = MemVfs::new();
     let segment_id_hex: String;
     {
-        let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-            .await
-            .unwrap();
+        let db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
         let mut w = db
             .create_segment(RealmId::new([1; 16]), SegmentKind::Unspecified)
             .await
@@ -31,9 +37,15 @@ async fn unlinked_sealed_staging_swept_on_open() {
     let _f = vfs.open(&staging_path, OpenMode::Read).await.unwrap();
     drop(_f);
     // Reopen. Reconciliation should sweep the orphan staging file.
-    let _db = Db::open_existing(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let _db = Db::open(
+        vfs.clone(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     // Staging file is gone.
     let res = vfs.open(&staging_path, OpenMode::Read).await;
     assert!(res.is_err(), "orphan staging file should have been swept");
@@ -48,9 +60,15 @@ async fn link_commit_then_rename_staging_recovers() {
     let vfs = MemVfs::new();
     let segment_id_hex: String;
     {
-        let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-            .await
-            .unwrap();
+        let db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
         let mut w = db
             .create_segment(RealmId::new([1; 16]), SegmentKind::Unspecified)
             .await
@@ -70,9 +88,15 @@ async fn link_commit_then_rename_staging_recovers() {
     vfs.rename(&live, &staging).await.unwrap();
     // Reopen. Reconciliation finds catalog row but file missing at live ->
     // looks for staging and promotes.
-    let db = Db::open_existing(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs.clone(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     // The live file is back.
     let _f = vfs.open(&live, OpenMode::Read).await.unwrap();
     drop(_f);

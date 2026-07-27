@@ -15,8 +15,56 @@
 
 #[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
 mod imp {
+    use std::cell::Cell;
+    use std::marker::PhantomData;
+
     use crate::RealmId;
     use crate::errors::CorruptionDetail;
+
+    thread_local! {
+        /// Live [`RichlyReported`] guards on this thread. A depth rather than a
+        /// flag: nesting must not leave the suppression stuck on when the inner
+        /// guard drops.
+        static RICH_REPORTS_IN_FLIGHT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Evidence that a site-specific report already covers the corruption about
+    /// to be constructed.
+    ///
+    /// Every rich capture in this module returns one. Bind it across the
+    /// `PagedbError::corruption(...)` call that reports the same failure and
+    /// [`corruption_captured`] stands down for that construction, so one
+    /// failure files one report — the site's, which carries forensics (the
+    /// failing page, the fsck hint, the store path) that the constructor, which
+    /// sees only a `CorruptionDetail`, cannot know.
+    ///
+    /// This is the mechanism, not a special case: a second site that grows its
+    /// own `DomainContext` gets the same suppression by returning this type
+    /// from its capture function, with nothing to rediscover.
+    ///
+    /// Deliberately not `Send`. The guard covers the construction immediately
+    /// following it and nothing else; holding it across an `.await` would
+    /// silence unrelated corruption raised by whatever ran in between, and the
+    /// compiler rejects that wherever the surrounding future must be `Send`.
+    #[must_use = "bind the guard so it outlives the corruption() call it covers"]
+    pub struct RichlyReported {
+        _not_send: PhantomData<*const ()>,
+    }
+
+    impl RichlyReported {
+        fn begin() -> Self {
+            RICH_REPORTS_IN_FLIGHT.with(|depth| depth.set(depth.get().saturating_add(1)));
+            Self {
+                _not_send: PhantomData,
+            }
+        }
+    }
+
+    impl Drop for RichlyReported {
+        fn drop(&mut self) {
+            RICH_REPORTS_IN_FLIGHT.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
 
     /// Breadcrumb: a store was (re)opened — marks epoch boundaries in the trail,
     /// the dimension along which freed-page use-after-free surfaces.
@@ -98,13 +146,18 @@ mod imp {
     /// authenticate. Records the failing page, expected binding, and realm so
     /// the failure is diagnosable from the report alone; the host application
     /// preserves the store bytes (it owns the real path behind the VFS).
+    ///
+    /// Returns a [`RichlyReported`] guard: bind it across the
+    /// `PagedbError::corruption(...)` that turns this same failure into an
+    /// error, so the caller gets the precise variant while this report — not
+    /// the constructor's generic one — is what gets filed.
     pub fn page_read_verify_failed(
         main_db_path: &str,
         page_id: u64,
         file: &str,
         binding: &str,
         realm: &RealmId,
-    ) {
+    ) -> RichlyReported {
         let ctx = PageReadVerifyFailure {
             page_id,
             file: file.to_owned(),
@@ -119,6 +172,7 @@ mod imp {
         .domain(&ctx)
         .with_backtrace()
         .emit();
+        RichlyReported::begin()
     }
 
     /// Forensic context for a [`CorruptionDetail`] captured at the moment
@@ -268,6 +322,12 @@ mod imp {
     /// reporting layer instead of only the one AEAD failure site this module
     /// originally covered.
     pub fn corruption_captured(detail: &CorruptionDetail) {
+        // A site-specific capture is already in flight for this exact failure
+        // and carries strictly more than this one could. Filing both would mean
+        // two reports for one event, the second of them less useful.
+        if RICH_REPORTS_IN_FLIGHT.with(Cell::get) > 0 {
+            return;
+        }
         let (kind, grouping_key) = classify(detail);
         let ctx = CorruptionConstructed {
             kind,
@@ -288,6 +348,10 @@ mod imp {
 mod imp {
     use crate::RealmId;
 
+    /// No-op counterpart of the recording build's suppression guard, so call
+    /// sites bind the same value under every cfg.
+    pub struct RichlyReported;
+
     pub fn reopened(_latest_commit: u64) {}
     pub fn committed(_commit_id: u64, _freed_pages: usize) {}
     pub fn lock_acquired(_mode: &str, _path: &str) {}
@@ -299,12 +363,16 @@ mod imp {
         _file: &str,
         _binding: &str,
         _realm: &RealmId,
-    ) {
+    ) -> RichlyReported {
+        RichlyReported
     }
 
     pub fn corruption_captured(_detail: &crate::errors::CorruptionDetail) {}
 }
 
+// `RichlyReported` is deliberately not re-exported: a call site binds it as the
+// return value of a rich capture (`let _report = diag::page_read_verify_failed(…)`)
+// and never names the type, so exporting it would only be an unused path.
 pub use imp::{
     committed, corruption_captured, flushed, lock_acquired, lock_rejected, page_read_verify_failed,
     reopened,

@@ -1,6 +1,6 @@
 //! Typed error spine. All domain errors land in `PagedbError`; sub-errors From-convert in.
 
-use crate::{CommitId, RealmId};
+use crate::{CommitId, DbMode, RealmId};
 
 /// Authoritative error type for every fallible operation in this crate.
 #[non_exhaustive]
@@ -8,11 +8,14 @@ use crate::{CommitId, RealmId};
 pub enum PagedbError {
     /// A page or footer's AEAD tag did not verify against its authenticated
     /// bytes, and the failure could not be attributed to a more specific
-    /// corruption reason. Raised on the segment page decrypt-retry path (all
-    /// candidate page kinds failed) and inside the raw cipher open call.
-    /// Treat the containing file or page as untrustworthy; a fuller
-    /// diagnosis usually surfaces as one of the [`CorruptionDetail`]
-    /// variants instead, so see those first when triaging.
+    /// corruption reason. Raised inside the raw cipher open call, and by the
+    /// warm-cache guards that reject a page whose cached realm or kind
+    /// disagrees with the request before any decryption happens.
+    ///
+    /// A tag failure discovered while actually reading a page from storage
+    /// carries its page identity instead, as
+    /// [`CorruptionDetail::PageUnverifiable`]; see the [`CorruptionDetail`]
+    /// variants first when triaging.
     #[error("checksum / AEAD tag verification failed")]
     ChecksumFailure,
 
@@ -43,11 +46,16 @@ pub enum PagedbError {
         limit: u64,
     },
 
-    /// The VFS backend reported the underlying storage device or filesystem
-    /// is full. Not raised by any production code path today — it exists
-    /// for VFS backends to report device-level exhaustion distinctly from a
-    /// generic [`Self::Io`] error; a caller that sees it should free disk
-    /// space or point the store at a volume with headroom.
+    /// The underlying storage device or filesystem is full. Every
+    /// `std::io::Error` that converts into a `PagedbError` is classified on
+    /// the way in, so device-level exhaustion from any VFS backend — in-tree
+    /// or third-party — arrives here rather than hiding inside a generic
+    /// [`Self::Io`].
+    ///
+    /// Structurally distinct from [`Self::Quota`]: a quota refusal is a cap
+    /// this store enforces and the caller can raise or free against, while
+    /// this is the host running out of bytes. Freeing pagedb data may not
+    /// help; the caller needs disk space or a different volume.
     #[error("no space (VFS-level exhaustion)")]
     NoSpace,
 
@@ -67,11 +75,11 @@ pub enum PagedbError {
     #[error("arithmetic overflow while computing {operation}")]
     ArithmeticOverflow { operation: &'static str },
 
-    /// The handle is open in a mode that does not permit the attempted
-    /// write. Raised by VFS backends when a file was opened read-only and by
-    /// the pager for a handle without write access. Only `Standalone` and
-    /// `Follower` handles may write; `ReadOnly` and `Observer` handles must
-    /// reopen (or promote, for a frozen reader) before writing.
+    /// A write was refused because the file or pager it targeted has no
+    /// write access. Raised by VFS backends when a file was opened read-only
+    /// and by the pager for a handle without write access. Handle-mode policy
+    /// does not raise this — a `Db` operation the handle's mode forbids
+    /// reports [`Self::WrongMode`], which also names the mode that would work.
     #[error("read-only handle")]
     ReadOnly,
 
@@ -83,11 +91,13 @@ pub enum PagedbError {
     #[error("writer already present")]
     WriterPresent,
 
-    /// A `Standalone`/`Follower` writer, or a `ReadOnly` promotion to
-    /// `Follower`, tried to acquire the writer sentinel while a frozen
-    /// (`ReadOnly`) reader already holds the frozen-readers lock. Writer
-    /// modes and frozen-reader mode are mutually exclusive on the same
-    /// store; retry once every frozen reader closes.
+    /// An operation was refused because readers still hold the state it would
+    /// destroy. Two shapes, one meaning: a `Standalone`/`Follower` writer (or
+    /// a `ReadOnly` promotion to `Follower`) tried to acquire the writer
+    /// sentinel while a frozen (`ReadOnly`) reader holds the frozen-readers
+    /// lock, or an in-process `ReadTxn` is pinned on a handle asked to replace
+    /// the bytes that reader is reading (`apply_incremental`). Retry once the
+    /// readers close.
     #[error("readers present")]
     ReadersPresent,
 
@@ -114,12 +124,23 @@ pub enum PagedbError {
     #[error("restored directory not promoted")]
     RestoredNotPromoted,
 
-    /// `apply_incremental` was called on a handle that is not in `Follower`
-    /// mode. Only a `Follower` handle has the base-commit identity an
-    /// incremental apply reconciles against; open the handle as `Follower`
-    /// (e.g. via `promote_to_follower`) before calling `apply_incremental`.
-    #[error("identity forked; apply_incremental refused")]
-    IdentityForked,
+    /// `operation` is not authorized for a handle in `actual` mode; it
+    /// requires a handle in `required` mode. The single answer to "this
+    /// handle cannot do that right now", raised by every mode gate
+    /// (`begin_write`, `create_segment`, compaction, `rekey_db`,
+    /// `promote_to_follower`, `apply_incremental`), so an embedder needs one
+    /// match arm and gets told which mode would have worked.
+    ///
+    /// Distinct from [`Self::ReadOnly`], which is a write refused by the
+    /// storage medium or file handle rather than by handle policy, and from
+    /// [`Self::Unsupported`], which no change of mode can resolve. Reopen (or
+    /// promote) the handle in `required` mode.
+    #[error("{operation} requires a {required:?} handle; this handle is {actual:?}")]
+    WrongMode {
+        operation: &'static str,
+        required: DbMode,
+        actual: DbMode,
+    },
 
     /// An incremental snapshot's manifest disagrees with this handle's
     /// current identity or reader-visible state in a way that makes the
@@ -298,24 +319,6 @@ pub enum PagedbError {
         oldest_pinning_commit: u64,
     },
 
-    /// Under [`ReaderStallPolicy::Reject`](crate::ReaderStallPolicy), a new
-    /// write would need free-list pages that reader pins are preventing the
-    /// writer from reclaiming, and no free pages remain. No production call
-    /// site raises this today (`Reject` policy's free-list path is exercised
-    /// only in `tests/smoke.rs`'s Display-coverage test); when it is wired
-    /// up, the caller's remedy is to wait for the pinning readers to close
-    /// or switch to `AbortOldest`.
-    #[error("free list exhausted")]
-    FreeListExhausted,
-
-    /// Under [`ReaderStallPolicy::Reject`](crate::ReaderStallPolicy), a
-    /// segment tombstone cannot be finalized because a reader still pins the
-    /// truncated range. No production call site raises this today (see
-    /// [`Self::FreeListExhausted`] — same policy, same test-only coverage);
-    /// the intended remedy is to wait for the pinning reader to close.
-    #[error("segment tombstone stalled by reader pin")]
-    SegmentTombstoneStalled,
-
     /// An apply-journal reconciliation deferred a segment tombstone because
     /// a reader still pins the range being truncated; the durable target is
     /// published for new readers, but this transaction returns the error to
@@ -386,11 +389,10 @@ pub enum PagedbError {
     },
 
     /// The requested operation is not implemented by the current backend or
-    /// target — e.g. `mmap_view` on WASM (no native mmap), an unknown
-    /// on-wire cipher id, or `promote_to_follower` called on a handle that
-    /// is not `ReadOnly`. Check the operation's docs for which
-    /// backends/modes support it; there is no runtime workaround short of
-    /// switching backend, target, or handle mode.
+    /// target — e.g. `mmap_view` on WASM (no native mmap) or an unknown
+    /// on-wire cipher id. Nothing the caller does at runtime resolves it
+    /// short of switching backend or target; an operation that a *different
+    /// handle mode* would allow reports [`Self::WrongMode`] instead.
     #[error("unsupported by backend")]
     Unsupported,
 
@@ -406,7 +408,23 @@ pub enum PagedbError {
     /// variants above. Inspect the wrapped error's `kind()` for the
     /// platform-reported cause.
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
+}
+
+/// Classify a backend I/O failure on its way into the error spine.
+///
+/// Hand-written rather than derived with `#[from]` so device exhaustion is
+/// separated from ordinary I/O exactly once, at the single boundary every `?`
+/// on a VFS call already crosses. Classifying at raise sites instead would mean
+/// every writer, flush, seal, and header commit repeating the same match — and
+/// one that forgot would silently re-bury a full disk inside [`PagedbError::Io`].
+impl From<std::io::Error> for PagedbError {
+    fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::StorageFull {
+            return Self::NoSpace;
+        }
+        Self::Io(error)
+    }
 }
 
 /// Per-reason detail for [`PagedbError::Corruption`]. Each variant carries exactly the
@@ -424,10 +442,23 @@ pub enum CorruptionDetail {
         footer_parent_file_id: [u8; 16],
         expected_parent_file_id: [u8; 16],
     },
-    /// Footer HK-MAC failed; segment identity is unverifiable.
+    /// Footer HK-MAC failed, so the file's contents cannot be trusted to be
+    /// what the catalog references.
+    ///
+    /// Raised only where the *trusted* identity is already in hand — the
+    /// catalog row that routed the read — because the footer's own cleartext
+    /// identity fields are exactly what failed to authenticate. A footer that
+    /// is unreadable for some other reason is [`Self::FooterFramingInvalid`].
+    ///
+    /// Carries the id rather than the embedder's name: segment files are
+    /// identity-keyed, so the id is what locates the bytes, and the name is a
+    /// catalog fact the authenticating layer does not have.
+    ///
+    /// The file is left in place: pagedb never auto-GCs a catalog-referenced
+    /// segment, since that would destroy forensics and possibly recoverable
+    /// bytes. Quarantine is the embedder's call, via `WriteTxn::unlink_segment`.
     FooterUnverifiable {
         realm_id: RealmId,
-        name: String,
         segment_id: [u8; 16],
     },
     /// Authenticated segment metadata differs from its trusted catalog routing entry.
@@ -444,13 +475,22 @@ pub enum CorruptionDetail {
         name: String,
         segment_id: [u8; 16],
     },
-    /// Pre-link staging file expected but not present.
-    StagingMissing {
-        realm_id: RealmId,
-        name: String,
-        segment_id: [u8; 16],
-    },
+    /// Publication had to promote `seg/.staging/<hex(segment_id)>`, but
+    /// neither the staging file nor an already-promoted `seg/<hex(segment_id)>`
+    /// exists.
+    ///
+    /// The durable record says this segment was published; the bytes are gone.
+    /// Carries only the segment id because that is the whole identity here —
+    /// paths are identity-keyed, and the promote work item is recorded by id,
+    /// not by the embedder-visible name.
+    StagingMissing { segment_id: [u8; 16] },
     /// Per-page AEAD tag verification failed during a read.
+    ///
+    /// `segment_id` is `None` for a main.db page. `evictable` is the segment's
+    /// declared quarantine policy when the read went through a catalog-routed
+    /// segment reader, and `None` when the page was read below that layer
+    /// (the pager knows page identity but not catalog metadata). It is a hint
+    /// for the embedder: the read itself never evicts anything.
     PageUnverifiable {
         realm_id: RealmId,
         segment_id: Option<[u8; 16]>,
@@ -480,10 +520,13 @@ pub enum CorruptionDetail {
         field: &'static str,
     },
     /// A segment footer's cleartext framing cannot be trusted to locate the
-    /// authenticated footer at all.
+    /// authenticated footer at all: a bad magic, an unaccepted format version,
+    /// a manifest offset or length that does not fit the page.
     ///
-    /// Raised before segment identity is known; once it is,
-    /// [`Self::FooterUnverifiable`] carries the realm, name, and id.
+    /// A caller that holds the segment's trusted identity checks the footer's
+    /// HK-MAC first and reports [`Self::FooterUnverifiable`] instead, so this
+    /// variant means the framing itself is wrong, not that authentication
+    /// failed.
     FooterFramingInvalid { field: &'static str },
     /// An authenticated B+ tree node body is not structurally valid.
     ///
@@ -601,6 +644,20 @@ impl PagedbError {
     pub fn corruption(detail: CorruptionDetail) -> Self {
         crate::diag::corruption_captured(&detail);
         Self::Corruption(detail)
+    }
+
+    /// Canonical constructor for a mode gate turning an operation away.
+    ///
+    /// Every gate funnels through here so the pair an embedder acts on —
+    /// what it asked for, and the mode that would have served it — can never
+    /// be assembled inconsistently at a call site.
+    #[must_use]
+    pub const fn wrong_mode(operation: &'static str, required: DbMode, actual: DbMode) -> Self {
+        Self::WrongMode {
+            operation,
+            required,
+            actual,
+        }
     }
 
     /// Canonical constructor for authenticated catalog/file metadata disagreement.

@@ -2,14 +2,14 @@
 //! binary-search lookup, and backward compatibility with v1-style segments.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, OpenOptions, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([0xCC; 16]);
 const KEK: [u8; 32] = [0x77; 32];
 
 async fn fresh_db() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+    Db::open(MemVfs::new(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap()
 }

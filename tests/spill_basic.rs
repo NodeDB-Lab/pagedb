@@ -15,9 +15,7 @@ const REALM: RealmId = RealmId::new([1u8; 16]);
 
 async fn open_with(vfs: MemVfs, scratch_bytes: usize) -> Db<MemVfs> {
     let opts = OpenOptions::default().with_scratch_bytes(scratch_bytes);
-    Db::open_internal_with_options(vfs, [9u8; 32], PAGE, REALM, opts)
-        .await
-        .unwrap()
+    Db::open(vfs, [9u8; 32], PAGE, REALM, opts).await.unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -74,7 +72,7 @@ async fn spill_budget_enforced() {
 async fn spill_cleanup_on_commit() {
     let vfs = MemVfs::new();
     let opts = OpenOptions::default().with_scratch_bytes(1024 * 1024);
-    let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
+    let db = Db::open(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
         .await
         .unwrap();
     {
@@ -93,7 +91,7 @@ async fn spill_cleanup_on_commit() {
 async fn spill_cleanup_on_abort() {
     let vfs = MemVfs::new();
     let opts = OpenOptions::default().with_scratch_bytes(1024 * 1024);
-    let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
+    let db = Db::open(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
         .await
         .unwrap();
     {
@@ -112,7 +110,7 @@ async fn spill_aead_protects_payload() {
     // Confirm bytes on disk are NOT plaintext.
     let vfs = MemVfs::new();
     let opts = OpenOptions::default().with_scratch_bytes(1024 * 1024);
-    let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
+    let db = Db::open(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
         .await
         .unwrap();
     let mut w = db.begin_write().await.unwrap();

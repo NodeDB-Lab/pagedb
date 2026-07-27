@@ -69,9 +69,11 @@ impl<V: Vfs + Clone> Db<V> {
     pub async fn rekey_db(&self, kek: impl Into<SecretKey>, new_mk_epoch: u64) -> Result<()> {
         let kek = kek.into();
         self.ensure_usable()?;
-        if !matches!(self.mode, crate::txn::mode::DbMode::Standalone) {
-            return Err(PagedbError::Unsupported);
-        }
+        self.require_mode(
+            "rekey_db",
+            crate::txn::mode::DbMode::Standalone,
+            crate::txn::db::DbModeCapabilities::allows_store_maintenance,
+        )?;
         if new_mk_epoch == 0 || new_mk_epoch <= self.mk_epoch.load(Ordering::SeqCst) {
             return Err(PagedbError::rekey_state_invalid("rekey.target_mk_epoch"));
         }
@@ -462,6 +464,8 @@ impl<V: Vfs + Clone> Db<V> {
                 target_header_key,
             )
             .await?;
+            #[cfg(test)]
+            self.interrupt_rekey_if_requested(RekeyTestFault::MainDone)?;
         }
         if !matches!(intent.stage, RekeyStage::SegmentsPending) {
             intent.stage = RekeyStage::SegmentsPending;
@@ -472,6 +476,8 @@ impl<V: Vfs + Clone> Db<V> {
                 target_header_key,
             )
             .await?;
+            #[cfg(test)]
+            self.interrupt_rekey_if_requested(RekeyTestFault::SegmentsPending)?;
         }
         self.migrate_rekey_segments(state, intent, target_header_key)
             .await?;
@@ -976,6 +982,8 @@ mod tests {
             RekeyTestFault::Intent,
             RekeyTestFault::MainPagesTargetReadable,
             RekeyTestFault::HeaderTargetPublished,
+            RekeyTestFault::MainDone,
+            RekeyTestFault::SegmentsPending,
             RekeyTestFault::SegmentSeal,
             RekeyTestFault::ProgressRowCommit,
             RekeyTestFault::CatalogSwapEffects,
@@ -1022,6 +1030,8 @@ mod tests {
             RekeyTestFault::Intent,
             RekeyTestFault::MainPagesTargetReadable,
             RekeyTestFault::HeaderTargetPublished,
+            RekeyTestFault::MainDone,
+            RekeyTestFault::SegmentsPending,
             RekeyTestFault::SegmentSeal,
             RekeyTestFault::ProgressRowCommit,
             RekeyTestFault::CatalogSwapEffects,

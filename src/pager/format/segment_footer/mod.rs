@@ -5,7 +5,7 @@ mod decode;
 mod encode;
 mod fields;
 
-pub use decode::decode_segment_footer;
+pub use decode::{decode_segment_footer, footer_identity_is_unverifiable};
 pub use encode::encode_segment_footer;
 pub use fields::{FORMAT_VERSION, SegmentFooterFields, max_manifest_len};
 // Layout boundaries the footer tests assert against directly.

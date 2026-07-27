@@ -7,7 +7,7 @@
 //! with pagedb's forensic domain context.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CipherId, Db, PagedbError, RealmId};
+use pagedb::{CipherId, CorruptionDetail, Db, OpenOptions, PagedbError, RealmId};
 
 const PAGE: usize = 4096;
 
@@ -23,12 +23,12 @@ async fn read_verify_failure_emits_faultbox_corruption_report() {
     let vfs = MemVfs::new();
     // realm_a writes; a breadcrumb is recorded on commit.
     {
-        let db_a = Db::open_internal_with_cipher(
+        let db_a = Db::open(
             vfs.clone(),
             [9u8; 32],
             PAGE,
             RealmId::new([1; 16]),
-            CipherId::Aes256Gcm,
+            OpenOptions::default().with_cipher(CipherId::Aes256Gcm),
         )
         .await
         .unwrap();
@@ -40,12 +40,24 @@ async fn read_verify_failure_emits_faultbox_corruption_report() {
     // realm_b reopens the same bytes: the B+ tree root was AAD'd under realm_a,
     // so realm_b's read triggers a tag failure — routed through the wired
     // `diag::page_read_verify_failed`.
-    let db_b = Db::open_existing(vfs, [9u8; 32], PAGE, RealmId::new([2; 16]))
-        .await
-        .unwrap();
+    let db_b = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([2; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let r = db_b.begin_read().await.unwrap();
     let err = r.get(b"k").await.err().unwrap();
-    assert!(matches!(err, PagedbError::ChecksumFailure));
+    assert!(
+        matches!(
+            err,
+            PagedbError::Corruption(CorruptionDetail::PageUnverifiable { .. })
+        ),
+        "expected a page-identified verification failure, got: {err:?}"
+    );
 
     // A corruption report was written with pagedb's forensic domain context.
     let dirs: Vec<_> = std::fs::read_dir(reports.path())

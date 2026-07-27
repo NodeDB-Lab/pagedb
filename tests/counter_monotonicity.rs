@@ -13,7 +13,7 @@ async fn counter_increments_persist_and_reload() {
 
     // Open, increment, close.
     {
-        let db = Db::open_internal_with_options(vfs.clone(), KEK, 4096, REALM, opts.clone())
+        let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts.clone())
             .await
             .unwrap();
         let mut txn = db.begin_write().await.unwrap();
@@ -26,7 +26,7 @@ async fn counter_increments_persist_and_reload() {
 
     // Reopen and verify the value is preserved.
     {
-        let db = Db::open_existing_with_options(vfs.clone(), KEK, 4096, REALM, opts.clone())
+        let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts.clone())
             .await
             .unwrap();
         let mut txn = db.begin_write().await.unwrap();
@@ -43,9 +43,7 @@ async fn counter_monotonicity_enforced() {
     let vfs = MemVfs::new();
     let opts = OpenOptions::default().with_buffer_pool_pages(64);
 
-    let db = Db::open_internal_with_options(vfs, KEK, 4096, REALM, opts)
-        .await
-        .unwrap();
+    let db = Db::open(vfs, KEK, 4096, REALM, opts).await.unwrap();
 
     // Set counter to 50.
     {
@@ -96,7 +94,7 @@ async fn counter_anchor_recovery_on_reopen() {
 
     // Open, set counter, close.
     {
-        let db = Db::open_internal_with_options(vfs.clone(), KEK, 4096, REALM, opts.clone())
+        let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts.clone())
             .await
             .unwrap();
         let mut txn = db.begin_write().await.unwrap();
@@ -108,7 +106,7 @@ async fn counter_anchor_recovery_on_reopen() {
 
     // Reopen — recovery_counter_monotonicity runs internally.
     {
-        let db = Db::open_existing_with_options(vfs.clone(), KEK, 4096, REALM, opts.clone())
+        let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts.clone())
             .await
             .unwrap();
         let mut txn = db.begin_write().await.unwrap();

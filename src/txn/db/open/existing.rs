@@ -23,8 +23,10 @@ use super::super::core::{Db, ReaderSnapshot, WriterState};
 use super::recovery::recover_open_state;
 
 impl<V: Vfs + Clone> Db<V> {
-    /// Like `open_existing` but with explicit memory budgets.
-    pub async fn open_existing_with_options(
+    /// Like `open_existing` but with explicit memory budgets. Test-only, for
+    /// the same reason.
+    #[cfg(test)]
+    pub(crate) async fn open_existing_with_options(
         vfs: V,
         kek: impl Into<SecretKey>,
         page_size: usize,
@@ -35,10 +37,16 @@ impl<V: Vfs + Clone> Db<V> {
         Self::open_existing_inner(vfs, kek, page_size, realm, options, DbMode::Standalone).await
     }
 
-    /// Open an existing database that was previously created with
-    /// `open_internal`. Reads and verifies both A/B header slots, picks the
-    /// active one, recovers the nonce generator, and restores catalog state.
-    pub async fn open_existing(
+    /// Reopen an existing database: reads and verifies both A/B header slots,
+    /// picks the active one, recovers the nonce generator, and restores catalog
+    /// state.
+    ///
+    /// Compiled only for the crate's own tests. It takes no sentinel, so a
+    /// handle from here would let a second writer attach to a live store —
+    /// safe in a single-threaded fixture, never safe to publish. Embedders
+    /// reopen through [`Db::open`].
+    #[cfg(test)]
+    pub(crate) async fn open_existing(
         vfs: V,
         kek: impl Into<SecretKey>,
         page_size: usize,

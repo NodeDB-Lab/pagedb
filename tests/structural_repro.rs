@@ -107,9 +107,7 @@ async fn futures_poll_once<F: std::future::Future + Unpin>(fut: F) -> Option<F::
 /// leaves sit dirty in the same txn — and drive freed pages through the
 /// durable free-list back into circulation.
 async fn sustained_impl<V: Vfs + Clone>(vfs: V) {
-    let db = Db::open_internal_with_options(vfs, KEK, PAGE, REALM, opts())
-        .await
-        .unwrap();
+    let db = Db::open(vfs, KEK, PAGE, REALM, opts()).await.unwrap();
     // expected: key index -> last-written generation.
     let mut expected: BTreeMap<u64, u64> = BTreeMap::new();
     let mut next_key: u64 = 0;
@@ -168,15 +166,11 @@ async fn reopen_cycle_impl<V: Vfs + Clone>(vfs: V) {
     };
 
     for cycle in 0..12u64 {
-        let db = if cycle == 0 {
-            Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, opts())
-                .await
-                .unwrap()
-        } else {
-            Db::open_existing_with_options(vfs.clone(), KEK, PAGE, REALM, opts())
-                .await
-                .unwrap_or_else(|e| panic!("reopen before cycle {cycle} failed: {e:?}"))
-        };
+        // The first cycle bootstraps and the rest reopen; `Db::open` resolves
+        // which from what is on disk.
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts())
+            .await
+            .unwrap_or_else(|e| panic!("open before cycle {cycle} failed: {e:?}"));
         // Cold read-back straight after reopen: every key must decode from
         // disk before any new write warms or repairs the cache.
         verify_all(&db, &expected).await;
@@ -243,7 +237,7 @@ async fn reopen_cycle_impl<V: Vfs + Clone>(vfs: V) {
 /// dropping it. On a real-file backend a dropped commit also abandons queued
 /// write submissions mid-io, which the memory backend cannot model.
 async fn cancelled_commit_impl<V: Vfs + Clone>(vfs: V) {
-    let mut db = Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, opts())
+    let mut db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts())
         .await
         .unwrap();
     let mut committed: BTreeMap<u64, u64> = BTreeMap::new();
@@ -297,7 +291,7 @@ async fn cancelled_commit_impl<V: Vfs + Clone>(vfs: V) {
         // Reopen cold and demand atomicity: the surviving state is exactly
         // `staged` (commit landed) or exactly `committed` (commit lost).
         drop(db);
-        db = Db::open_existing_with_options(vfs.clone(), KEK, PAGE, REALM, opts())
+        db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts())
             .await
             .unwrap_or_else(|e| panic!("reopen after cancellation at poll {k} failed: {e:?}"));
         let r = db.begin_read().await.unwrap();
@@ -348,7 +342,7 @@ async fn cancelled_commit_impl<V: Vfs + Clone>(vfs: V) {
 /// concurrency under real parallelism.
 async fn concurrent_impl<V: Vfs + Clone + Send + Sync + 'static>(vfs: V) {
     let db = std::sync::Arc::new(
-        Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, opts())
+        Db::open(vfs.clone(), KEK, PAGE, REALM, opts())
             .await
             .unwrap(),
     );
@@ -414,9 +408,7 @@ async fn concurrent_impl<V: Vfs + Clone + Send + Sync + 'static>(vfs: V) {
     verify_all(&db, &expected).await;
     drop(db);
 
-    let db = Db::open_existing_with_options(vfs, KEK, PAGE, REALM, opts())
-        .await
-        .unwrap();
+    let db = Db::open(vfs, KEK, PAGE, REALM, opts()).await.unwrap();
     verify_all(&db, &expected).await;
     let report = run_deep_walk(&db).await.unwrap();
     assert!(
@@ -464,7 +456,7 @@ async fn randomized_impl<V: Vfs + Clone>(seeds: u64, mut make_vfs: impl FnMut(u6
         let mut expected: BTreeMap<u64, u64> = BTreeMap::new();
         let mut next_key: u64 = 0;
 
-        let db = Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, opts())
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts())
             .await
             .unwrap();
         let mut db = db;
@@ -533,7 +525,7 @@ async fn randomized_impl<V: Vfs + Clone>(seeds: u64, mut make_vfs: impl FnMut(u6
             // Reopen every few rounds: cold-verify everything.
             if next() % 3 == 0 {
                 drop(db);
-                db = Db::open_existing_with_options(vfs.clone(), KEK, PAGE, REALM, opts())
+                db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts())
                     .await
                     .unwrap_or_else(|e| panic!("seed {seed} round {round} reopen: {e:?}"));
                 let r = db.begin_read().await.unwrap();

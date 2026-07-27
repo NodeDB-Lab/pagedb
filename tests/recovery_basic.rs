@@ -1,15 +1,21 @@
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, PagedbError, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, OpenOptions, PagedbError, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 
 #[tokio::test(flavor = "current_thread")]
-async fn open_existing_reconciles_clean_catalog() {
+async fn reopen_reconciles_clean_catalog() {
     let vfs = MemVfs::new();
     {
-        let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-            .await
-            .unwrap();
+        let db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
         let realm = RealmId::new([1; 16]);
         let mut w = db
             .create_segment(realm, SegmentKind::Unspecified)
@@ -22,9 +28,15 @@ async fn open_existing_reconciles_clean_catalog() {
         t.commit().await.unwrap();
     }
     // Reopen: reconciliation should succeed.
-    let db = Db::open_existing(vfs, [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let r = db.open_segment(RealmId::new([1; 16]), "ok").await.unwrap();
     let page = r.read_page(1).await.unwrap();
     assert!(page.starts_with(b"x"));
@@ -32,9 +44,15 @@ async fn open_existing_reconciles_clean_catalog() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn deferred_tombstone_pins_under_reader() {
-    let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        MemVfs::new(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let realm = RealmId::new([1; 16]);
     let mut w = db
         .create_segment(realm, SegmentKind::Unspecified)
@@ -68,9 +86,15 @@ async fn deferred_tombstone_pins_under_reader() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn gc_now_deletes_tombstones() {
-    let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        MemVfs::new(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let realm = RealmId::new([1; 16]);
     let mut w = db
         .create_segment(realm, SegmentKind::Unspecified)

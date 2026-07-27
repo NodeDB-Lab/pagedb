@@ -21,6 +21,33 @@ pub fn decode_segment_footer(
     Ok((fields, manifest))
 }
 
+/// Disprove a footer's identity without deciding how to report it.
+///
+/// Returns `true` only when the cleartext HK-MAC is present and does not
+/// match — the one condition that makes a segment's identity *unverifiable*
+/// rather than merely unreadable.
+///
+/// Split out of [`decode_segment_footer`] because the decoder cannot name the
+/// segment it just rejected: the identity fields it would quote live in the
+/// bytes whose MAC failed. A caller holding the segment's *trusted* identity
+/// (the catalog row that routed it here) runs this first and raises the
+/// identity-carrying error itself, so exactly one error is constructed — and
+/// therefore exactly one report filed — for one failure. Rewriting the
+/// decoder's error after the fact would construct two.
+///
+/// A buffer too short to hold a MAC has nothing to disprove and returns
+/// `false`, leaving [`decode_segment_footer`] to raise the framing error that
+/// actually describes it.
+pub fn footer_identity_is_unverifiable(bytes: &[u8], hk: &crate::crypto::keys::DerivedKey) -> bool {
+    if bytes.len() < FOOTER_CLEARTEXT_END {
+        return false;
+    }
+    let Ok(mac) = mac_hk(hk, &bytes[..FOOTER_FIELDS_END]) else {
+        return false;
+    };
+    !constant_time_eq(&mac, &bytes[FOOTER_FIELDS_END..FOOTER_CLEARTEXT_END])
+}
+
 struct ParsedFooter {
     manifest_offset: u32,
     manifest_len: usize,

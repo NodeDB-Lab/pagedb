@@ -51,7 +51,7 @@ fn value(i: u32) -> Vec<u8> {
 #[ignore = "slow scale regression; run with --run-ignored all"]
 async fn growing_keys_one_commit_each_stay_intact() {
     let n: u32 = 5000;
-    let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, lite_like_opts())
+    let db = Db::open(MemVfs::new(), KEK, PAGE, REALM, lite_like_opts())
         .await
         .unwrap();
 
@@ -97,7 +97,7 @@ async fn growing_keys_one_commit_each_stay_intact() {
 #[ignore = "slow scale regression; run with --run-ignored all"]
 async fn growing_keys_with_interleaved_readers_stay_intact() {
     let n: u32 = 5000;
-    let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, lite_like_opts())
+    let db = Db::open(MemVfs::new(), KEK, PAGE, REALM, lite_like_opts())
         .await
         .unwrap();
 

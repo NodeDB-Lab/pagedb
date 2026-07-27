@@ -6,14 +6,20 @@ const PAGE: usize = 4096;
 
 #[allow(dead_code)]
 async fn open() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), [7u8; 32], PAGE, RealmId::new([2; 16]))
-        .await
-        .unwrap()
+    Db::open(
+        MemVfs::new(),
+        [7u8; 32],
+        PAGE,
+        RealmId::new([2; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap()
 }
 
 async fn open_with_budget(budget: usize) -> Db<MemVfs> {
     let opts = OpenOptions::default().with_mmap_view_scratch_bytes(budget);
-    Db::open_internal_with_options(MemVfs::new(), [7u8; 32], PAGE, RealmId::new([2; 16]), opts)
+    Db::open(MemVfs::new(), [7u8; 32], PAGE, RealmId::new([2; 16]), opts)
         .await
         .unwrap()
 }

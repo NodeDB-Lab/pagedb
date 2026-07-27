@@ -1,6 +1,6 @@
 //! Mode policy, sentinel acquisition, and public mode constructors.
 
-use crate::crypto::{CipherId, SecretKey};
+use crate::crypto::SecretKey;
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
 use crate::vfs::Vfs;
@@ -33,9 +33,13 @@ pub(super) enum LongLivedLock {
     Observer,
 }
 
-/// The complete open-time authority matrix for a handle mode.
+/// The complete authority matrix for a handle mode.
+///
+/// Both the open flow and every runtime mode gate resolve against this one
+/// table, so "which modes may do X" is stated once rather than re-derived by
+/// each public method from its own `matches!` on `DbMode`.
 #[derive(Clone, Copy)]
-pub(in crate::txn::db) struct DbModeCapabilities {
+pub(crate) struct DbModeCapabilities {
     persistent_access: PersistentAccess,
     recovery_authority: RecoveryAuthority,
     long_lived_lock: LongLivedLock,
@@ -62,9 +66,38 @@ impl DbModeCapabilities {
         matches!(self.persistent_access, PersistentAccess::ReadOnly)
     }
 
+    /// Write transactions and segment creation: only a full writer may add
+    /// user data to the store.
     #[must_use]
-    pub(in crate::txn::db) const fn allows_user_writes(self) -> bool {
+    pub(crate) const fn allows_user_writes(self) -> bool {
         matches!(self.recovery_authority, RecoveryAuthority::Standalone)
+    }
+
+    /// Whole-store rewrites that publish no new user data but relocate or
+    /// re-seal every byte — compaction's dense repack, an online rekey. Same
+    /// authority as a user write, stated separately because it is a different
+    /// claim: these paths own the allocator and the key epoch, not the data.
+    #[must_use]
+    pub(crate) const fn allows_store_maintenance(self) -> bool {
+        self.runs_standalone_recovery()
+    }
+
+    /// Applying an incremental snapshot. Only an apply-authority handle
+    /// carries the base-commit identity a delta reconciles against, and only
+    /// it is licensed to install a producer's page space over its own.
+    #[must_use]
+    pub(crate) const fn applies_incremental_snapshots(self) -> bool {
+        matches!(self.recovery_authority, RecoveryAuthority::ApplyOnly)
+    }
+
+    /// Promotion to `Follower`. The promotion trades the frozen-reader
+    /// sentinel for the writer sentinel, so only the mode that actually holds
+    /// the frozen-reader lock has anything to trade — which is what separates
+    /// `ReadOnly` from `Observer` here, since their access and recovery
+    /// authority are otherwise identical.
+    #[must_use]
+    pub(crate) const fn promotes_to_follower(self) -> bool {
+        matches!(self.long_lived_lock, LongLivedLock::FrozenReader)
     }
 
     #[must_use]
@@ -98,7 +131,7 @@ impl DbModeCapabilities {
 
 impl DbMode {
     #[must_use]
-    pub(in crate::txn::db) const fn open_capabilities(self) -> DbModeCapabilities {
+    pub(crate) const fn open_capabilities(self) -> DbModeCapabilities {
         match self {
             Self::Standalone => DbModeCapabilities {
                 persistent_access: PersistentAccess::ReadWrite,
@@ -129,7 +162,32 @@ impl DbMode {
 }
 
 impl<V: Vfs + Clone> Db<V> {
-    /// Open a database in Standalone mode.
+    /// Turn away an operation this handle's mode does not authorize.
+    ///
+    /// `authorized` is read off the one capability matrix rather than from a
+    /// `matches!` at the call site, and `required` is the mode the embedder is
+    /// told to reopen or promote into. Every mode gate in the crate goes
+    /// through here, so "wrong mode" is a single variant an embedder can match
+    /// once instead of six method-specific spellings.
+    pub(crate) fn require_mode(
+        &self,
+        operation: &'static str,
+        required: DbMode,
+        authorized: impl FnOnce(DbModeCapabilities) -> bool,
+    ) -> Result<()> {
+        if authorized(self.mode.open_capabilities()) {
+            Ok(())
+        } else {
+            Err(PagedbError::wrong_mode(operation, required, self.mode))
+        }
+    }
+
+    /// Open a database in Standalone mode, creating it if `vfs` holds none.
+    ///
+    /// The bootstrap-versus-reopen decision is made here, under the writer
+    /// sentinel, from what is actually on disk — so two processes racing a
+    /// first open cannot both bootstrap. `options.cipher` selects the cipher
+    /// for a store this call creates and is ignored for one it finds.
     pub async fn open(
         vfs: V,
         kek: impl Into<SecretKey>,
@@ -225,13 +283,9 @@ impl<V: Vfs + Clone> Db<V> {
             // The caller already holds the writer sentinel acquired above, so
             // bootstrap through the lock-free inner path rather than
             // `open_internal_with_options`, which would try to reacquire it.
+            let cipher = options.cipher;
             Self::open_internal_with_options_and_cipher_unlocked(
-                vfs,
-                kek,
-                page_size,
-                realm,
-                options,
-                CipherId::Aes256Gcm,
+                vfs, kek, page_size, realm, options, cipher,
             )
             .await?
         };
@@ -248,9 +302,11 @@ impl<V: Vfs + Clone> Db<V> {
     /// other frozen readers and acquiring the writer sentinel.
     pub async fn promote_to_follower(mut self) -> Result<Self> {
         self.ensure_usable()?;
-        if self.mode != DbMode::ReadOnly {
-            return Err(PagedbError::Unsupported);
-        }
+        self.require_mode(
+            "promote_to_follower",
+            DbMode::ReadOnly,
+            DbModeCapabilities::promotes_to_follower,
+        )?;
         let acquisition = self.vfs.lock_exclusive(ACQUISITION_LOCK_PATH).await?;
         self.sentinel_locks.clear();
         let frozen_probe = self

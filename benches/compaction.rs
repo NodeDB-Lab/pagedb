@@ -14,7 +14,7 @@ use fluxbench::bench;
 use fluxbench::prelude::*;
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, RealmId};
+use pagedb::{Db, OpenOptions, RealmId};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [7; 32];
@@ -33,7 +33,7 @@ fn prepared_dense_repack() -> Db<MemVfs> {
         // Retire the previous iteration's store here, where it is not measured.
         drain_parked();
 
-        let db = Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+        let db = Db::open(MemVfs::new(), KEK, PAGE, REALM, OpenOptions::default())
             .await
             .expect("open bench store");
         let value = [0x2A; VALUE_LEN];

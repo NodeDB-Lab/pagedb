@@ -3,14 +3,14 @@
 //! interleaving of writes between compaction steps.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CompactBudget, Db, RealmId};
+use pagedb::{CompactBudget, Db, OpenOptions, RealmId};
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([0x55; 16]);
 const KEK: [u8; 32] = [0x22; 32];
 
 async fn fresh_db() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+    Db::open(MemVfs::new(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap()
 }
@@ -226,7 +226,7 @@ async fn compact_step_reopen_history_consistent() {
         // Default options retain commit history (Count(1024)). Build several
         // commits so a history tree exists, then incrementally compact through
         // intermediate steps and a final dense repack.
-        let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
             .await
             .unwrap();
         for round in 0u32..15 {
@@ -255,7 +255,7 @@ async fn compact_step_reopen_history_consistent() {
     // commit-history root (overwritten/truncated by the dense repack), so the
     // next write — which opens the history tree at that root — corrupted or
     // errored. It must now be a clean reset (root = 0).
-    let db = Db::open_existing(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     {
@@ -280,7 +280,7 @@ async fn compact_step_reopen_history_consistent() {
 #[tokio::test(flavor = "current_thread")]
 async fn compact_step_preserves_large_overflow_values() {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 

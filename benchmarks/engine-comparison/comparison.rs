@@ -94,7 +94,7 @@ fn open_pagedb_fresh() -> PagedbBench {
         .with_anchor_budget(10_000_000);
     let db = with_rt(|rt| {
         rt.block_on(async {
-            Db::open_internal_with_options(vfs, [0xAB; 32], 4096, RealmId::new([1; 16]), opts)
+            Db::open(vfs, [0xAB; 32], 4096, RealmId::new([1; 16]), opts)
                 .await
                 .unwrap()
         })

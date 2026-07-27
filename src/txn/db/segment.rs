@@ -4,7 +4,7 @@
 use crate::btree::BTree;
 use crate::catalog::codec::CatalogRowKind;
 use crate::catalog::codec::{Catalog, SegmentKind, SegmentMeta};
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
 use crate::segment::reader::SegmentReader;
 use crate::segment::writer::SegmentWriter;
 use crate::txn::write::SegmentSideEffect;
@@ -12,6 +12,8 @@ use crate::vfs::Vfs;
 use crate::vfs::types::OpenMode;
 use crate::{RealmId, Result};
 
+use super::super::mode::DbMode;
+use super::DbModeCapabilities;
 use super::core::{Db, PendingTombstone};
 
 /// Catalog segment rows read per batch while testing a reader snapshot for a
@@ -39,9 +41,11 @@ impl<V: Vfs + Clone> Db<V> {
         kind: SegmentKind,
     ) -> Result<SegmentWriter<V>> {
         self.ensure_usable()?;
-        if !self.mode.open_capabilities().allows_user_writes() {
-            return Err(PagedbError::ReadOnly);
-        }
+        self.require_mode(
+            "create_segment",
+            DbMode::Standalone,
+            DbModeCapabilities::allows_user_writes,
+        )?;
         self.vfs.mkdir_all("seg/.staging").await?;
         let segment_id = crate::crypto::random::segment_id()?;
         SegmentWriter::create_internal(self.pager.clone(), realm, segment_id, self.file_id, kind)
@@ -239,7 +243,14 @@ impl<V: Vfs + Clone> Db<V> {
         }
         let staging = crate::segment::writer::staging_path(&segment_id);
         if !self.path_exists(&staging).await? {
-            return Err(PagedbError::NotFound);
+            // Reaching here means a durable record (a commit's side effects or
+            // a replayed apply journal) says this segment is published, yet
+            // neither publication location holds it. That is missing data, not
+            // a lookup miss the caller can retry differently, so it must not
+            // share `NotFound` with "no such segment name".
+            return Err(PagedbError::corruption(CorruptionDetail::StagingMissing {
+                segment_id,
+            }));
         }
         self.vfs.rename(&staging, &live).await
     }

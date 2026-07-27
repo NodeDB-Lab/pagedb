@@ -1,5 +1,7 @@
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, PagedbError, QuotaKind, RealmId, RealmQuotas, SegmentKind, SegmentPageKind};
+use pagedb::{
+    Db, OpenOptions, PagedbError, QuotaKind, RealmId, RealmQuotas, SegmentKind, SegmentPageKind,
+};
 
 const PAGE: usize = 4096;
 
@@ -12,9 +14,15 @@ fn quotas(edit: impl FnOnce(&mut RealmQuotas)) -> RealmQuotas {
 }
 
 async fn open() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap()
+    Db::open(
+        MemVfs::new(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap()
 }
 
 async fn create_segment_of_size(

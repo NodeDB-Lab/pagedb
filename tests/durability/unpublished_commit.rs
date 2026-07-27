@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use pagedb::vfs::memory::{MemFile, MemLockHandle, MemVfs};
 use pagedb::vfs::{OpenMode, Vfs};
-use pagedb::{Db, PagedbError, RealmId, SegmentKind, run_deep_walk};
+use pagedb::{Db, OpenOptions, PagedbError, RealmId, SegmentKind, run_deep_walk};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [12u8; 32];
@@ -98,7 +98,7 @@ impl Vfs for RenameFaultVfs {
 #[tokio::test(flavor = "current_thread")]
 async fn one_segment_reconciliation_retry_publishes_once() {
     let vfs = RenameFaultVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     let writer = db
@@ -119,7 +119,7 @@ async fn one_segment_reconciliation_retry_publishes_once() {
 #[tokio::test(flavor = "current_thread")]
 async fn failed_segment_reconciliation_poisoned_handle_keeps_existing_snapshot_usable() {
     let vfs = RenameFaultVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     let existing = db.begin_read().await.unwrap();
@@ -188,7 +188,9 @@ async fn failed_segment_reconciliation_poisoned_handle_keeps_existing_snapshot_u
     drop(existing);
     drop(db);
 
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     let segment = reopened.open_segment(REALM, "replacement").await;
     assert!(
         segment.is_ok(),
@@ -199,7 +201,7 @@ async fn failed_segment_reconciliation_poisoned_handle_keeps_existing_snapshot_u
 #[tokio::test(flavor = "current_thread")]
 async fn rekey_segment_reconciliation_failure_poisoned_handle_reopens_with_readable_segment() {
     let vfs = RenameFaultVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     let writer = db
@@ -231,14 +233,16 @@ async fn rekey_segment_reconciliation_failure_poisoned_handle_reopens_with_reada
 
     vfs.fail_renames(false);
     drop(db);
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     assert!(reopened.open_segment(REALM, "rekeyed").await.is_ok());
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn compaction_swap_failure_poisoned_handle_reopens_at_durable_snapshot() {
     let vfs = RenameFaultVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     {
@@ -270,7 +274,9 @@ async fn compaction_swap_failure_poisoned_handle_reopens_at_durable_snapshot() {
 
     vfs.fail_sync_dirs(false);
     drop(db);
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     let read = reopened.begin_read().await.unwrap();
     assert_eq!(
         read.get(b"k-0199").await.unwrap().as_deref(),

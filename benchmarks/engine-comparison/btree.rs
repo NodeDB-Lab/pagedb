@@ -57,13 +57,12 @@ thread_local! {
 }
 
 async fn open_mem(cipher: CipherId, seed: u8) -> SharedDb<MemVfs> {
-    let db = Db::open_internal_with_options_and_cipher(
+    let db = Db::open(
         MemVfs::new(),
         [seed; 32],
         PAGE,
         RealmId::new([seed; 16]),
-        bench_opts(),
-        cipher,
+        bench_opts().with_cipher(cipher),
     )
     .await
     .unwrap();
@@ -73,13 +72,12 @@ async fn open_mem(cipher: CipherId, seed: u8) -> SharedDb<MemVfs> {
 async fn open_file(cipher: CipherId, seed: u8) -> (SharedDb<TokioVfs>, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let vfs = TokioVfs::new(dir.path());
-    let db = Db::open_internal_with_options_and_cipher(
+    let db = Db::open(
         vfs,
         [seed; 32],
         PAGE,
         RealmId::new([seed; 16]),
-        bench_opts(),
-        cipher,
+        bench_opts().with_cipher(cipher),
     )
     .await
     .unwrap();

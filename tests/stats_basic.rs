@@ -1,7 +1,7 @@
 //! Basic tests for `Db::stats()` and related observability surface.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, DbMode, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, DbMode, OpenOptions, RealmId, SegmentKind, SegmentPageKind};
 
 fn realm() -> RealmId {
     RealmId::new([0x42u8; 16])
@@ -13,7 +13,9 @@ fn kek() -> [u8; 32] {
 
 async fn fresh_db() -> Db<MemVfs> {
     let vfs = MemVfs::new();
-    Db::open_internal(vfs, kek(), 4096, realm()).await.unwrap()
+    Db::open(vfs, kek(), 4096, realm(), OpenOptions::default())
+        .await
+        .unwrap()
 }
 
 /// Write `n` transactions each inserting one key.
@@ -120,20 +122,14 @@ async fn stats_reports_mode() {
     let vfs = MemVfs::new();
     // Bootstrap first so ReadOnly open can find main.db.
     {
-        let db = Db::open_internal(vfs.clone(), kek(), 4096, realm())
+        let db = Db::open(vfs.clone(), kek(), 4096, realm(), OpenOptions::default())
             .await
             .unwrap();
         drop(db);
     }
-    let db = Db::<MemVfs>::open_read_only(
-        vfs,
-        kek(),
-        4096,
-        realm(),
-        pagedb::options::OpenOptions::default(),
-    )
-    .await
-    .unwrap();
+    let db = Db::<MemVfs>::open_read_only(vfs, kek(), 4096, realm(), OpenOptions::default())
+        .await
+        .unwrap();
     let s = db.stats().await.unwrap();
     assert_eq!(
         s.mode,

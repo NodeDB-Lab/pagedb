@@ -634,9 +634,11 @@ impl<V: Vfs + Clone> Db<V> {
         self.ensure_usable()?;
         let _span = tracing::debug_span!("snapshot.apply");
 
-        if !matches!(self.mode, DbMode::Follower) {
-            return Err(crate::errors::PagedbError::IdentityForked);
-        }
+        self.require_mode(
+            "apply_incremental",
+            DbMode::Follower,
+            crate::txn::db::DbModeCapabilities::applies_incremental_snapshots,
+        )?;
         // An apply owns the complete protocol, including recovery, validation,
         // image staging, and post-header reconciliation. A waiting caller
         // re-checks poison state after it acquires the gate.
@@ -874,6 +876,21 @@ impl<V: Vfs + Clone> Db<V> {
         }));
         let mut state = self.writer.lock().await;
         self.ensure_usable()?;
+        // Close reader admission for the remainder of the apply. Writer before
+        // visibility is the global destructive-operation order, the same one
+        // compaction, `gc_now`, the journal retry, and `WriteTxn::begin` take.
+        //
+        // Everything from here on either stages target-generation bytes through
+        // the Pager or replaces the file those bytes live in, and the durable
+        // header does not name the target until the rename below. A reader
+        // admitted anywhere in that stretch would resolve the still-published
+        // base roots against a file that is being turned into the target, and
+        // would race the tombstone pin scan that decides whether the segments
+        // it can name survive. The guard is held through the header write, the
+        // rename, the directory sync, the journal reconciliation, and the
+        // published replacement snapshot — released only once the roots and
+        // the bytes agree again.
+        let visibility = self.visibility_gate.write().await;
 
         // Move this handle's own metadata out of the incoming page space. The
         // producer allocates over the ids hosting the follower's commit-history
@@ -1074,11 +1091,16 @@ impl<V: Vfs + Clone> Db<V> {
 
         if actions.is_empty() {
             self.publish_snapshot(&state);
-            drop(state);
         } else {
-            drop(state);
-            self.retry_pending_apply_journal().await?;
+            // Reconciled without releasing the gate. The locking entry point
+            // would re-take both guards, and the instant between dropping and
+            // re-taking them is the one instant where `main.db` is the target
+            // image while the published snapshot still names base roots.
+            self.retry_pending_apply_journal_visible(&mut state, &visibility)
+                .await?;
         }
+        drop(state);
+        drop(visibility);
 
         Ok(crate::snapshot::ApplyStats {
             pages_applied,

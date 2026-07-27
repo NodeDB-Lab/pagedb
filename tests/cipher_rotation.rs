@@ -4,7 +4,7 @@
 /// from the pager's current configuration, so old pages remain readable after
 /// the configured cipher changes.
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CipherId, Db, RealmId};
+use pagedb::{CipherId, Db, OpenOptions, RealmId};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [5u8; 32];
@@ -12,9 +12,15 @@ const REALM: RealmId = RealmId::new([2u8; 16]);
 
 #[tokio::test(flavor = "current_thread")]
 async fn aes256gcm_write_read_round_trip() {
-    let db = Db::open_internal_with_cipher(MemVfs::new(), KEK, PAGE, REALM, CipherId::Aes256Gcm)
-        .await
-        .unwrap();
+    let db = Db::open(
+        MemVfs::new(),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default().with_cipher(CipherId::Aes256Gcm),
+    )
+    .await
+    .unwrap();
     let mut w = db.begin_write().await.unwrap();
     w.put(b"aes_key", b"aes_val").await.unwrap();
     w.commit().await.unwrap();
@@ -27,10 +33,15 @@ async fn aes256gcm_write_read_round_trip() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn chacha20poly1305_write_read_round_trip() {
-    let db =
-        Db::open_internal_with_cipher(MemVfs::new(), KEK, PAGE, REALM, CipherId::ChaCha20Poly1305)
-            .await
-            .unwrap();
+    let db = Db::open(
+        MemVfs::new(),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default().with_cipher(CipherId::ChaCha20Poly1305),
+    )
+    .await
+    .unwrap();
     let mut w = db.begin_write().await.unwrap();
     w.put(b"cc_key", b"cc_val").await.unwrap();
     w.commit().await.unwrap();
@@ -43,9 +54,15 @@ async fn chacha20poly1305_write_read_round_trip() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn plaintextmac_write_read_round_trip() {
-    let db = Db::open_internal_with_cipher(MemVfs::new(), KEK, PAGE, REALM, CipherId::PlaintextMac)
-        .await
-        .unwrap();
+    let db = Db::open(
+        MemVfs::new(),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default().with_cipher(CipherId::PlaintextMac),
+    )
+    .await
+    .unwrap();
     let mut w = db.begin_write().await.unwrap();
     w.put(b"pt_key", b"pt_val").await.unwrap();
     w.commit().await.unwrap();

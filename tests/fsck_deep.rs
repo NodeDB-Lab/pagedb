@@ -9,7 +9,7 @@ const REALM: RealmId = RealmId::new([1u8; 16]);
 
 async fn open_db() -> Db<MemVfs> {
     let opts = OpenOptions::default().with_buffer_pool_pages(64);
-    Db::open_internal_with_options(MemVfs::new(), KEK, 4096, REALM, opts)
+    Db::open(MemVfs::new(), KEK, 4096, REALM, opts)
         .await
         .unwrap()
 }
@@ -56,7 +56,7 @@ async fn empty_db_reports_clean() {
 async fn corrupt_page_detected() {
     let vfs = MemVfs::new();
     let opts = OpenOptions::default().with_buffer_pool_pages(64);
-    let db = Db::open_internal_with_options(vfs.clone(), KEK, 4096, REALM, opts)
+    let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts.clone())
         .await
         .unwrap();
 
@@ -68,13 +68,21 @@ async fn corrupt_page_detected() {
     }
     txn.commit().await.unwrap();
 
-    // Get the next_page_id to know which pages exist.
-    let next_pid = db.next_page_id().await;
+    // Page 4 is the first data page (pages 0-3 are reserved), so the writes
+    // above must have allocated it for the corruption below to land on a real
+    // page rather than past the end of the file.
+    let next_pid = db.stats().await.unwrap().main_db_next_page_id;
+    assert!(
+        next_pid > 4,
+        "the seed writes must have allocated at least one data page; got {next_pid}"
+    );
+    // Close the store before touching its bytes underneath it, the way a
+    // crash-then-fsck sequence does.
+    drop(db);
 
     // Corrupt a data page by flipping bytes directly in the MemVfs.
-    // Page 4 is the first data page (pages 0-3 are reserved).
-    if next_pid > 4 {
-        use pagedb::vfs::types::OpenMode;
+    {
+        use pagedb::vfs::OpenMode;
         use pagedb::vfs::{Vfs, VfsFile};
         let mut f = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
         // Flip bytes in the AEAD tag of page 4 (last 16 bytes of the page).
@@ -86,22 +94,21 @@ async fn corrupt_page_detected() {
         }
         f.write_at(corrupt_offset, &corrupt_buf).await.unwrap();
         f.sync().await.unwrap();
-        drop(f);
-
-        // Evict the page from cache so the deep walk reads from disk.
-        db.evict_main_pages(REALM);
-
-        let report = run_deep_walk(&db).await.unwrap();
-        assert!(
-            !report.page_issues.is_empty(),
-            "should detect corrupted page"
-        );
-        assert!(
-            report.page_issues.iter().any(|i| i.page_id == 4),
-            "page 4 should be reported as corrupted; issues: {:?}",
-            report.page_issues
-        );
     }
+
+    // A fresh handle starts with a cold buffer pool, so the deep walk reads the
+    // corrupted bytes from disk instead of the page the writer left warm.
+    let db = Db::open(vfs.clone(), KEK, 4096, REALM, opts).await.unwrap();
+    let report = run_deep_walk(&db).await.unwrap();
+    assert!(
+        !report.page_issues.is_empty(),
+        "should detect corrupted page"
+    );
+    assert!(
+        report.page_issues.iter().any(|i| i.page_id == 4),
+        "page 4 should be reported as corrupted; issues: {:?}",
+        report.page_issues
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -111,7 +118,7 @@ async fn free_list_pages_are_accounted_not_orphans() {
     let opts = OpenOptions::default()
         .with_buffer_pool_pages(64)
         .with_commit_history_retain(pagedb::options::RetainPolicy::Disabled);
-    let db = Db::open_internal_with_options(MemVfs::new(), KEK, 4096, REALM, opts)
+    let db = Db::open(MemVfs::new(), KEK, 4096, REALM, opts)
         .await
         .unwrap();
 
@@ -162,7 +169,7 @@ async fn retained_history_pages_are_not_reported_as_orphans() {
     let opts = OpenOptions::default()
         .with_buffer_pool_pages(64)
         .with_commit_history_retain(RetainPolicy::Count(1024));
-    let db = Db::open_internal_with_options(MemVfs::new(), KEK, 4096, REALM, opts)
+    let db = Db::open(MemVfs::new(), KEK, 4096, REALM, opts)
         .await
         .unwrap();
 

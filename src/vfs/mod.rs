@@ -23,8 +23,12 @@ pub mod memory;
 pub mod opfs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokio_backend;
-pub mod traits;
-pub mod types;
+// The backend contract is re-exported from `vfs` itself rather than published
+// as a module path. Both files also hold crate-internal machinery — the
+// positional-I/O progress rules, path canonicalization — that a public module
+// would expose by accident purely because the traits had to live somewhere.
+pub(crate) mod traits;
+pub(crate) mod types;
 pub mod wasi;
 
 #[cfg(all(target_os = "android", target_arch = "arm"))]

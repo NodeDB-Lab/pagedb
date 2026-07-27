@@ -57,6 +57,13 @@ pub(crate) struct VisibilityTestHook {
     pub(crate) reader_registered: tokio::sync::Notify,
     pub(crate) reader_may_read: tokio::sync::Notify,
     pub(crate) writer_waiting: tokio::sync::Notify,
+    /// Raised by an incremental apply once it is inside its publication
+    /// window: the tombstone pin scan has run, the live file is the target
+    /// image, and the target snapshot is not published yet.
+    pub(crate) apply_window_entered: tokio::sync::Notify,
+    /// Lets the apply leave that window. A test admits (or fails to admit) a
+    /// reader in between.
+    pub(crate) apply_window_release: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -65,6 +72,14 @@ pub(crate) enum RekeyTestFault {
     Intent,
     MainPagesTargetReadable,
     HeaderTargetPublished,
+    /// The main database is fully target-sealed and the intent says so, but no
+    /// segment has been touched yet. Without a fault here a crash landing in
+    /// `MainDone` cannot be produced at all, so the resume path that starts
+    /// from it is never entered.
+    MainDone,
+    /// The intent has been advanced to segments-pending and made durable, and
+    /// the segment migration has not begun.
+    SegmentsPending,
     SegmentSeal,
     ProgressRowCommit,
     CatalogSwapEffects,
@@ -385,6 +400,15 @@ impl<V: Vfs + Clone> Db<V> {
         *self.visibility_test_hook.lock() = Some(hook);
     }
 
+    /// Detach the hook so the rest of a test runs on unrehearsed paths. Every
+    /// pause point is a rendezvous that only completes when its counterpart
+    /// notifies, so a hook left installed past the interleaving it was staging
+    /// would park the next ordinary `begin_read`.
+    #[cfg(test)]
+    pub(crate) fn clear_visibility_test_hook(&self) {
+        *self.visibility_test_hook.lock() = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn interrupt_rekey_after(&self, point: RekeyTestFault) {
         *self.rekey_test_fault.lock() = Some(point);
@@ -408,6 +432,19 @@ impl<V: Vfs + Clone> Db<V> {
         if let Some(hook) = hook {
             hook.reader_selected.notify_one();
             hook.allow_reader_registration.notified().await;
+        }
+    }
+
+    /// Hold an incremental apply inside its publication window so a test can
+    /// try to admit a reader there. Mirrors
+    /// [`Self::pause_after_snapshot_selection`]: inert unless a hook is
+    /// installed.
+    #[cfg(test)]
+    pub(crate) async fn pause_in_apply_publication_window(&self) {
+        let hook = self.visibility_test_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook.apply_window_entered.notify_one();
+            hook.apply_window_release.notified().await;
         }
     }
 

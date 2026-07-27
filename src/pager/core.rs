@@ -16,7 +16,9 @@ use crate::crypto::keys::MasterKey;
 use crate::crypto::nonce::DEFAULT_ANCHOR_BUDGET;
 use crate::crypto::nonce::{MainDbNonceGen, SegmentNonceGen};
 use crate::crypto::{Aad, CipherId, Nonce};
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
+#[cfg(test)]
+use crate::pager::anchor::AnchorTestFault;
 use crate::pager::anchor::{HeaderCursor, LiveHeader, refresh_anchor};
 use crate::pager::cache::{Page, PageCache};
 use crate::pager::format::data_page::{
@@ -45,7 +47,7 @@ pub struct PagerConfig {
     pub anchor_budget: u64,
     pub dek_lru_capacity: usize,
     /// Number of AEAD-verification retries on a cache miss before surfacing
-    /// a `ChecksumFailure`. Set to > 0 only in `Observer` mode to absorb torn
+    /// a `PageUnverifiable`. Set to > 0 only in `Observer` mode to absorb torn
     /// reads; all other modes keep this at 0 so that AEAD failures remain
     /// hard corruption signals.
     pub observer_retry_count: u32,
@@ -183,9 +185,13 @@ pub struct Pager<V: Vfs> {
     /// collides with another journal's nonces under one key.
     journal_nonces: parking_lot::Mutex<BTreeMap<[u8; 16], SegmentNonceGen>>,
     pub(crate) inner: Arc<PagerInner>,
-    /// Retries on AEAD failure before surfacing `ChecksumFailure`. Non-zero
+    /// Retries on AEAD failure before surfacing `PageUnverifiable`. Non-zero
     /// only in `Observer` mode to absorb torn reads from a concurrent writer.
     observer_retry_count: u32,
+    /// One-shot interruption of the nonce-anchor durability path. See
+    /// [`AnchorTestFault`].
+    #[cfg(test)]
+    anchor_test_fault: parking_lot::Mutex<Option<AnchorTestFault>>,
 }
 
 /// How a read resolves the `page_kind` used to build the AAD.
@@ -278,6 +284,8 @@ impl<V: Vfs + Clone> Pager<V> {
             read_only: AtomicBool::new(true),
             keyring: self.keyring.duplicate(),
             observer_retry_count: self.observer_retry_count,
+            #[cfg(test)]
+            anchor_test_fault: parking_lot::Mutex::new(None),
             vfs: self.vfs.clone(),
             cfg,
         }
@@ -353,6 +361,8 @@ impl<V: Vfs> Pager<V> {
             read_only: AtomicBool::new(false),
             keyring: EpochKeyring::new(initial_epoch, cfg.cipher_id, mk),
             observer_retry_count,
+            #[cfg(test)]
+            anchor_test_fault: parking_lot::Mutex::new(None),
             vfs,
             cfg,
         })
@@ -426,8 +436,9 @@ impl<V: Vfs> Pager<V> {
     /// suffices — unlike probing one kind, catching the `ChecksumFailure`, and
     /// retrying the other, which reads and AEAD-checks twice and logs the first
     /// (expected) miss as an error. A page that is neither a leaf nor an
-    /// internal node (a misrouted pointer, or one that fails to authenticate
-    /// under its own declared kind) surfaces as `ChecksumFailure`.
+    /// internal node surfaces as `ChecksumFailure`; one that is a node kind but
+    /// fails to authenticate under it surfaces as `PageUnverifiable`, naming
+    /// the page.
     pub async fn read_main_node(
         &self,
         page_id: u64,
@@ -678,7 +689,28 @@ impl<V: Vfs> Pager<V> {
     /// the A/B header. Future nonces will be issued in `(persisted_anchor,
     /// persisted_anchor + budget]`.
     pub fn commit_anchor(&self, persisted: u64) -> Result<()> {
+        #[cfg(test)]
+        self.interrupt_anchor_if_requested(AnchorTestFault::Commit)?;
         self.main_nonce.lock().commit_anchor(persisted)
+    }
+
+    /// Arm a one-shot interruption of the anchor path. Consumed by the first
+    /// matching check; a mismatched point is left armed.
+    #[cfg(test)]
+    pub(crate) fn interrupt_anchor_after(&self, point: AnchorTestFault) {
+        *self.anchor_test_fault.lock() = Some(point);
+    }
+
+    #[cfg(test)]
+    fn interrupt_anchor_if_requested(&self, point: AnchorTestFault) -> Result<()> {
+        let mut fault = self.anchor_test_fault.lock();
+        if *fault == Some(point) {
+            *fault = None;
+            return Err(PagedbError::Io(std::io::Error::other(
+                "anchor test interruption",
+            )));
+        }
+        Ok(())
     }
 
     /// Bind the live `main.db` header to this pager: the key its A/B slots are
@@ -764,6 +796,8 @@ impl<V: Vfs> Pager<V> {
             self.cfg.page_size,
         )
         .await?;
+        #[cfg(test)]
+        self.interrupt_anchor_if_requested(AnchorTestFault::RefreshAfterHeader)?;
         // Only now is the anchor durable, so only now may the generator issue
         // past it. A crash before this point leaves the old anchor authoritative
         // and no nonce beyond it was ever issued.
@@ -1032,13 +1066,34 @@ impl<V: Vfs> Pager<V> {
             // process, a snapshot of the store for offline `pagedb-fsck`) so this
             // is debuggable from production without reproduction. Inert unless the
             // host app called `faultbox::init`.
-            crate::diag::page_read_verify_failed(
+            // The guard must outlive the `corruption()` call below: it is what
+            // keeps the constructor's generic capture from filing a second,
+            // thinner report for the same failure.
+            let _reported = crate::diag::page_read_verify_failed(
                 &self.cfg.main_db_path,
                 page_id,
                 &crate::diag::dbg_str(&file),
                 &crate::diag::dbg_str(&binding),
                 &realm_id,
             );
+            // Report the page that failed, not just that something did: the
+            // pager is the only layer that knows which file and page id the
+            // tag failure belongs to. `evictable` stays `None` — that is a
+            // catalog fact, and nothing below the catalog may invent it.
+            return Err(PagedbError::corruption(
+                CorruptionDetail::PageUnverifiable {
+                    realm_id,
+                    // An apply-journal sidecar is not a segment, so its id does
+                    // not go in a field named `segment_id`; `file` is already
+                    // in the diagnostic report above.
+                    segment_id: match file {
+                        FileKey::Segment(id) => Some(id),
+                        FileKey::Main | FileKey::ApplyJournal(_) => None,
+                    },
+                    page_id,
+                    evictable: None,
+                },
+            ));
         }
         Err(last_err.unwrap_or(PagedbError::ChecksumFailure))
     }
@@ -1409,7 +1464,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn wrong_realm_read_fails_with_checksum() {
+    async fn wrong_realm_read_fails_page_verification() {
         let pager = mk_pager().await;
         let realm_a = RealmId([1; 16]);
         let realm_b = RealmId([2; 16]);
@@ -1434,7 +1489,18 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(matches!(err, PagedbError::ChecksumFailure));
+        assert!(
+            matches!(
+                err,
+                PagedbError::Corruption(CorruptionDetail::PageUnverifiable {
+                    realm_id,
+                    segment_id: None,
+                    page_id: 5,
+                    evictable: None,
+                }) if realm_id == realm_b
+            ),
+            "cold cross-realm read must name the page that failed, got: {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

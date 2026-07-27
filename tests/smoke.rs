@@ -1,10 +1,9 @@
-use pagedb::{CommitId, CorruptionDetail, Evictable, PagedbError, QuotaKind, RealmId};
+use pagedb::{CommitId, CorruptionDetail, DbMode, Evictable, PagedbError, QuotaKind, RealmId};
 
 #[test]
 fn corruption_constructor_round_trips() {
     let err = PagedbError::corruption(CorruptionDetail::FooterUnverifiable {
         realm_id: RealmId::new([0u8; 16]),
-        name: "engine.idx".into(),
         segment_id: [1u8; 16],
     });
     assert!(matches!(err, PagedbError::Corruption(_)));
@@ -32,6 +31,16 @@ fn io_error_from_conversion() {
     let io = std::io::Error::other("disk wobble");
     let err: PagedbError = io.into();
     assert!(matches!(err, PagedbError::Io(_)));
+}
+
+#[test]
+fn device_exhaustion_is_classified_out_of_generic_io() {
+    let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    let err: PagedbError = full.into();
+    assert!(
+        matches!(err, PagedbError::NoSpace),
+        "a full device must not hide inside Io, got: {err:?}"
+    );
 }
 
 #[test]
@@ -67,8 +76,6 @@ fn every_variant_displays() {
             segment_id: [0; 16],
         }),
         PagedbError::corruption(CorruptionDetail::StagingMissing {
-            realm_id: realm,
-            name: "x".into(),
             segment_id: [0; 16],
         }),
         PagedbError::corruption(CorruptionDetail::PageUnverifiable {
@@ -89,7 +96,7 @@ fn every_variant_displays() {
         PagedbError::AlreadyOpen,
         PagedbError::AlreadyLocked,
         PagedbError::RestoredNotPromoted,
-        PagedbError::IdentityForked,
+        PagedbError::wrong_mode("apply_incremental", DbMode::Follower, DbMode::Standalone),
         PagedbError::CommitGone {
             commit: CommitId::new(10),
             oldest_available: CommitId::new(20),
@@ -106,8 +113,6 @@ fn every_variant_displays() {
             available_bytes: 50,
         },
         PagedbError::Aborted,
-        PagedbError::FreeListExhausted,
-        PagedbError::SegmentTombstoneStalled,
         PagedbError::ReadersPinningTruncatedRange,
         PagedbError::Unsupported,
     ];

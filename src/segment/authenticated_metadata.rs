@@ -5,11 +5,13 @@ use crate::catalog::codec::{SegmentKind, SegmentMeta};
 use crate::crypto::CipherId;
 use crate::crypto::kdf::derive_hk;
 use crate::crypto::keys::MasterKey;
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
 use crate::pager::Pager;
 use crate::pager::format::data_page::{body, extract_page_header_ids, open_data_page};
 use crate::pager::format::page_kind::PageKind;
-use crate::pager::format::segment_footer::{SegmentFooterFields, decode_segment_footer};
+use crate::pager::format::segment_footer::{
+    SegmentFooterFields, decode_segment_footer, footer_identity_is_unverifiable,
+};
 use crate::pager::format::structural_header::{SegmentHeaderFields, decode_segment_header};
 use crate::vfs::{Vfs, VfsFile, read_exact_at_borrowed};
 
@@ -90,6 +92,20 @@ pub(crate) async fn authenticate_segment_metadata<V: Vfs + Clone>(
 
     let mut footer_bytes = vec![0u8; page_size];
     read_exact_at_borrowed!(file, footer_offset, &mut footer_bytes[..])?;
+    // A failed footer HK-MAC is precisely what makes the file's own identity
+    // fields untrustworthy, so the decoder cannot say which segment it just
+    // rejected. `meta` is the catalog row that routed this open, so it can.
+    // Asked before decoding rather than by rewriting the decoder's error
+    // afterwards: a rewrite would construct the failure twice, and every
+    // construction is a filed report.
+    if footer_identity_is_unverifiable(&footer_bytes, &hk) {
+        return Err(PagedbError::corruption(
+            CorruptionDetail::FooterUnverifiable {
+                realm_id: meta.realm_id,
+                segment_id: meta.segment_id,
+            },
+        ));
+    }
     let (footer, manifest) = {
         let mut lru = pager.dek_lru().lock();
         let cipher = lru.get_or_derive(meta.realm_id, meta.mk_epoch, cipher_id, &master_key)?;

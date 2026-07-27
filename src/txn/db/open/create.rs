@@ -15,10 +15,15 @@ use crate::pager::{Pager, PagerConfig};
 use crate::vfs::Vfs;
 use crate::{CommitId, RealmId, Result};
 
-use super::super::super::mode::{ACQUISITION_LOCK_PATH, DbMode, WRITER_LOCK_PATH};
+use super::super::super::mode::DbMode;
+// Only the test-only locking wrapper below acquires sentinels here; the
+// production bootstrap already holds them by the time it reaches this module.
+#[cfg(test)]
+use super::super::super::mode::{ACQUISITION_LOCK_PATH, WRITER_LOCK_PATH};
 use super::super::super::policy::ReaderStallPolicy;
 use super::super::core::{Db, ReaderSnapshot, WriterState};
 use super::super::util::page_size_log2;
+#[cfg(test)]
 use super::modes::acquire_interlocking_mode_lock;
 
 struct FreshDbState<V: Vfs + Clone> {
@@ -109,9 +114,8 @@ impl<V: Vfs + Clone> Db<V> {
             sentinel_locks: Vec::new(),
             // Callers of the unlocked constructor (this fn) are responsible
             // for setting `lock_required`/`sentinel_locks` on the returned
-            // handle once they've done their own locking; see
-            // `open_internal_with_options_and_cipher` and
-            // `open_with_mode` in modes.rs.
+            // handle once they've done their own locking; see `open_with_mode`
+            // in modes.rs.
             lock_required: false,
             snapshot: Arc::new(parking_lot::RwLock::new(ReaderSnapshot {
                 commit_id: 0,
@@ -133,7 +137,13 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Bootstrap a fresh database. Creates `main.db`, writes an initial A/B
     /// header in slot A with `seq=1`.
-    pub async fn open_internal(
+    ///
+    /// Compiled only for the crate's own tests. Embedders reach a fresh store
+    /// through [`Db::open`], which decides bootstrap-versus-reopen from what is
+    /// on disk; skipping that decision is only ever what a fixture wants, so
+    /// this family must not exist in a build an embedder links against.
+    #[cfg(test)]
+    pub(crate) async fn open_internal(
         vfs: V,
         kek: impl Into<SecretKey>,
         page_size: usize,
@@ -151,28 +161,10 @@ impl<V: Vfs + Clone> Db<V> {
         .await
     }
 
-    /// Like `open_internal` but with explicit cipher selection.
-    pub async fn open_internal_with_cipher(
-        vfs: V,
-        kek: impl Into<SecretKey>,
-        page_size: usize,
-        realm: RealmId,
-        cipher_id: CipherId,
-    ) -> Result<Self> {
-        let kek = kek.into();
-        Self::open_internal_with_options_and_cipher(
-            vfs,
-            kek,
-            page_size,
-            realm,
-            OpenOptions::default(),
-            cipher_id,
-        )
-        .await
-    }
-
-    /// Like `open_internal` but with explicit memory budgets.
-    pub async fn open_internal_with_options(
+    /// Like `open_internal` but with explicit memory budgets. Test-only, for
+    /// the same reason.
+    #[cfg(test)]
+    pub(crate) async fn open_internal_with_options(
         vfs: V,
         kek: impl Into<SecretKey>,
         page_size: usize,
@@ -196,8 +188,11 @@ impl<V: Vfs + Clone> Db<V> {
     /// Bootstraps a fresh database directly, bypassing `Db::open`'s mode
     /// dispatch — so this acquires the same writer sentinel `Db::open` would
     /// before writing the initial header. Without it, two concurrent callers
-    /// of this function could race the bootstrap write unlocked.
-    pub async fn open_internal_with_options_and_cipher(
+    /// of this function could race the bootstrap write unlocked. Test-only;
+    /// the production bootstrap runs through `Db::open`, which already holds
+    /// the sentinel and calls the `_unlocked` inner directly.
+    #[cfg(test)]
+    pub(crate) async fn open_internal_with_options_and_cipher(
         vfs: V,
         kek: impl Into<SecretKey>,
         page_size: usize,

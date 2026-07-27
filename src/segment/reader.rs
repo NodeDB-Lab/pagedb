@@ -9,7 +9,7 @@ use crate::Result;
 use crate::catalog::codec::SegmentMeta;
 use crate::crypto::CipherId;
 use crate::crypto::aad::{Aad, AadFields};
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
 use crate::pager::Pager;
 use crate::pager::format::data_page::{body, extract_page_header_ids, open_data_page};
 use crate::pager::format::page_kind::PageKind;
@@ -276,7 +276,22 @@ impl<V: Vfs + Clone> SegmentReader<V> {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or(PagedbError::ChecksumFailure))
+        // Every candidate kind failed. Only an AEAD tag failure means the page
+        // itself did not authenticate; a decode rejection already names its own
+        // reason and must not be relabelled. The catalog row that opened this
+        // reader supplies the identity — realm, segment, and the embedder's
+        // quarantine policy — that the raw decrypt call cannot know.
+        match last_err {
+            None | Some(PagedbError::ChecksumFailure) => Err(PagedbError::corruption(
+                CorruptionDetail::PageUnverifiable {
+                    realm_id: self.meta.realm_id,
+                    segment_id: Some(self.meta.segment_id),
+                    page_id: id,
+                    evictable: Some(self.meta.evictable),
+                },
+            )),
+            Some(error) => Err(error),
+        }
     }
 
     pub async fn read_page(&self, id: u64) -> Result<Bytes> {

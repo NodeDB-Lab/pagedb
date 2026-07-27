@@ -9,7 +9,7 @@ const REALM: RealmId = RealmId::new([1u8; 16]);
 
 async fn open_with_policy(policy: RetainPolicy) -> Db<MemVfs> {
     let opts = OpenOptions::default().with_commit_history_retain(policy);
-    Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, opts)
+    Db::open(MemVfs::new(), KEK, PAGE, REALM, opts)
         .await
         .unwrap()
 }
@@ -125,16 +125,14 @@ async fn history_persists_across_reopen() {
     let opts = OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded);
 
     let ids = {
-        let db = Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, opts.clone())
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts.clone())
             .await
             .unwrap();
         write_n(&db, 5).await
     };
 
     // Reopen.
-    let db2 = Db::open_existing_with_options(vfs, KEK, PAGE, REALM, opts)
-        .await
-        .unwrap();
+    let db2 = Db::open(vfs, KEK, PAGE, REALM, opts).await.unwrap();
 
     let cid3 = ids[2]; // commit 3
     db2.begin_read_at(cid3)

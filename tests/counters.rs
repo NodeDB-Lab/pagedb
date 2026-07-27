@@ -1,12 +1,18 @@
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, PagedbError, RealmId};
+use pagedb::{Db, OpenOptions, PagedbError, RealmId};
 
 const PAGE: usize = 4096;
 
 async fn open() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap()
+    Db::open(
+        MemVfs::new(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -43,9 +49,15 @@ async fn increment_round_trip() {
 async fn counters_persist_across_reopen() {
     let vfs = MemVfs::new();
     {
-        let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-            .await
-            .unwrap();
+        let db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
         let mut w = db.begin_write().await.unwrap();
         {
             let mut c = w.counter("seq").unwrap();
@@ -53,9 +65,15 @@ async fn counters_persist_across_reopen() {
         }
         w.commit().await.unwrap();
     }
-    let db = Db::open_existing(vfs, [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let mut w = db.begin_write().await.unwrap();
     let c = w.counter("seq").unwrap();
     assert_eq!(c.get().await.unwrap(), 1234);
@@ -123,16 +141,18 @@ async fn increment_overflow_rejected() {
 #[tokio::test(flavor = "current_thread")]
 async fn many_increments_persist_with_intermediate_flush() {
     let vfs = MemVfs::new();
-    for chunk in 0..10u64 {
-        let db = if chunk == 0 {
-            Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-                .await
-                .unwrap()
-        } else {
-            Db::open_existing(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-                .await
-                .unwrap()
-        };
+    // One entry point for both the first iteration (which bootstraps) and the
+    // rest (which reopen): `Db::open` decides from what is on disk.
+    for _ in 0..10u64 {
+        let db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
         let mut w = db.begin_write().await.unwrap();
         {
             let mut c = w.counter("seq").unwrap();
@@ -143,9 +163,15 @@ async fn many_increments_persist_with_intermediate_flush() {
         w.commit().await.unwrap();
         drop(db);
     }
-    let db = Db::open_existing(vfs, [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let mut w = db.begin_write().await.unwrap();
     let c = w.counter("seq").unwrap();
     assert_eq!(c.get().await.unwrap(), 1000);

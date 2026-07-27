@@ -35,9 +35,11 @@ pub async fn compact_now<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
 #[allow(clippy::too_many_lines)]
 async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
     db.ensure_usable()?;
-    if !matches!(db.mode, crate::txn::mode::DbMode::Standalone) {
-        return Err(PagedbError::Unsupported);
-    }
+    db.require_mode(
+        "compaction",
+        crate::txn::mode::DbMode::Standalone,
+        crate::txn::db::DbModeCapabilities::allows_store_maintenance,
+    )?;
 
     let mut result = CompactStats::default();
 

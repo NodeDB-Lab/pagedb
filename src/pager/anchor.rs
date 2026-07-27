@@ -31,6 +31,27 @@ use crate::pager::header::{ActiveSlot, commit_header, read_header_slot};
 use crate::vfs::Vfs;
 use crate::vfs::types::OpenMode;
 
+/// Interruption points on the nonce-anchor durability path.
+///
+/// Neither point is reachable by refusing an I/O call from a VFS decorator:
+/// [`Self::Commit`] performs no I/O at all, and [`Self::RefreshAfterHeader`]
+/// sits between two operations that both succeed. They are armed and consumed
+/// exactly like the rekey protocol's own fault points — a one-shot set by
+/// `Pager::interrupt_anchor_after` and taken by the first matching check.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchorTestFault {
+    /// `Pager::commit_anchor` itself — the call every commit path treats as
+    /// poisoning when it fails, and whose failure path is otherwise
+    /// unreachable from a test.
+    Commit,
+    /// Inside an anchor refresh, after the replacement header is durable and
+    /// before the generator is permitted to issue nonces past it. A crash
+    /// here leaves a store whose live header carries an anchor the in-memory
+    /// generator never acknowledged.
+    RefreshAfterHeader,
+}
+
 /// Which A/B slot of `main.db` currently holds the authoritative header, and the
 /// `seq` it carries.
 ///
@@ -105,6 +126,8 @@ pub(crate) async fn refresh_anchor<V: Vfs>(
 
 #[cfg(test)]
 mod tests {
+    use super::AnchorTestFault;
+    use crate::errors::PagedbError;
     use crate::vfs::memory::MemVfs;
     use crate::vfs::types::OpenMode;
     use crate::vfs::{Vfs, VfsFile};
@@ -212,5 +235,49 @@ mod tests {
 
             assert_store_intact(vfs, committed).await;
         }
+    }
+
+    /// The refresh interrupted at its own seam, rather than simulated from the
+    /// outside by zeroing a slot afterwards.
+    ///
+    /// A refresh has exactly one instant where the durable state and the
+    /// in-memory generator disagree: the replacement header is on disk with a
+    /// higher anchor, and the generator has not yet been told it may issue past
+    /// the old one. Stopping there is the strictly safe direction — the store
+    /// reopens at the same commit with the same data, and the recovered
+    /// generator starts from an anchor no pre-crash nonce ever reached — and the
+    /// reopened writer must find nothing to repair.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refresh_interrupted_after_its_header_reopens_at_the_same_commit() {
+        let vfs = MemVfs::new();
+        let db = seeded_db(vfs.clone()).await;
+        let committed = db.latest_commit();
+        let durable_before = db.pager.durable_anchor();
+
+        db.pager
+            .interrupt_anchor_after(AnchorTestFault::RefreshAfterHeader);
+        let error = db
+            .pager
+            .refresh_main_anchor()
+            .await
+            .expect_err("the armed interruption must abort the refresh");
+        assert!(matches!(error, PagedbError::Io(_)));
+        assert_eq!(
+            db.pager.durable_anchor(),
+            durable_before,
+            "an aborted refresh must not let the generator issue past an anchor it never acknowledged"
+        );
+        drop(db);
+
+        assert_store_intact(vfs.clone(), committed).await;
+
+        let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+        let report = crate::recovery::deep_walk::run_deep_walk(&reopened)
+            .await
+            .unwrap();
+        assert!(
+            report.is_clean(),
+            "torn refresh left a store the writer must repair: {report:?}"
+        );
     }
 }

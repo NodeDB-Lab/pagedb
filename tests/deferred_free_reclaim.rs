@@ -34,7 +34,7 @@ fn no_history_opts() -> OpenOptions {
 }
 
 async fn fresh_db() -> Db<MemVfs> {
-    Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, no_history_opts())
+    Db::open(MemVfs::new(), KEK, PAGE, REALM, no_history_opts())
         .await
         .unwrap()
 }
@@ -139,7 +139,7 @@ async fn file_growth_is_independent_of_commit_count() {
 async fn bounded_history_reuses_pages_after_window() {
     const WINDOW: u32 = 8;
     let opts = OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(WINDOW));
-    let db = Db::open_internal_with_options(MemVfs::new(), KEK, PAGE, REALM, opts)
+    let db = Db::open(MemVfs::new(), KEK, PAGE, REALM, opts)
         .await
         .unwrap();
 
@@ -174,7 +174,7 @@ async fn free_list_survives_unclean_reopen() {
     // free list — and drop the handle without compacting or draining.
     let high_water_before;
     {
-        let db = Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, no_history_opts())
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, no_history_opts())
             .await
             .unwrap();
         {
@@ -203,7 +203,7 @@ async fn free_list_survives_unclean_reopen() {
     // Reopen and write a fresh working set. With the free list recovered from
     // disk, these allocations recycle the freed pages instead of extending the
     // file past where it already was.
-    let db = Db::open_existing_with_options(vfs.clone(), KEK, PAGE, REALM, no_history_opts())
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, no_history_opts())
         .await
         .unwrap();
     {

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use pagedb::vfs::memory::{MemFile, MemLockHandle, MemVfs};
 use pagedb::vfs::{OpenMode, ReadReq, Vfs, VfsFile, WriteReq};
-use pagedb::{Db, PagedbError, RealmId, SegmentKind, SegmentPageKind, run_deep_walk};
+use pagedb::{Db, OpenOptions, PagedbError, RealmId, SegmentKind, SegmentPageKind, run_deep_walk};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [0x3B; 32];
@@ -201,7 +201,7 @@ async fn assert_clean(db: &Db<BoundaryVfs>, context: &str) {
 #[tokio::test(flavor = "current_thread")]
 async fn commit_interrupted_at_the_header_swap_reopens_wholly_at_the_previous_commit() {
     let vfs = BoundaryVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -233,7 +233,9 @@ async fn commit_interrupted_at_the_header_swap_reopens_wholly_at_the_previous_co
     vfs.fail_header_writes(false);
     drop(db);
 
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     assert_eq!(reopened.latest_commit(), durable_commit);
     let read = reopened.begin_read().await.unwrap();
     for index in 0..200u32 {
@@ -259,7 +261,7 @@ async fn commit_interrupted_at_the_header_swap_reopens_wholly_at_the_previous_co
 #[tokio::test(flavor = "current_thread")]
 async fn a_store_reopened_after_an_interrupted_header_swap_commits_again_cleanly() {
     let vfs = BoundaryVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -282,7 +284,9 @@ async fn a_store_reopened_after_an_interrupted_header_swap_commits_again_cleanly
     vfs.fail_header_writes(false);
     drop(db);
 
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     assert_clean(&reopened, "reopen after an interrupted header swap").await;
     {
         let mut txn = reopened.begin_write().await.unwrap();
@@ -309,7 +313,7 @@ async fn a_store_reopened_after_an_interrupted_header_swap_commits_again_cleanly
 #[tokio::test(flavor = "current_thread")]
 async fn link_interrupted_before_the_promote_rename_reopens_with_a_readable_segment() {
     let vfs = BoundaryVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -335,7 +339,7 @@ async fn link_interrupted_before_the_promote_rename_reopens_with_a_readable_segm
     vfs.fail_renames(false);
     drop(db);
 
-    let reopened = Db::open_existing(vfs.clone(), KEK, PAGE, REALM)
+    let reopened = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     let reader = reopened.open_segment(REALM, "published").await.unwrap();
@@ -368,7 +372,7 @@ async fn link_interrupted_before_the_promote_rename_reopens_with_a_readable_segm
 #[tokio::test(flavor = "current_thread")]
 async fn unlink_interrupted_before_the_tombstone_rename_reopens_without_the_segment() {
     let vfs = BoundaryVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -406,7 +410,7 @@ async fn unlink_interrupted_before_the_tombstone_rename_reopens_without_the_segm
     vfs.fail_renames(false);
     drop(db);
 
-    let reopened = Db::open_existing(vfs.clone(), KEK, PAGE, REALM)
+    let reopened = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     assert!(
@@ -441,7 +445,7 @@ async fn unlink_interrupted_before_the_tombstone_rename_reopens_without_the_segm
 #[tokio::test(flavor = "current_thread")]
 async fn compaction_interrupted_after_the_scratch_rename_reopens_wholly_compacted() {
     let vfs = BoundaryVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -473,7 +477,7 @@ async fn compaction_interrupted_after_the_scratch_rename_reopens_wholly_compacte
     vfs.fail_sync_dirs(false);
     drop(db);
 
-    let reopened = Db::open_existing(vfs.clone(), KEK, PAGE, REALM)
+    let reopened = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     let read = reopened.begin_read().await.unwrap();

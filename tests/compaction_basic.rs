@@ -3,14 +3,14 @@
 //! free-list persistence across reopen.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, OpenOptions, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([0xAB; 16]);
 const KEK: [u8; 32] = [0x11; 32];
 
 async fn fresh_db() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+    Db::open(MemVfs::new(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap()
 }
@@ -134,7 +134,7 @@ async fn compact_truncates_main_db() {
 #[tokio::test(flavor = "current_thread")]
 async fn compact_now_preserves_top_of_keyspace_keys() {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -213,7 +213,9 @@ async fn compact_now_preserves_top_of_keyspace_keys() {
     .await;
 
     drop(db);
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     assert_all_present(
         &reopened,
         &high_key,
@@ -234,7 +236,7 @@ async fn compact_now_preserves_top_of_keyspace_keys() {
 #[tokio::test(flavor = "current_thread")]
 async fn compact_now_preserves_large_overflow_values() {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -274,7 +276,9 @@ async fn compact_now_preserves_large_overflow_values() {
     // And the store reopens cleanly — a partial/non-atomic repack would brick it
     // with an AEAD tag failure here.
     drop(db);
-    let db2 = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let db2 = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     let r = db2.begin_read().await.unwrap();
     let k0 = format!("k-{:05}", 0);
     assert_eq!(
@@ -291,7 +295,7 @@ async fn compact_now_preserves_large_overflow_values() {
 #[tokio::test(flavor = "current_thread")]
 async fn compaction_then_commit_keeps_large_values_readable_on_reopen() {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -325,7 +329,9 @@ async fn compaction_then_commit_keeps_large_values_readable_on_reopen() {
     }
 
     drop(db);
-    let db2 = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let db2 = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     let r = db2.begin_read().await.unwrap();
     for i in 0..n_small {
         let key = format!("a-{i:05}");
@@ -359,7 +365,7 @@ async fn compaction_then_commit_keeps_large_values_readable_on_reopen() {
 #[tokio::test(flavor = "current_thread")]
 async fn compact_now_round_trips_every_record_in_order() {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 
@@ -407,7 +413,9 @@ async fn compact_now_round_trips_every_record_in_order() {
     );
 
     drop(db);
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     let after_reopen = {
         let r = reopened.begin_read().await.unwrap();
         r.scan_prefix(b"rt-").await.unwrap()
@@ -553,7 +561,7 @@ async fn free_list_persists_across_reopen() {
 
     // Open, write, then delete to populate the deferred-free queue.
     {
-        let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
             .await
             .unwrap();
         let mut w = db.begin_write().await.unwrap();
@@ -574,7 +582,7 @@ async fn free_list_persists_across_reopen() {
 
     // Reopen and compact. The deferred-free pages should be drained and
     // reused, so next_page_id should not advance much when we write new data.
-    let db2 = Db::open_existing(vfs.clone(), KEK, PAGE, REALM)
+    let db2 = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
 

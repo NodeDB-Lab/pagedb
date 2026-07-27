@@ -10,6 +10,7 @@ use crate::options::RetainPolicy;
 use crate::snapshot::export::{
     SnapshotManifest, decode_manifest, derive_snapshot_hk_key, encode_manifest, open_manifest,
 };
+use crate::txn::db::VisibilityTestHook;
 use crate::vfs::tokio_backend::{TokioFile, TokioLockHandle, TokioVfs};
 use crate::vfs::{OpenMode, ReadReq, Vfs, VfsFile, WriteReq};
 use crate::{
@@ -279,11 +280,18 @@ async fn restore_yields_readonly_db() {
         .unwrap();
     assert_eq!(restored.mode(), DbMode::ReadOnly);
 
-    // begin_write must fail with ReadOnly.
+    // begin_write must be refused, naming the mode that would have served it.
     let err = restored.begin_write().await.err().unwrap();
     assert!(
-        matches!(err, PagedbError::ReadOnly),
-        "expected ReadOnly, got {err:?}"
+        matches!(
+            err,
+            PagedbError::WrongMode {
+                operation: "begin_write",
+                required: DbMode::Standalone,
+                actual: DbMode::ReadOnly,
+            }
+        ),
+        "expected WrongMode naming Standalone, got {err:?}"
     );
 
     std::fs::remove_dir_all(&src_dir).ok();
@@ -483,8 +491,7 @@ async fn restore_rejects_manifest_active_root_mismatch() {
     assert!(
         matches!(
             err,
-            PagedbError::IdentityForked
-                | PagedbError::Corruption(_)
+            PagedbError::Corruption(_)
                 | PagedbError::SnapshotIncompatible {
                     field: "target_active_root_page_id"
                 }
@@ -1115,12 +1122,11 @@ async fn apply_incremental_rejects_delta_when_follower_not_at_base_commit() {
     assert!(
         matches!(
             err,
-            PagedbError::IdentityForked
-                | PagedbError::SnapshotIncompatible {
-                    field: "base_commit"
-                }
+            PagedbError::SnapshotIncompatible {
+                field: "base_commit"
+            }
         ),
-        "expected IdentityForked for base-commit mismatch, got {err:?}"
+        "expected a base-commit identity failure, got {err:?}"
     );
 
     std::fs::remove_dir_all(&src_dir).ok();
@@ -1788,9 +1794,7 @@ async fn apply_incremental_rejects_wrong_realm_manifest() {
     assert!(
         matches!(
             err,
-            PagedbError::IdentityForked
-                | PagedbError::Corruption(_)
-                | PagedbError::SnapshotIncompatible { field: "realm_id" }
+            PagedbError::Corruption(_) | PagedbError::SnapshotIncompatible { field: "realm_id" }
         ),
         "expected identity failure for wrong-realm manifest, got {err:?}"
     );
@@ -1858,8 +1862,7 @@ async fn apply_incremental_rejects_non_advancing_target_commit() {
     assert!(
         matches!(
             err,
-            PagedbError::IdentityForked
-                | PagedbError::Corruption(_)
+            PagedbError::Corruption(_)
                 | PagedbError::SnapshotIncompatible {
                     field: "target_commit"
                 }
@@ -1886,7 +1889,7 @@ async fn apply_incremental_rejects_non_advancing_target_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 14: standalone db calling apply_incremental returns IdentityForked.
+// Test 14: standalone db calling apply_incremental is refused as a wrong mode.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn apply_incremental_rejects_on_standalone() {
@@ -1898,8 +1901,15 @@ async fn apply_incremental_rejects_on_standalone() {
 
     let err = db.apply_incremental(&snap_dir).await.err().unwrap();
     assert!(
-        matches!(err, PagedbError::IdentityForked),
-        "expected IdentityForked, got {err:?}"
+        matches!(
+            err,
+            PagedbError::WrongMode {
+                operation: "apply_incremental",
+                required: DbMode::Follower,
+                actual: DbMode::Standalone,
+            }
+        ),
+        "expected WrongMode naming Follower, got {err:?}"
     );
 
     std::fs::remove_dir_all(&src_dir).ok();
@@ -4684,6 +4694,251 @@ async fn apply_interrupted_at_the_header_swap_stays_at_the_base_commit_then_retr
     );
 
     drop(retried);
+    for dir in [&src_dir, &snap_dir, &delta_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Readers and the incremental image swap.
+// ---------------------------------------------------------------------------
+
+/// A reader pinned across a completed apply keeps reading its own generation.
+///
+/// The apply renames a different file over `main.db` and drops every cached
+/// main page, so a pinned `ReadTxn` resolves its base page ids out of the
+/// target image. That is safe by construction rather than by luck: a delta is
+/// defined as target-reachable minus base-reader-visible and is refused if it
+/// names a base-reader-visible page, and the image it is written into is a copy
+/// of the base — so every page the pinned reader can reach still holds its base
+/// bytes after the swap. This is the property that makes "a follower may apply
+/// while it serves reads" coherent, so it is asserted on values rather than
+/// left implied by the delta-planning code.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reader_pinned_across_an_apply_keeps_reading_its_own_generation() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for index in 0u32..256 {
+            txn.put(format!("k{index:05}").as_bytes(), b"base-generation")
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let base_commit = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+    // Supersede every key the pinned reader will touch, so the target's own
+    // pages carry visibly different bytes for the same keys.
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for index in 0u32..256 {
+            txn.put(format!("k{index:05}").as_bytes(), b"target-generation")
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let target_commit = db.latest_commit();
+    db.snapshot_incremental_to(base_commit, &delta_dir)
+        .await
+        .unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let pinned = follower.begin_read().await.unwrap();
+    assert_eq!(pinned.commit_id(), base_commit);
+    // Read one key before the swap and the rest after, so the pin is exercised
+    // both warm (cached) and cold (re-read from whatever file is live).
+    assert_eq!(
+        pinned.get(b"k00000").await.unwrap().as_deref(),
+        Some(b"base-generation".as_slice())
+    );
+
+    follower.apply_incremental(&delta_dir).await.unwrap();
+    assert_eq!(follower.latest_commit(), target_commit);
+
+    for index in 0u32..256 {
+        let key = format!("k{index:05}");
+        assert_eq!(
+            pinned.get(key.as_bytes()).await.unwrap().as_deref(),
+            Some(b"base-generation".as_slice()),
+            "{key}: a pinned reader must never resolve its own page ids to target bytes"
+        );
+    }
+    assert_eq!(
+        pinned.commit_id(),
+        base_commit,
+        "the pin must not have moved"
+    );
+    drop(pinned);
+
+    // And a reader admitted after the apply sees the target, so the two
+    // generations are genuinely different bytes rather than an unchanged store.
+    {
+        let fresh = follower.begin_read().await.unwrap();
+        assert_eq!(fresh.commit_id(), target_commit);
+        assert_eq!(
+            fresh.get(b"k00000").await.unwrap().as_deref(),
+            Some(b"target-generation".as_slice())
+        );
+    }
+
+    let report = run_deep_walk(&follower).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "follower after a pinned apply: {report:?}"
+    );
+
+    drop(follower);
+    for dir in [&src_dir, &snap_dir, &delta_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// No reader may be admitted inside the apply's publication window.
+///
+/// Between the image swap and `publish_snapshot`, the live `main.db` is the
+/// target image while the published snapshot still names base roots, and the
+/// tombstone pin scan that decides whether a removed segment's file survives
+/// has already run against `tracked_readers`. A reader admitted in that stretch
+/// registers too late for the scan to see it and holds a base catalog that
+/// names a segment file the apply has just renamed away — a snapshot that
+/// describes a store that does not exist.
+///
+/// The apply is held inside that window and an admission is attempted there.
+/// With reader admission closed for the whole stretch the attempt cannot
+/// complete; the probe is bounded so a regression reports the inconsistency it
+/// found rather than hanging.
+#[tokio::test(flavor = "current_thread")]
+async fn no_reader_is_admitted_inside_the_apply_publication_window() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+    let meta = {
+        let mut writer = source
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        writer
+            .append_page(SegmentPageKind::Data, b"window-segment")
+            .await
+            .unwrap();
+        writer.seal().await.unwrap()
+    };
+    {
+        let mut write = source.begin_write().await.unwrap();
+        write.put(b"base", b"base-value").await.unwrap();
+        write.link_segment("removed", &meta).await.unwrap();
+        write.commit().await.unwrap();
+    }
+    let base_commit = source.latest_commit();
+    source.snapshot_to(&snap_dir).await.unwrap();
+    {
+        let mut write = source.begin_write().await.unwrap();
+        write.unlink_segment("removed").await.unwrap();
+        write.commit().await.unwrap();
+    }
+    source
+        .snapshot_incremental_to(base_commit, &delta_dir)
+        .await
+        .unwrap();
+    drop(source);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    let hook = Arc::new(VisibilityTestHook::default());
+    follower.install_visibility_test_hook(hook.clone());
+
+    let (applied, probe) = tokio::join!(follower.apply_incremental(&delta_dir), async {
+        // Bounded so a build where the window is never reached fails on the
+        // assertions below instead of hanging the suite.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            hook.apply_window_entered.notified(),
+        )
+        .await
+        .is_err()
+        {
+            return None;
+        }
+        // `begin_read` also rendezvouses with this hook, after it has taken
+        // admission and selected a snapshot. Leave the permit waiting so the
+        // only thing that can hold the attempt up is admission itself.
+        hook.allow_reader_registration.notify_one();
+        let admitted =
+            tokio::time::timeout(std::time::Duration::from_millis(250), follower.begin_read())
+                .await;
+        let observed = match admitted {
+            // Admission stayed closed for the whole window: nothing to observe,
+            // which is the outcome the gate exists to produce.
+            Err(_elapsed) => None,
+            Ok(reader) => {
+                let reader = reader.expect("admission must not fail for any other reason");
+                let names_removed = !reader.list_segments("removed").await.unwrap().is_empty();
+                let opens_removed = reader.open_segment("removed").await.is_ok();
+                let base_value = reader.get(b"base").await.unwrap();
+                Some((names_removed, opens_removed, base_value))
+            }
+        };
+        // Always release, so a failure surfaces as an assertion.
+        hook.apply_window_release.notify_one();
+        observed
+    });
+
+    // Every remaining read in this test is an ordinary one.
+    follower.clear_visibility_test_hook();
+
+    let stats = applied.expect("the apply itself must still complete");
+    assert_eq!(
+        stats.segments_tombstoned, 1,
+        "this delta must remove a segment, or the publication window is never entered"
+    );
+
+    if let Some((names_removed, opens_removed, base_value)) = probe {
+        assert_eq!(
+            names_removed, opens_removed,
+            "a reader admitted inside the publication window holds a catalog naming a \
+             segment whose file the apply had already removed"
+        );
+        assert_eq!(
+            base_value.as_deref(),
+            Some(b"base-value".as_slice()),
+            "an admitted reader must resolve its own generation's values"
+        );
+    }
+
+    // The apply completed normally: the target is published and self-consistent.
+    {
+        let reader = follower.begin_read().await.unwrap();
+        assert!(reader.list_segments("removed").await.unwrap().is_empty());
+        assert!(reader.open_segment("removed").await.is_err());
+        assert_eq!(
+            reader.get(b"base").await.unwrap().as_deref(),
+            Some(b"base-value".as_slice())
+        );
+    }
+    let report = run_deep_walk(&follower).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "follower after a gated apply: {report:?}"
+    );
+
+    drop(follower);
     for dir in [&src_dir, &snap_dir, &delta_dir, &dst_dir] {
         std::fs::remove_dir_all(dir).ok();
     }

@@ -1,10 +1,16 @@
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, RealmId};
+use pagedb::{Db, OpenOptions, RealmId};
 
 async fn open_with_page_size(page_size: usize) -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), [7u8; 32], page_size, RealmId::new([1; 16]))
-        .await
-        .unwrap()
+    Db::open(
+        MemVfs::new(),
+        [7u8; 32],
+        page_size,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]

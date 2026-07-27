@@ -10,14 +10,14 @@
 //! reclamation that protects the old leaf page.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, RealmId};
+use pagedb::{Db, OpenOptions, RealmId};
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([0xEE; 16]);
 const KEK: [u8; 32] = [0x33; 32];
 
 async fn fresh_db() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+    Db::open(MemVfs::new(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap()
 }

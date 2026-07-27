@@ -1,7 +1,7 @@
 //! Reader creation is local to one `Db` handle and does not publish a commit.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CommitId, Db, RealmId};
+use pagedb::{CommitId, Db, OpenOptions, RealmId};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [11u8; 32];
@@ -15,7 +15,7 @@ async fn write_value(db: &Db<MemVfs>, key: &[u8], value: &[u8]) -> CommitId {
 
 #[tokio::test(flavor = "current_thread")]
 async fn read_constructors_preserve_the_published_commit() {
-    let db = Db::open_internal(MemVfs::new(), KEK, PAGE, REALM)
+    let db = Db::open(MemVfs::new(), KEK, PAGE, REALM, OpenOptions::default())
         .await
         .unwrap();
     let first = write_value(&db, b"first", b"one").await;

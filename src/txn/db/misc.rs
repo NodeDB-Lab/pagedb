@@ -25,33 +25,34 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// Returns `true` iff this handle is a full writer (Standalone mode).
+    ///
+    /// Resolved against the same capability matrix the gates enforce, so this
+    /// predicate and `begin_write`'s rejection can never disagree.
     pub fn is_writer(&self) -> bool {
-        matches!(self.mode, DbMode::Standalone)
+        self.mode.open_capabilities().allows_user_writes()
     }
 
     /// Returns `true` iff `apply_incremental` is callable on this handle
     /// (Follower mode only).
     pub fn can_apply_incremental(&self) -> bool {
-        matches!(self.mode, DbMode::Follower)
+        self.mode
+            .open_capabilities()
+            .applies_incremental_snapshots()
     }
 
-    /// Return the `next_page_id` from the current writer state.
+    /// Drop every cached page of `realm` so the next read goes to storage.
     ///
-    /// Intended for integration tests that need to know how many pages exist.
-    #[allow(clippy::unused_async)] // async signature preserved for API stability
-    pub async fn next_page_id(&self) -> u64 {
-        self.snapshot.read().next_page_id
-    }
-
-    /// Evict all clean and dirty pages for the main realm from the buffer
-    /// pool. Intended for integration tests that corrupt pages on disk and
-    /// want subsequent reads to see the disk contents rather than cached data.
-    pub fn evict_main_pages(&self, realm: crate::RealmId) {
+    /// Compiled only for the crate's own tests: nothing an embedder does is
+    /// supposed to depend on whether a page is warm, and publishing the lever
+    /// invites exactly that dependency. A test that needs a cold read from
+    /// outside the crate reopens the handle instead.
+    #[cfg(test)]
+    pub(crate) fn evict_main_pages(&self, realm: crate::RealmId) {
         self.pager.discard_dirty_main(realm);
     }
 
-    /// Return the current size of `main.db` in bytes. Useful for tests that
-    /// verify compaction shrinks the file.
+    /// Current size of `main.db` in bytes, read from the file rather than from
+    /// the page allocator — so it reflects truncation a compaction performed.
     pub async fn main_db_byte_size(&self) -> Result<u64> {
         self.ensure_usable()?;
         let f = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;

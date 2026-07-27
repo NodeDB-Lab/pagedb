@@ -18,7 +18,7 @@ use fluxbench::{bench, compare, synthetic};
 use tokio::sync::Mutex as AsyncMutex;
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, OpenOptions, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 /// Payload bytes per page (must fit inside `page_size - envelope_overhead`).
@@ -35,9 +35,15 @@ fn shared_db() -> Arc<AsyncMutex<Db<MemVfs>>> {
         if cell.borrow().is_none() {
             let db = with_rt(|rt| {
                 rt.block_on(async {
-                    Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-                        .await
-                        .unwrap()
+                    Db::open(
+                        MemVfs::new(),
+                        [9u8; 32],
+                        PAGE,
+                        RealmId::new([1; 16]),
+                        OpenOptions::default(),
+                    )
+                    .await
+                    .unwrap()
                 })
             });
             *cell.borrow_mut() = Some(Arc::new(AsyncMutex::new(db)));

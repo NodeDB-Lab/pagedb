@@ -4,16 +4,22 @@
 //! panicking or returning unexpected errors.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CommitId, Db, RealmId};
+use pagedb::{CommitId, Db, OpenOptions, RealmId};
 
 const PAGE: usize = 4096;
 
 #[tokio::test(flavor = "current_thread")]
 async fn commit_calls_sync_dir_without_error() {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs, [1u8; 32], PAGE, RealmId::new([1u8; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs,
+        [1u8; 32],
+        PAGE,
+        RealmId::new([1u8; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let mut w = db.begin_write().await.unwrap();
     w.put(b"key", b"value").await.unwrap();
     let cid = w.commit().await.unwrap();
@@ -32,7 +38,7 @@ async fn segment_promote_calls_sync_dir_without_error() {
 
     let vfs = MemVfs::new();
     let realm = RealmId::new([2u8; 16]);
-    let db = Db::open_internal(vfs, [2u8; 32], PAGE, realm)
+    let db = Db::open(vfs, [2u8; 32], PAGE, realm, OpenOptions::default())
         .await
         .unwrap();
 

@@ -1,14 +1,20 @@
+use pagedb::vfs::OpenMode;
 use pagedb::vfs::memory::MemVfs;
-use pagedb::vfs::types::OpenMode;
 use pagedb::vfs::{Vfs, VfsFile};
-use pagedb::{Db, PagedbError, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, OpenOptions, PagedbError, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 
 async fn open() -> Db<MemVfs> {
-    Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap()
+    Db::open(
+        MemVfs::new(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -49,9 +55,15 @@ async fn create_append_seal_link_read_round_trip() {
 #[tokio::test(flavor = "current_thread")]
 async fn catalog_referenced_corruption_is_not_reclaimed_during_recovery() {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs.clone(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let realm = RealmId::new([1; 16]);
     let mut writer = db
         .create_segment(realm, SegmentKind::Unspecified)
@@ -78,7 +90,7 @@ async fn catalog_referenced_corruption_is_not_reclaimed_during_recovery() {
     drop(file);
     drop(db);
 
-    let error = Db::open_existing(vfs.clone(), [9u8; 32], PAGE, realm)
+    let error = Db::open(vfs.clone(), [9u8; 32], PAGE, realm, OpenOptions::default())
         .await
         .err()
         .unwrap();
@@ -319,9 +331,15 @@ async fn read_txn_pins_catalog_snapshot() {
 #[tokio::test(flavor = "current_thread")]
 async fn segments_under_high_byte_realm_are_listed_and_counted() {
     let realm = RealmId::new([0xFF; 16]);
-    let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, realm)
-        .await
-        .unwrap();
+    let db = Db::open(
+        MemVfs::new(),
+        [9u8; 32],
+        PAGE,
+        realm,
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
 
     let mut w = db
         .create_segment(realm, SegmentKind::Unspecified)

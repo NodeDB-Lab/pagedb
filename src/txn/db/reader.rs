@@ -12,6 +12,7 @@ use super::super::mode::DbMode;
 use super::super::policy::ReaderStallPolicy;
 use super::super::read::ReadTxn;
 use super::super::write::WriteTxn;
+use super::DbModeCapabilities;
 use super::core::{Db, ReaderSnapshot, TrackedReader, WriterState, decode_commit_meta};
 
 impl<V: Vfs + Clone> Db<V> {
@@ -125,12 +126,14 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// Open a write transaction. Acquires the exclusive writer slot.
-    /// Returns `PagedbError::ReadOnly` if the handle is not in Standalone mode.
+    /// Returns `PagedbError::WrongMode` if the handle is not in Standalone mode.
     pub async fn begin_write(&self) -> Result<WriteTxn<'_, V>> {
         self.ensure_usable()?;
-        if !matches!(self.mode, DbMode::Standalone) {
-            return Err(PagedbError::ReadOnly);
-        }
+        self.require_mode(
+            "begin_write",
+            DbMode::Standalone,
+            DbModeCapabilities::allows_user_writes,
+        )?;
         tracing::debug!(name = "txn.begin_write", "opening write transaction");
         WriteTxn::begin(self).await
     }

@@ -46,9 +46,7 @@ async fn fill_until_stall(db: &Db<MemVfs>) -> Option<PagedbError> {
 async fn unbounded_never_aborts() {
     let vfs = MemVfs::new();
     let opts = opts_low_threshold();
-    let db = Db::open_internal_with_options(vfs, KEK, 4096, REALM, opts)
-        .await
-        .unwrap();
+    let db = Db::open(vfs, KEK, 4096, REALM, opts).await.unwrap();
     db.set_reader_stall_policy(ReaderStallPolicy::Unbounded);
 
     // Open a reader that pins old pages.
@@ -71,9 +69,7 @@ async fn unbounded_never_aborts() {
 async fn reject_returns_backlog_error() {
     let vfs = MemVfs::new();
     let opts = opts_low_threshold();
-    let db = Db::open_internal_with_options(vfs, KEK, 4096, REALM, opts)
-        .await
-        .unwrap();
+    let db = Db::open(vfs, KEK, 4096, REALM, opts).await.unwrap();
     db.set_reader_stall_policy(ReaderStallPolicy::Reject);
 
     // Non-abortable reader blocks draining.
@@ -90,9 +86,7 @@ async fn reject_returns_backlog_error() {
 async fn abort_oldest_aborts_old_reader() {
     let vfs = MemVfs::new();
     let opts = opts_low_threshold();
-    let db = Db::open_internal_with_options(vfs, KEK, 4096, REALM, opts)
-        .await
-        .unwrap();
+    let db = Db::open(vfs, KEK, 4096, REALM, opts).await.unwrap();
     db.set_reader_stall_policy(ReaderStallPolicy::AbortOldest);
 
     // Write initial data so the reader has something to read.
@@ -227,9 +221,7 @@ async fn reopen_with_drainable_backlog_does_not_brick_readers() {
 async fn non_abortable_reader_survives_abort_oldest() {
     let vfs = MemVfs::new();
     let opts = opts_low_threshold();
-    let db = Db::open_internal_with_options(vfs, KEK, 4096, REALM, opts)
-        .await
-        .unwrap();
+    let db = Db::open(vfs, KEK, 4096, REALM, opts).await.unwrap();
     db.set_reader_stall_policy(ReaderStallPolicy::AbortOldest);
 
     // Only a non-abortable reader is blocking.

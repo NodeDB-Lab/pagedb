@@ -24,7 +24,7 @@ use super::types::{CompactBudget, CompactProgress};
 /// be safely chunked). Compaction runs atomically to completion and always
 /// returns `more_work = false`; to reclaim periodically, call this again later.
 ///
-/// Returns `PagedbError::Unsupported` if the handle is not in `Standalone` mode.
+/// Returns `PagedbError::WrongMode` if the handle is not in `Standalone` mode.
 pub async fn compact_step<V: Vfs + Clone>(
     db: &Db<V>,
     budget: CompactBudget,

@@ -32,5 +32,8 @@ mod tests;
 mod util;
 
 pub use core::Db;
+#[cfg(test)]
+pub(crate) use core::VisibilityTestHook;
 pub(crate) use core::{CommitHistoryMeta, WriterState, encode_free_list_root};
+pub(crate) use open::DbModeCapabilities;
 pub(crate) use pending::PendingWriterState;

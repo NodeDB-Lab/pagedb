@@ -1,5 +1,5 @@
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CommitId, Db, PagedbError, RealmId, RealmQuotas};
+use pagedb::{CommitId, Db, OpenOptions, PagedbError, RealmId, RealmQuotas};
 
 const PAGE: usize = 4096;
 
@@ -13,9 +13,15 @@ fn quotas(edit: impl FnOnce(&mut RealmQuotas)) -> RealmQuotas {
 
 async fn open() -> (Db<MemVfs>, MemVfs) {
     let vfs = MemVfs::new();
-    let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs.clone(),
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     (db, vfs)
 }
 
@@ -64,32 +70,56 @@ async fn set_quotas_persists_across_reopen() {
     let vfs = MemVfs::new();
     let q = quotas(|q| q.max_pages = Some(7777));
     {
-        let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-            .await
-            .unwrap();
-        db.set_realm_quotas(RealmId::new([1; 16]), q).await.unwrap();
-    }
-    let db = Db::open_existing(vfs, [9u8; 32], PAGE, RealmId::new([1; 16]))
+        let db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
         .await
         .unwrap();
+        db.set_realm_quotas(RealmId::new([1; 16]), q).await.unwrap();
+    }
+    let db = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let got = db.realm_quotas(RealmId::new([1; 16])).await.unwrap();
     assert_eq!(got, q);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn open_existing_recovers_writes() {
+async fn reopen_recovers_writes() {
     let vfs = MemVfs::new();
     {
-        let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-            .await
-            .unwrap();
+        let db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap();
         let mut w = db.begin_write().await.unwrap();
         w.put(b"foo", b"bar").await.unwrap();
         w.commit().await.unwrap();
     }
-    let db = Db::open_existing(vfs, [9u8; 32], PAGE, RealmId::new([1; 16]))
-        .await
-        .unwrap();
+    let db = Db::open(
+        vfs,
+        [9u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
     let r = db.begin_read().await.unwrap();
     assert_eq!(
         r.get(b"foo").await.unwrap().as_deref(),
@@ -99,17 +129,29 @@ async fn open_existing_recovers_writes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn open_existing_with_wrong_kek_fails() {
+async fn reopen_with_wrong_kek_fails() {
     let vfs = MemVfs::new();
     {
-        let _db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
-            .await
-            .unwrap();
-    }
-    let err = Db::open_existing(vfs, [0u8; 32], PAGE, RealmId::new([1; 16]))
+        let _db = Db::open(
+            vfs.clone(),
+            [9u8; 32],
+            PAGE,
+            RealmId::new([1; 16]),
+            OpenOptions::default(),
+        )
         .await
-        .err()
         .unwrap();
+    }
+    let err = Db::open(
+        vfs,
+        [0u8; 32],
+        PAGE,
+        RealmId::new([1; 16]),
+        OpenOptions::default(),
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(matches!(err, PagedbError::Corruption(_)));
 }
 
