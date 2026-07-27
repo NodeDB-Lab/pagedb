@@ -1,11 +1,15 @@
 //! Tests for the deep-walk integrity checker.
 
+use std::sync::{Arc, Mutex};
+
 use pagedb::options::RetainPolicy;
 use pagedb::vfs::memory::MemVfs;
+use pagedb::vfs::{OpenMode, ReadReq, Vfs, VfsFile, WriteReq};
 use pagedb::{Db, OpenOptions, PagedbError, RealmId, run_deep_walk};
 
 const KEK: [u8; 32] = [3u8; 32];
 const REALM: RealmId = RealmId::new([1u8; 16]);
+const PAGE: usize = 4096;
 
 async fn open_db() -> Db<MemVfs> {
     let opts = OpenOptions::default().with_buffer_pool_pages(64);
@@ -226,5 +230,237 @@ async fn retained_history_pages_are_not_reported_as_orphans() {
          orphans: {:?}",
         report.orphan_page_ids.len(),
         report.orphan_page_ids
+    );
+}
+
+/// A `MemVfs` that shortens exactly one positional read by one byte, then
+/// behaves normally.
+///
+/// Every PageDB VFS is allowed to satisfy a request across several `read_at`
+/// calls, so a positive short read is a legal step in a transfer, not evidence
+/// about the file. The wrapper leaves the missing byte available to the next
+/// call, which is what makes the resulting report a statement about deep walk
+/// rather than about the mock: a clean report is only reachable by completing
+/// the same legal byte stream.
+#[derive(Clone)]
+struct ShortReadVfs {
+    inner: MemVfs,
+    short_read_at: Arc<Mutex<Option<(String, u64)>>>,
+}
+
+impl ShortReadVfs {
+    fn new() -> Self {
+        Self {
+            inner: MemVfs::new(),
+            short_read_at: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn short_once_at(&self, path: impl Into<String>, offset: u64) {
+        *self.short_read_at.lock().unwrap() = Some((path.into(), offset));
+    }
+
+    /// Whether the armed short read has been consumed. A test that never fires
+    /// it proves nothing, so the assertion belongs next to the report.
+    fn fired(&self) -> bool {
+        self.short_read_at.lock().unwrap().is_none()
+    }
+}
+
+struct ShortReadFile<F> {
+    inner: F,
+    path: String,
+    short_read_at: Arc<Mutex<Option<(String, u64)>>>,
+}
+
+impl Vfs for ShortReadVfs {
+    type File = ShortReadFile<<MemVfs as Vfs>::File>;
+    type LockHandle = <MemVfs as Vfs>::LockHandle;
+
+    async fn open(&self, path: &str, mode: OpenMode) -> pagedb::Result<Self::File> {
+        Ok(ShortReadFile {
+            inner: self.inner.open(path, mode).await?,
+            path: path.to_string(),
+            short_read_at: self.short_read_at.clone(),
+        })
+    }
+
+    async fn remove(&self, path: &str) -> pagedb::Result<()> {
+        self.inner.remove(path).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> pagedb::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn list_dir(&self, path: &str) -> pagedb::Result<Vec<String>> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn mkdir_all(&self, path: &str) -> pagedb::Result<()> {
+        self.inner.mkdir_all(path).await
+    }
+
+    async fn sync_dir(&self, path: &str) -> pagedb::Result<()> {
+        self.inner.sync_dir(path).await
+    }
+
+    async fn lock_exclusive(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+        self.inner.lock_exclusive(path).await
+    }
+
+    async fn lock_shared(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+        self.inner.lock_shared(path).await
+    }
+}
+
+impl<F: VfsFile + Sync> VfsFile for ShortReadFile<F> {
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> pagedb::Result<usize> {
+        let should_shorten = {
+            let mut armed = self.short_read_at.lock().unwrap();
+            let matches_here = armed
+                .as_ref()
+                .is_some_and(|(path, at)| path == &self.path && *at == offset);
+            if matches_here {
+                armed.take();
+            }
+            matches_here
+        };
+        if should_shorten && buf.len() > 1 {
+            let short_len = buf.len() - 1;
+            return self.inner.read_at(offset, &mut buf[..short_len]).await;
+        }
+        self.inner.read_at(offset, buf).await
+    }
+
+    async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> pagedb::Result<()> {
+        self.inner.read_at_vectored(reqs).await
+    }
+
+    async fn write_at(&mut self, offset: u64, buf: &[u8]) -> pagedb::Result<usize> {
+        self.inner.write_at(offset, buf).await
+    }
+
+    async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> pagedb::Result<()> {
+        self.inner.write_at_vectored(reqs).await
+    }
+
+    async fn sync(&mut self) -> pagedb::Result<()> {
+        self.inner.sync().await
+    }
+
+    async fn truncate(&mut self, len: u64) -> pagedb::Result<()> {
+        self.inner.truncate(len).await
+    }
+
+    async fn len(&self) -> pagedb::Result<u64> {
+        self.inner.len().await
+    }
+
+    async fn is_empty(&self) -> pagedb::Result<bool> {
+        self.inner.is_empty().await
+    }
+
+    fn supports_direct_io(&self) -> bool {
+        self.inner.supports_direct_io()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deep_walk_completes_a_short_main_data_page_read() {
+    let vfs = ShortReadVfs::new();
+    let opts = OpenOptions::default().with_buffer_pool_pages(64);
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts).await.unwrap();
+
+    let mut txn = db.begin_write().await.unwrap();
+    for i in 0u64..10 {
+        let key = format!("short-main-{i:04}");
+        txn.put(key.as_bytes(), &[0xCC; 128]).await.unwrap();
+    }
+    txn.commit().await.unwrap();
+
+    vfs.short_once_at("/main.db", (PAGE * 4) as u64);
+    let report = run_deep_walk(&db).await.unwrap();
+
+    assert!(vfs.fired(), "the armed short read never reached deep walk");
+    assert!(
+        report.page_issues.is_empty(),
+        "a legal short main.db read must be completed, not reported: {:?}",
+        report.page_issues
+    );
+    assert!(report.is_clean(), "report should be clean: {report:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deep_walk_completes_a_short_segment_data_page_read() {
+    let vfs = ShortReadVfs::new();
+    let opts = OpenOptions::default().with_buffer_pool_pages(64);
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts).await.unwrap();
+
+    let mut segment = db
+        .create_segment(REALM, pagedb::SegmentKind::Unspecified)
+        .await
+        .unwrap();
+    segment
+        .append_page(pagedb::SegmentPageKind::Data, b"deep-walk-short-segment")
+        .await
+        .unwrap();
+    let meta = segment.seal().await.unwrap();
+    let mut txn = db.begin_write().await.unwrap();
+    txn.link_segment("short-segment", &meta).await.unwrap();
+    txn.commit().await.unwrap();
+
+    let segment_path = format!("seg/{}", hex_lower(&meta.segment_id));
+    vfs.short_once_at(segment_path, PAGE as u64);
+
+    let report = run_deep_walk(&db).await.unwrap();
+
+    assert!(vfs.fired(), "the armed short read never reached deep walk");
+    assert!(
+        report.segment_issues.is_empty(),
+        "a legal short segment read must be completed, not reported: {:?}",
+        report.segment_issues
+    );
+    assert!(report.is_clean(), "report should be clean: {report:?}");
+}
+
+fn hex_lower(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A genuinely short file must still be reported, and the report must carry the
+/// numbers. `read_exact_at` completes legal short reads and surfaces real
+/// truncation as a bare end-of-file, so the walk restores the offset and the
+/// file length an operator needs to size the damage.
+#[tokio::test(flavor = "current_thread")]
+async fn deep_walk_reports_a_truncated_main_db_with_its_extent() {
+    let vfs = MemVfs::new();
+    let opts = OpenOptions::default().with_buffer_pool_pages(64);
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts).await.unwrap();
+
+    let mut txn = db.begin_write().await.unwrap();
+    for i in 0u64..400 {
+        let key = format!("truncated-{i:04}");
+        txn.put(key.as_bytes(), &[0xAB; 128]).await.unwrap();
+    }
+    txn.commit().await.unwrap();
+
+    let kept_bytes = (PAGE * 5) as u64;
+    {
+        let mut main = vfs.open("/main.db", OpenMode::CreateOrOpen).await.unwrap();
+        main.truncate(kept_bytes).await.unwrap();
+        main.sync().await.unwrap();
+    }
+
+    let report = run_deep_walk(&db).await.unwrap();
+    assert!(
+        report.page_issues.iter().any(|issue| {
+            issue.description.contains("truncated:")
+                && issue
+                    .description
+                    .contains(&format!("file is {kept_bytes} bytes"))
+        }),
+        "a truncated main.db must be reported with its extent: {:?}",
+        report.page_issues
     );
 }

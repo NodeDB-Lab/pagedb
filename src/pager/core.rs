@@ -949,11 +949,7 @@ impl<V: Vfs> Pager<V> {
         // mk_epoch before constructing AAD and selecting the DEK.
         self.inner.record_miss(file);
         let page_size = self.cfg.page_size;
-        let page_size_u64 =
-            u64::try_from(page_size).map_err(|_| PagedbError::arithmetic_overflow("page size"))?;
-        let page_offset = page_id
-            .checked_mul(page_size_u64)
-            .ok_or_else(|| PagedbError::arithmetic_overflow("page read offset"))?;
+        let page_offset = crate::pager::page_space::page_offset(page_id, page_size, "page read")?;
         let file_handle = self.open_file_handle(file).await?;
 
         // Observer-mode retry loop: on AEAD failure retry up to
