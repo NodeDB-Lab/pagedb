@@ -2,4 +2,6 @@
 
 mod identity;
 
-pub(crate) use identity::{database_identity, journal_id, segment_id};
+pub(crate) use identity::{database_identity, segment_id};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use identity::journal_id;

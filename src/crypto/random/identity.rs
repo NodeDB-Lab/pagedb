@@ -25,6 +25,9 @@ pub(crate) fn segment_id() -> Result<[u8; 16]> {
     random_nonzero_identity()
 }
 
+// Sole caller is `txn::db::snapshot::apply_incremental`, which is native-only
+// (`#![cfg(not(target_arch = "wasm32"))]`); gate the function the same way.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn journal_id() -> Result<[u8; 16]> {
     random_nonzero_identity()
 }

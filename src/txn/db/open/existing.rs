@@ -237,6 +237,7 @@ impl<V: Vfs + Clone> Db<V> {
             main_db_path,
             vfs: vfs_arc,
             writer: Arc::new(AsyncMutex::new(writer)),
+            #[cfg(not(target_arch = "wasm32"))]
             apply_gate: AsyncMutex::new(()),
             visibility_gate: tokio::sync::RwLock::new(()),
             tracked_readers: parking_lot::Mutex::new(Vec::new()),
