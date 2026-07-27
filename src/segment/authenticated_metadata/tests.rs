@@ -471,3 +471,123 @@ async fn missing_persisted_epoch_key_has_deterministic_error() {
         })
     ));
 }
+
+/// Generated adversarial input for the extent-index page decoder.
+///
+/// An index page body is a run of fixed-width entries whose `start_page_id`,
+/// `page_count`, ordering, reserved bytes, and zero-tail placement are all
+/// structural claims made by authenticated bytes. The validator is reached only
+/// through a `pub(crate)` path that needs a real pager and a real segment file,
+/// so it has no integration surface — and widening its visibility to give it
+/// one would enlarge the published API to serve a test. The property lives
+/// beside the code instead.
+mod generated {
+    use proptest::prelude::*;
+
+    use super::super::validate_index_entries;
+    use crate::segment::types::{EXTENT_INDEX_ENTRY_LEN, ExtentIndexEntry};
+
+    fn cases() -> u32 {
+        std::env::var("PAGEDB_PROPTEST_CASES")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(32)
+    }
+
+    fn config() -> ProptestConfig {
+        ProptestConfig {
+            cases: cases(),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    /// Drive one generated page body through the validator the way
+    /// `decode_extent_index` does, carrying the same cross-page state.
+    fn validate(page_body: &[u8], index_start_page: u64) -> crate::Result<Vec<ExtentIndexEntry>> {
+        let mut previous_end = 0u64;
+        let mut unused_tail = false;
+        let mut entries = Vec::new();
+        validate_index_entries(
+            page_body,
+            index_start_page,
+            &mut previous_end,
+            &mut unused_tail,
+            &mut entries,
+        )?;
+        Ok(entries)
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        /// Wholly random bodies, at lengths that straddle the entry stride so
+        /// the ragged-remainder path is reached from both sides.
+        #[test]
+        fn random_index_page_bodies_never_panic(
+            body in prop::collection::vec(any::<u8>(), 0..=(EXTENT_INDEX_ENTRY_LEN * 4 + 7)),
+            index_start_page in any::<u64>(),
+        ) {
+            let _ = validate(&body, index_start_page);
+        }
+
+        /// Structurally plausible entries: correct stride and zero reserved
+        /// bytes, with the two fields that bound a page range left hostile.
+        #[test]
+        fn plausible_entries_are_accepted_only_when_every_claim_holds(
+            entries in prop::collection::vec(
+                (any::<u64>(), any::<u32>(), any::<u64>()),
+                0..=4,
+            ),
+            trailing_zero_entries in 0usize..=2,
+            index_start_page in prop_oneof![Just(0u64), Just(1u64), 1u64..64, any::<u64>()],
+        ) {
+            let mut body = Vec::new();
+            for &(start_page_id, page_count, logical_bytes) in &entries {
+                body.extend_from_slice(&ExtentIndexEntry {
+                    start_page_id,
+                    page_count,
+                    logical_bytes,
+                }.encode());
+            }
+            for _ in 0..trailing_zero_entries {
+                body.extend_from_slice(&[0u8; EXTENT_INDEX_ENTRY_LEN]);
+            }
+
+            let Ok(decoded) = validate(&body, index_start_page) else {
+                return Ok(());
+            };
+            // Acceptance is a promise about the whole run, not one entry:
+            // extents are non-empty, in range, and non-overlapping in order.
+            let mut previous_end = 0u64;
+            for entry in &decoded {
+                prop_assert!(entry.start_page_id != 0);
+                prop_assert!(entry.page_count != 0);
+                prop_assert!(entry.start_page_id >= previous_end);
+                let end = entry
+                    .start_page_id
+                    .checked_add(u64::from(entry.page_count))
+                    .expect("an accepted extent cannot overflow its own end");
+                prop_assert!(end <= index_start_page);
+                previous_end = end;
+            }
+        }
+
+        /// A zero entry marks the unused tail. Anything after it is a page that
+        /// two different writers could have produced, so it must be refused.
+        #[test]
+        fn a_live_entry_after_the_zero_tail_is_refused(
+            leading_zero_entries in 1usize..=3,
+            start_page_id in 1u64..64,
+            page_count in 1u32..8,
+        ) {
+            let mut body = vec![0u8; leading_zero_entries * EXTENT_INDEX_ENTRY_LEN];
+            body.extend_from_slice(&ExtentIndexEntry {
+                start_page_id,
+                page_count,
+                logical_bytes: 0,
+            }.encode());
+            prop_assert!(validate(&body, u64::MAX).is_err());
+        }
+    }
+}

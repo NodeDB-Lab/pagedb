@@ -142,6 +142,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tempfile = "3"
 aes-gcm = "0.10"
 fluxbench = "0.1"
+# Generated adversarial input for the decoders and the structural walks. Runs
+# inside the normal `cargo nextest` suite on every Tier-1 target, which is why
+# it is proptest and not a nightly-only libFuzzer harness. Dev-only: it must
+# never reach the published surface or the default feature set.
+proptest = "1.11"
 
 [[bin]]
 name = "pagedb-fsck"

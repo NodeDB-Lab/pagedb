@@ -503,3 +503,78 @@ pub(crate) fn decode_commit_meta(bytes: &[u8]) -> Result<CommitHistoryMeta> {
         unix_seconds: read_u64(bytes, 32),
     })
 }
+
+/// Generated adversarial input for the commit-history row decoder.
+///
+/// The row is reached through a `pub(crate)` path, so it has no integration
+/// surface to test from — widening its visibility to make it reachable would
+/// enlarge the published API to serve a test, which is the wrong trade. The
+/// property lives beside the code instead.
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{CommitHistoryMeta, decode_commit_meta, encode_commit_meta};
+
+    const META_LEN: usize = 40;
+
+    fn cases() -> u32 {
+        std::env::var("PAGEDB_PROPTEST_CASES")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(32)
+    }
+
+    fn config() -> ProptestConfig {
+        ProptestConfig {
+            cases: cases(),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        /// A short row must be declined, never sliced. Trailing bytes are
+        /// tolerated by design (the row is a fixed prefix), so acceptance is
+        /// exactly "at least the fixed width".
+        #[test]
+        fn random_bytes_are_accepted_only_at_or_above_the_fixed_width(
+            bytes in prop::collection::vec(any::<u8>(), 0..=(META_LEN + 16)),
+        ) {
+            match decode_commit_meta(&bytes) {
+                Ok(_) => prop_assert!(bytes.len() >= META_LEN),
+                Err(_) => prop_assert!(bytes.len() < META_LEN),
+            }
+        }
+
+        #[test]
+        fn encoded_rows_round_trip_for_every_field_value(
+            active_root_page_id in any::<u64>(),
+            catalog_root_page_id in any::<u64>(),
+            free_list_root_page_id in any::<u64>(),
+            next_page_id in any::<u64>(),
+            unix_seconds in any::<u64>(),
+            trailing in prop::collection::vec(any::<u8>(), 0..=16),
+        ) {
+            let meta = CommitHistoryMeta {
+                active_root_page_id,
+                catalog_root_page_id,
+                free_list_root_page_id,
+                next_page_id,
+                unix_seconds,
+            };
+            let mut encoded = encode_commit_meta(&meta);
+            // A longer row is what a future format revision looks like from
+            // here; the fixed prefix must still decode unchanged.
+            encoded.extend_from_slice(&trailing);
+            let decoded = decode_commit_meta(&encoded).unwrap();
+            prop_assert_eq!(decoded.active_root_page_id, active_root_page_id);
+            prop_assert_eq!(decoded.catalog_root_page_id, catalog_root_page_id);
+            prop_assert_eq!(decoded.free_list_root_page_id, free_list_root_page_id);
+            prop_assert_eq!(decoded.next_page_id, next_page_id);
+            prop_assert_eq!(decoded.unix_seconds, unix_seconds);
+        }
+    }
+}

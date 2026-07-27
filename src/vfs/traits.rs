@@ -875,4 +875,89 @@ mod tests {
         write_all_at(&mut file, 11, b"page").await.unwrap();
         assert_eq!(file.calls(), vec![(11, 4), (13, 2)]);
     }
+
+    /// Generated logical paths. A logical path is embedder-supplied and is the
+    /// only thing standing between a segment name and the filesystem, so the
+    /// interesting inputs are the ones that *look* like ordinary names on one
+    /// platform and re-root the path on another. Enumerating those by hand is
+    /// how a platform gets missed; generating them is not.
+    mod generated {
+        use proptest::prelude::*;
+
+        use super::super::{canonical_native_path, resolve_native_path};
+
+        fn cases() -> u32 {
+            std::env::var("PAGEDB_PROPTEST_CASES")
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(32)
+        }
+
+        fn config() -> ProptestConfig {
+            ProptestConfig {
+                cases: cases(),
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            }
+        }
+
+        /// Characters chosen so separators, traversal, drive letters, UNC
+        /// prefixes and NUL are all common draws rather than lottery wins.
+        fn path_char() -> impl Strategy<Value = char> {
+            prop_oneof![
+                4 => prop::sample::select(vec![
+                    '/', '\\', '.', ':', 'a', 'b', 'C', '0', ' ', '\0',
+                ]),
+                1 => any::<char>(),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(config())]
+
+            #[test]
+            fn canonical_native_path_never_panics_and_never_re_roots(
+                path in prop::collection::vec(path_char(), 0..=24)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ) {
+                let Ok(canonical) = canonical_native_path(&path) else {
+                    return Ok(());
+                };
+                prop_assert!(canonical.starts_with('/'), "{canonical:?} is not rooted");
+                prop_assert!(
+                    !canonical.contains(':'),
+                    "{canonical:?} kept a drive-letter separator"
+                );
+                prop_assert!(
+                    !canonical.contains('\\'),
+                    "{canonical:?} kept a platform separator"
+                );
+                for component in canonical.trim_start_matches('/').split('/') {
+                    if component.is_empty() {
+                        continue;
+                    }
+                    prop_assert_ne!(component, ".");
+                    prop_assert_ne!(component, "..");
+                }
+            }
+
+            /// Accepting a path must also mean it resolves beneath the root:
+            /// canonicalisation is only useful if the resolved path cannot
+            /// escape.
+            #[test]
+            fn accepted_paths_resolve_beneath_the_root(
+                path in prop::collection::vec(path_char(), 0..=24)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ) {
+                let root = std::path::Path::new("/pagedb-root");
+                let Ok(resolved) = resolve_native_path(root, &path) else {
+                    return Ok(());
+                };
+                prop_assert!(
+                    resolved.starts_with(root),
+                    "{resolved:?} escaped {root:?} (from {path:?})"
+                );
+            }
+        }
+    }
 }
