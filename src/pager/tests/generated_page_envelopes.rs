@@ -20,7 +20,7 @@ use crate::pager::format::data_page::{
     seal_data_page,
 };
 use crate::pager::format::segment_footer::{
-    SegmentFooterFields, decode_segment_footer, encode_segment_footer,
+    FORMAT_VERSION, SegmentFooterFields, decode_segment_footer, encode_segment_footer,
 };
 use crate::pager::format::structural_header::{
     MainDbHeaderFields, SegmentHeaderFields, decode_main_db_header, decode_segment_header,
@@ -130,9 +130,9 @@ fn segment_header_fields() -> SegmentHeaderFields {
     }
 }
 
-fn footer_fields(format_version: u16, page_count: u64, final_counter: u64) -> SegmentFooterFields {
+fn footer_fields(page_count: u64, final_counter: u64) -> SegmentFooterFields {
     SegmentFooterFields {
-        format_version,
+        format_version: FORMAT_VERSION,
         cipher_id: CipherId::Aes256Gcm.as_byte(),
         segment_id: [0x77; 16],
         parent_file_id: [0x11; 16],
@@ -142,7 +142,7 @@ fn footer_fields(format_version: u16, page_count: u64, final_counter: u64) -> Se
         total_bytes: page_count * PAGE as u64,
         final_counter,
         index_start_page: 1,
-        index_page_count: if format_version == 2 { 1 } else { 0 },
+        index_page_count: 1,
     }
 }
 
@@ -300,7 +300,6 @@ proptest! {
 
     #[test]
     fn perturbed_valid_segment_footer_never_panics(
-        format_version in prop::sample::select(vec![1u16, 2]),
         page_count in 1u64..64,
         final_counter in 0u64..(1 << 40),
         manifest in prop::collection::vec(any::<u8>(), 0..=256),
@@ -308,7 +307,7 @@ proptest! {
     ) {
         let hk = derive_hk(&master_key()).unwrap();
         let cipher = data_page_cipher();
-        let fields = footer_fields(format_version, page_count, final_counter);
+        let fields = footer_fields(page_count, final_counter);
         let Ok(encoded) = encode_segment_footer(&fields, &manifest, &hk, &cipher, PAGE) else {
             return Ok(());
         };

@@ -547,6 +547,7 @@ impl<V: Vfs + Clone> Db<V> {
 
 #[cfg(test)]
 mod tests {
+    use crate::pager::format::segment_footer::FORMAT_VERSION;
     use crate::segment::types::SegmentPageKind;
     use crate::vfs::memory::MemVfs;
     use crate::{RealmId, SegmentKind};
@@ -563,51 +564,53 @@ mod tests {
             .await
             .unwrap();
 
-        let mut v1_writer = db
+        // A segment with no extents carries an empty index block; the
+        // replacement must keep that shape rather than synthesise one.
+        let mut plain_writer = db
             .create_segment(REALM, SegmentKind::Unspecified)
             .await
             .unwrap();
-        v1_writer.set_format_version_for_rekey_test(1);
-        v1_writer
-            .append_page(SegmentPageKind::Data, b"v1-data")
+        plain_writer
+            .append_page(SegmentPageKind::Data, b"plain-data")
             .await
             .unwrap();
-        v1_writer.set_manifest(b"v1-manifest").unwrap();
-        let v1_meta = v1_writer.seal().await.unwrap();
+        plain_writer.set_manifest(b"plain-manifest").unwrap();
+        let plain_meta = plain_writer.seal().await.unwrap();
         let mut txn = db.begin_write().await.unwrap();
-        txn.link_segment("v1", &v1_meta).await.unwrap();
+        txn.link_segment("plain", &plain_meta).await.unwrap();
         txn.commit().await.unwrap();
 
-        let mut v2_writer = db
+        let mut indexed_writer = db
             .create_segment(REALM, SegmentKind::Unspecified)
             .await
             .unwrap();
-        let extent = v2_writer
-            .append_extent(&[b"v2-extent-a", b"v2-extent-b"])
+        let extent = indexed_writer
+            .append_extent(&[b"extent-a", b"extent-b"])
             .await
             .unwrap();
-        v2_writer.set_manifest(b"v2-manifest").unwrap();
-        let v2_meta = v2_writer.seal().await.unwrap();
+        indexed_writer.set_manifest(b"indexed-manifest").unwrap();
+        let indexed_meta = indexed_writer.seal().await.unwrap();
         let mut txn = db.begin_write().await.unwrap();
-        txn.link_segment("v2", &v2_meta).await.unwrap();
+        txn.link_segment("indexed", &indexed_meta).await.unwrap();
         txn.commit().await.unwrap();
 
         db.rekey_db(KEK, 1).await.unwrap();
 
-        let v1 = db.open_segment(REALM, "v1").await.unwrap();
-        assert_eq!(v1.meta().format_version, 1);
+        let plain = db.open_segment(REALM, "plain").await.unwrap();
+        assert_eq!(plain.meta().format_version, FORMAT_VERSION);
+        assert_eq!(plain.index_page_count(), 0);
         assert_eq!(
-            v1.authenticated_footer().manifest.as_slice(),
-            b"v1-manifest"
+            plain.authenticated_footer().manifest.as_slice(),
+            b"plain-manifest"
         );
-        let v2 = db.open_segment(REALM, "v2").await.unwrap();
-        assert_eq!(v2.meta().format_version, 2);
+        let indexed = db.open_segment(REALM, "indexed").await.unwrap();
+        assert_eq!(indexed.meta().format_version, FORMAT_VERSION);
         assert_eq!(
-            v2.authenticated_footer().manifest.as_slice(),
-            b"v2-manifest"
+            indexed.authenticated_footer().manifest.as_slice(),
+            b"indexed-manifest"
         );
-        let pages = v2.find_extent(extent.start_page_id).await.unwrap();
-        assert!(pages[0].starts_with(b"v2-extent-a"));
-        assert!(pages[1].starts_with(b"v2-extent-b"));
+        let pages = indexed.find_extent(extent.start_page_id).await.unwrap();
+        assert!(pages[0].starts_with(b"extent-a"));
+        assert!(pages[1].starts_with(b"extent-b"));
     }
 }

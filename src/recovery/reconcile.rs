@@ -312,7 +312,7 @@ mod tests {
             final_counter: 0,
             mk_epoch: 0,
             cipher_id: CipherId::Aes256Gcm.as_byte(),
-            format_version: 2,
+            format_version: 1,
             evictable: Evictable::Authoritative,
         };
         let mut tree = BTree::open(pager.clone(), realm, 0, 4, PAGE_SIZE);

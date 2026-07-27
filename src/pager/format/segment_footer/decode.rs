@@ -4,8 +4,8 @@ use crate::{RealmId, Result};
 
 use super::auth::{constant_time_eq, footer_aad, mac_hk};
 use super::fields::{
-    FOOTER_CLEARTEXT_END_V1, FOOTER_CLEARTEXT_END_V2, FOOTER_FIELDS_END_V1, FOOTER_FIELDS_END_V2,
-    MAGIC, MANIFEST_TAG_LEN, SegmentFooterFields, max_manifest_len, max_manifest_len_v2,
+    FOOTER_CLEARTEXT_END, FOOTER_FIELDS_END, FORMAT_VERSION, MAGIC, MANIFEST_TAG_LEN,
+    SegmentFooterFields, max_manifest_len,
 };
 
 pub fn decode_segment_footer(
@@ -17,47 +17,27 @@ pub fn decode_segment_footer(
     let parsed = parse_cleartext(bytes, page_size)?;
     authenticate_cleartext(bytes, hk, &parsed)?;
     let (fields, ciphertext_end, tag_end) = assemble_fields(bytes, &parsed, cipher)?;
-    let manifest = authenticate_manifest(
-        bytes,
-        cipher,
-        &fields,
-        parsed.cleartext_end,
-        ciphertext_end,
-        tag_end,
-    )?;
+    let manifest = authenticate_manifest(bytes, cipher, &fields, ciphertext_end, tag_end)?;
     Ok((fields, manifest))
 }
 
 struct ParsedFooter {
-    fields_end: usize,
-    cleartext_end: usize,
-    max_manifest: usize,
     manifest_offset: u32,
     manifest_len: usize,
     fields: SegmentFooterFields,
 }
 
 fn parse_cleartext(bytes: &[u8], page_size: usize) -> Result<ParsedFooter> {
-    if bytes.len() != page_size || page_size < FOOTER_CLEARTEXT_END_V1 + MANIFEST_TAG_LEN {
+    if bytes.len() != page_size || page_size < FOOTER_CLEARTEXT_END + MANIFEST_TAG_LEN {
         return Err(PagedbError::Unsupported);
     }
     if bytes[..8] != MAGIC {
         return Err(PagedbError::footer_framing_invalid("magic"));
     }
     let format_version = u16_le(&bytes[8..10]);
-    let (fields_end, cleartext_end, max_manifest) = match format_version {
-        1 => (
-            FOOTER_FIELDS_END_V1,
-            FOOTER_CLEARTEXT_END_V1,
-            max_manifest_len(page_size),
-        ),
-        2 if page_size >= FOOTER_CLEARTEXT_END_V2 + MANIFEST_TAG_LEN => (
-            FOOTER_FIELDS_END_V2,
-            FOOTER_CLEARTEXT_END_V2,
-            max_manifest_len_v2(page_size),
-        ),
-        _ => return Err(PagedbError::Unsupported),
-    };
+    if format_version != FORMAT_VERSION {
+        return Err(PagedbError::footer_framing_invalid("format_version"));
+    }
     let mut offset = 10;
     let cipher_id = bytes[offset];
     offset += 1;
@@ -80,26 +60,10 @@ fn parse_cleartext(bytes: &[u8], page_size: usize) -> Result<ParsedFooter> {
     let manifest_len = usize::try_from(u32_le(&bytes[offset..offset + 4]))
         .map_err(|_| PagedbError::Unsupported)?;
     offset += 4;
-    let (index_start_page, index_page_count) = if format_version == 2 {
-        (
-            u64_le(&bytes[offset..offset + 8]),
-            u32_le(&bytes[offset + 8..offset + 12]),
-        )
-    } else {
-        (0, 0)
-    };
-    debug_assert_eq!(
-        if format_version == 2 {
-            offset + 12
-        } else {
-            offset
-        },
-        fields_end
-    );
+    let index_start_page = u64_le(&bytes[offset..offset + 8]);
+    let index_page_count = u32_le(&bytes[offset + 8..offset + 12]);
+    debug_assert_eq!(offset + 12, FOOTER_FIELDS_END);
     Ok(ParsedFooter {
-        fields_end,
-        cleartext_end,
-        max_manifest,
         manifest_offset,
         manifest_len,
         fields: SegmentFooterFields {
@@ -123,13 +87,13 @@ fn authenticate_cleartext(
     hk: &crate::crypto::keys::DerivedKey,
     parsed: &ParsedFooter,
 ) -> Result<()> {
-    let mac = mac_hk(hk, &bytes[..parsed.fields_end])?;
-    let valid_mac = constant_time_eq(&mac, &bytes[parsed.fields_end..parsed.cleartext_end]);
+    let mac = mac_hk(hk, &bytes[..FOOTER_FIELDS_END])?;
+    let valid_mac = constant_time_eq(&mac, &bytes[FOOTER_FIELDS_END..FOOTER_CLEARTEXT_END]);
     let expected_offset =
-        u32::try_from(parsed.cleartext_end).map_err(|_| PagedbError::Unsupported)?;
+        u32::try_from(FOOTER_CLEARTEXT_END).map_err(|_| PagedbError::Unsupported)?;
     if !valid_mac
         || parsed.manifest_offset != expected_offset
-        || parsed.manifest_len > parsed.max_manifest
+        || parsed.manifest_len > max_manifest_len(bytes.len())
     {
         return Err(PagedbError::footer_framing_invalid(
             "manifest_offset_or_length",
@@ -152,8 +116,7 @@ fn assemble_fields(
             },
         ));
     }
-    let ciphertext_end = parsed
-        .cleartext_end
+    let ciphertext_end = FOOTER_CLEARTEXT_END
         .checked_add(parsed.manifest_len)
         .ok_or_else(|| PagedbError::arithmetic_overflow("footer manifest end"))?;
     let tag_end = ciphertext_end
@@ -169,7 +132,6 @@ fn authenticate_manifest(
     bytes: &[u8],
     cipher: &Cipher,
     fields: &SegmentFooterFields,
-    cleartext_end: usize,
     ciphertext_end: usize,
     tag_end: usize,
 ) -> Result<Vec<u8>> {
@@ -181,7 +143,7 @@ fn authenticate_manifest(
     let mut file_id = [0u8; 6];
     file_id.copy_from_slice(&fields.segment_id[..6]);
     let nonce = Nonce::from_parts(file_id, nonce_counter);
-    let mut manifest = bytes[cleartext_end..ciphertext_end].to_vec();
+    let mut manifest = bytes[FOOTER_CLEARTEXT_END..ciphertext_end].to_vec();
     let mut tag = [0u8; MANIFEST_TAG_LEN];
     tag.copy_from_slice(&bytes[ciphertext_end..tag_end]);
     cipher

@@ -2,11 +2,11 @@ use crate::RealmId;
 use crate::crypto::Cipher;
 use crate::crypto::kdf::{derive_dek, derive_hk, derive_mk};
 use crate::crypto::nonce::Nonce;
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
 
 use super::{
-    FOOTER_CLEARTEXT_END, FOOTER_FIELDS_END, SegmentFooterFields, decode_segment_footer,
-    encode_segment_footer, max_manifest_len,
+    FOOTER_CLEARTEXT_END, FOOTER_FIELDS_END, FORMAT_VERSION, SegmentFooterFields,
+    decode_segment_footer, encode_segment_footer, max_manifest_len,
 };
 
 const PAGE_SIZE: usize = 4096;
@@ -20,7 +20,7 @@ fn keys() -> (crate::crypto::keys::DerivedKey, Cipher) {
 
 fn fields() -> SegmentFooterFields {
     SegmentFooterFields {
-        format_version: 1,
+        format_version: FORMAT_VERSION,
         cipher_id: 1,
         segment_id: [9; 16],
         parent_file_id: [1; 16],
@@ -71,6 +71,39 @@ fn rejects_footer_nonce_beyond_u48_counter_space() {
 
     exhausted.final_counter = Nonce::COUNTER_MAX - 1;
     assert!(encode_segment_footer(&exhausted, b"manifest", &header, &cipher, PAGE_SIZE).is_ok());
+}
+
+#[test]
+fn rejects_footer_whose_declared_format_version_is_not_the_accepted_one() {
+    let (header, cipher) = keys();
+    let encoded =
+        encode_segment_footer(&fields(), b"manifest", &header, &cipher, PAGE_SIZE).unwrap();
+    for declared in [FORMAT_VERSION - 1, FORMAT_VERSION + 1, u16::MAX] {
+        let mut forged = encoded.clone();
+        forged[8..10].copy_from_slice(&declared.to_le_bytes());
+        assert!(
+            matches!(
+                decode_segment_footer(&forged, &header, &cipher, PAGE_SIZE),
+                Err(PagedbError::Corruption(
+                    CorruptionDetail::FooterFramingInvalid {
+                        field: "format_version"
+                    }
+                ))
+            ),
+            "format_version={declared} must be rejected as unreadable framing"
+        );
+    }
+}
+
+#[test]
+fn refuses_to_encode_a_footer_under_an_unaccepted_format_version() {
+    let (header, cipher) = keys();
+    let mut unknown = fields();
+    unknown.format_version = FORMAT_VERSION + 1;
+    assert!(matches!(
+        encode_segment_footer(&unknown, b"manifest", &header, &cipher, PAGE_SIZE),
+        Err(PagedbError::Unsupported)
+    ));
 }
 
 #[test]

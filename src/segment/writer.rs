@@ -12,7 +12,7 @@ use crate::errors::{Evictable, PagedbError};
 use crate::pager::Pager;
 use crate::pager::format::data_page::{ENVELOPE_OVERHEAD, body_mut, seal_data_page};
 use crate::pager::format::segment_footer::{
-    SegmentFooterFields, encode_segment_footer, max_manifest_len_v2,
+    FORMAT_VERSION, SegmentFooterFields, encode_segment_footer, max_manifest_len,
 };
 use crate::pager::format::structural_header::{SegmentHeaderFields, encode_segment_header};
 use crate::vfs::types::OpenMode;
@@ -20,12 +20,6 @@ use crate::vfs::{Vfs, VfsFile, write_all_at};
 use crate::{RealmId, Result};
 
 use super::types::{EXTENT_INDEX_ENTRY_LEN, ExtentIndexEntry, ExtentRef, PageId, SegmentPageKind};
-
-/// Format version written by `SegmentWriter::seal`.
-/// v2 adds an encrypted extent index block between data pages and the footer,
-/// enabling `SegmentReader::find_extent` to perform lazy binary-search lookups
-/// without decoding all extents on open.
-const FORMAT_VERSION: u16 = 2;
 
 pub struct SegmentWriter<V: Vfs + Clone> {
     pager: Arc<Pager<V>>,
@@ -42,10 +36,9 @@ pub struct SegmentWriter<V: Vfs + Clone> {
     manifest: Vec<u8>,
     total_bytes: u64,
     /// Extents appended via `append_extent`. Each entry records the start
-    /// page id, count, and total logical bytes. Written as the index block
-    /// in v2 segments before the footer page.
+    /// page id, count, and total logical bytes. Serialised as the index block
+    /// that precedes the footer page.
     extents: Vec<ExtentIndexEntry>,
-    format_version: u16,
     evictable: Evictable,
     /// Exact footer layout copied during rekey. Its index pages have already
     /// been authenticated and appended as logical segment pages.
@@ -77,7 +70,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let mut file = pager.vfs().open(&path, OpenMode::CreateNew).await?;
 
         let header_fields = SegmentHeaderFields {
-            format_version: 1, // structural header is always v1; v2 is a footer-only version bump
+            format_version: 1,
             cipher_id,
             segment_kind: segment_kind as u8,
             segment_id,
@@ -108,14 +101,13 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             manifest: Vec::new(),
             total_bytes,
             extents: Vec::new(),
-            format_version: FORMAT_VERSION,
             evictable: Evictable::Authoritative,
             rekey_footer_layout: None,
         })
     }
 
     /// Construct a replacement writer that preserves the source segment's
-    /// logical footer version, extent-index layout, kind, and evictability.
+    /// extent-index layout, kind, and evictability.
     pub(crate) async fn create_rekey_internal(
         pager: Arc<Pager<V>>,
         source: &SegmentMeta,
@@ -131,7 +123,6 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             source.segment_kind,
         )
         .await?;
-        writer.format_version = source.format_version;
         writer.evictable = source.evictable;
         writer.rekey_footer_layout = Some((index_start_page, index_page_count));
         Ok(writer)
@@ -143,11 +134,6 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         payload: &[u8],
     ) -> Result<PageId> {
         self.append_page(kind, payload).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_format_version_for_rekey_test(&mut self, format_version: u16) {
-        self.format_version = format_version;
     }
 
     pub async fn append_page(&mut self, kind: SegmentPageKind, payload: &[u8]) -> Result<PageId> {
@@ -201,7 +187,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             logical_bytes = logical_bytes.saturating_add(payload.len() as u64);
         }
         let count = u32::try_from(pages.len()).map_err(|_| PagedbError::PayloadTooLarge)?;
-        // Record the extent in the index for v2 seal.
+        // Record the extent so `seal` can serialise the index block.
         self.extents.push(ExtentIndexEntry {
             start_page_id: start,
             page_count: count,
@@ -214,12 +200,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
     }
 
     pub fn set_manifest(&mut self, manifest: &[u8]) -> Result<()> {
-        let max_len = if self.format_version == 1 {
-            crate::pager::format::segment_footer::max_manifest_len(self.page_size)
-        } else {
-            max_manifest_len_v2(self.page_size)
-        };
-        if manifest.len() > max_len {
+        if manifest.len() > max_manifest_len(self.page_size) {
             return Err(PagedbError::ManifestTooLarge);
         }
         self.manifest = manifest.to_vec();
@@ -228,21 +209,19 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
 
     /// Seal the segment file.
     ///
-    /// If `append_extent` was called at least once, a v2 segment is written:
-    /// the extent index is serialised into a block of encrypted pages between
-    /// the last data page and the footer. The footer cleartext includes the
-    /// `index_start_page` and `index_page_count` so that `SegmentReader` can
-    /// locate the index without scanning the whole file.
-    ///
-    /// Segments with no extents (only `append_page` calls) are also written as
-    /// v2 with `index_page_count = 0`.
+    /// If `append_extent` was called at least once, the extent index is
+    /// serialised into a block of encrypted pages between the last data page
+    /// and the footer. The footer cleartext carries `index_start_page` and
+    /// `index_page_count` so that `SegmentReader` can locate the index without
+    /// scanning the whole file. Segments with no extents (only `append_page`
+    /// calls) record `index_page_count = 0`.
     #[allow(clippy::too_many_lines)]
     pub async fn seal(mut self) -> Result<SegmentMeta> {
         tracing::debug!(name = "segment.seal", "sealing segment file");
         let pager_mk_seal = self.pager.mk()?;
         let hk = derive_hk(&pager_mk_seal)?;
 
-        // ── Write extent index block (v2) ─────────────────────────────────────
+        // ── Write extent index block ──────────────────────────────────────────
         let entries_per_page = (self.page_size
             - crate::pager::format::data_page::ENVELOPE_OVERHEAD)
             / EXTENT_INDEX_ENTRY_LEN;
@@ -251,9 +230,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
 
         if let Some((source_index_start, source_index_count)) = self.rekey_footer_layout {
             let footer_page_id = self.next_page_id;
-            let invalid_layout = if self.format_version == 1 {
-                source_index_start != 0 || source_index_count != 0
-            } else if source_index_count == 0 {
+            let invalid_layout = if source_index_count == 0 {
                 source_index_start != 0
             } else {
                 source_index_start == 0
@@ -335,7 +312,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         // ── Write footer ──────────────────────────────────────────────────────
         let footer_page_id = self.next_page_id;
         let footer_fields = SegmentFooterFields {
-            format_version: self.format_version,
+            format_version: FORMAT_VERSION,
             cipher_id: self.cipher_id,
             segment_id: self.segment_id,
             parent_file_id: self.parent_file_id,
@@ -376,7 +353,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             final_counter: footer_fields.final_counter,
             mk_epoch: self.mk_epoch,
             cipher_id: self.cipher_id,
-            format_version: self.format_version,
+            format_version: FORMAT_VERSION,
             evictable: self.evictable,
         })
     }

@@ -4,9 +4,8 @@ use crate::errors::PagedbError;
 
 use super::auth::{footer_aad, mac_hk};
 use super::fields::{
-    FOOTER_CLEARTEXT_END_V1, FOOTER_CLEARTEXT_END_V2, FOOTER_FIELDS_END_V1, FOOTER_FIELDS_END_V2,
-    FOOTER_HEADER_MAC_LEN, MANIFEST_TAG_LEN, SegmentFooterFields, max_manifest_len,
-    max_manifest_len_v2,
+    FOOTER_CLEARTEXT_END, FOOTER_FIELDS_END, FOOTER_HEADER_MAC_LEN, FORMAT_VERSION,
+    MANIFEST_TAG_LEN, SegmentFooterFields, max_manifest_len,
 };
 
 pub fn encode_segment_footer(
@@ -16,27 +15,21 @@ pub fn encode_segment_footer(
     cipher: &Cipher,
     page_size: usize,
 ) -> Result<Vec<u8>> {
-    let (fields_end, cleartext_end) = match fields.format_version {
-        1 => (FOOTER_FIELDS_END_V1, FOOTER_CLEARTEXT_END_V1),
-        2 => (FOOTER_FIELDS_END_V2, FOOTER_CLEARTEXT_END_V2),
-        _ => return Err(PagedbError::Unsupported),
-    };
-    if page_size < cleartext_end + MANIFEST_TAG_LEN {
+    if fields.format_version != FORMAT_VERSION {
         return Err(PagedbError::Unsupported);
     }
-    let max_manifest = if fields.format_version == 1 {
-        max_manifest_len(page_size)
-    } else {
-        max_manifest_len_v2(page_size)
-    };
-    if manifest.len() > max_manifest {
+    if page_size < FOOTER_CLEARTEXT_END + MANIFEST_TAG_LEN {
+        return Err(PagedbError::Unsupported);
+    }
+    if manifest.len() > max_manifest_len(page_size) {
         return Err(PagedbError::ManifestTooLarge);
     }
     if cipher.id().as_byte() != fields.cipher_id {
         return Err(PagedbError::Unsupported);
     }
 
-    let manifest_offset = u32::try_from(cleartext_end).map_err(|_| PagedbError::Unsupported)?;
+    let manifest_offset =
+        u32::try_from(FOOTER_CLEARTEXT_END).map_err(|_| PagedbError::Unsupported)?;
     let manifest_len = u32::try_from(manifest.len()).map_err(|_| PagedbError::ManifestTooLarge)?;
     let mut out = vec![0u8; page_size];
     let mut offset = 0usize;
@@ -64,17 +57,15 @@ pub fn encode_segment_footer(
     offset += 4;
     out[offset..offset + 4].copy_from_slice(&manifest_len.to_le_bytes());
     offset += 4;
-    if fields.format_version == 2 {
-        out[offset..offset + 8].copy_from_slice(&fields.index_start_page.to_le_bytes());
-        offset += 8;
-        out[offset..offset + 4].copy_from_slice(&fields.index_page_count.to_le_bytes());
-        offset += 4;
-    }
-    debug_assert_eq!(offset, fields_end);
+    out[offset..offset + 8].copy_from_slice(&fields.index_start_page.to_le_bytes());
+    offset += 8;
+    out[offset..offset + 4].copy_from_slice(&fields.index_page_count.to_le_bytes());
+    offset += 4;
+    debug_assert_eq!(offset, FOOTER_FIELDS_END);
     let mac = mac_hk(hk, &out[..offset])?;
     out[offset..offset + FOOTER_HEADER_MAC_LEN].copy_from_slice(&mac);
     offset += FOOTER_HEADER_MAC_LEN;
-    debug_assert_eq!(offset, cleartext_end);
+    debug_assert_eq!(offset, FOOTER_CLEARTEXT_END);
 
     let nonce_counter = fields
         .final_counter
@@ -84,14 +75,14 @@ pub fn encode_segment_footer(
     let mut file_id = [0u8; 6];
     file_id.copy_from_slice(&fields.segment_id[..6]);
     let nonce = Nonce::from_parts(file_id, nonce_counter);
-    let manifest_end = cleartext_end
+    let manifest_end = FOOTER_CLEARTEXT_END
         .checked_add(manifest.len())
         .ok_or_else(|| PagedbError::arithmetic_overflow("footer manifest end"))?;
-    out[cleartext_end..manifest_end].copy_from_slice(manifest);
+    out[FOOTER_CLEARTEXT_END..manifest_end].copy_from_slice(manifest);
     let tag = cipher.encrypt(
         &nonce,
         &footer_aad(fields),
-        &mut out[cleartext_end..manifest_end],
+        &mut out[FOOTER_CLEARTEXT_END..manifest_end],
     )?;
     let tag_end = manifest_end
         .checked_add(MANIFEST_TAG_LEN)

@@ -60,7 +60,7 @@ pub struct MmapView {
     _private: (),
 }
 
-/// A single entry in the v2 segment extent index.
+/// A single entry in the segment extent index.
 ///
 /// Each entry describes one extent (a contiguous run of pages) appended via
 /// `SegmentWriter::append_extent`. Entries are sorted by `start_page_id` to

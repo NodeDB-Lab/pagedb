@@ -49,11 +49,10 @@ pub struct SegmentReader<V: Vfs + Clone> {
     /// Only read by the native `mmap_view` path; unused on `wasm32`.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     mmap_budget_limit: u64,
-    /// v2 extent index, lazily loaded on the first `find_extent` call.
-    /// `None` = not yet loaded (or v1 segment).
-    /// `Some(vec)` = loaded and sorted by `start_page_id`.
+    /// Extent index, lazily loaded on the first `find_extent` call.
+    /// Uninitialised = not yet loaded; initialised = sorted by `start_page_id`.
     extent_index: tokio::sync::OnceCell<Vec<ExtentIndexEntry>>,
-    /// v2 index block location from the footer (0/0 for v1 segments).
+    /// Index block size from the footer; 0 when the segment has no extents.
     index_page_count: u32,
     footer: AuthenticatedSegmentFooter,
 }
@@ -339,17 +338,16 @@ impl<V: Vfs + Clone> SegmentReader<V> {
         Err(PagedbError::Unsupported)
     }
 
-    /// Look up an extent by its `start_page_id` using the v2 binary-searchable
+    /// Look up an extent by its `start_page_id` using the binary-searchable
     /// extent index. Only the matching extent's pages are read from disk; the
     /// full index is loaded lazily on the first call and cached.
     ///
     /// Returns `PagedbError::NotFound` if:
-    /// - the segment has no extent index (`format_version == 1` or
-    ///   `index_page_count == 0`), or
+    /// - the segment has no extent index (`index_page_count == 0`), or
     /// - no extent with `start_page_id` equal to `id` exists in the index.
     ///
-    /// Use `read_extent` / `read_range` for v1 segments or when you already
-    /// know the extent bounds.
+    /// Use `read_extent` / `read_range` when you already know the extent
+    /// bounds.
     pub async fn find_extent(&self, start_page_id: u64) -> Result<Vec<bytes::Bytes>> {
         if self.index_page_count == 0 {
             return Err(PagedbError::NotFound);

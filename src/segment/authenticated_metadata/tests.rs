@@ -11,7 +11,9 @@ use crate::pager::Pager;
 use crate::pager::core::PagerConfig;
 use crate::pager::format::data_page::{body_mut, open_data_page, seal_data_page};
 use crate::pager::format::page_kind::PageKind;
-use crate::pager::format::segment_footer::{decode_segment_footer, encode_segment_footer};
+use crate::pager::format::segment_footer::{
+    FORMAT_VERSION, decode_segment_footer, encode_segment_footer,
+};
 use crate::vfs::memory::MemVfs;
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
@@ -141,7 +143,7 @@ async fn rejects_authenticated_footer_format_disagreement() {
         .open(&live_path(&meta.segment_id), OpenMode::Read)
         .await
         .unwrap();
-    meta.format_version = 1;
+    meta.format_version = FORMAT_VERSION + 1;
     is_mismatch(
         &authenticate_segment_metadata(&pager, &file, &meta, FILE_ID, PAGE_SIZE).await,
         "footer.format_version",
@@ -337,7 +339,7 @@ fn rejects_non_identity_keyed_reconciliation_path() {
         final_counter: 0,
         mk_epoch: 0,
         cipher_id: CipherId::Aes256Gcm.as_byte(),
-        format_version: 2,
+        format_version: 1,
         evictable: crate::errors::Evictable::Authoritative,
     };
     is_mismatch(

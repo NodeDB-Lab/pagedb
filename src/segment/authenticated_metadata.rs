@@ -232,28 +232,22 @@ fn validate_footer(
             "footer.final_counter_geometry",
         ));
     }
-    match footer.format_version {
-        1 if footer.index_start_page != 0 || footer.index_page_count != 0 => {
-            Err(PagedbError::segment_metadata_mismatch("footer.index"))
+    if footer.index_page_count == 0 {
+        // No extents: the index block is absent, so its start page must be the
+        // reserved zero rather than an address inside the file.
+        if footer.index_start_page != 0 {
+            return Err(PagedbError::segment_metadata_mismatch("footer.index"));
         }
-        2 if footer.index_page_count == 0 && footer.index_start_page != 0 => {
-            Err(PagedbError::segment_metadata_mismatch("footer.index"))
-        }
-        2 if footer.index_page_count != 0 => {
-            let index_end = footer
-                .index_start_page
-                .checked_add(u64::from(footer.index_page_count))
-                .ok_or_else(|| PagedbError::segment_geometry_invalid("footer.index_range"))?;
-            if footer.index_start_page == 0 || index_end != footer_page_id {
-                return Err(PagedbError::segment_metadata_mismatch("footer.index"));
-            }
-            Ok(())
-        }
-        1 | 2 => Ok(()),
-        _ => Err(PagedbError::segment_metadata_mismatch(
-            "footer.format_version",
-        )),
+        return Ok(());
     }
+    let index_end = footer
+        .index_start_page
+        .checked_add(u64::from(footer.index_page_count))
+        .ok_or_else(|| PagedbError::segment_geometry_invalid("footer.index_range"))?;
+    if footer.index_start_page == 0 || index_end != footer_page_id {
+        return Err(PagedbError::segment_metadata_mismatch("footer.index"));
+    }
+    Ok(())
 }
 
 pub(crate) struct ExtentIndexDecodeContext<'a, V: Vfs + Clone> {
@@ -266,7 +260,7 @@ pub(crate) struct ExtentIndexDecodeContext<'a, V: Vfs + Clone> {
     pub(crate) page_size: usize,
 }
 
-/// Decrypt, decode, and validate every v2 extent-index entry. Both open-time
+/// Decrypt, decode, and validate every extent-index entry. Both open-time
 /// reconciliation and `SegmentReader` use this path so a catalog-referenced
 /// segment cannot defer structural index failures until an indexed lookup.
 pub(crate) async fn decode_extent_index<V: Vfs + Clone>(
