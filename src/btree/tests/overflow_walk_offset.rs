@@ -1,8 +1,8 @@
 //! Regression: the overflow-chain walk (`collect_all_page_ids` /
 //! `collect_overflow_chain`, and the strict `find_dangling` invariant helper)
-//! must read a v2 overflow ROOT page's `next` pointer at the correct offset.
+//! must read an overflow ROOT page's `next` pointer at the correct offset.
 //!
-//! A v2 root is laid out `refcount[4] || next[8] || …`; a chain page is
+//! A root is laid out `refcount[4] || next[8] || …`; a chain page is
 //! `next[8] || …`. Reading byte 0 uniformly decoded the root's `refcount` (1 for
 //! a single-owner value) as the next page id, spuriously "chaining" to reserved
 //! page 1 and failing AEAD — a false positive that looked like store corruption.

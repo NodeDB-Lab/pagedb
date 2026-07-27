@@ -6,15 +6,35 @@ use crate::{CommitId, RealmId};
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum PagedbError {
+    /// A page or footer's AEAD tag did not verify against its authenticated
+    /// bytes, and the failure could not be attributed to a more specific
+    /// corruption reason. Raised on the segment page decrypt-retry path (all
+    /// candidate page kinds failed) and inside the raw cipher open call.
+    /// Treat the containing file or page as untrustworthy; a fuller
+    /// diagnosis usually surfaces as one of the [`CorruptionDetail`]
+    /// variants instead, so see those first when triaging.
     #[error("checksum / AEAD tag verification failed")]
     ChecksumFailure,
 
+    /// The in-memory epoch keyring has no master key installed for the
+    /// requested `(mk_epoch, cipher_id)` pair. Happens when a handle is
+    /// asked to decrypt or derive under an epoch it was never given key
+    /// material for — typically a rekey counterpart key that was not
+    /// supplied on resume. The caller must install the missing epoch's key
+    /// (e.g. via the rekey resume path, which takes both KEKs) before
+    /// retrying.
     #[error("required persisted key is unavailable: mk_epoch={mk_epoch} cipher_id={cipher_id}")]
     MissingPersistedKey { mk_epoch: u64, cipher_id: u8 },
 
     #[error("corruption: {0:?}")]
     Corruption(CorruptionDetail),
 
+    /// A realm exceeded one of the caps recorded in its
+    /// [`RealmQuotas`](crate::RealmQuotas) row — page count, dirty-page
+    /// count, scratch-page count, or segment bytes, per `kind`. The
+    /// transaction that would have crossed the limit is refused; the caller
+    /// must free space in that realm (delete data, commit and let
+    /// reclamation run) or raise the configured quota before retrying.
     #[error("quota exceeded: realm={realm:?} kind={kind:?} used={used} limit={limit}")]
     Quota {
         realm: RealmId,
@@ -23,36 +43,91 @@ pub enum PagedbError {
         limit: u64,
     },
 
+    /// The VFS backend reported the underlying storage device or filesystem
+    /// is full. Not raised by any production code path today — it exists
+    /// for VFS backends to report device-level exhaustion distinctly from a
+    /// generic [`Self::Io`] error; a caller that sees it should free disk
+    /// space or point the store at a volume with headroom.
     #[error("no space (VFS-level exhaustion)")]
     NoSpace,
 
+    /// A nonce generator's 48-bit per-file counter reached its maximum and
+    /// cannot issue another nonce without risking reuse under the same key.
+    /// The file (main.db or a segment) must be rekeyed to a fresh epoch
+    /// before any further page can be encrypted into it.
     #[error("nonce counter exhausted (per-file 2^48 limit reached); rekey required")]
     NonceCounterExhausted,
 
+    /// An internal size or offset computation — page offset, extent
+    /// capacity, length conversion between integer widths — would have
+    /// overflowed. `operation` names what was being computed. Not
+    /// recoverable by retrying with the same input; the caller must reduce
+    /// whatever value (payload size, page count) drove the computation out
+    /// of range.
     #[error("arithmetic overflow while computing {operation}")]
     ArithmeticOverflow { operation: &'static str },
 
+    /// The handle is open in a mode that does not permit the attempted
+    /// write. Raised by VFS backends when a file was opened read-only and by
+    /// the pager for a handle without write access. Only `Standalone` and
+    /// `Follower` handles may write; `ReadOnly` and `Observer` handles must
+    /// reopen (or promote, for a frozen reader) before writing.
     #[error("read-only handle")]
     ReadOnly,
 
+    /// A frozen-reader (`ReadOnly`) handle tried to acquire the writer
+    /// sentinel while a `Standalone` or `Follower` writer already holds it.
+    /// Only one writer may be open on a store at a time; retry once the
+    /// existing writer closes, or open in a mode that does not need the
+    /// writer lock.
     #[error("writer already present")]
     WriterPresent,
 
+    /// A `Standalone`/`Follower` writer, or a `ReadOnly` promotion to
+    /// `Follower`, tried to acquire the writer sentinel while a frozen
+    /// (`ReadOnly`) reader already holds the frozen-readers lock. Writer
+    /// modes and frozen-reader mode are mutually exclusive on the same
+    /// store; retry once every frozen reader closes.
     #[error("readers present")]
     ReadersPresent,
 
+    /// A writer-mode handle (`Standalone` or `Follower`) tried to acquire
+    /// the writer sentinel while another writer already holds it. Distinct
+    /// from [`Self::WriterPresent`], which is the frozen-reader side of the
+    /// same contention. Only one writer handle may be open on a store at a
+    /// time; close the existing writer first.
     #[error("already open")]
     AlreadyOpen,
 
+    /// A shared or exclusive VFS-level lock could not be acquired because
+    /// another handle already holds a conflicting lock on the same path.
+    /// Transient — retry after the contending handle releases the lock, or
+    /// treat as a longer-lived open-mode conflict if it persists.
     #[error("path lock contention")]
     AlreadyLocked,
 
+    /// `Db::open` found a directory left by an interrupted `restore_from`
+    /// that was never promoted to a live store. Restored directories must be
+    /// explicitly promoted before they can be opened normally; open with the
+    /// restore-completion path (or discard the directory and restore again)
+    /// instead of the standard open.
     #[error("restored directory not promoted")]
     RestoredNotPromoted,
 
+    /// `apply_incremental` was called on a handle that is not in `Follower`
+    /// mode. Only a `Follower` handle has the base-commit identity an
+    /// incremental apply reconciles against; open the handle as `Follower`
+    /// (e.g. via `promote_to_follower`) before calling `apply_incremental`.
     #[error("identity forked; apply_incremental refused")]
     IdentityForked,
 
+    /// An incremental snapshot's manifest disagrees with this handle's
+    /// current identity or reader-visible state in a way that makes the
+    /// snapshot inapplicable — `field` names which check failed (e.g. a
+    /// mismatched root or base commit). Distinct from
+    /// [`CorruptionDetail::SnapshotArtifactInvalid`]: the manifest itself is
+    /// well-formed, it just does not describe a target this handle can
+    /// reach. Apply a snapshot whose base matches this handle's state.
     #[error("incremental snapshot is incompatible: {field}")]
     SnapshotIncompatible { field: &'static str },
 
@@ -76,9 +151,22 @@ pub enum PagedbError {
     #[error("incremental snapshot would overwrite base-live page {page_id}")]
     SnapshotBasePageReused { page_id: u64 },
 
+    /// The durable A/B header names a commit whose apply-journal actions
+    /// (a pending incremental-apply reconciliation) could not be replayed or
+    /// reconciled on this open. The handle is poisoned at `commit`; the
+    /// remedy is a fresh `Db::open`, which retries journal replay from
+    /// scratch rather than continuing on a handle that may hold
+    /// partially-applied in-memory state.
     #[error("commit {commit:?} is durable but unpublished; reopen required")]
     DurablyCommittedButUnpublished { commit: CommitId },
 
+    /// A rekey resume began writing pages under the target epoch — an
+    /// operation with no safe in-process rollback — and then failed before
+    /// recovery could complete. The handle is poisoned at `commit` and
+    /// `source` carries the underlying failure. The remedy is the same as
+    /// [`Self::DurablyCommittedButUnpublished`]: reopen the store, which
+    /// drives recovery from the durable header rather than resuming on a
+    /// handle with mixed-epoch state in flight.
     #[error("rekey activated a target epoch at commit {commit:?}; reopen required: {source}")]
     RekeyTargetEpochActivated {
         commit: CommitId,
@@ -86,36 +174,81 @@ pub enum PagedbError {
         source: Box<PagedbError>,
     },
 
+    /// `begin_read_at(commit)` named a commit that has been pruned from the
+    /// commit-history index (by [`RetainPolicy`](crate::RetainPolicy)) and
+    /// is no longer reachable. `oldest_available` names the oldest commit a
+    /// point-in-time read can still target; request a commit at or after it,
+    /// or widen the retention policy before the commit is needed again.
     #[error("commit {commit:?} gone; oldest_available={oldest_available:?}")]
     CommitGone {
         commit: CommitId,
         oldest_available: CommitId,
     },
 
+    /// No row or resource matched the given key. Reused across several
+    /// lookups: a catalog/segment row absent from its tree, a `main.db`
+    /// missing under a mode that requires it to already exist, or a segment
+    /// extent index with no entry at the requested `start_page_id`.
+    /// Check the operation that raised it for which of these applies; the
+    /// caller's next step is usually to treat the key as absent rather than
+    /// retry.
     #[error("not found")]
     NotFound,
 
+    /// `link_segment` was called with a `name` that already has a catalog
+    /// row in this realm. Names are unique per realm; `unlink_segment` or
+    /// `replace_segment` the existing entry first, or choose a different
+    /// name.
     #[error("already linked")]
     AlreadyLinked,
 
+    /// `unlink_segment` or `replace_segment` named a segment that has no
+    /// catalog row in this realm — either it was never linked or a
+    /// concurrent operation already removed it. Nothing to do; the caller
+    /// should not retry the same unlink.
     #[error("not linked")]
     NotLinked,
 
+    /// A segment or counter name exceeds `MAX_SEGMENT_NAME_LEN` bytes.
+    /// Shorten the name before retrying; the catalog key encoding has no
+    /// escape for longer names.
     #[error("name too long")]
     NameTooLong,
 
+    /// A page read or cache access was asked for a page kind that does not
+    /// belong to the file it targets (a segment kind requested through the
+    /// main-db read path, or vice versa), or a decrypted page's kind byte
+    /// did not match any kind the caller was willing to accept. Indicates a
+    /// caller bug rather than on-disk corruption — the authenticated
+    /// envelope kind mismatches are instead reported as
+    /// [`CorruptionDetail::NodeKindMismatch`].
     #[error("illegal page kind for segment")]
     IllegalPageKind,
 
+    /// A value, key, or extent count would not fit its on-disk encoding —
+    /// a leaf record exceeding the page's capacity even as an overflow
+    /// reference, a separator too long for an internal node, or an extent
+    /// page count that overflows `u32`. Shrink the value/key or split the
+    /// write into multiple extents before retrying.
     #[error("payload too large")]
     PayloadTooLarge,
 
+    /// `SegmentWriter::append_extent` was called with an empty page list.
+    /// An extent must span at least one page; pass a non-empty slice.
     #[error("extent must contain at least one page")]
     EmptyExtent,
 
+    /// A segment footer manifest exceeds the format's maximum manifest
+    /// length for the segment's page size. Shrink the manifest payload
+    /// before calling `set_manifest` / sealing the segment.
     #[error("manifest too large")]
     ManifestTooLarge,
 
+    /// `mmap_view` was asked to map `segment_bytes` of decrypted scratch but
+    /// only `available_bytes` remain under
+    /// [`OpenOptions::mmap_view_scratch_bytes`](crate::OpenOptions). Drop an
+    /// existing `MmapView` to free budget, request a smaller extent, or
+    /// raise the configured budget.
     #[error(
         "mmap-view quota exceeded: segment_bytes={segment_bytes} available_bytes={available_bytes}"
     )]
@@ -124,6 +257,14 @@ pub enum PagedbError {
         available_bytes: u64,
     },
 
+    /// Under [`ReaderStallPolicy::AbortOldest`](crate::ReaderStallPolicy),
+    /// this is the oldest conflicting reader whose pin is blocking
+    /// reclamation the writer needs — its next operation is aborted so the
+    /// writer can proceed. Also returned by a `MainDbNonceGen` when a nonce
+    /// is requested past the current anchor budget and the caller must
+    /// persist `pending_anchor()` and call `commit_anchor` before issuing
+    /// more. In the reader case, drop the reader and retry with a fresh
+    /// snapshot; in the nonce case, commit the pending anchor first.
     #[error("aborted (reader stall policy)")]
     Aborted,
 
@@ -157,15 +298,37 @@ pub enum PagedbError {
         oldest_pinning_commit: u64,
     },
 
+    /// Under [`ReaderStallPolicy::Reject`](crate::ReaderStallPolicy), a new
+    /// write would need free-list pages that reader pins are preventing the
+    /// writer from reclaiming, and no free pages remain. No production call
+    /// site raises this today (`Reject` policy's free-list path is exercised
+    /// only in `tests/smoke.rs`'s Display-coverage test); when it is wired
+    /// up, the caller's remedy is to wait for the pinning readers to close
+    /// or switch to `AbortOldest`.
     #[error("free list exhausted")]
     FreeListExhausted,
 
+    /// Under [`ReaderStallPolicy::Reject`](crate::ReaderStallPolicy), a
+    /// segment tombstone cannot be finalized because a reader still pins the
+    /// truncated range. No production call site raises this today (see
+    /// [`Self::FreeListExhausted`] — same policy, same test-only coverage);
+    /// the intended remedy is to wait for the pinning reader to close.
     #[error("segment tombstone stalled by reader pin")]
     SegmentTombstoneStalled,
 
+    /// An apply-journal reconciliation deferred a segment tombstone because
+    /// a reader still pins the range being truncated; the durable target is
+    /// published for new readers, but this transaction returns the error to
+    /// signal the tombstone did not complete synchronously. Retry
+    /// `retry_pending_apply_journal` (implicitly driven by later opens/GC)
+    /// once the pinning reader closes.
     #[error("readers pinning truncated range")]
     ReadersPinningTruncatedRange,
 
+    /// Resuming a rekey whose source and target epochs use different KEKs
+    /// (`same_kek == false`) requires both the primary and counterpart KEK,
+    /// but only the primary was supplied. Retry the resume with the
+    /// counterpart KEK for `source_epoch`/`target_epoch` also provided.
     #[error(
         "rekey resume requires counterpart key for source epoch {source_epoch} and target epoch {target_epoch}"
     )]
@@ -174,6 +337,11 @@ pub enum PagedbError {
         target_epoch: u64,
     },
 
+    /// The KEK(s) supplied to resume a rekey do not reproduce the durable
+    /// intent's HK proof for `source_epoch` and/or `target_epoch` — either
+    /// the wrong KEK was supplied, or (for a same-KEK rekey) the single
+    /// supplied KEK cannot derive both epochs' header keys. Supply the KEK
+    /// that was active when the rekey was started.
     #[error(
         "rekey counterpart key does not prove source epoch {source_epoch} for target epoch {target_epoch}"
     )]
@@ -182,9 +350,25 @@ pub enum PagedbError {
         target_epoch: u64,
     },
 
+    /// The durable rekey-intent or rekey-progress catalog row cannot be
+    /// admitted — `field` names the check that failed (a missing intent row,
+    /// an unexpected `target_mk_epoch`, source/target cipher mismatch, or a
+    /// stage that still has segments pending when none were expected). This
+    /// is a recorded-state precondition failure, not necessarily on-disk
+    /// corruption of the row's bytes (that is
+    /// [`CorruptionDetail::CatalogRowInvalid`]); it means the rekey cannot
+    /// safely proceed from where it claims to be. Inspect the rekey state
+    /// and resume from a consistent stage, or restart the rekey.
     #[error("recorded rekey state is invalid: {field}")]
     RekeyStateInvalid { field: &'static str },
 
+    /// A rekey's replacement segment file (named by durable progress) could
+    /// not be opened, is absent from both the live and staging locations, or
+    /// fails its size/geometry sanity checks after opening. Because the
+    /// replacement id is durable progress, this fails closed rather than
+    /// regenerating the file — the caller must restore the missing
+    /// replacement file (e.g. from backup) or restart the rekey for this
+    /// segment.
     #[error("recorded rekey replacement segment {replacement_segment_id:?} is missing or invalid")]
     RekeyReplacementMissing { replacement_segment_id: [u8; 16] },
 
@@ -201,12 +385,26 @@ pub enum PagedbError {
         detail: &'static str,
     },
 
+    /// The requested operation is not implemented by the current backend or
+    /// target — e.g. `mmap_view` on WASM (no native mmap), an unknown
+    /// on-wire cipher id, or `promote_to_follower` called on a handle that
+    /// is not `ReadOnly`. Check the operation's docs for which
+    /// backends/modes support it; there is no runtime workaround short of
+    /// switching backend, target, or handle mode.
     #[error("unsupported by backend")]
     Unsupported,
 
+    /// The platform's cryptographically secure RNG failed to produce
+    /// randomness (nonces, salts, key material). Propagated verbatim from
+    /// `getrandom`. Not caller-recoverable beyond retrying — it indicates
+    /// the OS entropy source itself is unavailable or refused the request.
     #[error("cryptographically secure randomness unavailable: {0}")]
     Randomness(#[from] getrandom::Error),
 
+    /// An underlying `std::io::Error` from the VFS layer (open, read, write,
+    /// sync, rename, lock) that does not map to any of the more specific
+    /// variants above. Inspect the wrapped error's `kind()` for the
+    /// platform-reported cause.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

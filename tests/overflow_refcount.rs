@@ -1,6 +1,13 @@
-//! Integration tests for v2 overflow root pages with reference counting.
-//! Verifies that shared overflow chains survive partial deletions and are
-//! freed exactly when the last reference is dropped.
+//! Integration tests for v2 overflow chains (values that spill past a single
+//! page). Covers: writing and reading a value that spans two or three
+//! overflow pages, an overwrite freeing the old chain, a delete freeing the
+//! chain, inline and overflow values coexisting in the same tree, and a mix
+//! of overflow writes and deletes across many keys leaving unrelated keys
+//! uncorrupted. Every chain here is written with `refcount = 1` — no test
+//! shares a chain across multiple live references, and overflow-chain
+//! lifetime is not governed by refcounting: a CoW leaf that duplicates an
+//! overflow pointer is protected by the same commit-tagged deferred
+//! reclamation that protects the old leaf page.
 
 use pagedb::vfs::memory::MemVfs;
 use pagedb::{Db, RealmId};
