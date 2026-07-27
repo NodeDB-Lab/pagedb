@@ -1,10 +1,11 @@
 //! Open-flow recovery: apply-journal replay, catalog reconciliation,
-//! tombstone GC.
+//! tombstone GC, spill-scratch reclamation.
 
 pub(crate) mod deep_walk;
 pub(crate) mod gc;
 pub(crate) mod journal;
 pub(crate) mod reconcile;
+pub(crate) mod scratch;
 #[cfg(test)]
 mod tests;
 

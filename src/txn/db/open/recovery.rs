@@ -32,6 +32,14 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
             Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+
+        // Write-transaction spill scratch is keyed to the handle that wrote it,
+        // so anything still present belongs to a handle that is gone and is
+        // reclaimable outright. Without this the scratch of every transaction
+        // that died with its process would accumulate for the life of the
+        // store. Gated with the removals above because it needs write
+        // authority.
+        crate::recovery::scratch::delete_orphaned_scratch(&*db.vfs).await?;
     }
 
     // An incremental apply assembles its target beside `main.db` and renames it

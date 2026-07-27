@@ -274,6 +274,8 @@ impl<V: Vfs + Clone> Db<V> {
             mmap_bytes_in_use: Arc::new(AtomicU64::new(0)),
             spill_bytes_in_use: AtomicU64::new(0),
             txn_seq: AtomicU64::new(0),
+            spill_epoch: crate::crypto::random::spill_epoch()?,
+            orphaned_spill_paths: parking_lot::Mutex::new(Vec::new()),
             mode,
             aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
             sentinel_locks: Vec::new(),

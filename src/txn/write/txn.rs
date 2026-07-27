@@ -184,11 +184,18 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         // for the first call), so we add 1 to produce 1-based ids.
         let txn_seq = db.txn_seq.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // Drop cannot await VFS removal. Sweep the only scratch file a dropped
-        // predecessor could have left before this transaction can allocate its
-        // own path. Abort and commit already remove their files eagerly.
-        if txn_seq > 1 {
-            let _ = db.vfs.remove(&format!("tmp/scratch-{}", txn_seq - 1)).await;
+        // `Drop` cannot await VFS removal, so it leaves the exact paths of the
+        // scratch files it could not remove. This is the first point after
+        // those drops that both holds the writer lock and can await, so it is
+        // where they are collected. Removal is best effort for the same reason
+        // it is in abort and commit: a scratch file nothing references cannot
+        // make the durable store unopenable, and the next open sweeps whatever
+        // survives. Paths that fail to remove are not requeued — a path that
+        // cannot be removed now will not become removable by being retried on
+        // every subsequent transaction.
+        let orphaned = std::mem::take(&mut *db.orphaned_spill_paths.lock());
+        for path in orphaned {
+            let _ = db.vfs.remove(&path).await;
         }
 
         Ok(Self {
@@ -415,9 +422,19 @@ impl<V: Vfs + Clone> Drop for WriteTxn<'_, V> {
     fn drop(&mut self) {
         if !self.committed_or_aborted {
             self.db.pager.discard_dirty_main(self.db.realm_id);
+            // The gauge describes the live writer's scratch, and the writer
+            // lock this drop is about to release means there is no other one to
+            // account for. Leaving it set would report bytes of a transaction
+            // that no longer exists.
             self.db
                 .spill_bytes_in_use
                 .store(0, std::sync::atomic::Ordering::Relaxed);
+            // Removal has to await, which a drop cannot. Hand the exact path to
+            // the next `begin_write`; if the handle closes first, the next open
+            // sweeps it.
+            if let Some(path) = self.spill_path.take() {
+                self.db.orphaned_spill_paths.lock().push(path);
+            }
         }
     }
 }

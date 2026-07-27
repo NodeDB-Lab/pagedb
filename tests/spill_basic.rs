@@ -109,7 +109,7 @@ async fn spill_cleanup_on_abort() {
 async fn spill_drop_resets_stats_and_next_write_sweeps_stale_tmp() {
     let vfs = MemVfs::new();
     let opts = OpenOptions::default().with_scratch_bytes(1024 * 1024);
-    let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
+    let db = Db::open(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
         .await
         .unwrap();
     {
@@ -135,6 +135,37 @@ async fn spill_drop_resets_stats_and_next_write_sweeps_stale_tmp() {
         );
         w.abort().await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spill_scratch_outliving_a_handle_is_swept_at_the_next_open() {
+    let vfs = MemVfs::new();
+    let opts = OpenOptions::default().with_scratch_bytes(1024 * 1024);
+    {
+        let db = Db::open(vfs.clone(), [9u8; 32], PAGE, REALM, opts.clone())
+            .await
+            .unwrap();
+        let mut w = db.begin_write().await.unwrap();
+        let mut s = w.spill_scope();
+        s.append(b"outlives-the-handle").await.unwrap();
+        drop(s);
+        // Dropped with no further transaction to collect it, then the handle
+        // closes: the in-process path cannot reclaim this one.
+        drop(w);
+        drop(db);
+    }
+    assert!(
+        vfs.open("tmp/scratch-1", OpenMode::Read).await.is_ok(),
+        "the scratch file must genuinely survive the handle for this to test the open sweep"
+    );
+
+    let _db = Db::open(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
+        .await
+        .unwrap();
+    assert!(
+        vfs.open("tmp/scratch-1", OpenMode::Read).await.is_err(),
+        "open must reclaim spill scratch left by a handle that is gone"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

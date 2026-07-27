@@ -146,7 +146,7 @@ async fn quota_update_preserves_history_across_reopen() {
     let opts = OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded);
 
     let first_commit = {
-        let db = Db::open_internal_with_options(vfs.clone(), KEK, PAGE, REALM, opts.clone())
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, opts.clone())
             .await
             .unwrap();
         let ids = write_n(&db, 2).await;
@@ -159,9 +159,7 @@ async fn quota_update_preserves_history_across_reopen() {
         ids[0]
     };
 
-    let reopened = Db::open_existing_with_options(vfs, KEK, PAGE, REALM, opts)
-        .await
-        .unwrap();
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, opts).await.unwrap();
     let historical = reopened
         .begin_read_at(first_commit)
         .await
