@@ -1,13 +1,9 @@
-# Tag gate for a releasable build. Pushing a v* tag validates the tag, runs the
-# full test suite, and builds the `pagedb-fsck` binaries once. Nothing is
-# published and nothing leaves the repo.
+# Tag gate for a releasable build. A v* tag validates the version, runs the
+# complete reusable suite, builds each pagedb-fsck archive once, and records
+# immutable provenance. This workflow never publishes a crate or a release.
 #
-# The manual `Release` workflow then consumes THIS run's binary artifacts by run
-# ID for the GitHub Release, so a failure in the publish or release stage can be
-# fixed and retried without repeating the tests or the compile.
-#
-# Artifacts are retained 14 days: that is the window in which a `Release` run can
-# still resume from this prepare run.
+# Artifacts are retained for 14 days. A maintainer can retry distribution during
+# that window without rebuilding or silently substituting another tag's files.
 
 name: Release Prepare
 run-name: Release Prepare ${{ github.ref_name }}
@@ -33,14 +29,13 @@ jobs:
     with:
       ref: ${{ github.ref_name }}
 
-  # Full lint + cross-platform test + wasm/features/bench gates. Calls test.yml
-  # directly rather than ci.yml, whose PR-draft gate skips under workflow_call.
+  # Calls test.yml directly because ci.yml's pull-request draft gate does not
+  # describe a tag build.
   ci:
     name: CI Gate
     needs: validate-version
     uses: ./.github/workflows/test.yml
 
-  # ── Build pagedb-fsck binary per target ─────────────────────────────────
   build-binaries:
     name: Build fsck (${{ matrix.label }})
     needs: [validate-version, ci]
@@ -61,8 +56,8 @@ jobs:
             target: aarch64-apple-darwin
             label: macos-arm64
             ext: ""
-          # x86_64-apple-darwin cross-compiles on Apple Silicon; the Intel
-          # macos-13 image was retired, so build it on the arm64 runner.
+          # The x86_64 target cross-compiles on the current Apple Silicon
+          # runner; the retired Intel runner is not a release dependency.
           - runs-on: macos-latest
             target: x86_64-apple-darwin
             label: macos-x64
@@ -72,41 +67,52 @@ jobs:
             label: windows-x64
             ext: ".exe"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - name: Install Rust + target
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust and target
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: fsck-${{ matrix.target }}
-
       - name: Set version from tag
         shell: bash
-        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: bash scripts/ci/stamp_version.sh "$VERSION"
 
       - name: Build pagedb-fsck
-        run: cargo build --release --bin pagedb-fsck --target ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --bin pagedb-fsck --target "$TARGET"
 
-      - name: Package (Unix)
+      - name: Package archive
         if: runner.os != 'Windows'
+        env:
+          LABEL: ${{ matrix.label }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
           set -euo pipefail
-          cd target/${{ matrix.target }}/release
+          cd "target/${TARGET}/release"
           chmod +x pagedb-fsck
-          tar czf pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz pagedb-fsck
+          tar czf "pagedb-fsck-${VERSION}-${LABEL}.tar.gz" pagedb-fsck
 
-      - name: Package (Windows)
+      - name: Package archive
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          EXT: ${{ matrix.ext }}
+          LABEL: ${{ matrix.label }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
-          cd target/${{ matrix.target }}/release
-          $name = "pagedb-fsck-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.zip"
-          Compress-Archive -Path "pagedb-fsck${{ matrix.ext }}" -DestinationPath $name
+          Set-Location "target/$env:TARGET/release"
+          $name = "pagedb-fsck-$env:VERSION-$env:LABEL.zip"
+          Compress-Archive -Path "pagedb-fsck$env:EXT" -DestinationPath $name
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: fsck-${{ matrix.label }}
           path: |
@@ -115,29 +121,52 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  summary:
-    name: Release instructions
+  provenance:
+    name: Release provenance and instructions
     needs: [validate-version, build-binaries]
     runs-on: ubuntu-latest
     steps:
+      - name: Record prepared release
+        env:
+          COMMIT: ${{ needs.validate-version.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          jq -n \
+            --arg commit "$COMMIT" \
+            --arg repository "$REPOSITORY" \
+            --arg run_id "$RUN_ID" \
+            --arg tag "$TAG" \
+            --arg version "$VERSION" \
+            '{schema:1, repository:$repository, tag:$tag, version:$version, commit:$commit, prepare_run_id:$run_id}' \
+            > release-provenance.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-provenance
+          path: release-provenance.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Write summary
         env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
-          REPO: ${{ github.repository }}
+          REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
           {
             echo "## Prepared v${VERSION}"
             echo
-            echo "Tests passed and the fsck binaries are built. Publish with:"
+            echo "Tests passed, binaries were built, and provenance was recorded."
+            echo "Distribute this exact run with:"
             echo
             echo '```sh'
-            echo "gh workflow run release.yml -R ${REPO} \\"
+            echo "gh workflow run release.yml -R ${REPOSITORY} \\"
             echo "  -f tag=v${VERSION} \\"
             echo "  -f prepare_run_id=${RUN_ID}"
             echo '```'
             echo
-            echo "If one stage fails, re-run the same command with only the"
-            echo "remaining stage enabled (e.g. \`-f publish_crate=false\`)."
-            echo "Nothing is recompiled."
+            echo "Retry only a failed stage by disabling the completed one."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,6 @@
-# Reusable tag/version validation. Called by release-prepare.yml (from the
-# pushed tag) and release.yml (from the dispatched tag), so the two entry
-# points can never disagree about what a tag means.
+# Reusable tag/version validation. Release Prepare calls this from the pushed
+# tag, and Release calls it again from the manually dispatched tag. Both stages
+# therefore agree on tag syntax, package version, and the exact tag commit.
 
 name: Release Validate
 
@@ -8,7 +8,7 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: "Git ref to validate (a v* tag)"
+        description: "Release tag to validate (vX.Y.Z or vX.Y.Z-label.N)"
         required: true
         type: string
     outputs:
@@ -18,6 +18,9 @@ on:
       is_full_release:
         description: "true when the version carries no prerelease suffix"
         value: ${{ jobs.validate.outputs.is_full_release }}
+      commit:
+        description: "Commit referenced by the validated tag"
+        value: ${{ jobs.validate.outputs.commit }}
 
 permissions:
   contents: read
@@ -29,13 +32,16 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       is_full_release: ${{ steps.version.outputs.is_full_release }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Validate tag against Cargo.toml
         id: version
@@ -43,33 +49,42 @@ jobs:
           TAG: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          TAG_VERSION="${TAG#v}"
 
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z][A-Za-z0-9-]*\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid tag '$TAG'. Expected vX.Y.Z or vX.Y.Z-label.N"
+            exit 1
+          fi
+
+          TAG_VERSION="${TAG#v}"
+          TAG_BASE="${BASH_REMATCH[1]}"
           CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 \
             | jq -r '.packages[] | select(.name == "pagedb") | .version')
-          CARGO_BASE=$(echo "$CARGO_VERSION" | grep -oP '^\d+\.\d+\.\d+')
+          if [[ ! "$CARGO_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            echo "::error::Cargo.toml carries an invalid package version '$CARGO_VERSION'"
+            exit 1
+          fi
+          CARGO_BASE="${BASH_REMATCH[1]}"
 
           echo "Tag version:        $TAG_VERSION"
           echo "Cargo.toml version: $CARGO_VERSION"
           echo "Cargo.toml base:    $CARGO_BASE"
 
-          if [[ ! "$TAG_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[a-zA-Z]+\.[0-9]+)?$ ]]; then
-            echo "::error::Invalid tag format '$TAG'. Expected: vX.Y.Z or vX.Y.Z-label.N"
-            exit 1
-          fi
-
-          TAG_BASE="${BASH_REMATCH[1]}"
-
           if [[ "$TAG_BASE" != "$CARGO_BASE" ]]; then
-            echo "::error::Base version mismatch! Tag '$TAG_BASE' != Cargo.toml '$CARGO_BASE'"
+            echo "::error::Base version mismatch: tag '$TAG_BASE' != Cargo.toml '$CARGO_BASE'"
             exit 1
           fi
 
-          # Full release = no hyphen suffix (v0.1.0, not v0.1.0-beta.1)
+          TAG_COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          HEAD_COMMIT=$(git rev-parse HEAD)
+          if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+            echo "::error::Checkout '$HEAD_COMMIT' does not match tag '$TAG_COMMIT'"
+            exit 1
+          fi
+
           if [[ "$TAG_VERSION" == *-* ]]; then
             echo "is_full_release=false" >> "$GITHUB_OUTPUT"
           else
             echo "is_full_release=true" >> "$GITHUB_OUTPUT"
           fi
-
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"

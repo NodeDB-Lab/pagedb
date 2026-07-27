@@ -206,6 +206,12 @@ The API surface is intentionally redb-shaped. The lift is mostly sync→async �
 
 Pre-1.0. The format is stabilizing toward a freeze; expect format-version bumps until that lands. The on-disk format is versioned and cipher-agile by design, so future migration paths exist — but until 1.0, treat data as throwaway.
 
+## Releases
+
+Maintainers prepare a tagged build and distribute that exact run in separate
+workflows. The [release guide](RELEASING.md) documents the local contracts,
+provenance checks, retry procedure, and final publication verification.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) **OR** [Apache-2.0](LICENSE-APACHE), at your option.

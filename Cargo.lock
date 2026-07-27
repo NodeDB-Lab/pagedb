@@ -506,6 +506,8 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 [[package]]
 name = "faultbox"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a80929286082768f2ae95812c7aacd931ab3b1ad13c8ec70cda2a6c64994e9"
 dependencies = [
  "serde",
  "serde_json",

@@ -41,14 +41,16 @@ jobs:
     name: Lint, Format & Docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: lint
 
@@ -74,6 +76,12 @@ jobs:
       - name: Run doctests
         run: cargo test -p pagedb --doc --all-features
 
+      - name: Verify release contracts
+        run: |
+          bash scripts/test-stamp-version.sh
+          bash scripts/test-release-provenance.sh
+          bash scripts/test-release-workflow-contract.sh
+
       # Enforces the rule in CLAUDE.md: no checklist-letter or build-order
       # scaffolding may leak into source / Cargo.toml / README. Greps for
       # the explicit forbidden patterns; fails the job if any are present.
@@ -97,17 +105,19 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: test-${{ matrix.os }}
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
         with:
           tool: nextest
 
@@ -118,7 +128,7 @@ jobs:
 
       - name: Upload nextest report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-${{ matrix.os }}
           path: target/nextest/default/junit.xml
@@ -143,17 +153,19 @@ jobs:
       # Only presence is checked, never the value.
       PAGEDB_INVARIANT_CHECKS: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: invariants
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
         with:
           tool: nextest
 
@@ -162,7 +174,7 @@ jobs:
 
       - name: Upload nextest report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nextest-invariants
           path: target/nextest/default/junit.xml
@@ -193,19 +205,23 @@ jobs:
           - target: armv7-linux-androideabi
             label: android-armv7 (AndroidVfs / thread-pool)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust + target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: cross-${{ matrix.target }}
 
       - name: cargo check --lib
-        run: cargo check -p pagedb --target ${{ matrix.target }} --lib
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check -p pagedb --target "$TARGET" --lib
 
   # ─────────────────────────────────────────────────────────────────────────
   wasm:
@@ -216,67 +232,99 @@ jobs:
       matrix:
         include:
           - target: wasm32-unknown-unknown
-            features: --features opfs
+            feature: opfs
             label: wasm32 (OpfsVfs)
           - target: wasm32-wasip1
-            features: ""
+            feature: ""
             label: wasi (WasiVfs)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust + target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: wasm-${{ matrix.target }}
 
       - name: cargo check --lib
-        run: cargo check -p pagedb --target ${{ matrix.target }} --lib ${{ matrix.features }}
+        env:
+          FEATURE: ${{ matrix.feature }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$FEATURE" ]]; then
+            cargo check -p pagedb --target "$TARGET" --lib --features "$FEATURE"
+          else
+            cargo check -p pagedb --target "$TARGET" --lib
+          fi
 
   # ─────────────────────────────────────────────────────────────────────────
   features:
-    name: Feature matrix (${{ matrix.flags }})
+    name: Feature matrix (${{ matrix.config }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        flags:
-          - ""                           # default features
-          - "--no-default-features"
-          - "--features compression"
-          - "--all-features"
+        config: [default, no-default, compression, all]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: features
 
       - name: cargo check
-        run: cargo check -p pagedb --lib --bins --tests --benches ${{ matrix.flags }}
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: |
+          set -euo pipefail
+          case "$CONFIG" in
+            default)
+              cargo check -p pagedb --lib --bins --tests --benches
+              ;;
+            no-default)
+              cargo check -p pagedb --lib --bins --tests --benches --no-default-features
+              ;;
+            compression)
+              cargo check -p pagedb --lib --bins --tests --benches --features compression
+              ;;
+            all)
+              cargo check -p pagedb --lib --bins --tests --benches --all-features
+              ;;
+            *)
+              echo "::error::Unknown feature-matrix configuration '$CONFIG'"
+              exit 1
+              ;;
+          esac
 
   # ─────────────────────────────────────────────────────────────────────────
   bench:
     name: Benchmark (dry run)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       # The isolated comparison package links RocksDB (librocksdb-sys), whose
       # build runs bindgen and needs libclang.
       - name: Install LLVM/Clang
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: bench
 
@@ -293,11 +341,13 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
         with:
           tool: cargo-deny
       - name: Run cargo-deny
