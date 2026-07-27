@@ -183,6 +183,14 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         // Assign a txn_seq starting from 1: fetch_add returns the old value (0
         // for the first call), so we add 1 to produce 1-based ids.
         let txn_seq = db.txn_seq.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Drop cannot await VFS removal. Sweep the only scratch file a dropped
+        // predecessor could have left before this transaction can allocate its
+        // own path. Abort and commit already remove their files eagerly.
+        if txn_seq > 1 {
+            let _ = db.vfs.remove(&format!("tmp/scratch-{}", txn_seq - 1)).await;
+        }
+
         Ok(Self {
             db,
             guard,
@@ -407,6 +415,9 @@ impl<V: Vfs + Clone> Drop for WriteTxn<'_, V> {
     fn drop(&mut self) {
         if !self.committed_or_aborted {
             self.db.pager.discard_dirty_main(self.db.realm_id);
+            self.db
+                .spill_bytes_in_use
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

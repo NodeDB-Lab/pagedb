@@ -118,6 +118,38 @@ async fn stats_reports_buffer_pool() {
 }
 
 #[tokio::test]
+async fn evict_main_pages_forces_next_read_to_miss_cache() {
+    let db = fresh_db().await;
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(b"hello", b"world").await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    {
+        let reader = db.begin_read().await.unwrap();
+        assert_eq!(
+            reader.get(b"hello").await.unwrap().as_deref(),
+            Some(b"world".as_slice())
+        );
+    }
+    let before = db.stats().await.unwrap();
+
+    db.evict_main_pages(realm());
+
+    let reader = db.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"hello").await.unwrap().as_deref(),
+        Some(b"world".as_slice())
+    );
+    let after = db.stats().await.unwrap();
+    assert!(
+        after.buffer_pool_misses > before.buffer_pool_misses,
+        "eviction must force a VFS-backed cache miss: before={before:?}, after={after:?}"
+    );
+}
+
+#[tokio::test]
 async fn stats_reports_mode() {
     let vfs = MemVfs::new();
     // Bootstrap first so ReadOnly open can find main.db.

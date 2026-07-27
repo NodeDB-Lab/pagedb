@@ -870,6 +870,15 @@ impl<V: Vfs> Pager<V> {
         }
     }
 
+    /// Evict unpinned clean main.db pages so later reads fetch and authenticate
+    /// durable bytes without discarding in-flight writes.
+    pub fn evict_clean_main_pages(&self, _realm_id: crate::RealmId) {
+        self.inner
+            .buffer_pool
+            .lock()
+            .clear_clean_file(FileKey::Main);
+    }
+
     fn write_page(
         &self,
         file: FileKey,

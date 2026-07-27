@@ -106,6 +106,38 @@ async fn spill_cleanup_on_abort() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn spill_drop_resets_stats_and_next_write_sweeps_stale_tmp() {
+    let vfs = MemVfs::new();
+    let opts = OpenOptions::default().with_scratch_bytes(1024 * 1024);
+    let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
+        .await
+        .unwrap();
+    {
+        let mut w = db.begin_write().await.unwrap();
+        let mut s = w.spill_scope();
+        s.append(b"drop-cleanup").await.unwrap();
+        drop(s);
+        drop(w);
+    }
+
+    assert_eq!(
+        db.stats().await.unwrap().spill_bytes_in_use,
+        0,
+        "dropping an uncommitted transaction must clear observable spill accounting"
+    );
+
+    {
+        let w = db.begin_write().await.unwrap();
+        let res = vfs.open("tmp/scratch-1", OpenMode::Read).await;
+        assert!(
+            res.is_err(),
+            "the next write transaction must sweep stale spill tmp files from dropped transactions"
+        );
+        w.abort().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn spill_aead_protects_payload() {
     // Confirm bytes on disk are NOT plaintext.
     let vfs = MemVfs::new();
