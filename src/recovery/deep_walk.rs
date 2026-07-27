@@ -14,14 +14,15 @@ use crate::btree::leaf::{Leaf, LeafValue};
 use crate::btree::overflow;
 use crate::catalog::codec::{Catalog, SegmentMeta};
 use crate::crypto::aad::{Aad, AadFields, MAIN_DB_SEGMENT_ID};
+use crate::errors::PagedbError;
 use crate::pager::format::data_page::extract_page_header_ids;
 use crate::pager::format::page_kind::PageKind;
-use crate::pager::page_space::{FIRST_ALLOCATABLE_PAGE_ID, is_reserved};
+use crate::pager::page_space::{FIRST_ALLOCATABLE_PAGE_ID, is_reserved, page_offset};
 use crate::pager::{PageGuard, Pager};
 use crate::segment::authenticated_metadata::authenticate_segment_metadata;
 use crate::txn::db::Db;
 use crate::vfs::types::OpenMode;
-use crate::vfs::{Vfs, VfsFile};
+use crate::vfs::{Vfs, VfsFile, read_exact_at};
 
 /// A single page-level issue found during deep walk.
 #[non_exhaustive]
@@ -260,7 +261,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
 
     let vfs: &V = &db.vfs;
     let main_file_res = vfs.open(main_db_path, OpenMode::Read).await;
-    let main_file = match main_file_res {
+    let mut main_file = match main_file_res {
         Ok(f) => f,
         Err(e) => {
             report.page_issues.push(PageIssue {
@@ -275,24 +276,25 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     // (HK-MAC, cleartext) and are already verified by `Db::open`. Skip them.
     // Page 2 and 3 are reserved (apply-journal). Walk from page 4.
     for page_id in 4..next_page_id {
-        let offset = page_id * page_size as u64;
-        let mut buf = vec![0u8; page_size];
-        match main_file.read_at(offset, &mut buf).await {
-            Ok(n) if n < page_size => {
-                // Short read at the tail — the file may be smaller than expected.
-                // Report but continue.
+        let offset = match page_offset(page_id, page_size, "deep-walk main page offset") {
+            Ok(offset) => offset,
+            Err(error) => {
                 report.page_issues.push(PageIssue {
                     page_id,
-                    description: format!("short read: expected {page_size} bytes, got {n}"),
+                    description: format!("{error}"),
                 });
                 report.pages_examined += 1;
                 continue;
             }
-            Ok(_) => {}
-            Err(e) => {
+        };
+        let mut buf = vec![0u8; page_size];
+        match read_exact_at(&mut main_file, offset, &mut buf).await {
+            Ok(()) => {}
+            Err(error) => {
+                let description = describe_page_read_failure(&mut main_file, offset, error).await;
                 report.page_issues.push(PageIssue {
                     page_id,
-                    description: format!("read error: {e}"),
+                    description,
                 });
                 report.pages_examined += 1;
                 continue;
@@ -435,7 +437,7 @@ async fn check_segment<V: Vfs + Clone>(
     let page_size = pager.page_size();
 
     // Check file exists.
-    let Ok(file) = vfs.open(&live, OpenMode::Read).await else {
+    let Ok(mut file) = vfs.open(&live, OpenMode::Read).await else {
         report.drift_issues.push(DriftIssue {
             segment_id: meta.segment_id,
             description: "segment file missing from seg/".to_string(),
@@ -464,7 +466,16 @@ async fn check_segment<V: Vfs + Clone>(
     // We don't have a metadata API, but we can check via read: try reading one
     // byte past the expected end. If it succeeds (on some VFS) we skip the
     // check; if we read exactly `page_count * page_size` bytes we're consistent.
-    let expected_size = meta.page_count * page_size as u64;
+    let expected_size = match page_offset(meta.page_count, page_size, "segment expected size") {
+        Ok(offset) => offset,
+        Err(error) => {
+            report.segment_issues.push(SegmentIssue {
+                segment_id: meta.segment_id,
+                description: format!("{error}"),
+            });
+            return;
+        }
+    };
     let mut probe = vec![0u8; 1];
     let over_read = file.read_at(expected_size, &mut probe).await;
     match over_read {
@@ -483,24 +494,24 @@ async fn check_segment<V: Vfs + Clone>(
     // Walk data pages (1 .. page_count - 1, skipping header=0 and footer=last).
     let last_data = footer_page_id;
     for page_id in 1..last_data {
-        let offset = page_id * page_size as u64;
-        let mut buf = vec![0u8; page_size];
-        let read_res = file.read_at(offset, &mut buf).await;
-        match read_res {
-            Ok(n) if n < page_size => {
+        let offset = match page_offset(page_id, page_size, "segment data page offset") {
+            Ok(offset) => offset,
+            Err(error) => {
                 report.segment_issues.push(SegmentIssue {
                     segment_id: meta.segment_id,
-                    description: format!(
-                        "short read at page {page_id}: expected {page_size} bytes, got {n}"
-                    ),
+                    description: format!("page {page_id}: {error}"),
                 });
                 continue;
             }
-            Ok(_) => {}
-            Err(e) => {
+        };
+        let mut buf = vec![0u8; page_size];
+        match read_exact_at(&mut file, offset, &mut buf).await {
+            Ok(()) => {}
+            Err(error) => {
+                let description = describe_page_read_failure(&mut file, offset, error).await;
                 report.segment_issues.push(SegmentIssue {
                     segment_id: meta.segment_id,
-                    description: format!("read error at page {page_id}: {e}"),
+                    description: format!("page {page_id}: {description}"),
                 });
                 continue;
             }
@@ -549,6 +560,34 @@ async fn check_segment<V: Vfs + Clone>(
                 segment_id: meta.segment_id,
                 description: format!("page {page_id}: AEAD verification failed"),
             });
+        }
+    }
+}
+
+/// Turn a failed full-page read into a description that keeps the byte counts.
+///
+/// `read_exact_at` completes a legal short read and only gives up once the
+/// backend stops making progress, so the partial count it consumed never
+/// reaches the caller — a truncated file arrives here as a bare
+/// `UnexpectedEof`. On a diagnostic surface those numbers are the product: an
+/// operator needs to know the file is short and by how much, not merely that a
+/// read ended. Any other error is already self-describing and passes through.
+async fn describe_page_read_failure<F: VfsFile>(
+    file: &mut F,
+    offset: u64,
+    error: PagedbError,
+) -> String {
+    let is_eof = matches!(
+        &error,
+        PagedbError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof
+    );
+    if !is_eof {
+        return format!("read error: {error}");
+    }
+    match file.len().await {
+        Ok(len) => format!("truncated: page starts at offset {offset}, file is {len} bytes"),
+        Err(len_error) => {
+            format!("read error: {error} (file length unavailable: {len_error})")
         }
     }
 }
@@ -877,10 +916,10 @@ async fn diagnose_overflow_chain<V: Vfs + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OpenOptions;
     use crate::btree::node::body_capacity;
     use crate::pager::format::data_page::ENVELOPE_OVERHEAD;
     use crate::vfs::memory::MemVfs;
+    use crate::{OpenOptions, SegmentKind, SegmentPageKind};
 
     const PAGE: usize = 4096;
     const REALM: crate::RealmId = crate::RealmId::new([0xD3; 16]);
@@ -1071,6 +1110,72 @@ mod tests {
         assert!(
             issue_matching(&report, 0, "overflow value rooted at reserved page"),
             "deep walk must name the invalid overflow root: {report:?}"
+        );
+    }
+
+    /// A catalog `page_count` large enough to overflow a byte offset must be
+    /// rejected as a structured issue, never reach the arithmetic that would
+    /// wrap it, and never abort the walk. Authenticated metadata validation is
+    /// what stops it, ahead of any footer index or loop bound; the checked
+    /// `page_offset` behind it is the second line, covered directly in
+    /// `pager::page_space`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deep_walk_rejects_impossible_catalog_page_count() {
+        let db = open_db().await;
+        let mut segment = db
+            .create_segment(REALM, SegmentKind::Unspecified)
+            .await
+            .unwrap();
+        segment
+            .append_page(SegmentPageKind::Data, b"deep-walk")
+            .await
+            .unwrap();
+        let mut meta = segment.seal().await.unwrap();
+        {
+            let mut txn = db.begin_write().await.unwrap();
+            txn.link_segment("overflow", &meta).await.unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        meta.page_count = (u64::MAX / PAGE as u64) + 2;
+        let (catalog_root, next_page_id) = {
+            let state = db.writer.lock().await;
+            (state.catalog_root_page_id, state.next_page_id)
+        };
+        let mut tree = BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            catalog_root,
+            next_page_id,
+            db.page_size,
+        );
+        let key = Catalog::segment_key(REALM, b"overflow").unwrap();
+        tree.put(&key, &Catalog::encode_segment_meta(&meta))
+            .await
+            .unwrap();
+        tree.flush().await.unwrap();
+        {
+            let mut state = db.writer.lock().await;
+            state.catalog_root_page_id = tree.root_page_id();
+            state.next_page_id = state.next_page_id.max(tree.next_page_id());
+        }
+
+        let report = run_deep_walk(&db).await.unwrap();
+        assert!(
+            report.segment_issues.iter().any(|issue| {
+                issue.segment_id == meta.segment_id
+                    && issue
+                        .description
+                        .contains("authenticated segment metadata invalid")
+            }),
+            "impossible segment geometry must become a structured issue, got {report:?}"
+        );
+        assert!(
+            report.segment_issues.iter().all(|issue| {
+                !issue.description.contains("segment expected size")
+                    && !issue.description.contains("segment data page offset")
+            }),
+            "validation must reject the record before any offset arithmetic runs: {report:?}"
         );
     }
 

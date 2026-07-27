@@ -277,7 +277,13 @@ mod tests {
     use crate::vfs::{Vfs, VfsFile};
     use crate::{RealmId, btree::BTree};
 
-    use super::repair_catalog;
+    use super::{repair_catalog, sweep_orphans};
+
+    fn segment_id(value: u64) -> [u8; 16] {
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&value.to_le_bytes());
+        id
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn malformed_catalog_key_prevents_reconciliation_mutation() {
@@ -346,5 +352,58 @@ mod tests {
             })
         ));
         assert!(vfs.open(marker, OpenMode::Read).await.is_ok());
+    }
+
+    /// The sweep has three outcomes and every one of them is destructive if it
+    /// fires on the wrong file: an expected live segment must survive, a live
+    /// segment the catalog does not name must become a tombstone rather than a
+    /// deletion, and an unnamed staging file must be removed outright. The
+    /// expected set is large enough that a membership test which silently
+    /// matched on a prefix, a truncated id, or the first entry alone would
+    /// misclassify one of the three.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sweep_orphans_tombstones_live_orphans_and_removes_staged_orphans() {
+        let vfs = MemVfs::new();
+        vfs.mkdir_all("seg/.staging").await.unwrap();
+        let expected: Vec<[u8; 16]> = (0..1024).map(segment_id).collect();
+
+        for id in expected.iter().take(8) {
+            let path = crate::segment::writer::live_path(id);
+            let mut file = vfs.open(&path, OpenMode::CreateOrOpen).await.unwrap();
+            file.write_at(0, b"live").await.unwrap();
+        }
+
+        let live_orphan = segment_id(10_000);
+        let live_orphan_path = crate::segment::writer::live_path(&live_orphan);
+        let mut live_file = vfs
+            .open(&live_orphan_path, OpenMode::CreateOrOpen)
+            .await
+            .unwrap();
+        live_file.write_at(0, b"orphan").await.unwrap();
+
+        let staged_orphan = segment_id(10_001);
+        let staged_orphan_path = crate::segment::writer::staging_path(&staged_orphan);
+        let mut staged_file = vfs
+            .open(&staged_orphan_path, OpenMode::CreateOrOpen)
+            .await
+            .unwrap();
+        staged_file.write_at(0, b"orphan").await.unwrap();
+
+        sweep_orphans(&vfs, &expected, 77).await.unwrap();
+
+        for id in expected.iter().take(8) {
+            let path = crate::segment::writer::live_path(id);
+            assert!(
+                vfs.open(&path, OpenMode::Read).await.is_ok(),
+                "a segment the catalog names must survive the sweep: {path}"
+            );
+        }
+        assert!(vfs.open(&live_orphan_path, OpenMode::Read).await.is_err());
+        let tombstone = format!(
+            "seg/.tombstone/{}.77",
+            crate::hex::to_hex_lower(&live_orphan)
+        );
+        assert!(vfs.open(&tombstone, OpenMode::Read).await.is_ok());
+        assert!(vfs.open(&staged_orphan_path, OpenMode::Read).await.is_err());
     }
 }
