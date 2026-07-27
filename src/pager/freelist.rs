@@ -44,6 +44,73 @@ pub const fn chain_capacity(page_size: usize) -> usize {
     (body_capacity(page_size) - PAGE_HEADER_LEN) / ENTRY_LEN
 }
 
+/// Decode a chain page's header into `(next chain page id, entry count)`.
+///
+/// The count is validated against what the page body can physically hold: an
+/// on-disk count above capacity cannot come from [`write_chain`] (which caps
+/// chunks at capacity), so the page under the `Free` kind byte holds foreign or
+/// torn content. Surfacing corruption here is what keeps the entry slicing
+/// below from overrunning — a panic there poisons the pager mutex and wedges
+/// every subsequent commit.
+fn decode_chain_header(body: &[u8]) -> Result<(u64, usize)> {
+    if body.len() < PAGE_HEADER_LEN {
+        return Err(PagedbError::corruption(
+            crate::errors::CorruptionDetail::CatalogRowInvalid {
+                field: "freelist chain page shorter than its header",
+            },
+        ));
+    }
+    let mut next_b = [0u8; 8];
+    next_b.copy_from_slice(&body[0..8]);
+    let next = u64::from_le_bytes(next_b);
+    let mut cnt_b = [0u8; 4];
+    cnt_b.copy_from_slice(&body[8..12]);
+    let count = u32::from_le_bytes(cnt_b) as usize;
+    if count > (body.len() - PAGE_HEADER_LEN) / ENTRY_LEN {
+        return Err(PagedbError::corruption(
+            crate::errors::CorruptionDetail::CatalogRowInvalid {
+                field: "freelist chain page entry count exceeds capacity",
+            },
+        ));
+    }
+    Ok((next, count))
+}
+
+/// Count the `(commit_id, page_id)` entries the chain rooted at `head` holds,
+/// without materialising them. `head == 0` is an empty chain.
+///
+/// The counting counterpart to [`read_chain`], for callers that need only the
+/// depth. Collecting the entries to take their length would size an allocation
+/// by how many pages the durable free list is carrying, which grows with the
+/// database; this keeps the resident cost at one page guard.
+///
+/// `page_id_bound` is the allocator's `next_page_id`. Chain pages are real
+/// allocated page ids, so a chain that visits more than `page_id_bound` pages
+/// must by pigeonhole have revisited one — that bound stands in for the visited
+/// set [`read_chain`] keeps, which is itself proportional to the chain length.
+pub async fn count_chain<V: Vfs + Clone>(
+    pager: &Pager<V>,
+    realm_id: RealmId,
+    head: u64,
+    page_id_bound: u64,
+) -> Result<u64> {
+    let mut total: u64 = 0;
+    let mut steps: u64 = 0;
+    let mut page = head;
+    while page != 0 {
+        if steps >= page_id_bound {
+            return Err(PagedbError::page_chain_cycle("free_list", page));
+        }
+        steps += 1;
+        let guard = pager.read_main_page(page, realm_id, PageKind::Free).await?;
+        let (next, count) = decode_chain_header(guard.body_ref())?;
+        total = total.saturating_add(count as u64);
+        drop(guard);
+        page = next;
+    }
+    Ok(total)
+}
+
 /// Walk the free-list chain from `head`, returning all `(commit_id, page_id)`
 /// entries and the list of page ids the chain itself occupies. `head == 0` is
 /// an empty chain.
@@ -62,24 +129,7 @@ pub async fn read_chain<V: Vfs + Clone>(
         }
         let guard = pager.read_main_page(page, realm_id, PageKind::Free).await?;
         let body = guard.body_ref();
-        let mut next_b = [0u8; 8];
-        next_b.copy_from_slice(&body[0..8]);
-        let next = u64::from_le_bytes(next_b);
-        let mut cnt_b = [0u8; 4];
-        cnt_b.copy_from_slice(&body[8..12]);
-        let count = u32::from_le_bytes(cnt_b) as usize;
-        if count > (body.len().saturating_sub(PAGE_HEADER_LEN)) / ENTRY_LEN {
-            // On-disk count cannot come from write_chain (which caps chunks at
-            // capacity): the page under the Free kind byte holds foreign or
-            // torn content. Surface corruption instead of panicking on the
-            // slice overrun below — a panic here poisons the pager mutex and
-            // wedges every subsequent commit.
-            return Err(PagedbError::corruption(
-                crate::errors::CorruptionDetail::CatalogRowInvalid {
-                    field: "freelist chain page entry count exceeds capacity",
-                },
-            ));
-        }
+        let (next, count) = decode_chain_header(body)?;
         for i in 0..count {
             let off = PAGE_HEADER_LEN + i * ENTRY_LEN;
             let mut cid_b = [0u8; 8];
@@ -252,5 +302,48 @@ mod tests {
             ),
             "expected a free-list PageChainCycle naming page 10, got {error:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_chain_rejects_cycle_without_hanging() {
+        let pager = test_pager().await;
+        let mut body = vec![0u8; body_capacity(PAGE)];
+        body[0..8].copy_from_slice(&10u64.to_le_bytes());
+        pager
+            .write_main_page(10, REALM, PageKind::Free, &body)
+            .await
+            .unwrap();
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), count_chain(&pager, REALM, 10, 11))
+                .await
+                .expect("the page-id bound should end the walk before timeout")
+                .expect_err("free-list cycles must be corruption");
+        assert!(
+            matches!(
+                error,
+                PagedbError::Corruption(crate::errors::CorruptionDetail::PageChainCycle {
+                    structure: "free_list",
+                    page_id: 10,
+                })
+            ),
+            "expected a free-list PageChainCycle naming page 10, got {error:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_chain_matches_read_chain_across_pages() {
+        let pager = test_pager().await;
+        let cap = chain_capacity(PAGE);
+        let entries: Vec<(u64, u64)> = (0..(cap * 2 + 3) as u64).map(|i| (i, i + 100)).collect();
+        let chain_pages: Vec<u64> = vec![20, 21, 22];
+        let head = write_chain(&pager, REALM, PAGE, &chain_pages, &entries)
+            .await
+            .unwrap();
+
+        let (read, _) = read_chain(&pager, REALM, head).await.unwrap();
+        let counted = count_chain(&pager, REALM, head, 64).await.unwrap();
+        assert_eq!(counted, read.len() as u64);
+        assert_eq!(counted, entries.len() as u64);
     }
 }

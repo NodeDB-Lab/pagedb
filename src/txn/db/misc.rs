@@ -119,9 +119,16 @@ impl<V: Vfs + Clone> Db<V> {
         let latest_commit_id = snapshot.commit_id;
 
         // Durable free-list depth (chain rooted at the header's free_list_root).
-        let (free_list_entries, _) =
-            crate::pager::freelist::read_chain(&self.pager, self.realm_id, free_list_root).await?;
-        let free_list_pending_entries = free_list_entries.len() as u64;
+        // Counted in place rather than collected: how many pages the free list
+        // is carrying grows with the database, and a metrics call must not size
+        // an allocation by it.
+        let free_list_pending_entries = crate::pager::freelist::count_chain(
+            &self.pager,
+            self.realm_id,
+            free_list_root,
+            next_page_id,
+        )
+        .await?;
 
         // Main database file size.
         let main_db_bytes = self
