@@ -1,10 +1,10 @@
-//! Durable rekey-intent validation and legacy admission.
+//! Durable rekey-intent validation and admission.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::Result;
-use crate::catalog::codec::{LegacyRekeyState, RekeyIntent, RekeyStage};
+use crate::catalog::codec::RekeyIntent;
 use crate::crypto::DerivedKey;
 use crate::errors::PagedbError;
 
@@ -59,49 +59,10 @@ pub(crate) fn validate_intent_for_current_cipher(
     Ok(())
 }
 
-/// Legacy rows never identify a second KEK or durable segment progress. Their
-/// only safe interpretation is a same-KEK migration whose positional index is
-/// ignored as non-authoritative.
-pub(crate) fn migrate_legacy(
-    legacy: &LegacyRekeyState,
-    source_mk_epoch: u64,
-    cipher_id: u8,
-    source_hk: &DerivedKey,
-    file_id: &[u8; 16],
-    kek_salt: &[u8; 16],
-) -> Result<RekeyIntent> {
-    if legacy.target_mk_epoch == 0 || legacy.target_mk_epoch <= source_mk_epoch {
-        return Err(PagedbError::rekey_state_invalid("rekey.target_mk_epoch"));
-    }
-    crate::crypto::CipherId::from_byte(cipher_id)?;
-    Ok(RekeyIntent {
-        source_mk_epoch,
-        target_mk_epoch: legacy.target_mk_epoch,
-        source_cipher_id: cipher_id,
-        target_cipher_id: cipher_id,
-        same_kek: true,
-        stage: if legacy.main_db_done {
-            RekeyStage::MainDone
-        } else {
-            RekeyStage::Intent
-        },
-        source_hk_proof: intent_proof(
-            source_hk,
-            file_id,
-            kek_salt,
-            source_mk_epoch,
-            legacy.target_mk_epoch,
-            source_mk_epoch,
-            cipher_id,
-        )?,
-        target_hk_proof: [0; 16],
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::codec::Catalog;
+    use crate::catalog::codec::{Catalog, RekeyStage};
 
     fn intent() -> RekeyIntent {
         RekeyIntent {
@@ -145,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_intent_rejects_checked_and_reserved_bytes() {
+    fn intent_rejects_checked_and_reserved_bytes() {
         let mut bytes = Catalog::encode_rekey_intent(&intent());
         bytes[3] = 1;
         assert!(Catalog::decode_rekey_state(&bytes).is_err());
@@ -155,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_intent_rejects_impossible_epochs() {
+    fn intent_rejects_impossible_epochs() {
         let mut invalid = intent();
         invalid.target_mk_epoch = 0;
         let bytes = Catalog::encode_rekey_intent(&invalid);
@@ -163,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_intent_rejects_cipher_transition_at_admission() {
+    fn intent_rejects_cipher_transition_at_admission() {
         let mut invalid = intent();
         invalid.target_cipher_id = 2;
         assert!(matches!(

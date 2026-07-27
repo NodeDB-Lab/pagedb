@@ -1,5 +1,6 @@
 //! Pager: cache, page envelopes, header IO, AEAD dispatch.
 
+pub(crate) mod anchor;
 pub(crate) mod cache;
 pub(crate) mod core;
 pub(crate) mod format;

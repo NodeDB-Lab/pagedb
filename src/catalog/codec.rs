@@ -62,9 +62,9 @@ impl RekeyStage {
     }
 }
 
-/// Version-one durable rekey intent. HK proofs are one-way identifiers used to
-/// validate caller-provided key material; neither KEKs nor master keys are
-/// ever persisted.
+/// Durable rekey intent. HK proofs are one-way identifiers used to validate
+/// caller-provided key material; neither KEKs nor master keys are ever
+/// persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RekeyIntent {
     pub source_mk_epoch: u64,
@@ -77,23 +77,7 @@ pub struct RekeyIntent {
     pub target_hk_proof: [u8; 16],
 }
 
-/// Old, insufficient rekey state. It is decoded only to admit a conservative
-/// same-KEK upgrade; its positional segment index is never correctness state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyRekeyState {
-    pub target_mk_epoch: u64,
-    pub main_db_done: bool,
-    pub discarded_segments_index: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RekeyStateRow {
-    V1(RekeyIntent),
-    Legacy(LegacyRekeyState),
-}
-
-pub const LEGACY_REKEY_STATE_LEN: usize = 13;
-pub const REKEY_INTENT_V1_LEN: usize = 64;
+pub const REKEY_INTENT_LEN: usize = 64;
 pub const REKEY_SEGMENT_PROGRESS_LEN: usize = 20;
 
 /// Durable state of a replacement segment recorded under its source identity.
@@ -167,9 +151,10 @@ pub struct SegmentMeta {
 
 /// Catalog value for a quota row. Default = no caps.
 ///
-/// Build one from [`RealmQuotas::default`] and assign the caps you need: the
-/// type accretes fields as new quota dimensions land, so it is
-/// `#[non_exhaustive]`.
+/// Build one from [`RealmQuotas::default`] and set the caps you need with the
+/// `with_*` builder methods — `#[non_exhaustive]` blocks struct-literal
+/// construction (including `..Default::default()`) from outside this crate,
+/// and the type accretes fields as new quota dimensions land.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RealmQuotas {
@@ -177,6 +162,36 @@ pub struct RealmQuotas {
     pub max_dirty_pages: Option<u64>,
     pub max_scratch_pages: Option<u64>,
     pub max_segment_bytes: Option<u64>,
+}
+
+impl RealmQuotas {
+    /// Set the cap on total pages the realm may own.
+    #[must_use]
+    pub fn with_max_pages(mut self, v: u64) -> Self {
+        self.max_pages = Some(v);
+        self
+    }
+
+    /// Set the cap on dirty pages the realm may hold in a single write txn.
+    #[must_use]
+    pub fn with_max_dirty_pages(mut self, v: u64) -> Self {
+        self.max_dirty_pages = Some(v);
+        self
+    }
+
+    /// Set the cap on scratch pages the realm may spill during a write txn.
+    #[must_use]
+    pub fn with_max_scratch_pages(mut self, v: u64) -> Self {
+        self.max_scratch_pages = Some(v);
+        self
+    }
+
+    /// Set the cap on total segment bytes the realm may own.
+    #[must_use]
+    pub fn with_max_segment_bytes(mut self, v: u64) -> Self {
+        self.max_segment_bytes = Some(v);
+        self
+    }
 }
 
 pub const SEGMENT_META_LEN: usize = 94;
@@ -243,10 +258,10 @@ impl Catalog {
         key
     }
 
-    /// Encode a V1 rekey intent. All reserved bytes are emitted as zero.
+    /// Encode a rekey intent. All reserved bytes are emitted as zero.
     #[must_use]
-    pub fn encode_rekey_intent(intent: &RekeyIntent) -> [u8; REKEY_INTENT_V1_LEN] {
-        let mut out = [0u8; REKEY_INTENT_V1_LEN];
+    pub fn encode_rekey_intent(intent: &RekeyIntent) -> [u8; REKEY_INTENT_LEN] {
+        let mut out = [0u8; REKEY_INTENT_LEN];
         out[0] = 1;
         out[1] = intent.stage as u8;
         out[2] = u8::from(intent.same_kek);
@@ -259,36 +274,11 @@ impl Catalog {
         out
     }
 
-    /// Decode either a fixed V1 intent or the legacy 13-byte row. Legacy
-    /// positional progress is deliberately preserved only for diagnostics.
-    pub fn decode_rekey_state(bytes: &[u8]) -> Result<RekeyStateRow> {
-        if bytes.len() == LEGACY_REKEY_STATE_LEN {
-            let target_mk_epoch =
-                u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| {
-                    PagedbError::catalog_row_invalid("rekey.legacy.target_mk_epoch")
-                })?);
-            if target_mk_epoch == 0 {
-                return Err(PagedbError::catalog_row_invalid(
-                    "rekey.legacy.target_mk_epoch",
-                ));
-            }
-            return Ok(RekeyStateRow::Legacy(LegacyRekeyState {
-                target_mk_epoch,
-                main_db_done: match bytes[8] {
-                    0 => false,
-                    1 => true,
-                    _ => {
-                        return Err(PagedbError::catalog_row_invalid(
-                            "rekey.legacy.main_db_done",
-                        ));
-                    }
-                },
-                discarded_segments_index: u32::from_le_bytes(bytes[9..13].try_into().map_err(
-                    |_| PagedbError::catalog_row_invalid("rekey.legacy.discarded_segments_index"),
-                )?),
-            }));
-        }
-        if bytes.len() != REKEY_INTENT_V1_LEN
+    /// Decode a rekey intent row. Byte 0 is the row's version tag and has a
+    /// single accepted value; any other framing is a row this build cannot
+    /// interpret.
+    pub fn decode_rekey_state(bytes: &[u8]) -> Result<RekeyIntent> {
+        if bytes.len() != REKEY_INTENT_LEN
             || bytes[0] != 1
             || bytes[3] != 0
             || bytes[22..24].iter().any(|byte| *byte != 0)
@@ -325,7 +315,7 @@ impl Catalog {
         source_hk_proof.copy_from_slice(&bytes[24..40]);
         let mut target_hk_proof = [0u8; 16];
         target_hk_proof.copy_from_slice(&bytes[40..56]);
-        Ok(RekeyStateRow::V1(RekeyIntent {
+        Ok(RekeyIntent {
             source_mk_epoch,
             target_mk_epoch,
             source_cipher_id: bytes[20],
@@ -334,7 +324,7 @@ impl Catalog {
             stage: RekeyStage::from_byte(bytes[1])?,
             source_hk_proof,
             target_hk_proof,
-        }))
+        })
     }
 
     /// Encode fixed rekey replacement progress:
@@ -567,6 +557,7 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::CorruptionDetail;
 
     #[test]
     fn quota_key_layout() {
@@ -663,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn rekey_intent_v1_round_trip() {
+    fn rekey_intent_round_trip() {
         let intent = RekeyIntent {
             source_mk_epoch: 0,
             target_mk_epoch: 27,
@@ -675,26 +666,31 @@ mod tests {
             target_hk_proof: [8; 16],
         };
         let encoded = Catalog::encode_rekey_intent(&intent);
-        assert_eq!(
-            Catalog::decode_rekey_state(&encoded).unwrap(),
-            RekeyStateRow::V1(intent)
-        );
+        assert_eq!(Catalog::decode_rekey_state(&encoded).unwrap(), intent);
     }
 
+    /// A rekey-state row is fixed width. Anything narrower or wider is a row
+    /// shape this decoder has no interpretation for, and must be refused by
+    /// framing rather than partially read.
     #[test]
-    fn legacy_rekey_state_discards_positional_progress() {
-        let mut bytes = [0u8; LEGACY_REKEY_STATE_LEN];
-        bytes[..8].copy_from_slice(&4u64.to_le_bytes());
-        bytes[8] = 1;
-        bytes[9..].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(
-            Catalog::decode_rekey_state(&bytes).unwrap(),
-            RekeyStateRow::Legacy(LegacyRekeyState {
-                target_mk_epoch: 4,
-                main_db_done: true,
-                discarded_segments_index: u32::MAX,
-            })
-        );
+    fn rekey_state_rejects_rows_that_are_not_the_fixed_width() {
+        for width in [0usize, 1, 13, REKEY_INTENT_LEN - 1, REKEY_INTENT_LEN + 1] {
+            let mut bytes = vec![0u8; width];
+            if let Some(first) = bytes.first_mut() {
+                *first = 1;
+            }
+            assert!(
+                matches!(
+                    Catalog::decode_rekey_state(&bytes),
+                    Err(PagedbError::Corruption(
+                        CorruptionDetail::CatalogRowInvalid {
+                            field: "rekey.framing"
+                        }
+                    ))
+                ),
+                "a {width}-byte rekey-state row must be rejected"
+            );
+        }
     }
 
     #[test]

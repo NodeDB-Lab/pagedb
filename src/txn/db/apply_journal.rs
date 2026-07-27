@@ -1,6 +1,7 @@
 //! Live apply-journal reconciliation after an incremental header swap.
 
 use crate::errors::PagedbError;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::Vfs;
@@ -49,10 +50,8 @@ impl<V: Vfs + Clone> Db<V> {
             SegmentReconciliation::Complete => {}
         }
 
-        let next_seq = state
-            .seq
-            .checked_add(1)
-            .ok_or_else(|| PagedbError::arithmetic_overflow("apply-journal clear sequence"))?;
+        let header_cursor = self.pager.header_cursor()?;
+        let next_seq = header_cursor.next_seq()?;
         let counter_anchor = self.pager.pending_anchor();
         let fields = cleared_header_fields(self, &state, next_seq, counter_anchor)?;
         let hk = self.hk.read().clone();
@@ -61,7 +60,7 @@ impl<V: Vfs + Clone> Db<V> {
             &self.main_db_path,
             &hk,
             &fields,
-            state.active_slot,
+            header_cursor.slot,
             self.page_size,
         )
         .await
@@ -70,6 +69,10 @@ impl<V: Vfs + Clone> Db<V> {
             self.poison(commit);
             return Err(PagedbError::durably_committed_but_unpublished(commit));
         };
+        self.pager.note_header_written(HeaderCursor {
+            slot: next_slot,
+            seq: next_seq,
+        });
 
         if self.pager.commit_anchor(counter_anchor).is_err() {
             let commit = CommitId(state.latest_commit_id);
@@ -77,8 +80,6 @@ impl<V: Vfs + Clone> Db<V> {
             return Err(PagedbError::durably_committed_but_unpublished(commit));
         }
 
-        state.active_slot = next_slot;
-        state.seq = next_seq;
         state.pending_apply_journal_id = [0; 16];
         self.publish_snapshot(&state);
         drop(state);

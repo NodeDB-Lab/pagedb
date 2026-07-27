@@ -17,6 +17,7 @@ use crate::crypto::nonce::DEFAULT_ANCHOR_BUDGET;
 use crate::crypto::nonce::{MainDbNonceGen, SegmentNonceGen};
 use crate::crypto::{Aad, CipherId, Nonce};
 use crate::errors::PagedbError;
+use crate::pager::anchor::{HeaderCursor, LiveHeader, refresh_anchor};
 use crate::pager::cache::{Page, PageCache};
 use crate::pager::format::data_page::{
     ENVELOPE_OVERHEAD, HEADER_LEN, body, extract_page_header_ids, extract_page_kind,
@@ -171,6 +172,11 @@ pub struct Pager<V: Vfs> {
     files: AsyncMutex<BTreeMap<FileKey, Arc<AsyncMutex<V::File>>>>,
     dek_lru: parking_lot::Mutex<DekLru>,
     main_nonce: parking_lot::Mutex<MainDbNonceGen>,
+    /// Header key and A/B cursor for the live `main.db`, installed by the owning
+    /// `Db` once its header has been read (or bootstrapped). `None` on a handle
+    /// that never writes a main.db header — a read-only image view — which is
+    /// also a handle that never issues a main.db nonce.
+    live_header: parking_lot::Mutex<Option<LiveHeader>>,
     segment_nonces: parking_lot::Mutex<BTreeMap<[u8; 16], SegmentNonceGen>>,
     /// Per-journal-sidecar nonce generators. Each apply allocates a fresh,
     /// never-reused `journal_id`, so a generator seeded from that id never
@@ -263,6 +269,7 @@ impl<V: Vfs + Clone> Pager<V> {
         Self {
             dek_lru: parking_lot::Mutex::new(DekLru::with_capacity(cfg.dek_lru_capacity)),
             main_nonce: parking_lot::Mutex::new(main_nonce),
+            live_header: parking_lot::Mutex::new(None),
             segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             files: AsyncMutex::new(BTreeMap::new()),
@@ -337,6 +344,7 @@ impl<V: Vfs> Pager<V> {
         Ok(Self {
             dek_lru: parking_lot::Mutex::new(DekLru::with_capacity(cfg.dek_lru_capacity)),
             main_nonce: parking_lot::Mutex::new(main_nonce),
+            live_header: parking_lot::Mutex::new(None),
             segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             files: AsyncMutex::new(BTreeMap::new()),
@@ -627,6 +635,16 @@ impl<V: Vfs> Pager<V> {
             .await
     }
 
+    /// Whether the dirty main.db page set has reached the configured
+    /// buffer-pool budget.
+    ///
+    /// Dirty pages are never evicted, so a producer that seals pages in a long
+    /// loop is the one thing that can push the pool past its budget. Such a
+    /// producer polls this and flushes when it answers `true`.
+    pub fn main_dirty_at_budget(&self) -> bool {
+        self.inner.buffer_pool.lock().dirty_len() >= self.cfg.buffer_pool_pages.max(1)
+    }
+
     /// Drop all cached main.db pages so subsequent reads re-fetch from disk.
     /// Used after compaction replaces main.db (the cached pages no longer match
     /// the on-disk file) and on a failed compaction (to discard the partially
@@ -661,6 +679,97 @@ impl<V: Vfs> Pager<V> {
     /// persisted_anchor + budget]`.
     pub fn commit_anchor(&self, persisted: u64) -> Result<()> {
         self.main_nonce.lock().commit_anchor(persisted)
+    }
+
+    /// Bind the live `main.db` header to this pager: the key its A/B slots are
+    /// MAC'd under, and which slot is currently authoritative.
+    ///
+    /// Called once by each writable `Db` constructor. Until it is called the
+    /// pager cannot refresh the nonce anchor on its own, and a long run of
+    /// nonces fails at the budget exactly as it did before.
+    pub(crate) fn bind_live_header(
+        &self,
+        hk: Arc<parking_lot::RwLock<crate::crypto::keys::DerivedKey>>,
+        cursor: HeaderCursor,
+    ) {
+        *self.live_header.lock() = Some(LiveHeader { hk, cursor });
+    }
+
+    /// The slot and sequence the next `main.db` header write must use.
+    ///
+    /// Every writer path takes its A/B slot from here rather than from its own
+    /// state, because an anchor refresh can have moved the cursor since the last
+    /// commit without changing anything a commit would notice.
+    pub(crate) fn header_cursor(&self) -> Result<HeaderCursor> {
+        self.live_header
+            .lock()
+            .as_ref()
+            .map(|live| live.cursor)
+            .ok_or_else(|| PagedbError::structural_header_invalid("main.db", "header_cursor"))
+    }
+
+    /// Record a header this writer just made durable, so the next write — by a
+    /// commit or by an anchor refresh — targets the other slot.
+    pub(crate) fn note_header_written(&self, cursor: HeaderCursor) {
+        let mut live_header = self.live_header.lock();
+        if let Some(live) = live_header.as_mut() {
+            live.cursor = cursor;
+        }
+    }
+
+    /// How many more main.db nonces can be issued before the durable anchor has
+    /// to be advanced.
+    pub(crate) fn main_anchor_window(&self) -> u64 {
+        self.main_nonce.lock().window_remaining()
+    }
+
+    /// The anchor value currently recorded in the durable header. Tests assert
+    /// on it to prove an operation advanced the anchor as it ran, rather than
+    /// merely fitting inside a wider window.
+    #[cfg(test)]
+    pub(crate) fn durable_anchor(&self) -> u64 {
+        self.main_nonce.lock().durable_anchor()
+    }
+
+    /// Make the nonces issued so far durable by writing them into the live
+    /// header, changing nothing else, and reopen the issuing window.
+    ///
+    /// Safe to call at any point in any operation: the header written here names
+    /// exactly the state that was already durable, so it publishes nothing and a
+    /// crash straight afterwards reopens at the same commit. See
+    /// [`crate::pager::anchor`] for the full argument.
+    pub(crate) async fn refresh_main_anchor(&self) -> Result<()> {
+        let binding = {
+            let live_header = self.live_header.lock();
+            live_header
+                .as_ref()
+                .map(|live| (live.hk.clone(), live.cursor))
+        };
+        let Some((hk_handle, cursor)) = binding else {
+            // No live header bound: the caller is a read-only view, which has no
+            // business issuing main.db nonces at all. Report the same exhaustion
+            // the nonce generator would.
+            return Err(PagedbError::Aborted);
+        };
+        let anchor = self.main_nonce.lock().pending_anchor();
+        // Clone out of the lock: a rekey may swap the header key, and no
+        // `parking_lot` guard may cross the header write's awaits.
+        let hk = hk_handle.read().clone();
+        let next = refresh_anchor(
+            &self.vfs,
+            &self.cfg.main_db_path,
+            &hk,
+            cursor,
+            anchor,
+            self.cfg.page_size,
+        )
+        .await?;
+        // Only now is the anchor durable, so only now may the generator issue
+        // past it. A crash before this point leaves the old anchor authoritative
+        // and no nonce beyond it was ever issued.
+        self.main_nonce.lock().commit_anchor(anchor)?;
+        self.note_header_written(next);
+        Ok(())
     }
 
     /// Replace the main.db nonce generator with one recovered from a
@@ -996,9 +1105,29 @@ impl<V: Vfs> Pager<V> {
 
         // Pre-allocate a nonce per page (counter increments — single-threaded
         // by design; cheap).
+        //
+        // main.db nonces are drawn from the window the durable anchor opens, and
+        // that window is refreshed here rather than being assumed wide enough.
+        // The first refresh of a run lands immediately after the *previous*
+        // flush's `sync`, so the anchor is only ever made durable for nonces
+        // whose pages already are. A dirty set larger than one whole budget
+        // refreshes again mid-allocation; that anchor covers nonces this flush
+        // has claimed but not yet written, which is over-advancing — it can only
+        // skip counter values, never repeat one.
         let mut nonces: Vec<Nonce> = Vec::with_capacity(prepared.len());
-        for _ in 0..prepared.len() {
-            nonces.push(self.next_nonce_for_flush(file)?);
+        while nonces.len() < prepared.len() {
+            let still_needed = prepared.len() - nonces.len();
+            let mut window = self.flush_nonce_window(file);
+            if window < still_needed {
+                self.refresh_main_anchor().await?;
+                window = self.flush_nonce_window(file);
+            }
+            // A window of zero after a refresh means the configured budget
+            // cannot cover a single page; issue anyway so the generator reports
+            // the real exhaustion rather than looping here.
+            for _ in 0..window.min(still_needed).max(1) {
+                nonces.push(self.next_nonce_for_flush(file)?);
+            }
         }
 
         // Derive the per-realm DEK cipher ONCE before the parallel seal. All
@@ -1112,6 +1241,17 @@ impl<V: Vfs> Pager<V> {
         }
         files.insert(file, opened.clone());
         Ok(opened)
+    }
+
+    /// How many nonces this flush may still issue before its generator needs an
+    /// anchor commit. Only `main.db` has an anchor: segment and apply-journal
+    /// counters are committed whole by their own seal record, so their window is
+    /// unbounded here.
+    fn flush_nonce_window(&self, file: FileKey) -> usize {
+        match file {
+            FileKey::Main => usize::try_from(self.main_anchor_window()).unwrap_or(usize::MAX),
+            FileKey::Segment(_) | FileKey::ApplyJournal(_) => usize::MAX,
+        }
     }
 
     fn next_nonce_for_flush(&self, file: FileKey) -> Result<Nonce> {

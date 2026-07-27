@@ -733,6 +733,99 @@ async fn bulk_load_rejects_non_strict_key_order_without_poisoning_tree() {
     }
 }
 
+/// The streaming loader carries the strictly-increasing check across `push`
+/// calls, so a caller feeding it batch by batch is held to exactly the contract
+/// a caller handing over the whole input is held to.
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_loader_rejects_non_increasing_keys_across_pushes() {
+    for second_key in [b"a".as_slice(), b"b".as_slice()] {
+        let pager = fresh_pager().await;
+        let mut tree = fresh_tree(pager);
+        {
+            let mut loader = tree.bulk_loader().unwrap();
+            loader.push(b"b".to_vec(), b"one".to_vec()).await.unwrap();
+            let error = loader
+                .push(second_key.to_vec(), b"two".to_vec())
+                .await
+                .expect_err("descending and duplicate keys must both be rejected");
+            assert!(
+                matches!(error, PagedbError::BulkLoadNotMonotonic),
+                "expected BulkLoadNotMonotonic, got {error:?}"
+            );
+        }
+        assert_eq!(tree.root_page_id(), 0);
+        assert_eq!(tree.next_page_id(), 4);
+    }
+}
+
+/// The record preflight runs before the record allocates anything, so a rejected
+/// key leaves the allocator exactly where it was.
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_loader_rejects_oversized_key_before_allocating() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    // Fits a leaf but cannot fit an internal separator.
+    let key_len = body_capacity(PAGE) - 32;
+    {
+        let mut loader = tree.bulk_loader().unwrap();
+        let error = loader
+            .push(vec![b'a'; key_len], Vec::new())
+            .await
+            .expect_err("a key too large to separate must be rejected");
+        assert!(matches!(error, PagedbError::PayloadTooLarge));
+    }
+    assert_eq!(tree.root_page_id(), 0);
+    assert_eq!(
+        tree.next_page_id(),
+        4,
+        "the preflight must reject before any page is allocated"
+    );
+}
+
+/// A tree built by pushing records through the loader must be a well-formed
+/// multi-level tree: every record present, in order, overflow values resolved,
+/// and no dangling child or overflow pointer.
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_loader_builds_a_multi_level_tree_that_scans_in_order() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    // Inline values wide enough that a few records fill a leaf, so the record
+    // count below produces enough leaves to need more than one internal level.
+    let inline = vec![0x2Bu8; 900];
+    let spilled = vec![0xB4u8; PAGE]; // > PAGE/4 → overflow chain
+    let n = 1200usize;
+
+    {
+        let mut loader = tree.bulk_loader().unwrap();
+        for i in 0..n {
+            let value = if i % 11 == 0 { &spilled } else { &inline };
+            loader
+                .push(format!("k-{i:05}").into_bytes(), value.clone())
+                .await
+                .unwrap();
+        }
+        loader.finish().await.unwrap();
+    }
+
+    assert_ne!(tree.root_page_id(), 0);
+    assert!(
+        tree.find_dangling().await.is_none(),
+        "streamed tree must be structurally intact"
+    );
+
+    let all = tree.collect_all().await.unwrap();
+    assert_eq!(all.len(), n);
+    for (i, (key, value)) in all.iter().enumerate() {
+        assert_eq!(key.as_slice(), format!("k-{i:05}").as_bytes());
+        let want = if i % 11 == 0 { &spilled } else { &inline };
+        assert_eq!(value, want, "value mismatch at record {i}");
+    }
+    assert_eq!(
+        tree.get(b"k-00777").await.unwrap().as_deref(),
+        Some(inline.as_slice())
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn put_rejects_oversized_key_without_poisoning_tree() {
     let pager = fresh_pager().await;

@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, RealmQuotas};
 use crate::errors::PagedbError;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
 use crate::vfs::Vfs;
 use crate::{RealmId, Result};
@@ -137,10 +138,8 @@ impl<V: Vfs + Clone> Db<V> {
             .checked_add(1)
             .ok_or_else(|| PagedbError::arithmetic_overflow("catalog transaction id"))?;
 
-        let new_seq = state
-            .seq
-            .checked_add(1)
-            .ok_or_else(|| PagedbError::arithmetic_overflow("catalog header sequence"))?;
+        let header_cursor = self.pager.header_cursor()?;
+        let new_seq = header_cursor.next_seq()?;
         let counter_anchor = self.pager.pending_anchor();
         let catalog_root_bytes = encode_root_ref(new_catalog_root, new_catalog_txn_id);
 
@@ -163,16 +162,18 @@ impl<V: Vfs + Clone> Db<V> {
             &self.main_db_path,
             &hk_clone,
             &fields,
-            state.active_slot,
+            header_cursor.slot,
             self.page_size,
         )
         .await?;
+        self.pager.note_header_written(HeaderCursor {
+            slot: new_slot,
+            seq: new_seq,
+        });
 
         state.catalog_root_page_id = new_catalog_root;
         state.catalog_root_txn_id = new_catalog_txn_id;
         state.next_page_id = new_next;
-        state.active_slot = new_slot;
-        state.seq = new_seq;
         let _ = self
             .finish_durable_commit(
                 &state,

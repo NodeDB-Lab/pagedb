@@ -629,6 +629,109 @@ async fn promote_to_follower_allows_apply() {
     std::fs::remove_dir_all(&delta_dir).ok();
 }
 
+/// An incremental apply seals the follower's own relocated metadata into the
+/// staged image and writes no header until the swap, so — like a compaction
+/// rebuild — that whole run draws nonces from one anchor window.
+///
+/// The delta pages are copied verbatim and cost no nonces, so the only thing
+/// that makes this path consume any is the follower's own bookkeeping:
+/// `stage_reclaimed_free_list` rewrites the *complete* chain, one page per 252
+/// entries, and its entry set is `base-reader-visible − target-reachable`. A
+/// fixture whose target still reaches everything the base did therefore reclaims
+/// nothing and seals a single page — which an unbounded implementation would
+/// pass just as happily. So the source deletes the bulk of an overflow-backed
+/// tree between the base and the target: ~1500 pages that were live at the base
+/// and are not live at the target, which is six-plus chain pages the follower
+/// must seal in one flush.
+///
+/// The assertion is that the anchor ends more than a whole budget above where it
+/// started. One window carries at most `budget` nonces, so nothing but a refresh
+/// *during* the apply can satisfy it — widening the window cannot.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_is_not_bounded_by_the_anchor_budget() {
+    const BUDGET: u64 = 2;
+    const ROWS: u32 = 1600;
+    const KEPT: u32 = 100;
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dir = tempdir();
+
+    let db = make_db(&src_dir).await;
+    // Values above a quarter page each take an overflow page, so the base tree
+    // is roughly one page per row — the supply the deletion below turns into
+    // reclaimed ids.
+    let spilled = vec![0xA7u8; 3000];
+    for chunk in 0..4u32 {
+        let mut txn = db.begin_write().await.unwrap();
+        for index in 0..(ROWS / 4) {
+            txn.put(
+                format!("row-{:05}", chunk * (ROWS / 4) + index).as_bytes(),
+                &spilled,
+            )
+            .await
+            .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let base = db.latest_commit();
+    db.snapshot_to(&snap_dir).await.unwrap();
+
+    // Everything dropped here is a page the base commit reached and the target
+    // does not, which is exactly the follower's reclaim set.
+    {
+        let mut txn = db.begin_write().await.unwrap();
+        for index in KEPT..ROWS {
+            txn.delete(format!("row-{index:05}").as_bytes())
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let target = db.latest_commit();
+    db.snapshot_incremental_to(base, &delta_dir).await.unwrap();
+    drop(db);
+
+    let restored = Db::<TokioVfs>::restore_from(
+        &snap_dir,
+        &dst_dir,
+        OpenOptions::default().with_anchor_budget(BUDGET),
+        KEK,
+    )
+    .await
+    .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let before = follower.pager.durable_anchor();
+    follower
+        .apply_incremental(&delta_dir)
+        .await
+        .expect("an apply must not be bounded by the anchor budget");
+    let after = follower.pager.durable_anchor();
+    assert_eq!(follower.latest_commit(), target);
+    assert!(
+        after > before.saturating_add(BUDGET),
+        "the staging flush must advance the anchor past a whole window; it moved \
+         from {before} to {after} with a budget of {BUDGET}"
+    );
+
+    let rtxn = follower.begin_read().await.unwrap();
+    assert_eq!(
+        rtxn.get(b"row-00000").await.unwrap().as_deref(),
+        Some(spilled.as_slice()),
+        "a surviving row must read back after the apply"
+    );
+    assert!(
+        rtxn.get(b"row-01599").await.unwrap().is_none(),
+        "a deleted row must not survive the apply"
+    );
+
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+}
+
 /// A writer that recycles pages between the base and target commits still
 /// produces an applicable delta.
 ///

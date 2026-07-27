@@ -10,7 +10,6 @@ use crate::crypto::CipherId;
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
 use crate::pager::Pager;
-use crate::pager::header::ActiveSlot;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::Vfs;
 use crate::{CommitId, RealmId, Result};
@@ -72,12 +71,15 @@ pub(crate) enum RekeyTestFault {
     ProgressDeletion,
 }
 
+/// The A/B slot and sequence a header write must use are deliberately absent
+/// here: they live in the Pager's header cursor, which an anchor refresh can
+/// advance between two commits without the writer being involved. Two copies
+/// would let a refresh and a commit disagree about which slot is live, and the
+/// loser of that disagreement is a committed transaction.
 pub(crate) struct WriterState {
     pub root_page_id: u64,
     pub next_page_id: u64,
-    pub active_slot: ActiveSlot,
     pub latest_commit_id: u64,
-    pub seq: u64,
     pub catalog_root_page_id: u64,
     pub catalog_root_txn_id: u64,
     /// Head page id of the durable free-list chain (0 = empty). Stored in the
@@ -117,8 +119,9 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) page_size: usize,
     /// Header Key (HK) used to sign A/B header commits. Held in an `RwLock`
     /// so it can be updated atomically during an online rekey without
-    /// rebuilding the `Db` handle.
-    pub(crate) hk: parking_lot::RwLock<crate::crypto::keys::DerivedKey>,
+    /// rebuilding the `Db` handle, and behind an `Arc` because the Pager holds
+    /// the same handle to sign the anchor refreshes it writes on its own.
+    pub(crate) hk: Arc<parking_lot::RwLock<crate::crypto::keys::DerivedKey>>,
     pub(crate) main_db_path: String,
     pub(crate) vfs: Arc<V>,
     pub(crate) writer: Arc<AsyncMutex<WriterState>>,

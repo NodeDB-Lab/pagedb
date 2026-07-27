@@ -100,10 +100,15 @@ pub struct OpenOptions {
     /// [`DbStats`]: crate::DbStats
     pub metrics_enabled: bool,
 
-    /// Maximum number of nonces the main-db Pager may issue between A/B
-    /// header commits. A single write transaction cannot produce more than
-    /// this many newly-encrypted pages — exceed it and the txn aborts. Large
-    /// bulk loads need a larger budget. Default: 1024.
+    /// Maximum number of nonces the main-db Pager may issue between durable
+    /// nonce-anchor writes.
+    ///
+    /// It bounds how far the counter may run ahead of the anchor recorded in the
+    /// A/B header, not how much work an operation may do: a run that would
+    /// exhaust the window rewrites the live header with a larger anchor and
+    /// nothing else changed, then continues. A smaller budget therefore costs
+    /// extra header writes on large operations, and a crash re-opens having
+    /// skipped at most one budget's worth of counter values. Default: 1024.
     pub anchor_budget: u64,
 }
 
@@ -182,8 +187,9 @@ impl OpenOptions {
         self
     }
 
-    /// Set the main-db Pager's nonce anchor budget (max nonces per txn).
-    /// Bulk loads need a larger value. Default: 1024.
+    /// Set how far the main-db nonce counter may run ahead of the anchor in the
+    /// durable header. A larger value trades a wider post-crash counter skip for
+    /// fewer anchor writes during large operations. Default: 1024.
     #[must_use]
     pub fn with_anchor_budget(mut self, v: u64) -> Self {
         self.anchor_budget = v;

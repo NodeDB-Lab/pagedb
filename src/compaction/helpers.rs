@@ -1,11 +1,12 @@
-//! Internal helpers shared by `compact_now` and `compact_step`: range
-//! collection, catalog splitting, segment housekeeping, and header construction.
+//! Internal helpers shared by `compact_now` and `compact_step`: streaming tree
+//! rebuild, catalog row paging, segment housekeeping, and header construction.
 
 use std::sync::Arc;
 
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, CatalogRowKind, SegmentMeta};
 use crate::errors::PagedbError;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::txn::db::{Db, WriterState};
@@ -13,38 +14,84 @@ use crate::txn::write::SegmentSideEffect;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 
-/// Collect all key-value pairs from a tree via a full leaf-level scan.
+/// Records read from the source tree per batch while a repack streams it.
 ///
-/// Must stay unbounded: a dense repack rebuilds the tree from exactly what
-/// this returns, so a range scan against any invented maximum key would drop
-/// records at the top of the keyspace and publish a truncated-but-consistent
-/// tree — durable, silent data loss rather than a read error.
-pub(super) async fn collect_all_pairs<V: Vfs + Clone>(
-    tree: &BTree<V>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    tree.collect_all().await
-}
+/// One batch is the whole of what the repack holds of the source; the compacted
+/// side holds one leaf plus one internal node per level. Neither scales with the
+/// size of the store.
+const REPACK_RECORD_BATCH: usize = 256;
 
-/// Collect every catalog row, for rebuilding the catalog tree during a dense
-/// repack. Free pages are tracked in the durable free-list chain (reset
-/// separately by the repack), not in the catalog, so there are no housekeeping
-/// rows to filter here.
-pub(super) async fn collect_catalog_split<V: Vfs + Clone>(
-    pager: &Arc<crate::pager::Pager<V>>,
-    realm_id: crate::RealmId,
-    state: &WriterState,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    if state.catalog_root_page_id == 0 {
-        return Ok(Vec::new());
-    }
-    let tree = BTree::open(
-        pager.clone(),
-        realm_id,
-        state.catalog_root_page_id,
-        state.next_page_id,
-        pager.page_size(),
+/// Rebuild every record of the tree rooted at `source_root` into `dest` as a
+/// dense tree, streaming the source in bounded batches.
+///
+/// `keep` selects which rows carry over; rejected rows are dropped from the
+/// compacted tree.
+///
+/// The source is walked with no upper key bound — it is read to the end and cut
+/// off at the batch limit — because keys are arbitrary byte strings with no
+/// reserved sentinel and no length ceiling: a scan bounded by any invented
+/// maximum would drop the records at the top of the keyspace and publish a
+/// truncated-but-internally-consistent tree, which is silent durable data loss.
+/// Each batch resumes at the last key with a `0x00` byte appended, the exact
+/// successor in the key ordering, so paging never skips or repeats a record.
+///
+/// Compacted pages are flushed to `scratch` and dropped from the cache before
+/// every source read. That bounds the dirty set, and it is also required for
+/// correctness: the compacted tree addresses the same page-id space as the
+/// source and both are cached under the main file key, so a compacted page left
+/// resident would answer a source read with the wrong page. After the drop, the
+/// source reads come from the untouched `main.db` on disk.
+pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
+    db: &Db<V>,
+    scratch: &str,
+    source_root: u64,
+    source_next: u64,
+    dest: &mut BTree<V>,
+    keep: impl Fn(&[u8]) -> bool + Send,
+) -> Result<()> {
+    let source = BTree::open(
+        db.pager.clone(),
+        db.realm_id,
+        source_root,
+        source_next,
+        db.page_size,
     );
-    collect_all_pairs(&tree).await
+    let mut loader = dest.bulk_loader()?;
+    let mut cursor: Vec<u8> = Vec::new();
+    loop {
+        db.pager.flush_main_to(db.realm_id, scratch).await?;
+        db.pager.reset_main_pages();
+
+        let batch = source
+            .collect_batch_from(&cursor, REPACK_RECORD_BATCH)
+            .await?;
+        let Some((last_key, _)) = batch.last() else {
+            break;
+        };
+        cursor.clear();
+        cursor.extend_from_slice(last_key);
+        cursor.push(0);
+        let exhausted = batch.len() < REPACK_RECORD_BATCH;
+
+        for (key, value) in batch {
+            if !keep(&key) {
+                continue;
+            }
+            loader.push(key, value).await?;
+            // A compacted page is written once and never read back, so flushing
+            // it out mid-batch costs nothing and keeps the pool from growing
+            // with the tree instead of with the budget.
+            if db.pager.main_dirty_at_budget() {
+                db.pager.flush_main_to(db.realm_id, scratch).await?;
+                db.pager.reset_main_pages();
+            }
+        }
+
+        if exhausted {
+            break;
+        }
+    }
+    loader.finish().await
 }
 
 /// Catalog segment rows read per batch while compaction walks them. A row is a
@@ -118,7 +165,8 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     let new_cat_root = cat_tree.root_page_id();
     let new_next = cat_tree.next_page_id().max(state.next_page_id);
     let new_commit_id = state.latest_commit_id + 1;
-    let new_seq = state.seq + 1;
+    let header_cursor = db.pager.header_cursor()?;
+    let new_seq = header_cursor.next_seq()?;
     let counter_anchor = db.pager.pending_anchor();
 
     let mut catalog_root_bytes = [0u8; 16];
@@ -156,17 +204,19 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
         &db.main_db_path,
         &hk_clone,
         &fields,
-        state.active_slot,
+        header_cursor.slot,
         db.page_size,
     )
     .await?;
+    db.pager.note_header_written(HeaderCursor {
+        slot: new_slot,
+        seq: new_seq,
+    });
     // The catalog is durable at this point. Preserve its state internally but
     // retain the prior reader snapshot until segment replacement is reconciled.
     state.catalog_root_page_id = new_cat_root;
     state.catalog_root_txn_id = new_commit_id;
     state.next_page_id = new_next;
-    state.active_slot = new_slot;
-    state.seq = new_seq;
     state.latest_commit_id = new_commit_id;
 
     let effects = [

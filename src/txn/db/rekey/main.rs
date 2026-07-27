@@ -7,11 +7,12 @@ use subtle::ConstantTimeEq;
 
 use crate::Result;
 use crate::btree::BTree;
-use crate::catalog::codec::{Catalog, RekeyIntent, RekeyStage, RekeyStateRow};
+use crate::catalog::codec::{Catalog, RekeyIntent, RekeyStage};
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::{CipherId, DerivedKey, MasterKey, SecretKey};
 use crate::errors::PagedbError;
 use crate::pager::PageKind;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::{OpenMode, Vfs, VfsFile, read_exact_at};
@@ -21,7 +22,7 @@ use super::super::core::RekeyTestFault;
 use super::super::core::{
     Db, WriterState, decode_commit_meta, encode_free_list_root, encode_root_ref,
 };
-use super::intent::{intent_proof, migrate_legacy, validate_intent_for_current_cipher};
+use super::intent::{intent_proof, validate_intent_for_current_cipher};
 
 /// Commit-history rows read per batch while rekeying the roots they name.
 /// Rows are 40 bytes, so this is a few KiB resident regardless of how deep
@@ -502,26 +503,9 @@ impl<V: Vfs + Clone> Db<V> {
         let Some(bytes) = tree.get(&Catalog::rekey_state_key()).await? else {
             return Ok(None);
         };
-        match Catalog::decode_rekey_state(&bytes)? {
-            RekeyStateRow::V1(intent) => {
-                validate_intent_for_current_cipher(&intent, self.cipher_id.as_byte())?;
-                Ok(Some(intent))
-            }
-            RekeyStateRow::Legacy(legacy) => {
-                let source_epoch = self.mk_epoch.load(Ordering::SeqCst);
-                let source_header_key = self.hk.read().clone();
-                let intent = migrate_legacy(
-                    &legacy,
-                    source_epoch,
-                    self.cipher_id.as_byte(),
-                    &source_header_key,
-                    &self.file_id,
-                    &self.kek_salt,
-                )?;
-                validate_intent_for_current_cipher(&intent, self.cipher_id.as_byte())?;
-                Ok(Some(intent))
-            }
-        }
+        let intent = Catalog::decode_rekey_state(&bytes)?;
+        validate_intent_for_current_cipher(&intent, self.cipher_id.as_byte())?;
+        Ok(Some(intent))
     }
 
     pub(super) async fn write_rekey_intent_locked(
@@ -671,10 +655,11 @@ impl<V: Vfs + Clone> Db<V> {
             .record_rekey_freed_pages(state, freed_pages, next_page_id)
             .await?;
         let next_page_id = next_page_id.max(state.next_page_id);
-        let new_seq = state
-            .seq
-            .checked_add(1)
-            .ok_or_else(|| PagedbError::arithmetic_overflow("rekey header sequence"))?;
+        // Re-sealing pages under the target epoch refreshes the anchor whenever
+        // the window runs out, so the live cursor — not this writer's memory of
+        // it — names the slot this header supersedes.
+        let header_cursor = self.pager.header_cursor()?;
+        let new_seq = header_cursor.next_seq()?;
         let counter_anchor = self.pager.pending_anchor();
         let fields = self.rekey_header_fields(
             state,
@@ -688,14 +673,14 @@ impl<V: Vfs + Clone> Db<V> {
             &self.main_db_path,
             hk,
             &fields,
-            state.active_slot,
+            header_cursor.slot,
             self.page_size,
         )
         .await?;
+        self.pager
+            .note_header_written(HeaderCursor { slot, seq: new_seq });
         state.catalog_root_page_id = catalog_root_page_id;
         state.next_page_id = next_page_id;
-        state.active_slot = slot;
-        state.seq = new_seq;
         self.finish_durable_commit(
             state,
             crate::CommitId(state.latest_commit_id),
@@ -840,6 +825,55 @@ mod tests {
         assert_eq!(
             reader.get(b"preserved").await.unwrap().as_deref(),
             Some(b"source-epoch".as_slice())
+        );
+    }
+
+    /// A rekey re-seals every reachable page and writes no header between the
+    /// intent row and the target-header publication, so the whole re-seal draws
+    /// nonces from one anchor window. On a store larger than that window it must
+    /// still complete — and the anchor must end more than a whole budget above
+    /// where it started, which only an advance *during* the re-seal can produce.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rekey_is_not_bounded_by_the_anchor_budget() {
+        const BUDGET: u64 = 64;
+        let vfs = MemVfs::new();
+        let db = Db::open_internal_with_options(
+            vfs,
+            SOURCE_KEK,
+            PAGE,
+            REALM,
+            crate::OpenOptions::default().with_anchor_budget(BUDGET),
+        )
+        .await
+        .unwrap();
+
+        let spilled = vec![0x5Eu8; 3000]; // each value takes an overflow page
+        for round in 0..8u32 {
+            let mut txn = db.begin_write().await.unwrap();
+            for index in 0..40u32 {
+                txn.put(format!("r-{round:02}-{index:04}").as_bytes(), &spilled)
+                    .await
+                    .unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+
+        let before = db.pager.durable_anchor();
+        db.rekey_db(TARGET_KEK, 1)
+            .await
+            .expect("a rekey must not be bounded by the anchor budget");
+        let after = db.pager.durable_anchor();
+        assert!(
+            after > before.saturating_add(BUDGET),
+            "the re-seal must advance the anchor past a whole window; it moved \
+             from {before} to {after} with a budget of {BUDGET}"
+        );
+
+        let reader = db.begin_read().await.unwrap();
+        assert_eq!(
+            reader.get(b"r-07-0039").await.unwrap().as_deref(),
+            Some(spilled.as_slice()),
+            "a rekeyed store must read back under the target key"
         );
     }
 
@@ -1084,8 +1118,11 @@ mod tests {
         assert!(resumed.open_segment(REALM, "boundary").await.is_ok());
     }
 
+    /// A rekey-state row of an unrecognised shape names a transition this
+    /// build cannot reason about. Recovery must refuse the whole database
+    /// rather than guess at a migration and rotate keys on the guess.
     #[tokio::test(flavor = "current_thread")]
-    async fn legacy_intent_is_migrated_conservatively_during_recovery() {
+    async fn unrecognised_rekey_state_row_fails_recovery() {
         let vfs = MemVfs::new();
         let db = Db::open_internal(vfs.clone(), SOURCE_KEK, PAGE, REALM)
             .await
@@ -1095,12 +1132,12 @@ mod tests {
             .await
             .unwrap();
         writer
-            .append_page(SegmentPageKind::Data, b"legacy-intent")
+            .append_page(SegmentPageKind::Data, b"segment-data")
             .await
             .unwrap();
         let meta = writer.seal().await.unwrap();
         let mut txn = db.begin_write().await.unwrap();
-        txn.link_segment("legacy", &meta).await.unwrap();
+        txn.link_segment("linked", &meta).await.unwrap();
         txn.commit().await.unwrap();
 
         let mut state = db.writer.lock().await;
@@ -1111,10 +1148,10 @@ mod tests {
             state.next_page_id,
             db.page_size,
         );
-        let mut legacy = [0u8; crate::catalog::codec::LEGACY_REKEY_STATE_LEN];
-        legacy[..8].copy_from_slice(&1u64.to_le_bytes());
+        let mut off_width = [0u8; 13];
+        off_width[..8].copy_from_slice(&1u64.to_le_bytes());
         catalog
-            .put(&Catalog::rekey_state_key(), &legacy)
+            .put(&Catalog::rekey_state_key(), &off_width)
             .await
             .unwrap();
         catalog.flush().await.unwrap();
@@ -1136,20 +1173,17 @@ mod tests {
         drop(state);
         drop(db);
 
-        let reopened = Db::open_existing(vfs, SOURCE_KEK, PAGE, REALM)
-            .await
-            .unwrap();
-        let reader = reopened.open_segment(REALM, "legacy").await.unwrap();
+        let reopened = Db::open_existing(vfs, SOURCE_KEK, PAGE, REALM).await;
         assert!(
-            reader
-                .read_page(1)
-                .await
-                .unwrap()
-                .starts_with(b"legacy-intent")
-        );
-        assert_eq!(
-            reopened.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
-            1
+            matches!(
+                reopened,
+                Err(PagedbError::Corruption(
+                    crate::errors::CorruptionDetail::CatalogRowInvalid {
+                        field: "rekey.framing"
+                    }
+                ))
+            ),
+            "expected a typed catalog-row rejection, got a different outcome"
         );
     }
 
@@ -1174,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_cipher_v1_intent_is_rejected_by_codec_before_admission() {
+    fn mixed_cipher_intent_is_rejected_by_codec_before_admission() {
         let intent = RekeyIntent {
             source_mk_epoch: 0,
             target_mk_epoch: 1,

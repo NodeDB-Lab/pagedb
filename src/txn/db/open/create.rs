@@ -8,6 +8,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::{CipherId, SecretKey};
 use crate::options::OpenOptions;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::{ActiveSlot, bootstrap_header};
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::pager::{Pager, PagerConfig};
@@ -54,9 +55,7 @@ impl<V: Vfs + Clone> Db<V> {
         let writer = WriterState {
             root_page_id: 0,
             next_page_id: 4,
-            active_slot: ActiveSlot::A,
             latest_commit_id: 0,
-            seq: 1,
             catalog_root_page_id: 0,
             catalog_root_txn_id: 0,
             free_list_root_page_id: 0,
@@ -68,11 +67,22 @@ impl<V: Vfs + Clone> Db<V> {
             commit_retain_policy_tag: initial.commit_retain_policy_tag,
             commit_retain_policy_value: initial.commit_retain_policy_value,
         };
+        // `bootstrap_header` has just written slot A at `seq` 1, so that is where
+        // the A/B protocol continues from — for ordinary commits and for the
+        // pager's own anchor refreshes alike.
+        let hk = Arc::new(parking_lot::RwLock::new(hk));
+        pager.bind_live_header(
+            hk.clone(),
+            HeaderCursor {
+                slot: ActiveSlot::A,
+                seq: initial.seq,
+            },
+        );
         Self {
             pager: Arc::new(pager),
             realm_id,
             page_size,
-            hk: parking_lot::RwLock::new(hk),
+            hk,
             main_db_path,
             vfs,
             writer: Arc::new(AsyncMutex::new(writer)),

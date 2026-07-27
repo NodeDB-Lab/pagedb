@@ -9,6 +9,7 @@ use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::{CipherId, SecretKey};
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::ActiveSlot;
 use crate::pager::header::read_header_slot;
 use crate::pager::structural_header::MainDbHeaderFields;
@@ -209,9 +210,7 @@ impl<V: Vfs + Clone> Db<V> {
         let writer = WriterState {
             root_page_id: fields.active_root_page_id,
             next_page_id: fields.next_page_id,
-            active_slot,
             latest_commit_id: latest_commit,
-            seq: fields.seq,
             catalog_root_page_id,
             catalog_root_txn_id,
             free_list_root_page_id: super::super::core::decode_free_list_root(
@@ -229,11 +228,23 @@ impl<V: Vfs + Clone> Db<V> {
             commit_retain_policy_value: fields.commit_retain_policy_value,
         };
 
+        // The slot just selected is where the A/B protocol resumes. Binding it to
+        // the pager is what lets a long nonce run refresh the anchor in place
+        // without a commit.
+        let hk = Arc::new(parking_lot::RwLock::new(hk));
+        pager.bind_live_header(
+            hk.clone(),
+            HeaderCursor {
+                slot: active_slot,
+                seq: fields.seq,
+            },
+        );
+
         let db = Self {
             pager: Arc::new(pager),
             realm_id: realm,
             page_size,
-            hk: parking_lot::RwLock::new(hk),
+            hk,
             main_db_path,
             vfs: vfs_arc,
             writer: Arc::new(AsyncMutex::new(writer)),

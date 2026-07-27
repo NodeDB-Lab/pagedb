@@ -9,9 +9,8 @@
 //! so far.
 
 use crate::catalog::codec::{
-    Catalog, LegacyRekeyState, REALM_QUOTAS_LEN, REKEY_INTENT_V1_LEN, REKEY_SEGMENT_PROGRESS_LEN,
-    RekeyIntent, RekeySegmentProgress, RekeySegmentProgressState, RekeyStage, RekeyStateRow,
-    SEGMENT_META_LEN, SegmentKind,
+    Catalog, REALM_QUOTAS_LEN, REKEY_INTENT_LEN, REKEY_SEGMENT_PROGRESS_LEN, RekeyIntent,
+    RekeySegmentProgress, RekeySegmentProgressState, RekeyStage, SEGMENT_META_LEN, SegmentKind,
 };
 use crate::crypto::CipherId;
 use crate::{CommitId, Evictable, RealmId, RealmQuotas, SegmentMeta};
@@ -110,7 +109,7 @@ proptest! {
             13,
             REKEY_SEGMENT_PROGRESS_LEN,
             REALM_QUOTAS_LEN,
-            REKEY_INTENT_V1_LEN,
+            REKEY_INTENT_LEN,
             SEGMENT_META_LEN,
         ]),
         filler in prop::collection::vec(any::<u8>(), 0..=SEGMENT_META_LEN + 8),
@@ -175,10 +174,7 @@ proptest! {
         // Epoch ordering is a decode-time rule, so only the well-ordered case
         // is required to round-trip; the rest must still decline safely.
         if target_mk_epoch != 0 && target_mk_epoch > source_mk_epoch {
-            prop_assert_eq!(
-                Catalog::decode_rekey_state(&encoded).unwrap(),
-                RekeyStateRow::V1(intent)
-            );
+            prop_assert_eq!(Catalog::decode_rekey_state(&encoded).unwrap(), intent);
         } else {
             prop_assert!(Catalog::decode_rekey_state(&encoded).is_err());
         }
@@ -186,26 +182,23 @@ proptest! {
         decode_every_row_kind(&mutated);
     }
 
-    /// The legacy 13-byte row shares one decoder with the fixed V1 intent, so
-    /// its bytes are also adversarial input for the V1 framing checks.
+    /// Rekey state is a fixed-width row. A row of any other width carries no
+    /// interpretation, so the decoder must refuse it outright instead of
+    /// reading whichever prefix happens to be present.
     #[test]
-    fn legacy_rekey_state_rows_never_panic(
-        target_mk_epoch in any::<u64>(),
-        main_db_done in any::<u8>(),
-        discarded_segments_index in any::<u32>(),
+    fn off_width_rekey_state_rows_are_always_rejected(
+        head in any::<u64>(),
+        tail in any::<u8>(),
+        width in (0usize..=(REKEY_INTENT_LEN * 2)).prop_filter(
+            "the fixed width has its own round-trip property",
+            |width| *width != REKEY_INTENT_LEN,
+        ),
     ) {
-        let mut bytes = Vec::with_capacity(13);
-        bytes.extend_from_slice(&target_mk_epoch.to_le_bytes());
-        bytes.push(main_db_done);
-        bytes.extend_from_slice(&discarded_segments_index.to_le_bytes());
-        match Catalog::decode_rekey_state(&bytes) {
-            Ok(RekeyStateRow::Legacy(LegacyRekeyState { target_mk_epoch: got, .. })) => {
-                prop_assert_eq!(got, target_mk_epoch);
-                prop_assert!(main_db_done <= 1);
-            }
-            Ok(other) => prop_assert!(false, "13-byte row decoded as {:?}", other),
-            Err(_) => prop_assert!(target_mk_epoch == 0 || main_db_done > 1),
+        let mut bytes = vec![tail; width];
+        for (slot, byte) in bytes.iter_mut().zip(head.to_le_bytes()) {
+            *slot = byte;
         }
+        prop_assert!(Catalog::decode_rekey_state(&bytes).is_err());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::pager::Pager;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::recovery::journal::{
@@ -953,10 +954,11 @@ impl<V: Vfs + Clone> Db<V> {
         // metadata had to bump-allocate past it.
         let new_next_page_id = staged_free_list.next_page_id;
 
-        let new_seq = state
-            .seq
-            .checked_add(1)
-            .ok_or_else(|| crate::errors::PagedbError::arithmetic_overflow("apply sequence"))?;
+        // Staging the follower's relocated metadata into the image seals pages,
+        // and sealing them may have refreshed the anchor in the live header. Read
+        // the cursor after that work so this header supersedes the right slot.
+        let header_cursor = self.pager.header_cursor()?;
+        let new_seq = header_cursor.next_seq()?;
         let counter_anchor = self.pager.pending_anchor();
 
         // Install the target trees the producer shipped in the manifest. The
@@ -1008,7 +1010,7 @@ impl<V: Vfs + Clone> Db<V> {
             staged_image,
             &hk_clone,
             &fields_with_journal,
-            state.active_slot,
+            header_cursor.slot,
             self.page_size,
         )
         .await?;
@@ -1042,8 +1044,14 @@ impl<V: Vfs + Clone> Db<V> {
         // The target image is durable. Advance only internal writer state;
         // prior readers remain on the old snapshot until the nonce anchor and
         // journal actions establish a safe target directory.
-        state.active_slot = new_slot;
-        state.seq = new_seq;
+        // The staged image is now `main.db`, and the header just written is the
+        // slot it opens from. Any anchor refresh that landed in the file this
+        // rename replaced went with it, and this header's anchor is at least as
+        // large, so the durable anchor never moves backwards across the swap.
+        self.pager.note_header_written(HeaderCursor {
+            slot: new_slot,
+            seq: new_seq,
+        });
         state.latest_commit_id = new_commit_id;
         state.next_page_id = new_next_page_id;
         state.root_page_id = new_root_page_id;

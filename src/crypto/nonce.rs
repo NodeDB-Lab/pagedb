@@ -128,6 +128,27 @@ impl MainDbNonceGen {
         self.next.saturating_sub(1)
     }
 
+    /// How many more nonces can be issued before the durable anchor has to be
+    /// advanced. Zero means the next `next_nonce()` returns `Aborted`.
+    ///
+    /// Callers that issue nonces in long runs — a compaction rebuild, a rekey
+    /// re-seal, a large flush — size their work against this instead of against
+    /// a fixed page count: the budget is configurable and can be far smaller
+    /// than one flush.
+    #[must_use]
+    pub fn window_remaining(&self) -> u64 {
+        self.durable_anchor
+            .saturating_add(self.budget)
+            .saturating_sub(self.pending_anchor())
+    }
+
+    /// The anchor value currently persisted in the A/B header.
+    #[cfg(test)]
+    #[must_use]
+    pub fn durable_anchor(&self) -> u64 {
+        self.durable_anchor
+    }
+
     /// Notify the generator that the header writer has durably persisted the
     /// supplied anchor. Must be ≥ the current `durable_anchor` and ≤
     /// `pending_anchor()`.
@@ -230,6 +251,25 @@ mod tests {
         for _ in 0..4 {
             let _ = g.next_nonce().unwrap();
         }
+        assert!(matches!(g.next_nonce(), Err(PagedbError::Aborted)));
+    }
+
+    #[test]
+    fn window_remaining_tracks_issued_and_committed_nonces() {
+        let mut g = MainDbNonceGen::new(&[0; 16], 4);
+        assert_eq!(g.window_remaining(), 4);
+        let _ = g.next_nonce().unwrap();
+        let _ = g.next_nonce().unwrap();
+        assert_eq!(g.window_remaining(), 2);
+        let pending = g.pending_anchor();
+        g.commit_anchor(pending).unwrap();
+        assert_eq!(g.durable_anchor(), 2);
+        // A committed anchor restores the whole budget without issuing anything.
+        assert_eq!(g.window_remaining(), 4);
+        for _ in 0..4 {
+            let _ = g.next_nonce().unwrap();
+        }
+        assert_eq!(g.window_remaining(), 0);
         assert!(matches!(g.next_nonce(), Err(PagedbError::Aborted)));
     }
 

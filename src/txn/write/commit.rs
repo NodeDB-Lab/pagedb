@@ -40,6 +40,7 @@
 //! intact.
 
 use crate::errors::PagedbError;
+use crate::pager::anchor::HeaderCursor;
 use crate::pager::freelist;
 use crate::pager::freelist::CHAIN_METADATA_CID;
 use crate::pager::header::commit_header;
@@ -283,7 +284,10 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         self.db.pager.flush_main(self.db.realm_id).await?;
 
         let new_next = pending.next_page_id;
-        let new_seq = self.guard.seq + 1;
+        // Read the A/B cursor after the flush above: sealing those pages may
+        // have refreshed the anchor, which moves the slot this commit supersedes.
+        let header_cursor = self.db.pager.header_cursor()?;
+        let new_seq = header_cursor.next_seq()?;
         let counter_anchor = self.db.pager.pending_anchor();
 
         let mut catalog_root_bytes = [0u8; 16];
@@ -324,10 +328,14 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             &self.db.main_db_path,
             &hk_clone,
             &fields,
-            self.guard.active_slot,
+            header_cursor.slot,
             self.db.page_size,
         )
         .await?;
+        self.db.pager.note_header_written(HeaderCursor {
+            slot: new_slot,
+            seq: new_seq,
+        });
         // From this point the header is durable. Advance writer state before
         // any fallible post-header work so a failed reconciliation can never
         // regress the next durable write. Keep the prior reader snapshot until
@@ -338,8 +346,6 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // commit, and a refusal must leave nothing behind.
         pending.publish(&mut self.guard);
         self.guard.root_page_id = new_root;
-        self.guard.active_slot = new_slot;
-        self.guard.seq = new_seq;
         self.guard.latest_commit_id = new_commit_id;
         self.guard.catalog_root_page_id = new_catalog_root;
         self.guard.catalog_root_txn_id = new_commit_id;

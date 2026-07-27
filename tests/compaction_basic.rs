@@ -349,6 +349,75 @@ async fn compaction_then_commit_keeps_large_values_readable_on_reopen() {
     );
 }
 
+// ─── A repack is a pure rewrite ───────────────────────────────────────────────
+
+/// Every record present before a dense repack must be present after it, in the
+/// same order and with the same bytes — overflow-backed values included. The
+/// repack streams the old tree in batches and packs the new one leaf by leaf, so
+/// a dropped batch boundary or a mis-linked leaf would show up here as a missing
+/// or reordered record rather than as a read error.
+#[tokio::test(flavor = "current_thread")]
+async fn compact_now_round_trips_every_record_in_order() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
+
+    let inline = vec![0x6Du8; 200];
+    let spilled = vec![0x9Fu8; 3000]; // > PAGE/4 → overflow chain
+    let n = 600u32;
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0..n {
+            let value = if i % 4 == 0 { &spilled } else { &inline };
+            w.put(format!("rt-{i:05}").as_bytes(), value).await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+    // Free pages so the repack has something to reclaim and actually runs.
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0..n {
+            if i % 3 == 0 {
+                w.delete(format!("rt-{i:05}").as_bytes()).await.unwrap();
+            }
+        }
+        w.commit().await.unwrap();
+    }
+
+    let before = {
+        let r = db.begin_read().await.unwrap();
+        r.scan_prefix(b"rt-").await.unwrap()
+    };
+    assert!(!before.is_empty());
+
+    let stats = db.compact_now().await.unwrap();
+    assert!(
+        stats.main_db_pages_reclaimed > 0,
+        "setup did not enter the dense repack: {stats:?}"
+    );
+
+    let after = {
+        let r = db.begin_read().await.unwrap();
+        r.scan_prefix(b"rt-").await.unwrap()
+    };
+    assert_eq!(
+        after, before,
+        "repack must not add, drop, or reorder records"
+    );
+
+    drop(db);
+    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let after_reopen = {
+        let r = reopened.begin_read().await.unwrap();
+        r.scan_prefix(b"rt-").await.unwrap()
+    };
+    assert_eq!(
+        after_reopen, before,
+        "the published compacted store must round-trip across a reopen"
+    );
+}
+
 // ─── Test 3: compact_now repacks segments ─────────────────────────────────────
 
 #[tokio::test(flavor = "current_thread")]
