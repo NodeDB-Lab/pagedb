@@ -836,17 +836,27 @@ impl<V: Vfs> Pager<V> {
             realm = ?realm_id.0,
             "page AEAD/MAC verification failed on read"
         );
-        // Black box: capture a structured corruption report (and, once per
-        // process, a snapshot of the store for offline `pagedb-fsck`) so this
-        // is debuggable from production without reproduction. Inert unless the
-        // host app called `faultbox::init`.
-        crate::diag::page_read_verify_failed(
-            &self.cfg.main_db_path,
-            page_id,
-            &crate::diag::dbg_str(&file),
-            &crate::diag::dbg_str(&binding),
-            &realm_id,
-        );
+        // `last_err` is not always an authentication failure: the loop above
+        // also lands here after exhausting retries on a header-decode
+        // rejection (`extract_page_header_ids` / on-disk cipher id), which is
+        // a plain `PagedbError`, not proof the page failed to authenticate.
+        // Only `ChecksumFailure` — the AEAD/MAC tag actually failing to
+        // verify — is the corruption signal this report exists for; anything
+        // else (and any plain I/O error, which already returns earlier via
+        // `?` and never reaches this tail at all) must not raise one.
+        if matches!(last_err, Some(PagedbError::ChecksumFailure)) {
+            // Black box: capture a structured corruption report (and, once per
+            // process, a snapshot of the store for offline `pagedb-fsck`) so this
+            // is debuggable from production without reproduction. Inert unless the
+            // host app called `faultbox::init`.
+            crate::diag::page_read_verify_failed(
+                &self.cfg.main_db_path,
+                page_id,
+                &crate::diag::dbg_str(&file),
+                &crate::diag::dbg_str(&binding),
+                &realm_id,
+            );
+        }
         Err(last_err.unwrap_or(PagedbError::ChecksumFailure))
     }
 

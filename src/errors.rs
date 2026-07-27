@@ -379,57 +379,86 @@ pub enum Evictable {
 impl PagedbError {
     /// Canonical constructor for corruption errors. Call sites never write
     /// `PagedbError::Corruption { … }` directly.
+    ///
+    /// This is the one funnel every `CorruptionDetail` variant passes
+    /// through — the named constructors below all route here rather than
+    /// building `Self::Corruption` themselves — so a single capture call
+    /// covers the whole taxonomy. Not `const fn`: `diag::corruption_captured`
+    /// is a plain function call (whether it is a live capture or an inert
+    /// no-op is a runtime fact — feature flag, target, and whether the host
+    /// called `faultbox::init` — not something `const` evaluation can know),
+    /// so nothing that reaches it can stay `const`. See the named
+    /// constructors below for what that cost the call sites that used to be
+    /// `const fn`.
     #[must_use]
     pub fn corruption(detail: CorruptionDetail) -> Self {
+        crate::diag::corruption_captured(&detail);
         Self::Corruption(detail)
     }
 
     /// Canonical constructor for authenticated catalog/file metadata disagreement.
+    ///
+    /// Was `const fn` before diagnostics capture moved into [`Self::corruption`];
+    /// routing through it to reach that one capture point costs `const`-ness
+    /// here. No call site in this crate invokes it from a const context
+    /// (verified), so the loss is inert in practice.
     #[must_use]
-    pub const fn segment_metadata_mismatch(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::SegmentMetadataMismatch { field })
+    pub fn segment_metadata_mismatch(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::SegmentMetadataMismatch { field })
     }
 
     /// Canonical constructor for malformed segment-file geometry.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn segment_geometry_invalid(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::SegmentGeometryInvalid { field })
+    pub fn segment_geometry_invalid(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::SegmentGeometryInvalid { field })
     }
 
     /// Canonical constructor for malformed authenticated catalog rows.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn catalog_row_invalid(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::CatalogRowInvalid { field })
+    pub fn catalog_row_invalid(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::CatalogRowInvalid { field })
     }
 
     /// Canonical constructor for one unusable structural header copy.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn structural_header_invalid(header: &'static str, field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::StructuralHeaderInvalid { header, field })
+    pub fn structural_header_invalid(header: &'static str, field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::StructuralHeaderInvalid { header, field })
     }
 
     /// Canonical constructor for unusable segment-footer cleartext framing.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn footer_framing_invalid(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::FooterFramingInvalid { field })
+    pub fn footer_framing_invalid(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::FooterFramingInvalid { field })
     }
 
     /// Canonical constructor for a structurally invalid B+ tree node body.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn node_body_malformed(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::NodeBodyMalformed { field })
+    pub fn node_body_malformed(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::NodeBodyMalformed { field })
     }
 
     /// Canonical constructor for a node that is not the expected kind. Pass
     /// `Some(page_id)` when the authenticated envelope kind and the body
     /// disagree, `None` when a decoder was handed the other node kind.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn node_kind_mismatch(
+    pub fn node_kind_mismatch(
         page_id: Option<u64>,
         expected: &'static str,
         found: &'static str,
     ) -> Self {
-        Self::Corruption(CorruptionDetail::NodeKindMismatch {
+        Self::corruption(CorruptionDetail::NodeKindMismatch {
             page_id,
             expected,
             found,
@@ -437,27 +466,35 @@ impl PagedbError {
     }
 
     /// Canonical constructor for a structurally invalid overflow page or chain.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn overflow_body_malformed(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::OverflowBodyMalformed { field })
+    pub fn overflow_body_malformed(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::OverflowBodyMalformed { field })
     }
 
     /// Canonical constructor for an undecodable apply-journal record.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn journal_record_malformed(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::JournalRecordMalformed { field })
+    pub fn journal_record_malformed(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::JournalRecordMalformed { field })
     }
 
     /// Canonical constructor for an unusable snapshot manifest or directory entry.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn snapshot_artifact_invalid(field: &'static str) -> Self {
-        Self::Corruption(CorruptionDetail::SnapshotArtifactInvalid { field })
+    pub fn snapshot_artifact_invalid(field: &'static str) -> Self {
+        Self::corruption(CorruptionDetail::SnapshotArtifactInvalid { field })
     }
 
     /// Canonical constructor for a live tree pointer into a reserved page.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn reserved_page_referenced(parent_page_id: u64, child_page_id: u64) -> Self {
-        Self::Corruption(CorruptionDetail::ReservedPageReferenced {
+    pub fn reserved_page_referenced(parent_page_id: u64, child_page_id: u64) -> Self {
+        Self::corruption(CorruptionDetail::ReservedPageReferenced {
             parent_page_id,
             child_page_id,
         })
@@ -466,20 +503,24 @@ impl PagedbError {
     /// Canonical constructor for a cyclic linked page structure. `structure`
     /// names the walk that found the loop — `"btree_descent"`,
     /// `"leaf_siblings"`, `"free_list"`.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn page_chain_cycle(structure: &'static str, page_id: u64) -> Self {
-        Self::Corruption(CorruptionDetail::PageChainCycle { structure, page_id })
+    pub fn page_chain_cycle(structure: &'static str, page_id: u64) -> Self {
+        Self::corruption(CorruptionDetail::PageChainCycle { structure, page_id })
     }
 
     /// Canonical constructor for a leaf whose sibling link and parent path
     /// disagree about which leaf comes next.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn leaf_sibling_mismatch(
+    pub fn leaf_sibling_mismatch(
         leaf_page_id: u64,
         right_sibling: u64,
         parent_next: Option<u64>,
     ) -> Self {
-        Self::Corruption(CorruptionDetail::LeafSiblingMismatch {
+        Self::corruption(CorruptionDetail::LeafSiblingMismatch {
             leaf_page_id,
             right_sibling,
             parent_next,
@@ -487,9 +528,11 @@ impl PagedbError {
     }
 
     /// Canonical constructor for a cyclic overflow chain.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn overflow_chain_cycle(root_page_id: u64, page_id: u64) -> Self {
-        Self::Corruption(CorruptionDetail::OverflowChainCycle {
+    pub fn overflow_chain_cycle(root_page_id: u64, page_id: u64) -> Self {
+        Self::corruption(CorruptionDetail::OverflowChainCycle {
             root_page_id,
             page_id,
         })
@@ -497,13 +540,15 @@ impl PagedbError {
 
     /// Canonical constructor for one page claimed by two incompatible
     /// references in a single traversal.
+    ///
+    /// No longer `const fn`, for the same reason as [`Self::segment_metadata_mismatch`].
     #[must_use]
-    pub const fn page_kind_aliased(
+    pub fn page_kind_aliased(
         page_id: u64,
         walked_as: &'static str,
         referenced_as: &'static str,
     ) -> Self {
-        Self::Corruption(CorruptionDetail::PageKindAliased {
+        Self::corruption(CorruptionDetail::PageKindAliased {
             page_id,
             walked_as,
             referenced_as,

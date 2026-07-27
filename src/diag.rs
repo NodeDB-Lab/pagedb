@@ -16,6 +16,7 @@
 #[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
 mod imp {
     use crate::RealmId;
+    use crate::errors::CorruptionDetail;
 
     /// Breadcrumb: a store was (re)opened — marks epoch boundaries in the trail,
     /// the dimension along which freed-page use-after-free surfaces.
@@ -119,6 +120,168 @@ mod imp {
         .with_backtrace()
         .emit();
     }
+
+    /// Forensic context for a [`CorruptionDetail`] captured at the moment
+    /// `PagedbError::corruption()` constructs it — the one funnel every
+    /// `CorruptionDetail` variant passes through.
+    struct CorruptionConstructed {
+        /// Stable per-variant identifier, independent of the instance's field
+        /// values, so `faultbox`'s domain-kind bucket is the failure *mode*.
+        kind: &'static str,
+        /// Coalescing key: variant name plus whichever fields identify the
+        /// structural bug rather than the specific instance (never a raw
+        /// `page_id`/`segment_id`/counter alone) — the same grouping
+        /// discipline `PageReadVerifyFailure` already uses, so one bug landed
+        /// once still collapses to one report under fuzzing.
+        grouping_key: String,
+        /// Full `Debug` rendering of the detail, for a report that is
+        /// diagnosable on its own.
+        detail_debug: String,
+    }
+
+    impl faultbox::DomainContext for CorruptionConstructed {
+        fn domain_kind(&self) -> &'static str {
+            self.kind
+        }
+        fn grouping_key(&self) -> String {
+            self.grouping_key.clone()
+        }
+        fn to_json(&self) -> faultbox::serde_json::Value {
+            faultbox::serde_json::json!({ "detail": self.detail_debug })
+        }
+    }
+
+    /// Classify a [`CorruptionDetail`] into a stable domain kind and a
+    /// grouping key that names the structural fields of the failure but never
+    /// the instance-specific ones (page ids, segment ids), so many
+    /// occurrences of one bug — the common shape under fuzzing — coalesce
+    /// into one report instead of one per occurrence.
+    fn classify(detail: &CorruptionDetail) -> (&'static str, String) {
+        match detail {
+            CorruptionDetail::ForeignSegment { .. } => (
+                "pagedb.corruption.foreign_segment",
+                "ForeignSegment".to_owned(),
+            ),
+            CorruptionDetail::FooterUnverifiable { .. } => (
+                "pagedb.corruption.footer_unverifiable",
+                "FooterUnverifiable".to_owned(),
+            ),
+            CorruptionDetail::SegmentMetadataMismatch { field } => (
+                "pagedb.corruption.segment_metadata_mismatch",
+                format!("SegmentMetadataMismatch:field={field}"),
+            ),
+            CorruptionDetail::SegmentGeometryInvalid { field } => (
+                "pagedb.corruption.segment_geometry_invalid",
+                format!("SegmentGeometryInvalid:field={field}"),
+            ),
+            CorruptionDetail::CatalogRowInvalid { field } => (
+                "pagedb.corruption.catalog_row_invalid",
+                format!("CatalogRowInvalid:field={field}"),
+            ),
+            CorruptionDetail::SegmentMissing { .. } => (
+                "pagedb.corruption.segment_missing",
+                "SegmentMissing".to_owned(),
+            ),
+            CorruptionDetail::StagingMissing { .. } => (
+                "pagedb.corruption.staging_missing",
+                "StagingMissing".to_owned(),
+            ),
+            CorruptionDetail::PageUnverifiable { .. } => (
+                "pagedb.corruption.page_unverifiable",
+                "PageUnverifiable".to_owned(),
+            ),
+            CorruptionDetail::ManifestUnverifiable { .. } => (
+                "pagedb.corruption.manifest_unverifiable",
+                "ManifestUnverifiable".to_owned(),
+            ),
+            CorruptionDetail::HeaderUnverifiable => (
+                "pagedb.corruption.header_unverifiable",
+                "HeaderUnverifiable".to_owned(),
+            ),
+            CorruptionDetail::StructuralHeaderInvalid { header, field } => (
+                "pagedb.corruption.structural_header_invalid",
+                format!("StructuralHeaderInvalid:header={header}:field={field}"),
+            ),
+            CorruptionDetail::FooterFramingInvalid { field } => (
+                "pagedb.corruption.footer_framing_invalid",
+                format!("FooterFramingInvalid:field={field}"),
+            ),
+            CorruptionDetail::NodeBodyMalformed { field } => (
+                "pagedb.corruption.node_body_malformed",
+                format!("NodeBodyMalformed:field={field}"),
+            ),
+            CorruptionDetail::NodeKindMismatch {
+                expected, found, ..
+            } => (
+                "pagedb.corruption.node_kind_mismatch",
+                format!("NodeKindMismatch:expected={expected}:found={found}"),
+            ),
+            CorruptionDetail::OverflowBodyMalformed { field } => (
+                "pagedb.corruption.overflow_body_malformed",
+                format!("OverflowBodyMalformed:field={field}"),
+            ),
+            CorruptionDetail::JournalRecordMalformed { field } => (
+                "pagedb.corruption.journal_record_malformed",
+                format!("JournalRecordMalformed:field={field}"),
+            ),
+            CorruptionDetail::SnapshotArtifactInvalid { field } => (
+                "pagedb.corruption.snapshot_artifact_invalid",
+                format!("SnapshotArtifactInvalid:field={field}"),
+            ),
+            CorruptionDetail::ReservedPageReferenced { .. } => (
+                "pagedb.corruption.reserved_page_referenced",
+                "ReservedPageReferenced".to_owned(),
+            ),
+            CorruptionDetail::OverflowChainCycle { .. } => (
+                "pagedb.corruption.overflow_chain_cycle",
+                "OverflowChainCycle".to_owned(),
+            ),
+            CorruptionDetail::PageChainCycle { structure, .. } => (
+                "pagedb.corruption.page_chain_cycle",
+                format!("PageChainCycle:structure={structure}"),
+            ),
+            CorruptionDetail::LeafSiblingMismatch { .. } => (
+                "pagedb.corruption.leaf_sibling_mismatch",
+                "LeafSiblingMismatch".to_owned(),
+            ),
+            CorruptionDetail::PageKindAliased {
+                walked_as,
+                referenced_as,
+                ..
+            } => (
+                "pagedb.corruption.page_kind_aliased",
+                format!("PageKindAliased:walked_as={walked_as}:referenced_as={referenced_as}"),
+            ),
+            // `CorruptionDetail` is `#[non_exhaustive]`: within this crate that
+            // only guards against missing a match arm when a variant is added,
+            // not against external construction, so a catch-all still reports
+            // *something* rather than silently dropping a future variant.
+            #[allow(unreachable_patterns)]
+            _ => ("pagedb.corruption.other", "Other".to_owned()),
+        }
+    }
+
+    /// Capture a structured corruption report at the moment a
+    /// [`CorruptionDetail`] is constructed — called from
+    /// `PagedbError::corruption()`, the single funnel every variant passes
+    /// through, so every precise diagnosis in the taxonomy reaches the
+    /// reporting layer instead of only the one AEAD failure site this module
+    /// originally covered.
+    pub fn corruption_captured(detail: &CorruptionDetail) {
+        let (kind, grouping_key) = classify(detail);
+        let ctx = CorruptionConstructed {
+            kind,
+            grouping_key,
+            detail_debug: format!("{detail:?}"),
+        };
+        let _ = faultbox::Capture::new(
+            faultbox::EventKind::Corruption,
+            "corruption detail constructed",
+        )
+        .domain(&ctx)
+        .with_backtrace()
+        .emit();
+    }
 }
 
 #[cfg(not(all(feature = "diagnostics", not(target_arch = "wasm32"))))]
@@ -138,10 +301,13 @@ mod imp {
         _realm: &RealmId,
     ) {
     }
+
+    pub fn corruption_captured(_detail: &crate::errors::CorruptionDetail) {}
 }
 
 pub use imp::{
-    committed, flushed, lock_acquired, lock_rejected, page_read_verify_failed, reopened,
+    committed, corruption_captured, flushed, lock_acquired, lock_rejected, page_read_verify_failed,
+    reopened,
 };
 
 /// Convenience for call sites that hold `Debug`-only types: format a value for
