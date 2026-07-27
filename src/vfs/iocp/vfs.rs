@@ -3,6 +3,11 @@
 //! cross-process exclusion — same protocol as the Tokio fallback. Segment
 //! files open with `FILE_SHARE_DELETE` so tombstone-rename protocols succeed
 //! against held handles.
+//!
+//! Path operations have no overlapped form: `CreateFile`, `MoveFileEx`,
+//! directory enumeration and friends all park the calling thread. They run on
+//! the blocking pool; only path validation and the in-process lock table stay
+//! on the executor.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -19,6 +24,7 @@ use crate::errors::PagedbError;
 
 use super::file::IocpFile;
 use super::port::Port;
+use crate::vfs::blocking::offload;
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
 
@@ -188,7 +194,7 @@ impl IocpVfs {
             .clone()
     }
 
-    fn do_lock(&self, path: &str, kind: LockKind) -> Result<IocpLockHandle> {
+    async fn do_lock(&self, path: &str, kind: LockKind) -> Result<IocpLockHandle> {
         let logical_path = canonical_native_path(path)?;
         let entry = self.lookup_or_create_entry(&logical_path);
         {
@@ -201,10 +207,18 @@ impl IocpVfs {
             }
         }
         let lock_path = self.resolve(&logical_path)?;
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-        }
-        match OsLockFileExHandle::try_acquire(&lock_path, kind) {
+        // Creating the sentinel file and taking the OS lock are both blocking
+        // syscalls. `LockFileEx` itself is `LOCKFILE_FAIL_IMMEDIATELY`, so it
+        // never waits on a conflict — but opening the file can still stall on
+        // the filesystem, so the pair goes to the pool together.
+        let acquired = offload(move || {
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+            }
+            OsLockFileExHandle::try_acquire(&lock_path, kind)
+        })
+        .await;
+        match acquired {
             Ok(os_lock) => Ok(IocpLockHandle {
                 lock_ref: entry,
                 kind,
@@ -230,61 +244,67 @@ impl Vfs for IocpVfs {
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
         let p = self.resolve(path)?;
-        if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+        let (file, writable) = offload(move || {
+            if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+                }
             }
-        }
-        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
-        // FILE_SHARE_DELETE is required so tombstone-rename protocols succeed
-        // while readers hold handles open.
-        const FILE_SHARE_RWD: u32 = 0x0000_0007;
-        let (file, writable) = match mode {
-            OpenMode::Read => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .share_mode(FILE_SHARE_RWD)
-                    .custom_flags(FILE_FLAG_OVERLAPPED)
-                    .open(&p)
-                    .map_err(PagedbError::Io)?;
-                (f, false)
-            }
-            OpenMode::ReadWrite => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .share_mode(FILE_SHARE_RWD)
-                    .custom_flags(FILE_FLAG_OVERLAPPED)
-                    .open(&p)
-                    .map_err(PagedbError::Io)?;
-                (f, true)
-            }
-            OpenMode::CreateNew => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .share_mode(FILE_SHARE_RWD)
-                    .custom_flags(FILE_FLAG_OVERLAPPED)
-                    .open(&p)
-                    .map_err(PagedbError::Io)?;
-                (f, true)
-            }
-            OpenMode::CreateOrOpen => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .share_mode(FILE_SHARE_RWD)
-                    .custom_flags(FILE_FLAG_OVERLAPPED)
-                    .open(&p)
-                    .map_err(PagedbError::Io)?;
-                (f, true)
-            }
-        };
+            // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+            // FILE_SHARE_DELETE is required so tombstone-rename protocols
+            // succeed while readers hold handles open.
+            const FILE_SHARE_RWD: u32 = 0x0000_0007;
+            let opened = match mode {
+                OpenMode::Read => {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(FILE_SHARE_RWD)
+                        .custom_flags(FILE_FLAG_OVERLAPPED)
+                        .open(&p)
+                        .map_err(PagedbError::Io)?;
+                    (f, false)
+                }
+                OpenMode::ReadWrite => {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .share_mode(FILE_SHARE_RWD)
+                        .custom_flags(FILE_FLAG_OVERLAPPED)
+                        .open(&p)
+                        .map_err(PagedbError::Io)?;
+                    (f, true)
+                }
+                OpenMode::CreateNew => {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .share_mode(FILE_SHARE_RWD)
+                        .custom_flags(FILE_FLAG_OVERLAPPED)
+                        .open(&p)
+                        .map_err(PagedbError::Io)?;
+                    (f, true)
+                }
+                OpenMode::CreateOrOpen => {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .share_mode(FILE_SHARE_RWD)
+                        .custom_flags(FILE_FLAG_OVERLAPPED)
+                        .open(&p)
+                        .map_err(PagedbError::Io)?;
+                    (f, true)
+                }
+            };
+            Ok(opened)
+        })
+        .await?;
         let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
         let handle = file.as_raw_handle() as HANDLE;
+        // `CreateIoCompletionPort` only registers the handle with the port; it
+        // returns without waiting on anything, so it stays on the executor.
         self.inner.port.associate(handle, key)?;
         Ok(IocpFile::new(
             file,
@@ -296,45 +316,53 @@ impl Vfs for IocpVfs {
 
     async fn remove(&self, path: &str) -> Result<()> {
         let p = self.resolve(path)?;
-        match std::fs::remove_file(&p) {
+        offload(move || match std::fs::remove_file(&p) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(PagedbError::Io(e)),
-        }
+        })
+        .await
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let f = self.resolve(from)?;
         let t = self.resolve(to)?;
-        if let Some(parent) = t.parent() {
-            std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-        }
-        // `std::fs::rename` on Windows is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`,
-        // which is the primitive the architecture's tombstone protocol relies on.
-        std::fs::rename(&f, &t).map_err(PagedbError::Io)
+        offload(move || {
+            if let Some(parent) = t.parent() {
+                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+            }
+            // `std::fs::rename` on Windows is
+            // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which is the primitive
+            // the tombstone protocol relies on.
+            std::fs::rename(&f, &t).map_err(PagedbError::Io)
+        })
+        .await
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let p = self.resolve(path)?;
-        let iter = match std::fs::read_dir(&p) {
-            Ok(it) => it,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(PagedbError::Io(e)),
-        };
-        let mut out = Vec::new();
-        for entry in iter {
-            let entry = entry.map_err(PagedbError::Io)?;
-            if let Some(name) = entry.file_name().to_str() {
-                out.push(name.to_string());
+        offload(move || {
+            let iter = match std::fs::read_dir(&p) {
+                Ok(it) => it,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(PagedbError::Io(e)),
+            };
+            let mut out = Vec::new();
+            for entry in iter {
+                let entry = entry.map_err(PagedbError::Io)?;
+                if let Some(name) = entry.file_name().to_str() {
+                    out.push(name.to_string());
+                }
             }
-        }
-        out.sort();
-        Ok(out)
+            out.sort();
+            Ok(out)
+        })
+        .await
     }
 
     async fn mkdir_all(&self, path: &str) -> Result<()> {
         let p = self.resolve(path)?;
-        std::fs::create_dir_all(&p).map_err(PagedbError::Io)
+        offload(move || std::fs::create_dir_all(&p).map_err(PagedbError::Io)).await
     }
 
     async fn sync_dir(&self, path: &str) -> Result<()> {
@@ -347,11 +375,11 @@ impl Vfs for IocpVfs {
     }
 
     async fn lock_exclusive(&self, path: &str) -> Result<Self::LockHandle> {
-        self.do_lock(path, LockKind::Exclusive)
+        self.do_lock(path, LockKind::Exclusive).await
     }
 
     async fn lock_shared(&self, path: &str) -> Result<Self::LockHandle> {
-        self.do_lock(path, LockKind::Shared)
+        self.do_lock(path, LockKind::Shared).await
     }
 
     fn root_path(&self) -> Option<&std::path::Path> {

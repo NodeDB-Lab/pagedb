@@ -176,6 +176,11 @@ impl OpfsVfs {
     }
 
     /// Dispatch a single `OpfsOp` to the worker and await its `OpfsResult`.
+    ///
+    /// `post_message` returns as soon as the message is queued — the worker
+    /// does the blocking OPFS work on its own thread — so nothing here parks
+    /// the caller. The registry guard is scoped so it is released before the
+    /// only await point.
     pub(crate) async fn dispatch(&self, op: OpfsOp) -> Result<OpfsResult> {
         let id = self.0.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel::<OpfsResult>();

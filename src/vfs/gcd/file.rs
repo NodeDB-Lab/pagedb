@@ -5,7 +5,11 @@
 //! the channel is released, independently of the `std::fs::File` we hold).
 //! Reads and writes call `dispatch_io_read` / `dispatch_io_write` with block
 //! handlers; the handlers accumulate chunks and, on `done`, send the result
-//! through a `tokio::sync::oneshot`.
+//! through a `tokio::sync::oneshot`. Submission returns immediately, so the
+//! read/write paths never park a thread — the only wait is on the oneshot.
+//!
+//! `fsync`, `ftruncate` and `metadata` have no `dispatch_io` equivalent and do
+//! park the caller, so those run on the blocking pool instead.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -19,11 +23,14 @@ use dispatch2::{DispatchData, DispatchIO, DispatchIOCloseFlags, DispatchQueue, D
 
 use crate::Result;
 use crate::errors::PagedbError;
+use crate::vfs::blocking::offload;
 use crate::vfs::traits::{VfsFile, checked_signed_file_len};
 use crate::vfs::types::{ReadReq, WriteReq};
 
 pub struct GcdFile {
-    file: std::fs::File,
+    /// Shared so a blocking-pool call can own a reference to the descriptor
+    /// for its whole duration, independently of when this `GcdFile` drops.
+    file: Arc<std::fs::File>,
     writable: bool,
     channel: DispatchRetained<DispatchIO>,
     queue: DispatchRetained<DispatchQueue>,
@@ -71,15 +78,11 @@ impl GcdFile {
         };
 
         Ok(Self {
-            file,
+            file: Arc::new(file),
             writable,
             channel,
             queue,
         })
-    }
-
-    fn fd(&self) -> std::os::unix::io::RawFd {
-        self.file.as_raw_fd()
     }
 
     fn checked_dispatch_offset(offset: u64, len: usize) -> Result<libc::off_t> {
@@ -119,11 +122,19 @@ impl Drop for GcdFile {
         // Close the channel cooperatively. Outstanding ops complete with
         // ECANCELED (the cleanup handler will then close the dup fd).
         self.channel.close(DispatchIOCloseFlags(0));
-        // `self.file` drops here, closing our original fd.
+        // `self.file` drops here. A blocking-pool call still holding its own
+        // `Arc` keeps the original fd open until it finishes, which is exactly
+        // the guarantee that lets those calls outlive a cancelled future.
     }
 }
 
-/// Submit a `dispatch_io` read and return immediately. Kept synchronous on
+/// Submit a `dispatch_io` read and return immediately.
+///
+/// `dispatch_io_read` enqueues the request and returns without waiting, so this
+/// is not a blocking call despite being a plain `fn`: the only wait is the
+/// caller's `await` on the oneshot the handler completes.
+///
+/// Kept synchronous on
 /// purpose: the handler `RcBlock` and the raw block pointer derived from it are
 /// `!Send`, so they must never be live across an await point in the calling
 /// future (`VfsFile::read_at` must return a `Send` future). The handler
@@ -180,8 +191,9 @@ fn submit_read(
     drop(handler);
 }
 
-/// Submit a `dispatch_io` write and return immediately. Synchronous for the
-/// same reason as [`submit_read`]: the handler block, its raw pointer, and the
+/// Submit a `dispatch_io` write and return immediately. Non-blocking and
+/// synchronous for the same reasons as [`submit_read`]: `dispatch_io_write`
+/// enqueues without waiting, and the handler block, its raw pointer, and the
 /// `DispatchData` are all `!Send` and must not cross an await point.
 fn submit_write(
     channel: &DispatchIO,
@@ -296,14 +308,19 @@ impl VfsFile for GcdFile {
     }
 
     async fn sync(&mut self) -> Result<()> {
-        // SAFETY: `fd()` returns the valid raw fd owned by `self.file`,
-        // which is alive for the duration of this call. `fsync` is a
-        // self-contained syscall with no aliasing requirements.
-        let rc = unsafe { libc::fsync(self.fd()) };
-        if rc != 0 {
-            return Err(PagedbError::Io(std::io::Error::last_os_error()));
-        }
-        Ok(())
+        // `fsync` waits on the device — it can outlast a whole commit, so it
+        // never runs on the executor.
+        let file = Arc::clone(&self.file);
+        offload(move || {
+            // SAFETY: the `Arc` keeps the fd open for the whole call, and
+            // `fsync` is a self-contained syscall with no aliasing needs.
+            let rc = unsafe { libc::fsync(file.as_raw_fd()) };
+            if rc != 0 {
+                return Err(PagedbError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn truncate(&mut self, len: u64) -> Result<()> {
@@ -311,17 +328,22 @@ impl VfsFile for GcdFile {
             return Err(PagedbError::ReadOnly);
         }
         let len = checked_signed_file_len(len, "ftruncate")?;
-        // SAFETY: `fd()` is valid as above and `len` was checked to fit the
-        // signed native file-offset type.
-        let rc = unsafe { libc::ftruncate(self.fd(), len) };
-        if rc != 0 {
-            return Err(PagedbError::Io(std::io::Error::last_os_error()));
-        }
-        Ok(())
+        let file = Arc::clone(&self.file);
+        offload(move || {
+            // SAFETY: the `Arc` keeps the fd valid, and `len` was checked to
+            // fit the signed native file-offset type before the syscall.
+            let rc = unsafe { libc::ftruncate(file.as_raw_fd(), len) };
+            if rc != 0 {
+                return Err(PagedbError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn len(&self) -> Result<u64> {
-        Ok(self.file.metadata().map_err(PagedbError::Io)?.len())
+        let file = Arc::clone(&self.file);
+        offload(move || Ok(file.metadata().map_err(PagedbError::Io)?.len())).await
     }
 
     async fn is_empty(&self) -> Result<bool> {

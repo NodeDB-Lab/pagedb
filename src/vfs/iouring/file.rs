@@ -1,7 +1,10 @@
-//! `IouringFile`: per-file I/O using `io_uring` for reads, writes, fsync, and
-//! ftruncate. Each async op acquires the shared ring mutex, pushes SQE(s),
-//! calls `submit_and_wait(N)`, drains matching CQEs, then releases the lock.
-//! No background poller thread, no `spawn_blocking`.
+//! `IouringFile`: per-file I/O using `io_uring` for reads, writes and fsync.
+//! Each op acquires the shared ring mutex, pushes SQE(s), calls
+//! `submit_and_wait(N)`, drains matching CQEs, then releases the lock. No
+//! background poller thread.
+//!
+//! `ftruncate` and `metadata` have no opcode in this ring's feature set and are
+//! ordinary blocking syscalls, so they run on the blocking pool.
 #![allow(unsafe_code)]
 
 use std::os::unix::io::AsRawFd;
@@ -14,6 +17,7 @@ use parking_lot::Mutex;
 
 use crate::Result;
 use crate::errors::PagedbError;
+use crate::vfs::blocking::offload;
 use crate::vfs::traits::{
     VfsFile, checked_indexed_completion, checked_iouring_positioned_offset, checked_read_count,
     checked_signed_file_len, write_all_at,
@@ -22,7 +26,9 @@ use crate::vfs::types::{ReadReq, WriteReq};
 
 /// Per-file handle backed by an `std::fs::File` fd and the shared `io_uring`.
 pub struct IouringFile {
-    file: std::fs::File,
+    /// Shared so a blocking-pool call can own a reference to the descriptor
+    /// for its whole duration, independently of when this handle drops.
+    file: Arc<std::fs::File>,
     writable: bool,
     ring: Arc<Mutex<IoUring>>,
 }
@@ -30,7 +36,7 @@ pub struct IouringFile {
 impl IouringFile {
     pub(crate) fn new(file: std::fs::File, writable: bool, ring: Arc<Mutex<IoUring>>) -> Self {
         Self {
-            file,
+            file: Arc::new(file),
             writable,
             ring,
         }
@@ -371,22 +377,26 @@ impl VfsFile for IouringFile {
             return Err(PagedbError::ReadOnly);
         }
         // `ftruncate` is not available as a first-class `io_uring` opcode in
-        // v0.7. Use the syscall directly via libc; for regular files this is
-        // synchronous and does not trigger disk I/O in the common path.
-        //
+        // v0.7, so it goes through libc — which means it parks the calling
+        // thread (shrinking a file can free extents on a busy device) and
+        // belongs on the blocking pool.
         let len = checked_signed_file_len(len, "ftruncate")?;
-        // SAFETY: `self.file.as_raw_fd()` is valid for this method call and
-        // `len` was checked before entering the signed native syscall.
-        let rc = unsafe { libc::ftruncate(self.file.as_raw_fd(), len) };
-        if rc != 0 {
-            return Err(PagedbError::Io(std::io::Error::last_os_error()));
-        }
-        Ok(())
+        let file = Arc::clone(&self.file);
+        offload(move || {
+            // SAFETY: the `Arc` keeps the fd valid for the whole call and
+            // `len` was checked before entering the signed native syscall.
+            let rc = unsafe { libc::ftruncate(file.as_raw_fd(), len) };
+            if rc != 0 {
+                return Err(PagedbError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn len(&self) -> Result<u64> {
-        let meta = self.file.metadata().map_err(PagedbError::Io)?;
-        Ok(meta.len())
+        let file = Arc::clone(&self.file);
+        offload(move || Ok(file.metadata().map_err(PagedbError::Io)?.len())).await
     }
 
     async fn is_empty(&self) -> Result<bool> {

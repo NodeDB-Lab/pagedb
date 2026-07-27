@@ -4,6 +4,11 @@
 //! arbitrates `lock_exclusive` / `lock_shared` within the single browser JS
 //! realm using the [`LockMap`] reference-counted table. [`OpfsLockHandle`] is
 //! the RAII guard handed back to callers; dropping it releases the lock.
+//!
+//! The `std::sync::Mutex` around the table guards pure in-memory bookkeeping:
+//! every guard is taken and dropped inside a single non-async expression, so
+//! none is ever held across an await, and none can contend on a single-threaded
+//! JS realm anyway.
 
 #![cfg(all(target_arch = "wasm32", feature = "opfs"))]
 // The unsafe Send + Sync impls below are required to satisfy `Vfs: Send + Sync`

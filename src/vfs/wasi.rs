@@ -27,6 +27,12 @@
 //!
 //! # Positioned I/O
 //!
+//! Blocking is unavoidable here, and deliberately not offloaded. WASI preview1
+//! has no async file syscall and no thread pool to hand work to: `fd_read` and
+//! `fd_write` are the only primitives the runtime offers, and the component is
+//! single-threaded, so there is no other task for a wait to stall. Every method
+//! below is `async` purely to satisfy the trait.
+//!
 //! Positioned reads and writes use the stable `Seek` + `Read` / `Write` traits
 //! under the file's `Mutex`: each operation seeks to the target offset and then
 //! transfers. The mutex serialises the seek/transfer pair, so the shared file

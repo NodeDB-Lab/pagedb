@@ -1,5 +1,9 @@
 //! RAM-backed VFS used for unit tests, the in-memory `Db` flavor, and as the
 //! reference semantic for native backends.
+//!
+//! Every method here is `async` in name only: the work is a `memcpy` under a
+//! `parking_lot::Mutex` with no syscall and no await point, so no guard is ever
+//! live across a suspension and nothing needs the blocking pool.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

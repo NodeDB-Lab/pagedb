@@ -3,8 +3,12 @@
 //! `CreateIoCompletionPort`. Operations serialize through a
 //! `parking_lot::Mutex` guarding the port: a caller posts a single overlapped
 //! `ReadFile` / `WriteFile`, calls `GetQueuedCompletionStatus`, and releases
-//! the lock. This mirrors the io_uring backend's "hold the ring, submit,
-//! wait" model — intentionally simple, no background reaper thread.
+//! the lock — intentionally simple, no background reaper thread.
+//!
+//! `GetQueuedCompletionStatus` parks the calling thread until the kernel has a
+//! packet, so that whole submit + dequeue cycle runs on the blocking pool (see
+//! `file.rs`). Nothing in this module may be called from a future that is
+//! polled on the executor.
 #![allow(unsafe_code)]
 
 use std::sync::Arc;
@@ -104,6 +108,9 @@ impl Port {
 
     /// Block until any completion packet arrives on this port. Returns
     /// (bytes_transferred, completion_key, overlapped_ptr).
+    ///
+    /// This parks the thread with an infinite timeout, so it must only ever be
+    /// reached from the blocking pool.
     ///
     /// # Safety
     ///

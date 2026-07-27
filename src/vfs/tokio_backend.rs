@@ -20,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::Result;
 use crate::errors::PagedbError;
 
+use super::blocking::offload;
 use super::traits::{Vfs, VfsFile, canonical_native_path, resolve_native_path};
 use super::types::{OpenMode, ReadReq, WriteReq};
 
@@ -442,40 +443,47 @@ impl Vfs for TokioVfs {
 
     async fn sync_dir(&self, path: &str) -> Result<()> {
         let p = self.resolve(path)?;
-        // Open the directory with std::fs (synchronous) to call sync_all.
+        // `tokio::fs` has no directory-sync form, so this is the one place the
+        // backend reaches for `std::fs` — on the blocking pool, because the
+        // sync waits on the device.
+        //
         // On platforms where opening a directory handle is unsupported or
         // syncing it returns Unsupported/PermissionDenied (e.g., some Windows
         // filesystems), treat as a no-op — the rename durability guarantee is
         // best-effort in those environments.
-        let dir = match std::fs::File::open(&p) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            // Opening a directory as a file handle is unsupported on some
-            // platforms — notably Windows, where it fails with PermissionDenied
-            // ("Access is denied") at open, before sync_all is ever reached.
-            // Directory fsync is best-effort there, so treat it as a no-op.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                return Ok(());
+        offload(move || {
+            let dir = match std::fs::File::open(&p) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                // Opening a directory as a file handle is unsupported on some
+                // platforms — notably Windows, where it fails with
+                // PermissionDenied ("Access is denied") at open, before
+                // sync_all is ever reached. Directory fsync is best-effort
+                // there, so treat it as a no-op.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(e) => return Err(PagedbError::Io(e)),
+            };
+            match dir.sync_all() {
+                Ok(()) => Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(PagedbError::Io(e)),
             }
-            Err(e) => return Err(PagedbError::Io(e)),
-        };
-        match dir.sync_all() {
-            Ok(()) => Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(PagedbError::Io(e)),
-        }
+        })
+        .await
     }
 
     async fn lock_exclusive(&self, path: &str) -> Result<Self::LockHandle> {
@@ -495,10 +503,17 @@ impl Vfs for TokioVfs {
         #[cfg(unix)]
         {
             let lock_path = self.resolve(&logical_path)?;
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            match OsFcntlHandle::try_acquire(&lock_path, LockKind::Exclusive) {
+            // `*_SETLK` never waits on a conflict, but creating the sentinel
+            // file can still stall on the filesystem, so the pair goes to the
+            // blocking pool together.
+            let acquired = offload(move || {
+                if let Some(parent) = lock_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+                }
+                OsFcntlHandle::try_acquire(&lock_path, LockKind::Exclusive)
+            })
+            .await;
+            match acquired {
                 Ok(os_lock) => Ok(TokioLockHandle {
                     lock_ref: entry,
                     kind: LockKind::Exclusive,
@@ -517,10 +532,17 @@ impl Vfs for TokioVfs {
         #[cfg(windows)]
         {
             let lock_path = self.resolve(&logical_path)?;
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            match OsLockFileExHandle::try_acquire(&lock_path, LockKind::Exclusive) {
+            // `LOCKFILE_FAIL_IMMEDIATELY` never waits on a conflict, but
+            // creating the sentinel file can still stall on the filesystem, so
+            // the pair goes to the blocking pool together.
+            let acquired = offload(move || {
+                if let Some(parent) = lock_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+                }
+                OsLockFileExHandle::try_acquire(&lock_path, LockKind::Exclusive)
+            })
+            .await;
+            match acquired {
                 Ok(os_lock) => Ok(TokioLockHandle {
                     lock_ref: entry,
                     kind: LockKind::Exclusive,
@@ -561,10 +583,16 @@ impl Vfs for TokioVfs {
         #[cfg(unix)]
         {
             let lock_path = self.resolve(&logical_path)?;
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            match OsFcntlHandle::try_acquire(&lock_path, LockKind::Shared) {
+            // Same reasoning as the exclusive path: the lock request itself
+            // never waits, the sentinel-file creation can.
+            let acquired = offload(move || {
+                if let Some(parent) = lock_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+                }
+                OsFcntlHandle::try_acquire(&lock_path, LockKind::Shared)
+            })
+            .await;
+            match acquired {
                 Ok(os_lock) => Ok(TokioLockHandle {
                     lock_ref: entry,
                     kind: LockKind::Shared,
@@ -584,10 +612,16 @@ impl Vfs for TokioVfs {
         #[cfg(windows)]
         {
             let lock_path = self.resolve(&logical_path)?;
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            match OsLockFileExHandle::try_acquire(&lock_path, LockKind::Shared) {
+            // Same reasoning as the exclusive path: the lock request itself
+            // never waits, the sentinel-file creation can.
+            let acquired = offload(move || {
+                if let Some(parent) = lock_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+                }
+                OsLockFileExHandle::try_acquire(&lock_path, LockKind::Shared)
+            })
+            .await;
+            match acquired {
                 Ok(os_lock) => Ok(TokioLockHandle {
                     lock_ref: entry,
                     kind: LockKind::Shared,

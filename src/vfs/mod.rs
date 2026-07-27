@@ -7,6 +7,8 @@
 
 #[cfg(all(target_os = "android", target_arch = "arm"))]
 pub mod android;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod blocking;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod gcd;
 #[cfg(target_os = "windows")]

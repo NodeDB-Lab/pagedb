@@ -1,7 +1,12 @@
 //! Shared `io_uring` instance. One ring is held per `IouringVfs`. All callers
 //! acquire a `parking_lot::Mutex<IoUring>` lock, push SQE(s), call
 //! `submit_and_wait`, and drain matching CQEs before releasing the lock.
-//! This is intentionally simple: no background poller, no `spawn_blocking`.
+//! This is intentionally simple: no background poller.
+//!
+//! `submit_and_wait` parks the calling thread inside `io_uring_enter` until the
+//! requested completions land; the ring fd is not registered with a reactor and
+//! the lock is held across the wait. Changing that is a design decision for the
+//! ring as a whole, not something an individual call site can opt out of.
 
 use std::sync::Arc;
 
