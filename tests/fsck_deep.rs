@@ -1,7 +1,8 @@
 //! Tests for the deep-walk integrity checker.
 
+use pagedb::options::RetainPolicy;
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, OpenOptions, RealmId, run_deep_walk};
+use pagedb::{Db, OpenOptions, PagedbError, RealmId, run_deep_walk};
 
 const KEK: [u8; 32] = [3u8; 32];
 const REALM: RealmId = RealmId::new([1u8; 16]);
@@ -149,4 +150,74 @@ async fn free_list_pages_are_accounted_not_orphans() {
         report.orphan_page_ids
     );
     assert!(report.is_clean(), "report should be clean");
+}
+
+/// With commit-history retention enabled, superseded-but-retained tree
+/// versions are still reachable through the commit-history index used by
+/// `begin_read_at`. A healthy store with several retained generations must
+/// not report those pages as orphans, and a retained generation must still
+/// be genuinely readable back.
+#[tokio::test(flavor = "current_thread")]
+async fn retained_history_pages_are_not_reported_as_orphans() {
+    let opts = OpenOptions::default()
+        .with_buffer_pool_pages(64)
+        .with_commit_history_retain(RetainPolicy::Count(1024));
+    let db = Db::open_internal_with_options(MemVfs::new(), KEK, 4096, REALM, opts)
+        .await
+        .unwrap();
+
+    // Repeatedly overwrite the same key set across several generations so
+    // copy-on-write genuinely supersedes earlier pages instead of only
+    // appending new ones. Enough keys/bytes to span multiple B+ tree pages.
+    let mut commits = Vec::new();
+    for generation in 0u8..24 {
+        let mut txn = db.begin_write().await.unwrap();
+        for i in 0u32..300 {
+            let key = format!("hkey{i:05}");
+            txn.put(key.as_bytes(), &[generation; 128]).await.unwrap();
+        }
+        let commit_id = txn.commit().await.unwrap();
+        commits.push(commit_id);
+    }
+
+    let report = run_deep_walk(&db).await.unwrap();
+    assert!(
+        report.orphan_page_ids.is_empty(),
+        "pages held for retained history are accounted by the deferred-free \
+         chain, not leaked, got {} orphans: {:?}",
+        report.orphan_page_ids.len(),
+        report.orphan_page_ids
+    );
+
+    // The pages the walk just declined to call orphans are genuinely live: an
+    // earlier retained commit still opens and reads back its own generation.
+    let earliest = commits[0];
+    let historical = db.begin_read_at(earliest).await.unwrap();
+    assert_eq!(
+        historical.get(b"hkey00000").await.unwrap().as_deref(),
+        Some([0u8; 128].as_slice()),
+        "retained historical commit must still read back its own generation's value"
+    );
+    drop(historical);
+
+    // Compaction is the pass that actually reclaims superseded pages. It
+    // retires retained history rather than preserving it, so the reachable set
+    // shrinks to the live roots — and must still balance exactly.
+    db.compact_now().await.unwrap();
+    assert!(
+        matches!(
+            db.begin_read_at(earliest).await,
+            Err(PagedbError::CommitGone { .. })
+        ),
+        "compaction retires retained history instead of pinning it forever"
+    );
+
+    let report = run_deep_walk(&db).await.unwrap();
+    assert!(
+        report.orphan_page_ids.is_empty(),
+        "compaction must return every superseded page to the free list, got {} \
+         orphans: {:?}",
+        report.orphan_page_ids.len(),
+        report.orphan_page_ids
+    );
 }

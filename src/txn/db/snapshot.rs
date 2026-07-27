@@ -725,6 +725,20 @@ impl<V: Vfs + Clone> Db<V> {
             ));
         }
 
+        // The complementary difference: pages a reader could reach at the base
+        // commit that the target no longer reaches. Nothing in the delta names
+        // them — their bytes never changed, only the roots moved off them — so
+        // installing the target roots strands them outside both the roots and
+        // this handle's free list unless they are folded in below. Derived from
+        // the two sets this apply has already walked and authenticated, which
+        // is why the delta itself need not carry them: the receiver is the only
+        // side that can act on them, and it can already name them exactly.
+        let reclaimed_page_ids: BTreeSet<u64> = base_pages
+            .reader_visible
+            .difference(&target_page_ids)
+            .copied()
+            .collect();
+
         let target_segments = self
             .catalog_segment_metas(
                 manifest.target_catalog_root_page_id,
@@ -793,6 +807,30 @@ impl<V: Vfs + Clone> Db<V> {
         let mut state = self.writer.lock().await;
         self.ensure_usable()?;
 
+        // Fold the reclaim set into this handle's own free-list chain, and drop
+        // any entry the target has since put back into service. The rewritten
+        // chain is staged through the Pager and becomes durable with the very
+        // header swap that installs the target roots, so the roots and the
+        // free-list accounting for the pages they abandoned can never diverge:
+        // a crash before that swap leaves the previous chain and the previous
+        // roots both intact, and the retry redoes the fold.
+        let alloc_cursor = manifest.next_page_id_at_target.max(state.next_page_id);
+        let staged_free_list = self
+            .stage_reclaimed_free_list(
+                &state,
+                &reclaimed_page_ids,
+                &target_page_ids,
+                new_commit_id,
+                alloc_cursor,
+            )
+            .await?;
+        // Back the cursor this apply is about to publish with real extent
+        // before the chain pages flush into it, so no observable point has a
+        // header naming pages `main.db` does not contain.
+        self.ensure_main_db_covers_cursor(staged_free_list.next_page_id)
+            .await?;
+        self.pager.flush_main(self.realm_id).await?;
+
         // Write the journal record to a fresh apply-journal sidecar via the
         // Pager AEAD path. A fresh, never-reused `journal_id` guarantees the
         // sidecar's nonce space never collides with another file's under one
@@ -820,10 +858,13 @@ impl<V: Vfs + Clone> Db<V> {
         };
         let (journal_root_page_id, journal_root_version) = encode_journal_id(&journal_id);
 
+        // The target's allocation cursor, extended if hosting the rewritten
+        // free-list chain had to bump-allocate past it.
+        let new_next_page_id = staged_free_list.next_page_id;
+
         // Commit the A/B header with the journal root pointing at the slot we
         // just wrote. After this commit, a crash-recovery replay can re-execute
         // the promote renames idempotently.
-        let new_next_page_id = manifest.next_page_id_at_target;
         let new_seq = state
             .seq
             .checked_add(1)
@@ -855,7 +896,9 @@ impl<V: Vfs + Clone> Db<V> {
             active_root_txn_id: new_commit_id,
             counter_anchor,
             commit_id: crate::CommitId(new_commit_id),
-            free_list_root: crate::txn::db::encode_free_list_root(state.free_list_root_page_id),
+            free_list_root: crate::txn::db::encode_free_list_root(
+                staged_free_list.free_list_root_page_id,
+            ),
             catalog_root: catalog_root_bytes,
             apply_journal_root_page_id: journal_root_page_id,
             apply_journal_root_version: journal_root_version,
@@ -887,6 +930,7 @@ impl<V: Vfs + Clone> Db<V> {
         state.root_page_id = new_root_page_id;
         state.catalog_root_page_id = new_catalog_root_page_id;
         state.catalog_root_txn_id = new_commit_id;
+        state.free_list_root_page_id = staged_free_list.free_list_root_page_id;
         // The header is the source of truth for a pending apply. Mirror it in
         // live writer state immediately so every subsequent operation sees the
         // same retry obligation.

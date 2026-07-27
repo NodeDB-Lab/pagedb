@@ -14,7 +14,7 @@ use pagedb::vfs::tokio_backend::{TokioFile, TokioLockHandle, TokioVfs};
 use pagedb::vfs::{OpenMode, Vfs};
 use pagedb::{
     ApplyStats, CommitId, Db, DbMode, OpenOptions, PagedbError, RealmId, SegmentKind,
-    SegmentPageKind, SnapshotStats,
+    SegmentPageKind, SnapshotStats, run_deep_walk,
 };
 
 const PAGE: usize = 4096;
@@ -3449,4 +3449,74 @@ async fn concurrent_incremental_applies_are_serialized_before_raw_page_writes() 
     for path in paths {
         std::fs::remove_dir_all(path).ok();
     }
+}
+
+/// Applying an incremental delta writes raw pages directly to `main.db`,
+/// bypassing the normal write-txn path that the free-list accounting relies
+/// on elsewhere. That makes it its own place where a page could end up
+/// reachable from neither a live root nor the free list — a leak the deep
+/// walk's orphan check exists to catch.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_incremental_leaves_no_orphan_pages_on_the_follower() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..200 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[1u8; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    let base = source.latest_commit();
+    source.snapshot_to(&snap_dir).await.unwrap();
+
+    // Several more commits after the base snapshot, overwriting the same key
+    // set each time so copy-on-write both allocates fresh pages and recycles
+    // superseded ones, exercising both halves of the delta.
+    for generation in 0u8..5 {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..200 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[generation; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    source
+        .snapshot_incremental_to(base, &delta_dir)
+        .await
+        .unwrap();
+    drop(source);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    follower.apply_incremental(&delta_dir).await.unwrap();
+
+    let report = run_deep_walk(&follower).await.unwrap();
+    assert!(
+        report.orphan_page_ids.is_empty(),
+        "snapshot apply must not leave leaked pages on the follower, got {} orphans: {:?}",
+        report.orphan_page_ids.len(),
+        report.orphan_page_ids
+    );
+    assert!(
+        report.is_clean(),
+        "follower deep-walk report should be clean after apply_incremental: {report:?}"
+    );
+
+    drop(follower);
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
 }

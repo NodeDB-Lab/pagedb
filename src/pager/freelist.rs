@@ -30,6 +30,14 @@ use crate::{PagedbError, RealmId, Result};
 const ENTRY_LEN: usize = 16;
 const PAGE_HEADER_LEN: usize = 12;
 
+/// Freeing-commit tag for pages that only ever hosted the chain itself.
+///
+/// No reader snapshot traverses the free list, so its superseded chain pages
+/// are not gated behind reader pins the way data-page frees are. Real commit
+/// ids start at 1, so this sentinel sits below every reclamation floor and the
+/// pages are recyclable as soon as the header that supersedes them is durable.
+pub const CHAIN_METADATA_CID: u64 = 0;
+
 /// Number of `(commit_id, page_id)` entries one free-list page can hold.
 #[must_use]
 pub const fn chain_capacity(page_size: usize) -> usize {

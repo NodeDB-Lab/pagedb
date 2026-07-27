@@ -14,6 +14,10 @@ mod manifest_validation;
 mod misc;
 mod open;
 mod reader;
+// Serves the native-only incremental-snapshot apply path, like
+// `manifest_validation` above; gate it the same way.
+#[cfg(not(target_arch = "wasm32"))]
+mod reclaim;
 pub(crate) mod rekey;
 mod segment;
 #[cfg(not(target_arch = "wasm32"))]

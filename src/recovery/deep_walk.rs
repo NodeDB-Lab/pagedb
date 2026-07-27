@@ -65,14 +65,18 @@ pub struct DeepWalkReport {
 impl DeepWalkReport {
     /// `true` iff no integrity issues were found.
     ///
-    /// Orphan pages (pages with valid AEAD but unreachable from any live root)
-    /// are **informational** and do not affect cleanliness — they are expected
-    /// for deferred-free pages awaiting GC.
+    /// Orphan pages are not informational: pages deferred for GC are recorded
+    /// in the free-list chain and are already folded into `reachable` by
+    /// `run_deep_walk`, so a page that still lands in `orphan_page_ids` is
+    /// unreferenced by any root *and* absent from the free list — a genuine
+    /// leak. A leak that doesn't fail this check is invisible, so it must
+    /// count here.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.page_issues.is_empty()
             && self.segment_issues.is_empty()
             && self.drift_issues.is_empty()
+            && self.orphan_page_ids.is_empty()
     }
 
     /// Write a human-readable text report to `out`.
@@ -107,7 +111,11 @@ impl DeepWalkReport {
         }
         writeln!(out)?;
 
-        writeln!(out, "--- orphan pages ({}) ---", self.orphan_page_ids.len())?;
+        writeln!(
+            out,
+            "--- orphan pages: leaked, unreferenced by any root or the free list ({}) ---",
+            self.orphan_page_ids.len()
+        )?;
         let sample: Vec<_> = self.orphan_page_ids.iter().take(20).collect();
         for pid in &sample {
             writeln!(out, "  page {pid}")?;
