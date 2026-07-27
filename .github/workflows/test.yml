@@ -7,21 +7,23 @@
 # Not triggered directly — `workflow_call` only.
 #
 # Jobs:
-#   lint        — rustfmt + clippy + doc + doctests + checklist-scaffold gate
+#   lint        — rustfmt + clippy (both workspace packages) + doc + doctests
+#                 + checklist-scaffold gate
 #   test        — `cargo nextest run` on Linux / macOS / Windows. Crash tests
 #                 are serialised by `.config/nextest.toml`, which `cargo test`
 #                 ignores — that is why this workflow always uses nextest.
 #   invariants  — the same suite with PAGEDB_INVARIANT_CHECKS set, so the
 #                 opt-in commit-time structural checks are actually exercised.
 #   cross       — `cargo check` across every Tier-1/Tier-2 target the VFS
-#                 backend matrix in resource/architecture.md §8 covers, so a
-#                 platform-specific backend never regresses unnoticed.
+#                 backend matrix covers, so a platform-specific backend never
+#                 regresses unnoticed. Format-bit-identity across these targets
+#                 is a release gate, so a target dropped here is a silent hole.
 #   wasm        — `cargo check` for wasm32-unknown-unknown (OPFS) and
 #                 wasm32-wasip1 (WASI VFS).
 #   features    — build with every feature flag combination that ships.
-#   bench       — fluxbench dry-run (compiles benches, runs the smallest
-#                 measurement so a broken bench fails CI without burning a
-#                 long benchmark slot).
+#   bench       — compiles every bench target in both packages without running
+#                 any measurement, so a bench that stops building fails CI
+#                 without burning a long benchmark slot.
 
 name: Test
 
@@ -48,6 +50,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # The isolated comparison package links RocksDB (librocksdb-sys), whose
+      # build runs bindgen and needs libclang.
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: lint
@@ -68,15 +75,22 @@ jobs:
       - name: Clippy (all targets, all features)
         run: cargo clippy -p pagedb --all-targets --all-features -- -D warnings
 
+      # No `--all-features` — the comparison package has no feature flags.
+      - name: Clippy (engine comparison)
+        run: cargo clippy -p pagedb-engine-comparison --all-targets -- -D warnings
+
       - name: Build docs
         run: cargo doc -p pagedb --no-deps --all-features
 
       - name: Run doctests
         run: cargo test -p pagedb --doc --all-features
 
-      # Enforces the rule in CLAUDE.md: no checklist-letter or build-order
-      # scaffolding may leak into source / Cargo.toml / README. Greps for
-      # the explicit forbidden patterns; fails the job if any are present.
+      # Code is organised by what it does, never by the order it was built,
+      # so no build-order scaffolding may leak into source / Cargo.toml /
+      # README: no checklist letters, no "step N" / "phase N" / "milestone
+      # MN" markers, in prose or in identifiers. A reader must not be able to
+      # reconstruct the build sequence from the code. Greps for the explicit
+      # forbidden patterns; fails the job if any are present.
       - name: Checklist-scaffold leak gate
         run: |
           set -euo pipefail
@@ -84,7 +98,7 @@ jobs:
                 -e '\b(step_[a-z]_|phase_[a-z]_|m[0-9]+_)\w*' \
                 -e '(?i)\b(added in step|step [A-Z]\b|phase [A-Z]\b|milestone M[0-9])' \
                 src/ Cargo.toml README.md; then
-            echo "::error::Checklist-scaffold leaked into source — see CLAUDE.md 'Code rules'."
+            echo "::error::Build-order scaffolding leaked into source. Name things by what they do, not by the order they landed."
             exit 1
           fi
 
@@ -169,8 +183,9 @@ jobs:
           if-no-files-found: ignore
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Per-platform VFS backends (architecture.md §8) must each at least
-  # type-check on every target they exist for. Compile-only — running on
+  # Per-platform VFS backends must each at least type-check on every target
+  # they exist for: one backend per platform family, selected by cfg, so a
+  # target absent here compiles nowhere. Compile-only — running on
   # these targets would require emulators / Apple runners we don't gate
   # every PR on.
   cross:
@@ -282,11 +297,14 @@ jobs:
 
       # Compile-only smoke; running fluxbench in CI is a separate, manually-
       # dispatched workflow so we don't pay the runtime on every PR. This
-      # job catches "the bench no longer compiles" regressions.
+      # job catches "the bench no longer compiles" regressions. Package-wide,
+      # no `--bench` filters: naming targets individually is what let two
+      # benches go uncompiled, and a package-wide build can't silently miss
+      # a newly added target.
       - name: Build benches
         run: |
-          cargo bench --no-run -p pagedb --bench segment
-          cargo bench --no-run -p pagedb-engine-comparison --bench btree --bench comparison
+          cargo bench --no-run -p pagedb
+          cargo bench --no-run -p pagedb-engine-comparison
 
   # ─────────────────────────────────────────────────────────────────────────
   audit:

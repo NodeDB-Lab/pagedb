@@ -23,6 +23,9 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
+# Benchmarking goes through the `harness = false` fluxbench targets below;
+# the default libtest harness must not also build one for the lib.
+bench = false
 
 [dependencies]
 # Production black-box recorder — corruption/invariant reports with a
@@ -143,6 +146,7 @@ fluxbench = "0.1"
 [[bin]]
 name = "pagedb-fsck"
 path = "src/bin/pagedb-fsck/main.rs"
+bench = false
 
 # These are executable benchmarks, not test harnesses. The cross-engine suite
 # is a separate non-default workspace package so normal PageDB tests never
