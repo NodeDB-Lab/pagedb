@@ -9,6 +9,15 @@
 //! neither owns nor can see it. Without this the pages are reachable from no
 //! root and named by no free-list entry: space that never returns.
 //!
+//! The reclaim set is the *only* thing folded here, and deliberately so. Ids
+//! below the published cursor that no root reaches are the producer's free
+//! space: the follower replicates that page space but does not own it and never
+//! allocates from it, so pulling those ids into follower-owned structures would
+//! claim an authority this handle does not have. It would also be actively
+//! harmful — chain pages join the published base set that an apply refuses to
+//! overwrite, so a longer chain means more ids the producer's next delta
+//! collides with, trading a phantom leak for real replication failures.
+//!
 //! The rewrite mirrors the one a normal commit performs: entries carry the
 //! commit that freed them, the chain is hosted only on pages already free and
 //! below the reclamation floor, and the new head reaches disk with the same
@@ -140,8 +149,11 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Growing is unconditional and shrinking never happens: this must not undo
     /// a delta write or a chain page that landed past the cursor. The zero
-    /// pages it materializes are readable and carry no AEAD tag, exactly like
-    /// the pages GC zeroes, so nothing mistakes them for damage.
+    /// pages it materializes carry no AEAD tag and so can never be
+    /// authenticated. That is not damage and not a leak here: they are the
+    /// producer's free space, which this handle replicates without owning, so
+    /// the deep walk deliberately does not hold a replicating handle to account
+    /// for them.
     pub(super) async fn ensure_main_db_covers_cursor(&self, next_page_id: u64) -> Result<()> {
         let page_size = u64::try_from(self.page_size)
             .map_err(|_| PagedbError::arithmetic_overflow("page size"))?;

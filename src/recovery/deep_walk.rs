@@ -51,7 +51,13 @@ pub struct DeepWalkReport {
     pub page_issues: Vec<PageIssue>,
     /// Segment-level issues (bad footer MAC, unreadable pages inside a segment).
     pub segment_issues: Vec<SegmentIssue>,
-    /// Pages with valid AEAD but unreachable from any live tree root.
+    /// Leaked pages: unreferenced by every live root *and* absent from the free
+    /// list, so nothing will ever hand them out again.
+    ///
+    /// This is a claim about an allocator, not about bytes, so it is only ever
+    /// populated for a handle that owns the allocator behind `main.db` — see
+    /// [`DeepWalkReport::is_clean`]. On a replicating handle the set is always
+    /// empty, and its emptiness carries no information.
     pub orphan_page_ids: Vec<u64>,
     /// Catalog rows that reference segments missing from disk, or where
     /// the on-disk file size disagrees with the catalog record.
@@ -71,6 +77,19 @@ impl DeepWalkReport {
     /// unreferenced by any root *and* absent from the free list — a genuine
     /// leak. A leak that doesn't fail this check is invisible, so it must
     /// count here.
+    ///
+    /// That verdict is not universal, because an orphan is unreferenced space
+    /// in an allocator *this handle controls*. A replicating handle's `main.db`
+    /// is the producer's allocator: the handle adopts the producer's cursor,
+    /// receives only the pages the producer's roots reach, and never allocates
+    /// from the ids in between — those are the producer's free space. The same
+    /// page that is a leak on the writer that owns it is simply not this
+    /// handle's leak to report. So [`run_deep_walk`] records orphans only for
+    /// [`DbMode::Standalone`](crate::DbMode::Standalone).
+    ///
+    /// Every other part of the report is a claim about bytes rather than about
+    /// ownership — AEAD, structure, catalog drift — and still applies in every
+    /// mode, so `is_clean` remains meaningful on a follower.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.page_issues.is_empty()
@@ -154,10 +173,22 @@ impl DeepWalkReport {
 /// The `Db` must be open in any mode. The walk reads from the VFS directly
 /// rather than going through the B+ tree API so it can examine every physical
 /// page including free, spill, and unreferenced pages.
+///
+/// Leak detection is mode-scoped — see [`DeepWalkReport::is_clean`]. Everything
+/// else the walk verifies holds in every mode.
 #[allow(clippy::too_many_lines)]
 pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport> {
     db.ensure_usable()?;
     let mut report = DeepWalkReport::default();
+
+    // Only a Standalone handle owns the allocator behind `main.db`, so only it
+    // can be leaking. Follower and ReadOnly replicate a producer's page space,
+    // and an Observer is reading a live writer's — in all three the ids no root
+    // reaches belong to that other writer's free space, and calling them leaks
+    // would report someone else's bookkeeping as this store's corruption.
+    // Matching Standalone positively rather than excluding the others keeps
+    // that conservative reading if `DbMode` ever grows a variant.
+    let owns_page_space = db.is_writer();
 
     let (next_page_id, catalog_root, catalog_next, free_list_root) = {
         let state = db.writer.lock().await;
@@ -264,9 +295,21 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
             }
         }
 
-        // Skip all-zero pages — they are freed/reclaimed pages that GC has
-        // zeroed out. They carry no AEAD tag and are not corruption.
+        // A zeroed page carries no AEAD tag, so authentication can say nothing
+        // about it and accounting is the only evidence available. That evidence
+        // is already complete here: `reachable` holds the reserved pages, every
+        // live root's pages, and — folded in above — the free-list chain's own
+        // pages plus every page it names. Either way the page is skipped without
+        // attempting a tag it cannot have; the only question left is whether
+        // its absence from `reachable` is this store's problem. On a handle that
+        // owns the allocator it is — no root and no free list names the page, so
+        // nothing will ever hand it out again. On a replicating handle the very
+        // same page is the producer's free space, which is why the judgement is
+        // gated rather than the skip.
         if buf.iter().all(|&b| b == 0) {
+            if owns_page_space && !reachable.contains(&page_id) {
+                report.orphan_page_ids.push(page_id);
+            }
             report.pages_examined += 1;
             continue;
         }
@@ -321,7 +364,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
                 page_id,
                 description: "AEAD verification failed".to_string(),
             });
-        } else if !reachable.contains(&page_id) {
+        } else if owns_page_space && !reachable.contains(&page_id) {
             report.orphan_page_ids.push(page_id);
         }
 
