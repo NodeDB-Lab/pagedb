@@ -57,6 +57,14 @@ impl<V: Vfs + Clone> Db<V> {
         freeing_commit_id: u64,
         alloc_cursor: u64,
     ) -> Result<StagedFreeList> {
+        // Deliberately the whole chain, not the write path's bounded window.
+        // The fold has to answer a question about the *complete* entry set —
+        // whether the target's roots reach any page this handle records as free
+        // — and drop every such entry. An entry left unexamined in an unscanned
+        // tail is a page the follower's free list hands out while its own roots
+        // still point at it, which is the double-free this check exists to
+        // prevent. Residency is the price; an apply is not the per-commit hot
+        // path, and it already materialises the base and target page sets.
         let (existing, old_chain_pages) =
             freelist::read_chain(&self.pager, self.realm_id, state.free_list_root_page_id).await?;
 
@@ -128,6 +136,8 @@ impl<V: Vfs + Clone> Db<V> {
             entries,
             host_candidates,
             alloc_cursor,
+            // The whole chain was read, so there is no retained tail to splice.
+            0,
         )
         .await?;
         Ok(StagedFreeList {

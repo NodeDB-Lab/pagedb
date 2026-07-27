@@ -204,9 +204,15 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// Insert the new commit-history entry and prune per the retention policy.
-    /// Returns the page ids freed by this tree's copy-on-write and pruning, so
-    /// the caller can hand them to the shared allocator cache for reuse (they
-    /// are never reader-pinned).
+    /// Returns the page ids freed by this tree's copy-on-write and pruning.
+    ///
+    /// Those ids go into the commit's free-list entry set like any other free,
+    /// and deliberately **not** straight into the shared allocator cache. The
+    /// cache is loaded once, at `begin_write`, from the bounded window of the
+    /// durable chain that the following commit rewrites; a page pushed in from
+    /// anywhere else would be handed to an allocator without the chain entry
+    /// naming it ever being located, so nothing would delete it and the
+    /// unscanned tail would keep naming it. One page id, two owners.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn write_commit_history_entry(
         &self,
@@ -228,9 +234,15 @@ impl<V: Vfs + Clone> Db<V> {
         );
         // The commit-history tree is not part of any reader's pinned snapshot
         // (readers track the data and catalog roots, never the history root), so
-        // every page its copy-on-write/prune frees is immediately reusable.
-        // Recycle freely and feed the shared allocator cache so per-commit
-        // history churn does not leak pages over a long-lived writer's lifetime.
+        // every page its copy-on-write/prune frees is immediately reusable
+        // in-session — hence the zero reuse threshold.
+        //
+        // Sharing the allocator cache is a one-way street: this tree *draws*
+        // from it (recording each draw in the consumed sink, which is what
+        // deletes the entry from the rewritten window at commit) and never
+        // pushes into it. Its own frees leave through `drain_freed` into the
+        // commit's entry set instead, so no page reaches an allocator without
+        // the window entry that names it having been located first.
         hist_tree.set_reuse_threshold(0);
         hist_tree.set_free_page_cache(self.free_page_cache.clone());
         hist_tree.set_free_page_consumed(self.free_page_consumed.clone());

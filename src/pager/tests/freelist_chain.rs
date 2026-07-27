@@ -50,7 +50,7 @@ async fn round_trip(total: u64, host_count: usize) {
         .collect();
     const BUMP_BASE: u64 = 500_000;
 
-    let (head, new_next) = rewrite_chain(&pager, REALM, PAGE, entries, hosts, BUMP_BASE)
+    let (head, new_next) = rewrite_chain(&pager, REALM, PAGE, entries, hosts, BUMP_BASE, 0)
         .await
         .unwrap_or_else(|e| panic!("rewrite_chain(total={total}, hosts={host_count}): {e:?}"));
 

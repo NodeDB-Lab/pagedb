@@ -206,8 +206,14 @@ impl<V: Vfs> BTree<V> {
 
     /// Wire in the `Db`'s shared free-page cache. After this call,
     /// `allocate_page` pops from the shared pool before bumping `next_page_id`.
-    /// The pool is loaded at `begin_write` with the durable free-list's
-    /// floor-safe pages, so recycling from it is always snapshot-safe.
+    /// The pool is loaded at `begin_write` with the floor-safe pages of the
+    /// bounded free-list window the following commit rewrites, so recycling
+    /// from it is always snapshot-safe.
+    ///
+    /// The pool is draw-only: nothing here may push into it. The commit deletes
+    /// a recycled id from the chain by finding it in that window, so an id
+    /// pushed in from elsewhere would be handed out while the unscanned tail
+    /// still named it — the same page id given to two live structures.
     pub fn set_free_page_cache(&mut self, cache: Arc<parking_lot::Mutex<Vec<u64>>>) {
         self.free_page_cache = Some(cache);
     }

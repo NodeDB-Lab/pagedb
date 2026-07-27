@@ -4,6 +4,8 @@
 mod commit;
 mod counter;
 mod spill;
+#[cfg(test)]
+mod tests;
 mod txn;
 
 pub use counter::CounterRef;

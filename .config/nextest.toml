@@ -14,6 +14,7 @@ test-threads = "num-cpus"
 [[profile.default.overrides]]
 filter = """
     binary(crash_basic)
+    | binary(crash_boundaries)
     | binary(recovery_basic)
     | binary(fsck_deep)
     | binary(durability)

@@ -56,13 +56,22 @@ pub struct WriteTxn<'db, V: Vfs + Clone> {
     pub(crate) spill_bytes_used: u64,
     /// Per-append metadata used by `SpillScope::read` to reconstruct AAD/nonce.
     pub(crate) spill_segments: Vec<SpillSegmentMeta>,
-    /// The durable free-list's `(commit_id, page_id)` entries as loaded at
-    /// begin. The commit path rewrites the chain from these (minus the pages
-    /// reused this txn, plus the pages freed this txn).
+    /// The `(commit_id, page_id)` entries carried by the bounded window of the
+    /// durable free list that was scanned at begin. The commit path rewrites
+    /// exactly that window (minus the pages reused this txn, plus the pages
+    /// freed this txn) and splices it onto [`Self::retained_tail_page_id`].
+    ///
+    /// This is the *whole* set of page ids this transaction is allowed to hand
+    /// to the allocator: an id the window did not name cannot be deleted from
+    /// the chain by the rewrite, so the untouched tail would still name it.
     pub(crate) free_set_loaded: Vec<(u64, u64)>,
-    /// Page ids the old free-list chain occupied at begin. They become free
-    /// once this commit's new chain supersedes them.
+    /// Page ids the scanned window occupied at begin. They become free once
+    /// this commit's new chain supersedes them.
     pub(crate) old_chain_pages: Vec<u64>,
+    /// Head of the part of the durable chain the window did not reach. It is
+    /// neither read nor rewritten: the fresh prefix's last page simply links to
+    /// it, and every page beyond carries its own `next` and count.
+    pub(crate) retained_tail_page_id: u64,
     /// Reclamation floor at begin: free-list entries tagged below this are
     /// drainable (no snapshot pins them). The reader-stall policy is evaluated
     /// at commit against only the entries at/above it — the backlog genuinely
@@ -104,26 +113,46 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         };
         let reuse_threshold = guard.next_page_id;
 
-        // Load the durable free-list and rebuild the shared allocator cache with
-        // exactly the pages below the reclamation floor — the older of the
-        // oldest live-reader pin and the oldest retained commit-history root.
-        // Those are observable by no snapshot, so they are safe to recycle now.
+        // The reclamation floor: the older of the oldest live-reader pin and the
+        // oldest retained commit-history root. Free-list entries tagged below it
+        // are observable by no snapshot and safe to recycle now.
         let history_floor = db
             .oldest_retained_history_commit(guard.commit_history_root_page_id, guard.next_page_id)
             .await?;
         let floor = min_reader
             .unwrap_or(u64::MAX)
             .min(history_floor.map_or(u64::MAX, |h| h.saturating_add(1)));
-        let (free_set_loaded, old_chain_pages) = crate::pager::freelist::read_chain(
+
+        // Rebuild the shared allocator cache from the durable free list.
+        //
+        // Only a bounded *window* of the chain is materialised. Loading the
+        // whole chain made both this scan and the commit that rewrites it cost
+        // O(free pages) on the hottest path in the system, which is precisely
+        // the residency the `OpenOptions` budgets exist to cap; a store with a
+        // large free list would blow past them on every single write.
+        //
+        // The window is also the safety boundary. A page may enter the
+        // allocator cache ONLY from here, and the commit deletes it from the
+        // rewritten window in the same breath. Feeding the cache an id this
+        // walk did not locate would re-add a page the untouched tail still
+        // names — one id in the chain twice, later handed to two different live
+        // structures. A leaked page is recoverable; a double-free is not.
+        let window = crate::pager::freelist::read_chain_prefix(
             &db.pager,
             db.realm_id,
             guard.free_list_root_page_id,
+            crate::pager::freelist::WINDOW_PAGES,
         )
         .await?;
         {
+            // Scan order matters: the cache is popped from the back, so the
+            // allocator consumes the deepest entries in the window first. That
+            // empties the window at the end nearest the retained tail, which is
+            // what lets the next rewrite's splice point move forward instead of
+            // parking at a fixed depth.
             let mut cache = db.free_page_cache.lock();
             cache.clear();
-            for (cid, pid) in &free_set_loaded {
+            for (cid, pid) in &window.entries {
                 if *cid < floor {
                     cache.push(*pid);
                 }
@@ -167,8 +196,9 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
             spill_path: None,
             spill_bytes_used: 0,
             spill_segments: Vec::new(),
-            free_set_loaded,
-            old_chain_pages,
+            free_set_loaded: window.entries,
+            old_chain_pages: window.chain_pages,
+            retained_tail_page_id: window.tail,
             reclaim_floor: floor,
         })
     }

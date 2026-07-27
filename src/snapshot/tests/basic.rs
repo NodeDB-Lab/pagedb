@@ -11,7 +11,7 @@ use crate::snapshot::export::{
     SnapshotManifest, decode_manifest, derive_snapshot_hk_key, encode_manifest, open_manifest,
 };
 use crate::vfs::tokio_backend::{TokioFile, TokioLockHandle, TokioVfs};
-use crate::vfs::{OpenMode, Vfs};
+use crate::vfs::{OpenMode, ReadReq, Vfs, VfsFile, WriteReq};
 use crate::{
     ApplyStats, CommitId, Db, DbMode, OpenOptions, PagedbError, RealmId, SegmentKind,
     SegmentPageKind, SnapshotStats, run_deep_walk,
@@ -4070,5 +4070,255 @@ async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snap
     drop(source);
     for dir in cleanup_dirs {
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// A `TokioVfs` whose `main.db` A/B header slots can be made unwritable.
+///
+/// The delta pages an incremental apply writes land at page 4 and above, so
+/// rejecting writes below that boundary stops an apply exactly between "the
+/// target pages are on disk" and "the header names them" — the apply's commit
+/// point.
+#[derive(Clone)]
+struct HeaderFaultVfs {
+    inner: TokioVfs,
+    fail_header_writes: Arc<AtomicBool>,
+}
+
+impl HeaderFaultVfs {
+    fn new(root: &std::path::Path) -> Self {
+        Self {
+            inner: TokioVfs::new(root),
+            fail_header_writes: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_header_writes(&self, fail: bool) {
+        self.fail_header_writes.store(fail, Ordering::SeqCst);
+    }
+
+    fn injected() -> PagedbError {
+        PagedbError::Io(std::io::Error::other("injected header swap interruption"))
+    }
+}
+
+impl Vfs for HeaderFaultVfs {
+    type File = HeaderFaultFile;
+    type LockHandle = TokioLockHandle;
+
+    async fn open(&self, path: &str, mode: OpenMode) -> crate::Result<Self::File> {
+        Ok(HeaderFaultFile {
+            inner: self.inner.open(path, mode).await?,
+            is_main_db: path == "/main.db",
+            fail_header_writes: self.fail_header_writes.clone(),
+        })
+    }
+
+    async fn remove(&self, path: &str) -> crate::Result<()> {
+        self.inner.remove(path).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> crate::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn list_dir(&self, path: &str) -> crate::Result<Vec<String>> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn mkdir_all(&self, path: &str) -> crate::Result<()> {
+        self.inner.mkdir_all(path).await
+    }
+
+    async fn sync_dir(&self, path: &str) -> crate::Result<()> {
+        self.inner.sync_dir(path).await
+    }
+
+    async fn lock_exclusive(&self, path: &str) -> crate::Result<Self::LockHandle> {
+        self.inner.lock_exclusive(path).await
+    }
+
+    async fn lock_shared(&self, path: &str) -> crate::Result<Self::LockHandle> {
+        self.inner.lock_shared(path).await
+    }
+
+    fn root_path(&self) -> Option<&std::path::Path> {
+        Some(self.inner.root_path())
+    }
+}
+
+struct HeaderFaultFile {
+    inner: TokioFile,
+    is_main_db: bool,
+    fail_header_writes: Arc<AtomicBool>,
+}
+
+impl HeaderFaultFile {
+    fn rejects(&self, offset: u64) -> bool {
+        self.is_main_db
+            && self.fail_header_writes.load(Ordering::SeqCst)
+            && offset < 2 * PAGE as u64
+    }
+}
+
+impl VfsFile for HeaderFaultFile {
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::Result<usize> {
+        self.inner.read_at(offset, buf).await
+    }
+
+    async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> crate::Result<()> {
+        self.inner.read_at_vectored(reqs).await
+    }
+
+    async fn write_at(&mut self, offset: u64, buf: &[u8]) -> crate::Result<usize> {
+        if self.rejects(offset) {
+            return Err(HeaderFaultVfs::injected());
+        }
+        self.inner.write_at(offset, buf).await
+    }
+
+    async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> crate::Result<()> {
+        if reqs.iter().any(|req| self.rejects(req.offset)) {
+            return Err(HeaderFaultVfs::injected());
+        }
+        self.inner.write_at_vectored(reqs).await
+    }
+
+    async fn sync(&mut self) -> crate::Result<()> {
+        self.inner.sync().await
+    }
+
+    async fn truncate(&mut self, len: u64) -> crate::Result<()> {
+        self.inner.truncate(len).await
+    }
+
+    async fn len(&self) -> crate::Result<u64> {
+        self.inner.len().await
+    }
+
+    async fn is_empty(&self) -> crate::Result<bool> {
+        self.inner.is_empty().await
+    }
+
+    fn supports_direct_io(&self) -> bool {
+        self.inner.supports_direct_io()
+    }
+}
+
+/// An incremental apply interrupted at its header swap leaves the follower
+/// wholly at the base commit, and a later apply of the very same delta carries
+/// it all the way to the target.
+///
+/// The delta pages are already on disk when the swap is refused, so the two
+/// halves of the property are what matter: nothing of the target may be
+/// observable while its header is not durable, and the pages left behind must
+/// not block the retry that finishes the transfer.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_interrupted_at_the_header_swap_stays_at_the_base_commit_then_retries_through() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+    {
+        let mut txn = source.begin_write().await.unwrap();
+        txn.put(b"base", b"base-value").await.unwrap();
+        txn.commit().await.unwrap();
+    }
+    let base_commit = source.latest_commit();
+    source.snapshot_to(&snap_dir).await.unwrap();
+    {
+        let mut txn = source.begin_write().await.unwrap();
+        txn.put(b"target", b"target-value").await.unwrap();
+        txn.commit().await.unwrap();
+    }
+    let target_commit = source.latest_commit();
+    source
+        .snapshot_incremental_to(base_commit, &delta_dir)
+        .await
+        .unwrap();
+    drop(source);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    drop(restored);
+
+    // Refuse the header swap the apply ends with, after its delta pages and
+    // journal sidecar are already durable.
+    let fault_vfs = HeaderFaultVfs::new(&dst_dir);
+    let follower = Db::open_read_only(fault_vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap()
+        .promote_to_follower()
+        .await
+        .unwrap();
+    fault_vfs.fail_header_writes(true);
+    assert!(
+        follower.apply_incremental(&delta_dir).await.is_err(),
+        "a refused header swap must fail the apply"
+    );
+    fault_vfs.fail_header_writes(false);
+    drop(follower);
+
+    let reopened = Db::<TokioVfs>::open_read_only(
+        TokioVfs::new(&dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.latest_commit(),
+        base_commit,
+        "an unswapped header leaves the follower at its base commit"
+    );
+    {
+        let read = reopened.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(b"base").await.unwrap().as_deref(),
+            Some(b"base-value".as_slice())
+        );
+        assert!(
+            read.get(b"target").await.unwrap().is_none(),
+            "no part of the target commit may be observable before its header is durable"
+        );
+    }
+    let report = run_deep_walk(&reopened).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "interrupted apply left the follower unsound: {report:?}"
+    );
+
+    let retried = reopened.promote_to_follower().await.unwrap();
+    retried.apply_incremental(&delta_dir).await.unwrap();
+    assert_eq!(
+        retried.latest_commit(),
+        target_commit,
+        "the retry must carry the follower to the delta's target"
+    );
+    {
+        let read = retried.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(b"target").await.unwrap().as_deref(),
+            Some(b"target-value".as_slice())
+        );
+        assert_eq!(
+            read.get(b"base").await.unwrap().as_deref(),
+            Some(b"base-value".as_slice())
+        );
+    }
+    let report = run_deep_walk(&retried).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "completed apply after an interruption: {report:?}"
+    );
+
+    drop(retried);
+    for dir in [&src_dir, &snap_dir, &delta_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
     }
 }

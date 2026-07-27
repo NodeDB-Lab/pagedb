@@ -193,9 +193,9 @@ fn generated_freelist_chains_terminate_or_report_corruption() {
                         .unwrap();
                 }
                 let _ = read_chain(&pager, REALM, FIRST_PAGE).await;
-                // `count_chain` keeps no visited set — it detects cycles by
-                // tortoise-and-hare — so it needs generated coverage of its own
-                // rather than inheriting `read_chain`'s.
+                // `count_chain` reads only page headers where `read_chain`
+                // decodes every entry, so the two take different paths through
+                // a forged body and each needs generated coverage.
                 let _ = count_chain(&pager, REALM, FIRST_PAGE).await;
             });
             Ok(())
@@ -256,7 +256,7 @@ fn written_freelist_chains_read_back_without_loss() {
             let outcome = block_on(async {
                 let pager = fresh_pager().await;
                 let (head, _next) =
-                    rewrite_chain(&pager, REALM, PAGE, entries, hosts, BUMP_BASE).await?;
+                    rewrite_chain(&pager, REALM, PAGE, entries, hosts, BUMP_BASE, 0).await?;
                 read_chain(&pager, REALM, head).await
             });
             let (read_entries, chain_pages) =
@@ -301,7 +301,7 @@ fn hand_laid_chains_of_generated_shape_read_back_exactly() {
             prop_assume!(entries.len() <= chain_capacity(PAGE) * chain_pages.len());
             let outcome = block_on(async {
                 let pager = fresh_pager().await;
-                let head = write_chain(&pager, REALM, PAGE, &chain_pages, &entries).await?;
+                let head = write_chain(&pager, REALM, PAGE, &chain_pages, &entries, 0).await?;
                 read_chain(&pager, REALM, head).await
             });
             let (read_entries, _) =

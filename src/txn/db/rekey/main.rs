@@ -1,6 +1,6 @@
 //! Main-database rekey transition and durable intent publication.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 use subtle::ConstantTimeEq;
@@ -271,43 +271,44 @@ impl<V: Vfs + Clone> Db<V> {
     /// Re-encrypt both the durable free-list chain and every reusable page it
     /// names. Rewriting only the chain would leave those pages sealed under
     /// the retired epoch, so a later allocation could not authenticate them.
+    ///
+    /// The walk is streamed one chain page at a time. Touching every named page
+    /// is inherently proportional to the free list's size in IO, but holding
+    /// their ids was proportional to it in memory too, on a path that already
+    /// flushes to stay inside the buffer-pool budget. Streaming keeps a single
+    /// page of ids resident instead.
+    ///
+    /// Re-sealing a page twice is harmless — the second read opens it under the
+    /// epoch the first one wrote and marks it dirty again — so no cross-page
+    /// deduplication set is needed to tolerate a chain that names one page more
+    /// than once.
     async fn rewrite_free_list_pages(&self, root_page_id: u64) -> Result<()> {
         if root_page_id == 0 {
             return Ok(());
         }
 
-        let (entries, chain_pages) =
-            crate::pager::freelist::read_chain(&self.pager, self.realm_id, root_page_id).await?;
-        let mut reusable_pages = entries
-            .into_iter()
-            .map(|(_, page_id)| page_id)
-            .collect::<BTreeSet<_>>();
-
-        for page_id in chain_pages {
+        let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
+        let mut walk = crate::pager::freelist::ChainWalk::new(root_page_id);
+        while let Some(chain_page_id) = walk.advance(&self.pager, self.realm_id).await? {
+            let named: Vec<u64> = walk.entries().iter().map(|&(_, page_id)| page_id).collect();
             self.pager
                 .rewrite_page_under_current_epoch(
-                    page_id,
+                    chain_page_id,
                     self.realm_id,
                     crate::pager::PageKind::Free,
                 )
                 .await?;
-            reusable_pages.remove(&page_id);
-        }
-        if reusable_pages.is_empty() {
-            return Ok(());
-        }
-
-        let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
-        for page_id in reusable_pages {
-            let offset = page_id
-                .checked_mul(self.page_size as u64)
-                .ok_or_else(|| PagedbError::arithmetic_overflow("free-list page offset"))?;
-            let Some(kind) = read_main_page_kind(&mut file, offset).await? else {
-                continue;
-            };
-            self.pager
-                .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
-                .await?;
+            for page_id in named {
+                let offset = page_id
+                    .checked_mul(self.page_size as u64)
+                    .ok_or_else(|| PagedbError::arithmetic_overflow("free-list page offset"))?;
+                let Some(kind) = read_main_page_kind(&mut file, offset).await? else {
+                    continue;
+                };
+                self.pager
+                    .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -611,12 +612,19 @@ impl<V: Vfs + Clone> Db<V> {
         if freed_pages.is_empty() {
             return Ok(next_page_id);
         }
-        let (mut entries, old_chain) = crate::pager::freelist::read_chain(
+        // A bounded window, spliced onto the retained tail, for the same reason
+        // the commit path uses one: the fold only prepends entries, so nothing
+        // here needs a view of the complete set. Hosts are empty, so no page
+        // reaches an allocator from this path at all and the window carries no
+        // duplicate-safety obligation beyond deleting what it rewrites.
+        let window = crate::pager::freelist::read_chain_prefix(
             &self.pager,
             self.realm_id,
             state.free_list_root_page_id,
+            crate::pager::freelist::WINDOW_PAGES,
         )
         .await?;
+        let mut entries = window.entries;
         entries.extend(
             freed_pages
                 .iter()
@@ -625,7 +633,12 @@ impl<V: Vfs + Clone> Db<V> {
         // Chain pages are writer-only metadata that no reader snapshot ever
         // traverses, so they carry a commit id below every real floor and are
         // immediately recyclable — the same rule the ordinary commit path uses.
-        entries.extend(old_chain.into_iter().map(|page_id| (0, page_id)));
+        entries.extend(
+            window
+                .chain_pages
+                .into_iter()
+                .map(|page_id| (crate::pager::freelist::CHAIN_METADATA_CID, page_id)),
+        );
         let (new_free_list_root, new_next_page_id) = crate::pager::freelist::rewrite_chain(
             &self.pager,
             self.realm_id,
@@ -633,6 +646,7 @@ impl<V: Vfs + Clone> Db<V> {
             entries,
             Vec::new(),
             next_page_id,
+            window.tail,
         )
         .await?;
         state.free_list_root_page_id = new_free_list_root;
@@ -955,6 +969,73 @@ mod tests {
                         .starts_with(b"rekey-boundary")
                 );
             }
+        }
+    }
+
+    /// Every interruption boundary of the rekey protocol must reopen to a state
+    /// the protocol's own invariants accept, not merely to one that opens.
+    ///
+    /// The resume runs during open, so afterwards there is no intent row left to
+    /// resume from, the source epoch is retired — the transition's own
+    /// completion condition — and the segment reads back under the target key.
+    /// The deep walk then holds the whole store to its structural contract,
+    /// including the pages each durable stage superseded: a stage that abandons
+    /// its copy-on-write leftovers leaves them unreachable from every root and
+    /// absent from the free list, which is a leak the reopened writer owns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_rekey_boundary_resumes_to_a_completed_store_without_leaks() {
+        let boundaries = [
+            RekeyTestFault::Intent,
+            RekeyTestFault::MainPagesTargetReadable,
+            RekeyTestFault::HeaderTargetPublished,
+            RekeyTestFault::SegmentSeal,
+            RekeyTestFault::ProgressRowCommit,
+            RekeyTestFault::CatalogSwapEffects,
+            RekeyTestFault::ProgressDeletion,
+        ];
+        for point in boundaries {
+            let vfs = interrupted_rekey(point).await;
+            let db = Db::open_existing_with_counterpart_kek(
+                vfs,
+                SOURCE_KEK,
+                TARGET_KEK,
+                PAGE,
+                REALM,
+                crate::OpenOptions::default(),
+            )
+            .await
+            .unwrap();
+
+            {
+                let state = db.writer.lock().await;
+                assert!(
+                    db.load_rekey_intent(&state).await.unwrap().is_none(),
+                    "{point:?}: the resumed rekey must clear its durable intent"
+                );
+            }
+            assert!(
+                matches!(
+                    db.pager.mk_for(0, db.cipher_id),
+                    Err(PagedbError::MissingPersistedKey { mk_epoch: 0, .. })
+                ),
+                "{point:?}: a completed rekey retires the source epoch"
+            );
+
+            let reader = db.open_segment(REALM, "boundary").await.unwrap();
+            assert!(
+                reader
+                    .read_page(1)
+                    .await
+                    .unwrap()
+                    .starts_with(b"rekey-boundary"),
+                "{point:?}: the migrated segment must read back under the target key"
+            );
+            drop(reader);
+
+            let report = crate::recovery::deep_walk::run_deep_walk(&db)
+                .await
+                .unwrap();
+            assert!(report.is_clean(), "{point:?}: deep walk report: {report:?}");
         }
     }
 

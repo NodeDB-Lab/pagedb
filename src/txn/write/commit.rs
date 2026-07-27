@@ -10,21 +10,34 @@
 //! catalog tree, so maintaining it adds no catalog churn and survives an
 //! unclean shutdown.
 //!
-//! Each commit, after materializing all three trees, rebuilds the chain:
-//! `(free pages before) − (pages reused this commit) + (pages freed this
-//! commit) + (the old chain's own pages)`. Every entry is tagged with the
-//! commit that freed it; `begin` recycles only those below the reclamation
-//! floor (observable by no reader and no retained-history root). The chain is
-//! committed atomically with the header swap, so no freed page is ever lost as
-//! an orphan, and a page is recycled only after the commit that overwrote it is
-//! durable.
+//! Each commit, after materializing all three trees, rewrites the bounded
+//! *window* of the chain that `begin` scanned: `(window entries) − (pages
+//! reused this commit) + (pages freed this commit) + (the window's own pages)`.
+//! The fresh pages are spliced onto the retained tail — the part of the chain
+//! the window did not reach, which is left byte-for-byte alone because every
+//! chain page carries its own `next` and count and the header publishes only
+//! the head. Both the memory the rewrite holds and the pages it writes are
+//! therefore capped by the scan budget rather than by how many pages are free.
+//!
+//! Every entry is tagged with the commit that freed it; `begin` recycles only
+//! those below the reclamation floor (observable by no reader and no
+//! retained-history root). The chain is committed atomically with the header
+//! swap, so no freed page is ever lost as an orphan, and a page is recycled
+//! only after the commit that overwrote it is durable.
+//!
+//! The window rewrite trades a global view for a bounded one, so the
+//! duplicate-safety that came free from rebuilding the whole chain has to be
+//! stated as a rule instead: a page may enter the allocator cache only from the
+//! scanned window, and this commit deletes it from that window. An id fed to
+//! the allocator from anywhere else would still be named by the untouched tail.
 //!
 //! Crash-safety of the rewrite: new chain pages are drawn only from pages that
 //! were *already free* before this commit (or freshly bump-allocated) — never
-//! from pages this commit freed (still live under the old root until the swap)
-//! nor from the old chain's own pages (must stay readable until the swap). On a
-//! crash before the header swap, the old `free_list_root` and everything it
-//! references are intact.
+//! from pages this commit freed (still live under the old root until the swap),
+//! nor from the window's own pages (must stay readable until the swap), nor
+//! from the retained tail (never superseded at all). On a crash before the
+//! header swap, the old `free_list_root` and everything it references are
+//! intact.
 
 use crate::errors::PagedbError;
 use crate::pager::freelist;
@@ -114,13 +127,17 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .into_iter()
             .collect();
 
-        // All free pages after this commit: the loaded chain's entries minus
-        // the ones reused, kept with their original freeing-commit tag.
+        // The scanned window after this commit: its entries minus the ones
+        // reused, kept with their original freeing-commit tag. Every id in
+        // `consumed` came from this window (the allocator cache is loaded from
+        // nowhere else), so filtering here is what discharges the rule that a
+        // recycled page leaves the chain in the same commit that hands it out.
         let prior_free: Vec<(u64, u64)> = std::mem::take(&mut self.free_set_loaded)
             .into_iter()
             .filter(|(_, pid)| !consumed.contains(pid))
             .collect();
         let old_chain: Vec<u64> = std::mem::take(&mut self.old_chain_pages);
+        let retained_tail = self.retained_tail_page_id;
 
         // Pages safe to *host* the rewritten chain: only those below the
         // reclamation floor and not reused — i.e. the remaining contents of the
@@ -140,7 +157,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         let mut entries: Vec<(u64, u64)> = prior_free;
         entries.extend(all_freed.iter().map(|&pid| (new_commit_id, pid)));
 
-        // The superseded old-chain pages are writer-only metadata — NO reader
+        // The superseded window pages are writer-only metadata — NO reader
         // snapshot ever traverses the free-list — so, unlike data-page frees,
         // they must not be floor-gated by pinned readers. Tag them with the
         // sentinel commit `0`, which is below every real reclamation floor (real
@@ -160,17 +177,44 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // it) are being recycled and must not count, or an inherited-but-
         // drainable backlog would spuriously abort a reader on reopen. Evaluated
         // before the chain write so a reject aborts cleanly.
-        let stuck = entries
+        //
+        // The threshold is defined over the whole chain, which a windowed
+        // rewrite cannot produce on its own: `entries` covers only the scanned
+        // window. The retained tail is counted by streaming it — one page of
+        // entries resident at a time. That bounds MEMORY, not IO: the read cost
+        // stays proportional to the number of chain pages, and it is not
+        // pretended otherwise. Making it O(1) would need a durable aggregate in
+        // the header, which is a format change.
+        //
+        // The tail walk doubles as the tail's corruption check: the window walk
+        // at `begin` only authenticated the pages it scanned, and this runs
+        // before the header swap, so a torn or cyclic tail still fails the
+        // commit rather than being published.
+        let tail_stuck = freelist::count_at_or_above_floor(
+            &self.db.pager,
+            self.db.realm_id,
+            retained_tail,
+            self.reclaim_floor,
+        )
+        .await?;
+        let window_stuck = entries
             .iter()
             .filter(|(cid, _)| *cid >= self.reclaim_floor)
             .count() as u64;
-        self.db.evaluate_stall_policy(stuck)?;
+        self.db
+            .evaluate_stall_policy(tail_stuck.saturating_add(window_stuck))?;
 
         // Opt-in structural invariant. Run before the free-list rewrite and
         // durable header swap so a violation cannot publish a commit that the
         // caller observes as failed. Check every live tree, including commit
         // history, and keep the strict dangling-pointer walk that detects pages
         // freed in an earlier commit.
+        //
+        // The freed set is the rewritten window: every page this commit frees,
+        // every page it carries forward from the window, and the window's own
+        // superseded pages. Entries in the retained tail were already checked by
+        // the commit that put them there and are not re-walked, which keeps the
+        // check's cost tied to the same budget as the rewrite it guards.
         if let Some(rollback) = invariant_rollback {
             let freed = entries.iter().map(|&(_, page_id)| page_id).collect();
             let roots = [
@@ -196,8 +240,11 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             }
         }
 
-        // Rewrite the chain, hosting it on the floor-safe pages (the cache
-        // remainder) and bump-allocating only if those run out.
+        // Rewrite the scanned window, hosting it on the floor-safe pages (the
+        // cache remainder) and bump-allocating only if those run out, then
+        // splice it onto the retained tail. When the window covered the whole
+        // chain `retained_tail` is 0 and this is a full rewrite, exactly as
+        // before.
         let (new_free_list_root, new_next_page) = freelist::rewrite_chain(
             &self.db.pager,
             self.db.realm_id,
@@ -205,6 +252,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             entries,
             host_candidates,
             self.guard.next_page_id,
+            retained_tail,
         )
         .await?;
         self.guard.next_page_id = new_next_page;
