@@ -48,15 +48,33 @@ use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 use std::collections::HashSet;
 
-use super::super::db::{CommitHistoryMeta, encode_free_list_root};
+use super::super::db::{CommitHistoryMeta, PendingWriterState, encode_free_list_root};
 use super::txn::WriteTxn;
 
 impl<V: Vfs + Clone> WriteTxn<'_, V> {
     /// Flush dirty pages, write the A/B header, apply pending segment side
     /// effects, and publish the new root to readers. Returns the assigned
     /// `CommitId`.
-    #[allow(clippy::too_many_lines)]
     pub async fn commit(mut self) -> Result<CommitId> {
+        let outcome = self.commit_body().await;
+        // The per-transaction spill file and the byte gauge it feeds belong to
+        // this transaction whichever way it ended: a refused commit that left
+        // `tmp/scratch-<seq>` on disk and the gauge non-zero would be a
+        // candidate leaving a trace behind, the same class of bug as an
+        // advanced allocation cursor. Cleaned up here, once, so no exit from
+        // the body can forget it.
+        self.cleanup_spill_async().await;
+        self.db
+            .spill_bytes_in_use
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        outcome
+    }
+
+    /// The commit protocol proper. Split from [`Self::commit`] so that every
+    /// early return — and every fallible step added between materialization and
+    /// the durable header write — passes through one shared cleanup.
+    #[allow(clippy::too_many_lines)]
+    async fn commit_body(&mut self) -> Result<CommitId> {
         debug_assert!(
             self.db.write_lock_satisfied(),
             "page write without held writer lock"
@@ -65,13 +83,15 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // Note: span is not entered via `.entered()` to keep this async fn's
         // future `Send`. Use `tracing::instrument` or enter in sync sections only.
         let new_commit_id = self.guard.latest_commit_id + 1;
-        // `Some` is both the enablement signal for the opt-in invariant and the
-        // means of undoing what materialization is about to advance — the check
-        // is never reachable without the rollback it needs. Presence of the
-        // variable enables it, including a non-Unicode value.
-        let invariant_rollback = std::env::var_os("PAGEDB_INVARIANT_CHECKS")
-            .is_some()
-            .then(|| InvariantRollback::capture(&self.guard));
+        // Presence of the variable enables the opt-in structural invariant,
+        // including a non-Unicode value.
+        let invariant_checks = std::env::var_os("PAGEDB_INVARIANT_CHECKS").is_some();
+        // A candidate commit that does not become durable must leave no trace
+        // in shared state. Everything this function advances before the header
+        // write lands here rather than in the shared `WriterState`, and is
+        // published only once that header is durable — so every fallible step
+        // below (and any added later) can return with nothing to unwind.
+        let mut pending = PendingWriterState::capture(&self.guard);
 
         // ── Materialize all trees first ──────────────────────────────────────
         // Done before accounting freed pages so every copy-on-write spine free
@@ -82,7 +102,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         self.sync_allocator_from_catalog();
         let new_root = self.btree.root_page_id();
         let new_catalog_root = self.catalog_tree.root_page_id();
-        self.guard.next_page_id = self
+        pending.next_page_id = self
             .btree
             .next_page_id()
             .max(self.catalog_tree.next_page_id());
@@ -96,7 +116,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             active_root_page_id: new_root,
             catalog_root_page_id: new_catalog_root,
             free_list_root_page_id: self.guard.free_list_root_page_id,
-            next_page_id: self.guard.next_page_id,
+            next_page_id: pending.next_page_id,
             unix_seconds,
         };
         let mut hist_freed: Vec<u64> = Vec::new();
@@ -106,7 +126,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         ) {
             hist_freed = self
                 .db
-                .write_commit_history_entry(&mut self.guard, new_commit_id, history_meta)
+                .write_commit_history_entry(&mut pending, new_commit_id, history_meta)
                 .await?;
         }
 
@@ -176,7 +196,9 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // a pin — those at/above the reclamation floor. Drainable entries (below
         // it) are being recycled and must not count, or an inherited-but-
         // drainable backlog would spuriously abort a reader on reopen. Evaluated
-        // before the chain write so a reject aborts cleanly.
+        // before the chain write so a reject aborts cleanly: it returns without
+        // unwinding because the candidate's advances are held in `pending` and
+        // the shared state still describes the durable header.
         //
         // The threshold is defined over the whole chain, which a windowed
         // rewrite cannot produce on its own: `entries` covers only the scanned
@@ -215,27 +237,27 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // superseded pages. Entries in the retained tail were already checked by
         // the commit that put them there and are not re-walked, which keeps the
         // check's cost tied to the same budget as the rewrite it guards.
-        if let Some(rollback) = invariant_rollback {
+        //
+        // No unwind is needed here: the shared writer state still describes the
+        // durable header, and `Drop` discards this candidate's dirty pages, so
+        // the next writer bump-allocates over the pages it abandoned instead of
+        // leaking their ids.
+        if invariant_checks {
             let freed = entries.iter().map(|&(_, page_id)| page_id).collect();
             let roots = [
                 ("data", new_root),
                 ("catalog", new_catalog_root),
-                ("commit-history", self.guard.commit_history_root_page_id),
+                ("commit-history", pending.commit_history_root_page_id),
             ];
             if let Err(violation) = assert_freed_pages_unreachable(
                 self.db,
                 roots,
-                self.guard.next_page_id,
+                pending.next_page_id,
                 &freed,
                 new_commit_id,
             )
             .await
             {
-                // Unwind to exactly the state the still-durable header
-                // describes, so the next writer bump-allocates over the pages
-                // this candidate abandoned instead of leaking their ids.
-                // `Drop` discards the dirty pages themselves.
-                rollback.restore(&mut self.guard);
                 panic!("{violation}");
             }
         }
@@ -251,16 +273,16 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             self.db.page_size,
             entries,
             host_candidates,
-            self.guard.next_page_id,
+            pending.next_page_id,
             retained_tail,
         )
         .await?;
-        self.guard.next_page_id = new_next_page;
+        pending.next_page_id = new_next_page;
 
         // ── Flush + header swap ──────────────────────────────────────────────
         self.db.pager.flush_main(self.db.realm_id).await?;
 
-        let new_next = self.guard.next_page_id;
+        let new_next = pending.next_page_id;
         let new_seq = self.guard.seq + 1;
         let counter_anchor = self.db.pager.pending_anchor();
 
@@ -288,8 +310,8 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             catalog_root: catalog_root_bytes,
             apply_journal_root_page_id: 0,
             apply_journal_root_version: 0,
-            commit_history_root_page_id: self.guard.commit_history_root_page_id,
-            commit_history_root_version: self.guard.commit_history_root_version,
+            commit_history_root_page_id: pending.commit_history_root_page_id,
+            commit_history_root_version: pending.commit_history_root_version,
             restore_mode: 0,
             next_page_id: new_next,
             commit_retain_policy_tag: policy_tag,
@@ -310,16 +332,18 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // any fallible post-header work so a failed reconciliation can never
         // regress the next durable write. Keep the prior reader snapshot until
         // segment effects have completed and their directories are synced.
+        //
+        // This is also the single point at which the candidate's advances
+        // become shared: everything up to here could still have refused the
+        // commit, and a refusal must leave nothing behind.
+        pending.publish(&mut self.guard);
         self.guard.root_page_id = new_root;
-        self.guard.next_page_id = new_next;
         self.guard.active_slot = new_slot;
         self.guard.seq = new_seq;
         self.guard.latest_commit_id = new_commit_id;
         self.guard.catalog_root_page_id = new_catalog_root;
         self.guard.catalog_root_txn_id = new_commit_id;
         self.guard.free_list_root_page_id = new_free_list_root;
-        // commit_history_root_page_id and commit_history_root_version are
-        // already updated inside write_commit_history_entry.
         self.committed_or_aborted = true;
 
         // Black box: record the commit + how many pages it freed into the
@@ -327,9 +351,10 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // in page recycling, so this trail is what a corruption report needs.
         crate::diag::committed(new_commit_id, all_freed.len());
 
-        // `visibility_guard` was acquired before the reclamation-floor scan
-        // in `WriteTxn::begin` and remains held through this publication.
-        let _visibility = &self.visibility_guard;
+        // `visibility_guard` was acquired before the reclamation-floor scan in
+        // `WriteTxn::begin` and is still held here — it is passed straight into
+        // the publication below, so the floor a reader could have observed
+        // cannot have moved between the scan and this commit becoming visible.
         if self
             .db
             .finish_durable_commit_visible(
@@ -342,65 +367,21 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .await
             .is_err()
         {
-            self.cleanup_spill_async().await;
-            self.db
-                .spill_bytes_in_use
-                .store(0, std::sync::atomic::Ordering::Relaxed);
             return Err(PagedbError::durably_committed_but_unpublished(CommitId(
                 new_commit_id,
             )));
         }
 
         // The allocator cache is rebuilt from the durable free-list at the next
-        // `begin_write`, so nothing is handed off here.
+        // `begin_write`, so nothing is handed off here. The spill tmp file is
+        // removed by the caller, on this and every other exit.
 
-        // Remove the spill tmp file (best-effort; error is non-fatal).
-        self.cleanup_spill_async().await;
-
-        self.db
-            .spill_bytes_in_use
-            .store(0, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
             name = "txn.commit",
             commit_id = new_commit_id,
             "write transaction committed"
         );
         Ok(CommitId(new_commit_id))
-    }
-}
-
-/// The writer fields a candidate commit advances before the opt-in invariant
-/// runs, captured so a rejected candidate can be unwound.
-///
-/// These four are exactly what tree materialization and
-/// `write_commit_history_entry` assign. Everything else the pre-invariant
-/// stretch of `commit` touches is either transaction-local (dies with the
-/// `WriteTxn`) or rebuilt from the durable free-list by the next
-/// `begin_write` — the shared allocator caches among them — so it needs no
-/// rollback of its own.
-#[derive(Clone, Copy)]
-struct InvariantRollback {
-    next_page_id: u64,
-    commit_history_root_page_id: u64,
-    commit_history_root_version: u64,
-    commit_history_count: Option<u64>,
-}
-
-impl InvariantRollback {
-    fn capture(state: &super::super::db::WriterState) -> Self {
-        Self {
-            next_page_id: state.next_page_id,
-            commit_history_root_page_id: state.commit_history_root_page_id,
-            commit_history_root_version: state.commit_history_root_version,
-            commit_history_count: state.commit_history_count,
-        }
-    }
-
-    fn restore(self, state: &mut super::super::db::WriterState) {
-        state.next_page_id = self.next_page_id;
-        state.commit_history_root_page_id = self.commit_history_root_page_id;
-        state.commit_history_root_version = self.commit_history_root_version;
-        state.commit_history_count = self.commit_history_count;
     }
 }
 

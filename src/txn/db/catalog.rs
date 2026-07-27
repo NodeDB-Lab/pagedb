@@ -11,9 +11,10 @@ use crate::vfs::Vfs;
 use crate::{RealmId, Result};
 
 use super::core::{
-    CommitHistoryMeta, Db, HeaderFieldsParams, WriterState, decode_commit_meta, encode_commit_meta,
+    CommitHistoryMeta, Db, HeaderFieldsParams, decode_commit_meta, encode_commit_meta,
     encode_root_ref,
 };
+use super::pending::PendingWriterState;
 
 /// Named-counter rows read per batch while validating them at open. Rows are a
 /// fixed-width authenticated value, so this is a few KiB resident regardless of
@@ -213,10 +214,15 @@ impl<V: Vfs + Clone> Db<V> {
     /// anywhere else would be handed to an allocator without the chain entry
     /// naming it ever being located, so nothing would delete it and the
     /// unscanned tail would keep naming it. One page id, two owners.
+    ///
+    /// `state` is the *candidate* writer state, not the shared one: this call
+    /// is fallible at several points and runs long before the header that
+    /// would make its new root durable, so a commit that never publishes must
+    /// leave the shared state naming the old root. See [`PendingWriterState`].
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn write_commit_history_entry(
         &self,
-        state: &mut WriterState,
+        state: &mut PendingWriterState,
         new_commit_id: u64,
         meta: CommitHistoryMeta,
     ) -> Result<Vec<u64>> {

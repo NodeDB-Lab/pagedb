@@ -17,6 +17,7 @@ mod history_carry;
 mod manifest_validation;
 mod misc;
 mod open;
+mod pending;
 mod reader;
 // Serves the native-only incremental-snapshot apply path, like
 // `manifest_validation` above; gate it the same way.
@@ -32,3 +33,4 @@ mod util;
 
 pub use core::Db;
 pub(crate) use core::{CommitHistoryMeta, WriterState, encode_free_list_root};
+pub(crate) use pending::PendingWriterState;

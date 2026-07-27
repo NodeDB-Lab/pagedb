@@ -22,6 +22,7 @@ filter = """
     | binary(compaction_incremental)
     | binary(deferred_free_reclaim)
     | binary(reader_stall_policy)
+    | binary(concurrency_stress)
     | (binary(pagedb) & (
         test(/crash/) | test(/recover/) | test(/rekey/)
         | test(/anchor/) | test(/torn/) | test(/journal/) | test(/replay/)
