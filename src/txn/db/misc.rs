@@ -122,13 +122,8 @@ impl<V: Vfs + Clone> Db<V> {
         // Counted in place rather than collected: how many pages the free list
         // is carrying grows with the database, and a metrics call must not size
         // an allocation by it.
-        let free_list_pending_entries = crate::pager::freelist::count_chain(
-            &self.pager,
-            self.realm_id,
-            free_list_root,
-            next_page_id,
-        )
-        .await?;
+        let free_list_pending_entries =
+            crate::pager::freelist::count_chain(&self.pager, self.realm_id, free_list_root).await?;
 
         // Main database file size.
         let main_db_bytes = self

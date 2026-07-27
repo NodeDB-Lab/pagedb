@@ -82,33 +82,59 @@ fn decode_chain_header(body: &[u8]) -> Result<(u64, usize)> {
 /// The counting counterpart to [`read_chain`], for callers that need only the
 /// depth. Collecting the entries to take their length would size an allocation
 /// by how many pages the durable free list is carrying, which grows with the
-/// database; this keeps the resident cost at one page guard.
+/// database; this keeps the resident cost at O(1) — two page cursors, no
+/// visited set at all.
 ///
-/// `page_id_bound` is the allocator's `next_page_id`. Chain pages are real
-/// allocated page ids, so a chain that visits more than `page_id_bound` pages
-/// must by pigeonhole have revisited one — that bound stands in for the visited
-/// set [`read_chain`] keeps, which is itself proportional to the chain length.
+/// Termination on a cyclic chain comes from Floyd's tortoise-and-hare: the hare
+/// takes two links for the tortoise's one, so on a chain that loops it laps the
+/// tortoise within one turn of the cycle, and on a chain that ends the tortoise
+/// simply reaches the terminator. Both bounds are properties of the chain
+/// itself. That is the whole point of the shape: any guard phrased as "stop
+/// after N steps" is only as good as the N its caller happened to pass, and a
+/// caller with no better number than the page-id space would spin for 2^64
+/// links before concluding anything.
 pub async fn count_chain<V: Vfs + Clone>(
     pager: &Pager<V>,
     realm_id: RealmId,
     head: u64,
-    page_id_bound: u64,
 ) -> Result<u64> {
     let mut total: u64 = 0;
-    let mut steps: u64 = 0;
-    let mut page = head;
-    while page != 0 {
-        if steps >= page_id_bound {
-            return Err(PagedbError::page_chain_cycle("free_list", page));
-        }
-        steps += 1;
-        let guard = pager.read_main_page(page, realm_id, PageKind::Free).await?;
-        let (next, count) = decode_chain_header(guard.body_ref())?;
+    let mut tortoise = head;
+    let mut hare = head;
+
+    while tortoise != 0 {
+        let (next, count) = read_chain_link(pager, realm_id, tortoise).await?;
         total = total.saturating_add(count as u64);
-        drop(guard);
-        page = next;
+        tortoise = next;
+
+        // Two hare links per tortoise link. The hare reaching the chain's
+        // terminator is not a result on its own — the tortoise still has to
+        // walk the rest to finish counting — so it just parks at 0.
+        for _ in 0..2 {
+            if hare == 0 {
+                break;
+            }
+            let (next, _) = read_chain_link(pager, realm_id, hare).await?;
+            hare = next;
+        }
+
+        if hare != 0 && hare == tortoise {
+            return Err(PagedbError::page_chain_cycle("free_list", hare));
+        }
     }
     Ok(total)
+}
+
+/// Read one chain page and return its `(next, entry count)` header.
+async fn read_chain_link<V: Vfs + Clone>(
+    pager: &Pager<V>,
+    realm_id: RealmId,
+    page_id: u64,
+) -> Result<(u64, usize)> {
+    let guard = pager
+        .read_main_page(page_id, realm_id, PageKind::Free)
+        .await?;
+    decode_chain_header(guard.body_ref())
 }
 
 /// Walk the free-list chain from `head`, returning all `(commit_id, page_id)`
@@ -314,11 +340,10 @@ mod tests {
             .await
             .unwrap();
 
-        let error =
-            tokio::time::timeout(Duration::from_secs(1), count_chain(&pager, REALM, 10, 11))
-                .await
-                .expect("the page-id bound should end the walk before timeout")
-                .expect_err("free-list cycles must be corruption");
+        let error = tokio::time::timeout(Duration::from_secs(1), count_chain(&pager, REALM, 10))
+            .await
+            .expect("cycle detection should end the walk before timeout")
+            .expect_err("free-list cycles must be corruption");
         assert!(
             matches!(
                 error,
@@ -328,6 +353,38 @@ mod tests {
                 })
             ),
             "expected a free-list PageChainCycle naming page 10, got {error:?}"
+        );
+    }
+
+    /// Rho shape: `20 → 21 → 22 → 21`. The head is not itself on the cycle, so
+    /// comparing every link against the head never fires, and the cycle is
+    /// longer than one link, so a self-loop check never fires either. Only a
+    /// detector that tracks relative progress ends this walk.
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_chain_rejects_a_cycle_reached_through_a_tail() {
+        let pager = test_pager().await;
+        for (page_id, next) in [(20u64, 21u64), (21, 22), (22, 21)] {
+            let mut body = vec![0u8; body_capacity(PAGE)];
+            body[0..8].copy_from_slice(&next.to_le_bytes());
+            pager
+                .write_main_page(page_id, REALM, PageKind::Free, &body)
+                .await
+                .unwrap();
+        }
+
+        let error = tokio::time::timeout(Duration::from_secs(1), count_chain(&pager, REALM, 20))
+            .await
+            .expect("cycle detection should end the walk before timeout")
+            .expect_err("free-list cycles must be corruption");
+        assert!(
+            matches!(
+                error,
+                PagedbError::Corruption(crate::errors::CorruptionDetail::PageChainCycle {
+                    structure: "free_list",
+                    ..
+                })
+            ),
+            "expected a free-list PageChainCycle, got {error:?}"
         );
     }
 
@@ -342,7 +399,7 @@ mod tests {
             .unwrap();
 
         let (read, _) = read_chain(&pager, REALM, head).await.unwrap();
-        let counted = count_chain(&pager, REALM, head, 64).await.unwrap();
+        let counted = count_chain(&pager, REALM, head).await.unwrap();
         assert_eq!(counted, read.len() as u64);
         assert_eq!(counted, entries.len() as u64);
     }
