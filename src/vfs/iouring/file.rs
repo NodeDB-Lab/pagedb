@@ -1,10 +1,23 @@
-//! `IouringFile`: per-file I/O using `io_uring` for reads, writes and fsync.
-//! Each op acquires the shared ring mutex, pushes SQE(s), calls
-//! `submit_and_wait(N)`, drains matching CQEs, then releases the lock. No
-//! background poller thread.
+//! `IouringFile`: per-file I/O using `io_uring` for reads, writes and fsync,
+//! plus `ftruncate` / `metadata` where the ring has no opcode.
 //!
-//! `ftruncate` and `metadata` have no opcode in this ring's feature set and are
-//! ordinary blocking syscalls, so they run on the blocking pool.
+//! Nothing here runs on the async executor. `submit_and_wait` parks the caller
+//! inside `io_uring_enter` until the requested completions land, and it does so
+//! while holding the shared ring mutex — so every operation hands a
+//! self-contained closure to the blocking pool instead. The closure owns
+//! everything the kernel can reach for the duration: the descriptor through an
+//! `Arc`, the transfer buffer, and the SQEs that point at it. A caller that
+//! drops the future mid-flight therefore cannot free memory the kernel is still
+//! writing into — the pool thread runs the submit + drain to completion and
+//! releases the ring lock before it returns.
+//!
+//! That costs one buffer copy and one pool hop per operation, and the copy is
+//! not negotiable: it is what makes the buffer outlive a cancelled future.
+//! The alternative is not "the same behaviour, faster" — a backend that parks
+//! the polling thread stalls every other task on a current-thread runtime, from
+//! the group-commit batcher down to unrelated readers. That is a correctness
+//! failure with a latency symptom, not a slow path, so it loses to the copy
+//! every time.
 #![allow(unsafe_code)]
 
 use std::os::unix::io::AsRawFd;
@@ -25,6 +38,12 @@ use crate::vfs::traits::{
 use crate::vfs::types::{ReadReq, WriteReq};
 
 /// Per-file handle backed by an `std::fs::File` fd and the shared `io_uring`.
+///
+/// `Send` and `Sync` are both derived, not asserted: `Arc<std::fs::File>` is
+/// thread-safe, and `io_uring::IoUring` is `Send + Sync`, so `Arc<Mutex<_>>`
+/// around it is too. Nothing about this type needs a hand-written auto-trait
+/// impl, and it must not grow one — a manual impl would silently keep holding
+/// once a future field stopped qualifying.
 pub struct IouringFile {
     /// Shared so a blocking-pool call can own a reference to the descriptor
     /// for its whole duration, independently of when this handle drops.
@@ -42,6 +61,12 @@ impl IouringFile {
         }
     }
 
+    /// The two owned handles a blocking-pool cycle needs. Both are `Arc`
+    /// clones, and both keep their target alive for as long as the cycle runs.
+    fn shared(&self) -> (Arc<std::fs::File>, Arc<Mutex<IoUring>>) {
+        (Arc::clone(&self.file), Arc::clone(&self.ring))
+    }
+
     fn check_write_range(offset: u64, len: usize) -> Result<()> {
         let len = u64::try_from(len).map_err(|_| {
             PagedbError::Io(std::io::Error::new(
@@ -56,6 +81,14 @@ impl IouringFile {
             ))
         })?;
         Ok(())
+    }
+
+    /// Validate a buffer length against the SQE length field. Called once on
+    /// the executor so a deterministic input error is reported before any
+    /// buffer is copied, and again on the pool where the SQE is actually built.
+    fn entry_len(len: usize) -> Result<u32> {
+        u32::try_from(len)
+            .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))
     }
 
     /// Submit a single SQE, wait for exactly one CQE with matching
@@ -176,72 +209,98 @@ impl IouringFile {
     }
 }
 
-// SAFETY: `IouringFile` contains a `std::fs::File` (which is `Send`) and an
-// `Arc<Mutex<IoUring>>`. `IoUring` itself is not `Send`; however we only
-// access it while holding the `parking_lot::Mutex` lock. The trait contract
-// (`&self`/`&mut self`) means at most one async I/O method executes at a
-// time per file handle, so the ring is never accessed from multiple threads
-// simultaneously.
-unsafe impl Send for IouringFile {}
-
 impl VfsFile for IouringFile {
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        checked_iouring_positioned_offset(offset, buf.len())?;
-        let fd = Fd(self.file.as_raw_fd());
-        let len = u32::try_from(buf.len())
-            .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
-        // SAFETY: `buf` is a mutable slice alive for this async fn frame;
-        // the ring lock is held across submit+drain so the kernel cannot
-        // touch the buffer after we return.
-        let entry = opcode::Read::new(fd, buf.as_mut_ptr(), len)
-            .offset(offset)
-            .build()
-            .user_data(0);
-        let mut ring = self.ring.lock();
-        let n = unsafe { Self::submit_one(&mut ring, &entry, 0) }.map_err(PagedbError::Io)?;
-        // n >= 0 guaranteed by submit_one (negative becomes Err).
-        #[allow(clippy::cast_sign_loss)]
-        checked_read_count(n as usize, buf.len())
+        let len = buf.len();
+        checked_iouring_positioned_offset(offset, len)?;
+        // Reject an impossible length before allocating scratch for it.
+        Self::entry_len(len)?;
+        let (file, ring) = self.shared();
+        let (scratch, read) = offload(move || {
+            let fd = Fd(file.as_raw_fd());
+            let entry_len = IouringFile::entry_len(len)?;
+            let mut scratch = vec![0u8; len];
+            let entry = opcode::Read::new(fd, scratch.as_mut_ptr(), entry_len)
+                .offset(offset)
+                .build()
+                .user_data(0);
+            let n = {
+                let mut guard = ring.lock();
+                // SAFETY: `scratch` is owned by this closure and outlives the
+                // submit+drain below, and the ring lock is held across both, so
+                // the kernel is finished with the buffer before this returns.
+                unsafe { IouringFile::submit_one(&mut guard, &entry, 0) }
+            }
+            .map_err(PagedbError::Io)?;
+            // n >= 0 guaranteed by submit_one (negative becomes Err).
+            #[allow(clippy::cast_sign_loss)]
+            let read = checked_read_count(n as usize, len)?;
+            Ok((scratch, read))
+        })
+        .await?;
+        buf[..read].copy_from_slice(&scratch[..read]);
+        Ok(read)
     }
 
     async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> Result<()> {
         if reqs.is_empty() {
             return Ok(());
         }
-        let fd = Fd(self.file.as_raw_fd());
-        // Build one Read SQE per request; each gets its index as user_data.
-        let mut entries: Vec<io_uring::squeue::Entry> = Vec::with_capacity(reqs.len());
-        for (i, req) in reqs.iter_mut().enumerate() {
+        // Validate every request before any I/O runs, so a deterministic input
+        // error cannot leave a prefix of the batch applied.
+        let mut plan: Vec<(u64, usize)> = Vec::with_capacity(reqs.len());
+        for req in reqs.iter() {
             checked_iouring_positioned_offset(req.offset, req.buf.len())?;
-            let len = u32::try_from(req.buf.len())
-                .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
-            entries.push(
-                opcode::Read::new(fd, req.buf.as_mut_ptr(), len)
-                    .offset(req.offset)
-                    .build()
-                    .user_data(i as u64),
-            );
+            Self::entry_len(req.buf.len())?;
+            plan.push((req.offset, req.buf.len()));
         }
+        let (file, ring) = self.shared();
+        let completed = offload(move || {
+            let fd = Fd(file.as_raw_fd());
+            // Build one Read SQE per request; each gets its index as user_data.
+            let mut buffers: Vec<Vec<u8>> = plan.iter().map(|&(_, len)| vec![0u8; len]).collect();
+            let mut entries: Vec<io_uring::squeue::Entry> = Vec::with_capacity(plan.len());
+            for (i, ((offset, len), scratch)) in plan.iter().zip(buffers.iter_mut()).enumerate() {
+                let entry_len = IouringFile::entry_len(*len)?;
+                entries.push(
+                    opcode::Read::new(fd, scratch.as_mut_ptr(), entry_len)
+                        .offset(*offset)
+                        .build()
+                        .user_data(i as u64),
+                );
+            }
 
-        let mut ring = self.ring.lock();
-        // SAFETY: `req.buf` slices are tied to the `reqs` argument's `'_`
-        // lifetime. The ring lock is held across submit+drain so the kernel
-        // cannot access those buffers after `submit_batch` returns.
-        let results =
-            unsafe { Self::submit_batch(&mut ring, &entries) }.map_err(PagedbError::Io)?;
-        drop(entries); // buf raw-ptrs no longer needed; drop before touching reqs
+            let results = {
+                let mut guard = ring.lock();
+                // SAFETY: every buffer referenced by `entries` lives in
+                // `buffers`, owned by this closure, and the ring lock is held
+                // across submit+drain so the kernel cannot touch them after
+                // `submit_batch` returns.
+                unsafe { IouringFile::submit_batch(&mut guard, &entries) }
+            }
+            .map_err(PagedbError::Io)?;
+            drop(entries); // buf raw-ptrs no longer needed
+
+            let mut out: Vec<(Vec<u8>, usize)> = Vec::with_capacity(plan.len());
+            for ((_, len), (scratch, res)) in plan.iter().zip(buffers.into_iter().zip(results)) {
+                if res < 0 {
+                    return Err(PagedbError::Io(std::io::Error::from_raw_os_error(-res)));
+                }
+                // res >= 0 guaranteed above.
+                #[allow(clippy::cast_sign_loss)]
+                let nread = checked_read_count(res as usize, *len)?;
+                out.push((scratch, nread));
+            }
+            Ok(out)
+        })
+        .await?;
 
         // Zero tail past EOF — mirrors TokioVfs / MemVfs contract.
-        for (req, &res) in reqs.iter_mut().zip(results.iter()) {
-            if res < 0 {
-                return Err(PagedbError::Io(std::io::Error::from_raw_os_error(-res)));
-            }
-            // res >= 0 guaranteed above.
-            #[allow(clippy::cast_sign_loss)]
-            let nread = checked_read_count(res as usize, req.buf.len())?;
+        for (req, (scratch, nread)) in reqs.iter_mut().zip(completed) {
+            req.buf[..nread].copy_from_slice(&scratch[..nread]);
             for b in &mut req.buf[nread..] {
                 *b = 0;
             }
@@ -257,20 +316,31 @@ impl VfsFile for IouringFile {
             return Ok(0);
         }
         Self::check_write_range(offset, buf.len())?;
-        let fd = Fd(self.file.as_raw_fd());
-        let len = u32::try_from(buf.len())
-            .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
-        // SAFETY: `buf` is an immutable slice alive for this async fn frame;
-        // the ring lock is held across submit+drain.
-        let entry = opcode::Write::new(fd, buf.as_ptr(), len)
-            .offset(offset)
-            .build()
-            .user_data(0);
-        let mut ring = self.ring.lock();
-        let n = unsafe { Self::submit_one(&mut ring, &entry, 0) }.map_err(PagedbError::Io)?;
-        // n >= 0 guaranteed by submit_one.
-        #[allow(clippy::cast_sign_loss)]
-        Ok(n as usize)
+        Self::entry_len(buf.len())?;
+        let (file, ring) = self.shared();
+        // The pool thread outlives this future, so it writes from its own copy
+        // rather than from the caller's borrow.
+        let data = buf.to_vec();
+        offload(move || {
+            let fd = Fd(file.as_raw_fd());
+            let entry_len = IouringFile::entry_len(data.len())?;
+            let entry = opcode::Write::new(fd, data.as_ptr(), entry_len)
+                .offset(offset)
+                .build()
+                .user_data(0);
+            let n = {
+                let mut guard = ring.lock();
+                // SAFETY: `data` is owned by this closure and outlives the
+                // submit+drain below; the ring lock is held across both.
+                unsafe { IouringFile::submit_one(&mut guard, &entry, 0) }
+            }
+            .map_err(PagedbError::Io)?;
+            // n >= 0 guaranteed by submit_one.
+            #[allow(clippy::cast_sign_loss)]
+            let written = n as usize;
+            Ok(written)
+        })
+        .await
     }
 
     async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> Result<()> {
@@ -283,66 +353,76 @@ impl VfsFile for IouringFile {
         for req in reqs {
             Self::check_write_range(req.offset, req.buf.len())?;
         }
-        let fd = Fd(self.file.as_raw_fd());
         // Empty requests are already complete. Skipping them also ensures that
         // a zero-byte CQE always represents impossible progress on real data.
-        let mut entries: Vec<io_uring::squeue::Entry> = Vec::with_capacity(reqs.len());
-        let mut entry_to_request = Vec::with_capacity(reqs.len());
+        // Each surviving entry carries the index of the request it came from so
+        // a short write can be finished against the caller's own buffer.
+        let mut plan: Vec<(usize, u64, Vec<u8>)> = Vec::with_capacity(reqs.len());
         for (i, req) in reqs.iter().enumerate() {
             if req.buf.is_empty() {
                 continue;
             }
-            let len = u32::try_from(req.buf.len())
-                .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))?;
-            let user_data = u64::try_from(entry_to_request.len()).map_err(|_| {
-                PagedbError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "too many vectored write requests",
-                ))
-            })?;
-            entries.push(
-                opcode::Write::new(fd, req.buf.as_ptr(), len)
-                    .offset(req.offset)
-                    .build()
-                    .user_data(user_data),
-            );
-            entry_to_request.push(i);
+            Self::entry_len(req.buf.len())?;
+            plan.push((i, req.offset, req.buf.to_vec()));
         }
-        if entries.is_empty() {
+        if plan.is_empty() {
             return Ok(());
         }
+        let (file, ring) = self.shared();
+        let short_writes = offload(move || {
+            let fd = Fd(file.as_raw_fd());
+            let mut entries: Vec<io_uring::squeue::Entry> = Vec::with_capacity(plan.len());
+            for (slot, (_, offset, data)) in plan.iter().enumerate() {
+                let entry_len = IouringFile::entry_len(data.len())?;
+                let user_data = u64::try_from(slot).map_err(|_| {
+                    PagedbError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "too many vectored write requests",
+                    ))
+                })?;
+                entries.push(
+                    opcode::Write::new(fd, data.as_ptr(), entry_len)
+                        .offset(*offset)
+                        .build()
+                        .user_data(user_data),
+                );
+            }
 
-        let results = {
-            let mut ring = self.ring.lock();
-            // SAFETY: `req.buf` slices are tied to the `reqs` argument's `'_`
-            // lifetime. The ring lock is held across submit+drain.
-            unsafe { Self::submit_batch(&mut ring, &entries) }.map_err(PagedbError::Io)?
-        };
-        drop(entries);
+            let results = {
+                let mut guard = ring.lock();
+                // SAFETY: every buffer referenced by `entries` lives in `plan`,
+                // owned by this closure, and the ring lock is held across
+                // submit+drain.
+                unsafe { IouringFile::submit_batch(&mut guard, &entries) }
+            }
+            .map_err(PagedbError::Io)?;
+            drop(entries);
 
-        let mut short_writes = Vec::new();
-        for (entry_index, &res) in results.iter().enumerate() {
-            if res < 0 {
-                return Err(PagedbError::Io(std::io::Error::from_raw_os_error(-res)));
+            let mut short_writes = Vec::new();
+            for (slot, &res) in results.iter().enumerate() {
+                if res < 0 {
+                    return Err(PagedbError::Io(std::io::Error::from_raw_os_error(-res)));
+                }
+                let written = usize::try_from(res)
+                    .map_err(|_| PagedbError::Io(std::io::Error::other("negative write result")))?;
+                let (request_index, _, data) = &plan[slot];
+                if written > data.len() {
+                    return Err(PagedbError::Io(std::io::Error::other(
+                        "io_uring write overreported bytes",
+                    )));
+                }
+                if written == 0 {
+                    return Err(PagedbError::Io(std::io::Error::from(
+                        std::io::ErrorKind::WriteZero,
+                    )));
+                }
+                if written < data.len() {
+                    short_writes.push((*request_index, written));
+                }
             }
-            let written = usize::try_from(res)
-                .map_err(|_| PagedbError::Io(std::io::Error::other("negative write result")))?;
-            let request_index = entry_to_request[entry_index];
-            let request = &reqs[request_index];
-            if written > request.buf.len() {
-                return Err(PagedbError::Io(std::io::Error::other(
-                    "io_uring write overreported bytes",
-                )));
-            }
-            if written == 0 {
-                return Err(PagedbError::Io(std::io::Error::from(
-                    std::io::ErrorKind::WriteZero,
-                )));
-            }
-            if written < request.buf.len() {
-                short_writes.push((request_index, written));
-            }
-        }
+            Ok(short_writes)
+        })
+        .await?;
 
         for (request_index, written) in short_writes {
             let request = &reqs[request_index];
@@ -364,12 +444,20 @@ impl VfsFile for IouringFile {
     }
 
     async fn sync(&mut self) -> Result<()> {
-        let fd = Fd(self.file.as_raw_fd());
-        let entry = opcode::Fsync::new(fd).build().user_data(0);
-        let mut ring = self.ring.lock();
-        // SAFETY: `Fsync` carries no buffer pointer; there is nothing to alias.
-        unsafe { Self::submit_one(&mut ring, &entry, 0) }.map_err(PagedbError::Io)?;
-        Ok(())
+        let (file, ring) = self.shared();
+        offload(move || {
+            let fd = Fd(file.as_raw_fd());
+            let entry = opcode::Fsync::new(fd).build().user_data(0);
+            let completed = {
+                let mut guard = ring.lock();
+                // SAFETY: `Fsync` carries no buffer pointer; there is nothing
+                // to alias. The `Arc` keeps the fd open for the whole call.
+                unsafe { IouringFile::submit_one(&mut guard, &entry, 0) }
+            };
+            completed.map_err(PagedbError::Io)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn truncate(&mut self, len: u64) -> Result<()> {
