@@ -3520,3 +3520,137 @@ async fn apply_incremental_leaves_no_orphan_pages_on_the_follower() {
     std::fs::remove_dir_all(&delta_dir).ok();
     std::fs::remove_dir_all(&dst_dir).ok();
 }
+
+/// Folding a reclaimed chain into the follower's free list can bump-allocate
+/// past pages the producer never touched, pushing the follower's visible
+/// `next_page_id` ahead of the producer's own cursor. `apply_incremental`
+/// requires the next delta's `next_page_id_at_target` to be `>=` the
+/// follower's current cursor, so if the fold-in ever runs the follower ahead
+/// of the producer, a second chained delta would be rejected and the
+/// follower could never catch up. Apply two deltas back-to-back, the second
+/// chained onto the first delta's own target commit, to prove that door
+/// stays open.
+#[tokio::test(flavor = "current_thread")]
+async fn chained_incremental_applies_keep_the_follower_able_to_advance() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_one_dir = tempdir();
+    let delta_two_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..200 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[1u8; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    let base = source.latest_commit();
+    source.snapshot_to(&snap_dir).await.unwrap();
+
+    // First run of overwrite-generations: supersedes and recycles pages,
+    // exactly like the single-delta orphan test, then export delta one.
+    for generation in 0u8..5 {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..200 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[generation; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    let delta_one_target = source.latest_commit();
+    source
+        .snapshot_incremental_to(base, &delta_one_dir)
+        .await
+        .unwrap();
+
+    // More overwrite-generations on top, so delta two chains onto delta
+    // one's own target commit rather than the original base.
+    for generation in 5u8..10 {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..200 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[generation; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    let delta_two_target = source.latest_commit();
+    source
+        .snapshot_incremental_to(delta_one_target, &delta_two_dir)
+        .await
+        .unwrap();
+    drop(source);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    follower
+        .apply_incremental(&delta_one_dir)
+        .await
+        .expect("first chained delta must apply");
+    assert_eq!(follower.latest_commit(), delta_one_target);
+    {
+        let report = run_deep_walk(&follower).await.unwrap();
+        assert!(
+            report.orphan_page_ids.is_empty(),
+            "no orphans expected after the first delta, got {:?}",
+            report.orphan_page_ids
+        );
+        let rtxn = follower.begin_read().await.unwrap();
+        for i in 0u32..200 {
+            assert_eq!(
+                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                Some(vec![4u8; 128]),
+                "key k{i:05} should reflect generation 4 after the first delta"
+            );
+        }
+    }
+
+    // This is the assertion that catches the cursor-runahead hazard: if
+    // folding delta one's reclaimed chain into the follower's free list
+    // bump-allocated the follower's next_page_id past the producer's own
+    // cursor at delta_one_target, validate_incremental_manifest would reject
+    // this second delta as stale even though it correctly chains onto the
+    // commit the follower is sitting at.
+    follower.apply_incremental(&delta_two_dir).await.expect(
+        "second chained delta must apply without the follower's cursor outrunning the producer",
+    );
+    assert_eq!(follower.latest_commit(), delta_two_target);
+    {
+        let report = run_deep_walk(&follower).await.unwrap();
+        assert!(
+            report.orphan_page_ids.is_empty(),
+            "no orphans expected after the second delta, got {:?}",
+            report.orphan_page_ids
+        );
+        assert!(
+            report.is_clean(),
+            "follower deep-walk report should be clean after both chained deltas: {report:?}"
+        );
+        let rtxn = follower.begin_read().await.unwrap();
+        for i in 0u32..200 {
+            assert_eq!(
+                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                Some(vec![9u8; 128]),
+                "key k{i:05} should reflect generation 9 after the second delta"
+            );
+        }
+    }
+
+    drop(follower);
+    std::fs::remove_dir_all(&src_dir).ok();
+    std::fs::remove_dir_all(&snap_dir).ok();
+    std::fs::remove_dir_all(&delta_one_dir).ok();
+    std::fs::remove_dir_all(&delta_two_dir).ok();
+    std::fs::remove_dir_all(&dst_dir).ok();
+}
