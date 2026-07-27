@@ -1,8 +1,15 @@
-use pagedb::errors::QuotaKind;
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, PagedbError, RealmId, RealmQuotas, SegmentKind, SegmentPageKind};
+use pagedb::{Db, PagedbError, QuotaKind, RealmId, RealmQuotas, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
+
+/// `RealmQuotas` is `#[non_exhaustive]`, so it is built from the default and
+/// then mutated rather than written as a struct literal.
+fn quotas(edit: impl FnOnce(&mut RealmQuotas)) -> RealmQuotas {
+    let mut q = RealmQuotas::default();
+    edit(&mut q);
+    q
+}
 
 async fn open() -> Db<MemVfs> {
     Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, RealmId::new([1; 16]))
@@ -39,15 +46,9 @@ async fn link_segment_no_quota_succeeds() {
 async fn link_segment_under_quota_succeeds() {
     let db = open().await;
     let realm = RealmId::new([1; 16]);
-    db.set_realm_quotas(
-        realm,
-        RealmQuotas {
-            max_segment_bytes: Some(1_000_000),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(realm, quotas(|q| q.max_segment_bytes = Some(1_000_000)))
+        .await
+        .unwrap();
     let meta = create_segment_of_size(&db, realm, 1).await;
     let mut w = db.begin_write().await.unwrap();
     w.link_segment("seg", &meta).await.unwrap();
@@ -59,15 +60,9 @@ async fn link_segment_over_quota_rejected() {
     let db = open().await;
     let realm = RealmId::new([1; 16]);
     // Set a tight cap so the second link exceeds it.
-    db.set_realm_quotas(
-        realm,
-        RealmQuotas {
-            max_segment_bytes: Some(20_000),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(realm, quotas(|q| q.max_segment_bytes = Some(20_000)))
+        .await
+        .unwrap();
     let meta1 = create_segment_of_size(&db, realm, 1).await;
     {
         let mut w = db.begin_write().await.unwrap();
@@ -91,15 +86,9 @@ async fn quota_isolated_per_realm() {
     let db = open().await;
     let realm_a = RealmId::new([1; 16]);
     let realm_b = RealmId::new([2; 16]);
-    db.set_realm_quotas(
-        realm_a,
-        RealmQuotas {
-            max_segment_bytes: Some(20_000),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(realm_a, quotas(|q| q.max_segment_bytes = Some(20_000)))
+        .await
+        .unwrap();
     let meta_a = create_segment_of_size(&db, realm_a, 1).await;
     let meta_b = create_segment_of_size(&db, realm_b, 5).await;
     {
@@ -117,15 +106,9 @@ async fn quota_isolated_per_realm() {
 async fn replace_segment_within_quota_succeeds() {
     let db = open().await;
     let realm = RealmId::new([1; 16]);
-    db.set_realm_quotas(
-        realm,
-        RealmQuotas {
-            max_segment_bytes: Some(50_000),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(realm, quotas(|q| q.max_segment_bytes = Some(50_000)))
+        .await
+        .unwrap();
     let meta1 = create_segment_of_size(&db, realm, 5).await;
     {
         let mut w = db.begin_write().await.unwrap();
@@ -142,15 +125,9 @@ async fn replace_segment_within_quota_succeeds() {
 async fn replace_segment_over_quota_rejected() {
     let db = open().await;
     let realm = RealmId::new([1; 16]);
-    db.set_realm_quotas(
-        realm,
-        RealmQuotas {
-            max_segment_bytes: Some(20_000),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(realm, quotas(|q| q.max_segment_bytes = Some(20_000)))
+        .await
+        .unwrap();
     let meta1 = create_segment_of_size(&db, realm, 1).await; // small
     {
         let mut w = db.begin_write().await.unwrap();
@@ -173,15 +150,9 @@ async fn replace_segment_over_quota_rejected() {
 async fn quota_default_after_unset() {
     let db = open().await;
     let realm = RealmId::new([1; 16]);
-    db.set_realm_quotas(
-        realm,
-        RealmQuotas {
-            max_segment_bytes: Some(20_000),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(realm, quotas(|q| q.max_segment_bytes = Some(20_000)))
+        .await
+        .unwrap();
     // Remove the cap.
     db.set_realm_quotas(realm, RealmQuotas::default())
         .await

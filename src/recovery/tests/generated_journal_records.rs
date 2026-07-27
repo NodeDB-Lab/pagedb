@@ -7,7 +7,7 @@
 //! here drive those two fields across their whole range and assert the decoder
 //! declines rather than allocating, panicking, or spinning.
 
-use pagedb::recovery::journal::{
+use crate::recovery::journal::{
     ApplyJournalRecord, JournalAction, decode_journal_stream, decode_record, encode_journal_pages,
 };
 use proptest::prelude::*;

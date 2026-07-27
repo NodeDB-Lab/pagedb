@@ -22,6 +22,11 @@ impl<V: Vfs> BTree<V> {
     /// new epoch.
     ///
     /// Returns the count of pages touched.
+    ///
+    /// Production rekey always drives [`Self::rekey_walk_unique`] with a shared
+    /// map so retained roots are not re-sealed once per root; this single-root
+    /// entry point exists so tests can exercise a walk in isolation.
+    #[cfg(test)]
     pub async fn rekey_walk(&self) -> Result<u64> {
         self.rekey_walk_unique(&mut BTreeMap::new()).await
     }

@@ -1,8 +1,6 @@
-use pagedb::catalog::codec::SegmentKind;
-use pagedb::segment::types::SegmentPageKind;
 use pagedb::vfs::memory::MemVfs;
 use pagedb::vfs::{OpenMode, Vfs};
-use pagedb::{Db, RealmId};
+use pagedb::{Db, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 

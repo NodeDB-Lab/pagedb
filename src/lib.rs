@@ -10,22 +10,30 @@
     clippy::missing_panics_doc
 )]
 
-pub mod btree;
-pub mod catalog;
-pub mod compaction;
-pub mod crypto;
-pub mod diag;
-pub mod errors;
+// Internal layering. The crate's supported surface is the set of items
+// re-exported below plus the `options` and `vfs` modules — everything else is
+// physical on-disk format, key material, or recovery ordering that embedders
+// must not be able to reach around.
+pub(crate) mod btree;
+pub(crate) mod catalog;
+pub(crate) mod compaction;
+pub(crate) mod crypto;
+pub(crate) mod diag;
+pub(crate) mod errors;
+// Not part of the supported surface; shared with the `pagedb-fsck` binary,
+// which is a separate crate and can only see `pub` paths.
 #[doc(hidden)]
 pub mod hex;
-pub mod observability;
+pub(crate) mod observability;
 pub mod options;
-pub mod pager;
-pub mod realm;
-pub mod recovery;
-pub mod segment;
-pub mod snapshot;
-pub mod txn;
+pub(crate) mod pager;
+pub(crate) mod realm;
+pub(crate) mod recovery;
+pub(crate) mod segment;
+pub(crate) mod snapshot;
+pub(crate) mod txn;
+// Embedders select or implement a storage backend, so the trait, its request
+// types, and the shipped backends are legitimately public.
 pub mod vfs;
 
 pub use catalog::codec::{RealmQuotas, SegmentKind, SegmentMeta};
@@ -33,8 +41,8 @@ pub use compaction::{CompactBudget, CompactProgress, CompactStats};
 pub use crypto::{CipherId, SecretKey};
 pub use errors::{CorruptionDetail, Evictable, PagedbError, QuotaKind};
 pub use observability::DbStats;
-pub use options::OpenOptions;
-pub use recovery::{DeepWalkReport, run_deep_walk};
+pub use options::{OpenOptions, RetainPolicy};
+pub use recovery::{DeepWalkReport, DriftIssue, PageIssue, SegmentIssue, run_deep_walk};
 pub use segment::{
     ExtentRef, GcStats, MmapView, PageId, SegmentPageKind, SegmentReader, SegmentWriter,
 };

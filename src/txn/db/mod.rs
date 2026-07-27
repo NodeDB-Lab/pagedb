@@ -22,6 +22,8 @@ pub(crate) mod rekey;
 mod segment;
 #[cfg(not(target_arch = "wasm32"))]
 mod snapshot;
+#[cfg(test)]
+mod tests;
 mod util;
 
 pub use core::Db;

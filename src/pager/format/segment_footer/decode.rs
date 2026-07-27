@@ -180,7 +180,7 @@ fn authenticate_manifest(
         .ok_or(PagedbError::NonceCounterExhausted)?;
     let mut file_id = [0u8; 6];
     file_id.copy_from_slice(&fields.segment_id[..6]);
-    let nonce = Nonce::from_parts(&file_id, nonce_counter);
+    let nonce = Nonce::from_parts(file_id, nonce_counter);
     let mut manifest = bytes[cleartext_end..ciphertext_end].to_vec();
     let mut tag = [0u8; MANIFEST_TAG_LEN];
     tag.copy_from_slice(&bytes[ciphertext_end..tag_end]);

@@ -1,9 +1,7 @@
 //! Basic tests for `Db::stats()` and related observability surface.
 
-use pagedb::txn::db::Db;
-use pagedb::txn::mode::DbMode;
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{Db, DbMode, RealmId, SegmentKind, SegmentPageKind};
 
 fn realm() -> RealmId {
     RealmId::new([0x42u8; 16])

@@ -67,11 +67,11 @@ async fn truncate_len_and_read_only_contract() {
     let mut reader = vfs.open("/truncate", OpenMode::Read).await.unwrap();
     assert!(matches!(
         reader.write_at(0, b"x").await,
-        Err(pagedb::errors::PagedbError::ReadOnly)
+        Err(pagedb::PagedbError::ReadOnly)
     ));
     assert!(matches!(
         reader.truncate(0).await,
-        Err(pagedb::errors::PagedbError::ReadOnly)
+        Err(pagedb::PagedbError::ReadOnly)
     ));
     assert!(!reader.supports_direct_io());
 }
@@ -95,7 +95,7 @@ async fn rejects_parent_directory_escape() {
         Err(error) => error,
     };
     match error {
-        pagedb::errors::PagedbError::Io(error) => {
+        pagedb::PagedbError::Io(error) => {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -113,7 +113,7 @@ async fn equivalent_lock_paths_share_one_domain() {
         Ok(_) => panic!("equivalent logical paths must share one lock domain"),
         Err(error) => error,
     };
-    assert!(matches!(error, pagedb::errors::PagedbError::AlreadyLocked));
+    assert!(matches!(error, pagedb::PagedbError::AlreadyLocked));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -139,7 +139,7 @@ async fn vectored_write_rejects_unrepresentable_offset_without_partial_write() {
         .write_at_vectored(&writes)
         .await
         .expect_err("an invalid offset must reject the whole vectored write");
-    assert!(matches!(error, pagedb::errors::PagedbError::Io(_)));
+    assert!(matches!(error, pagedb::PagedbError::Io(_)));
 
     let mut actual = [0xff; 8];
     assert_eq!(file.read_at(0, &mut actual).await.unwrap(), 0);
@@ -168,7 +168,7 @@ async fn vectored_write_rejects_signed_offset_range_without_partial_write() {
         .write_at_vectored(&writes)
         .await
         .expect_err("a range past off_t::MAX must reject the whole vectored write");
-    assert!(matches!(error, pagedb::errors::PagedbError::Io(_)));
+    assert!(matches!(error, pagedb::PagedbError::Io(_)));
 
     let mut actual = [0xff; 8];
     assert_eq!(file.read_at(0, &mut actual).await.unwrap(), 0);
@@ -204,7 +204,7 @@ async fn vectored_read_rejects_unrepresentable_offset_without_touching_buffers()
         .read_at_vectored(&mut reads)
         .await
         .expect_err("an invalid offset must reject before filling buffers");
-    assert!(matches!(error, pagedb::errors::PagedbError::Io(_)));
+    assert!(matches!(error, pagedb::PagedbError::Io(_)));
     assert_eq!(first, [0x55; 8]);
     assert_eq!(second, [0x66; 1]);
 }

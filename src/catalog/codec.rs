@@ -123,8 +123,10 @@ pub struct RekeySegmentProgress {
     pub state: RekeySegmentProgressState,
 }
 
-/// Engine-defined segment type tag. This slice ships only `Unspecified`;
-/// engine adapters add concrete variants later.
+/// Engine-defined segment type tag. Only `Unspecified` ships today; engine
+/// adapters add concrete variants later, so this is `#[non_exhaustive]` and
+/// growing it stays a non-breaking change.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SegmentKind {
@@ -146,6 +148,7 @@ impl SegmentKind {
 }
 
 /// Catalog value for a segment row.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMeta {
     pub segment_id: [u8; 16],
@@ -163,6 +166,11 @@ pub struct SegmentMeta {
 }
 
 /// Catalog value for a quota row. Default = no caps.
+///
+/// Build one from [`RealmQuotas::default`] and assign the caps you need: the
+/// type accretes fields as new quota dimensions land, so it is
+/// `#[non_exhaustive]`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RealmQuotas {
     pub max_pages: Option<u64>,

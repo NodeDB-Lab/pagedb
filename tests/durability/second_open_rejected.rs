@@ -4,9 +4,8 @@
 //! left the first handle's data intact — the rejected path must be a no-op,
 //! never a partial write.
 
-use pagedb::errors::PagedbError;
 use pagedb::vfs::tokio_backend::TokioVfs;
-use pagedb::{Db, OpenOptions, RealmId};
+use pagedb::{Db, OpenOptions, PagedbError, RealmId};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [7u8; 32];

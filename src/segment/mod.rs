@@ -3,10 +3,10 @@
 
 pub(crate) mod authenticated_metadata;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod mmap;
-pub mod reader;
-pub mod types;
-pub mod writer;
+pub(crate) mod mmap;
+pub(crate) mod reader;
+pub(crate) mod types;
+pub(crate) mod writer;
 
 pub use reader::SegmentReader;
 pub use types::{ExtentRef, GcStats, MmapView, PageId, SegmentPageKind};

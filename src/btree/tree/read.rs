@@ -147,7 +147,7 @@ impl<V: Vfs> BTree<V> {
         let Some(idx) = leaf.find(key) else {
             return Ok(None);
         };
-        match leaf.value_at(idx)? {
+        match leaf.value_at(idx) {
             LeafValueRef::Inline(v) => Ok(Some(v.to_vec())),
             LeafValueRef::Overflow {
                 total_len,

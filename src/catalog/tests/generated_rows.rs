@@ -8,13 +8,13 @@
 //! field, and enumerating them by hand is exactly what has not caught defects
 //! so far.
 
-use pagedb::catalog::codec::{
+use crate::catalog::codec::{
     Catalog, LegacyRekeyState, REALM_QUOTAS_LEN, REKEY_INTENT_V1_LEN, REKEY_SEGMENT_PROGRESS_LEN,
     RekeyIntent, RekeySegmentProgress, RekeySegmentProgressState, RekeyStage, RekeyStateRow,
     SEGMENT_META_LEN, SegmentKind,
 };
-use pagedb::crypto::CipherId;
-use pagedb::{CommitId, Evictable, RealmId, RealmQuotas, SegmentMeta};
+use crate::crypto::CipherId;
+use crate::{CommitId, Evictable, RealmId, RealmQuotas, SegmentMeta};
 use proptest::prelude::*;
 
 fn cases() -> u32 {

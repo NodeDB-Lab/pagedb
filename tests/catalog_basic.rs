@@ -3,6 +3,14 @@ use pagedb::{CommitId, Db, PagedbError, RealmId, RealmQuotas};
 
 const PAGE: usize = 4096;
 
+/// `RealmQuotas` is `#[non_exhaustive]`, so it is built from the default and
+/// then mutated rather than written as a struct literal.
+fn quotas(edit: impl FnOnce(&mut RealmQuotas)) -> RealmQuotas {
+    let mut q = RealmQuotas::default();
+    edit(&mut q);
+    q
+}
+
 async fn open() -> (Db<MemVfs>, MemVfs) {
     let vfs = MemVfs::new();
     let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
@@ -21,12 +29,12 @@ async fn quotas_default_on_unset_realm() {
 #[tokio::test(flavor = "current_thread")]
 async fn set_and_get_quotas_round_trip() {
     let (db, _) = open().await;
-    let q = RealmQuotas {
-        max_pages: Some(1000),
-        max_dirty_pages: Some(64),
-        max_scratch_pages: None,
-        max_segment_bytes: Some(10 * 1024 * 1024),
-    };
+    let q = quotas(|q| {
+        q.max_pages = Some(1000);
+        q.max_dirty_pages = Some(64);
+        q.max_scratch_pages = None;
+        q.max_segment_bytes = Some(10 * 1024 * 1024);
+    });
     db.set_realm_quotas(RealmId::new([1; 16]), q).await.unwrap();
     let got = db.realm_quotas(RealmId::new([1; 16])).await.unwrap();
     assert_eq!(got, q);
@@ -35,14 +43,8 @@ async fn set_and_get_quotas_round_trip() {
 #[tokio::test(flavor = "current_thread")]
 async fn quotas_are_per_realm_independent() {
     let (db, _) = open().await;
-    let q_a = RealmQuotas {
-        max_segment_bytes: Some(1_000_000),
-        ..RealmQuotas::default()
-    };
-    let q_b = RealmQuotas {
-        max_segment_bytes: Some(10_000_000),
-        ..RealmQuotas::default()
-    };
+    let q_a = quotas(|q| q.max_segment_bytes = Some(1_000_000));
+    let q_b = quotas(|q| q.max_segment_bytes = Some(10_000_000));
     db.set_realm_quotas(RealmId::new([1; 16]), q_a)
         .await
         .unwrap();
@@ -60,10 +62,7 @@ async fn quotas_are_per_realm_independent() {
 #[tokio::test(flavor = "current_thread")]
 async fn set_quotas_persists_across_reopen() {
     let vfs = MemVfs::new();
-    let q = RealmQuotas {
-        max_pages: Some(7777),
-        ..RealmQuotas::default()
-    };
+    let q = quotas(|q| q.max_pages = Some(7777));
     {
         let db = Db::open_internal(vfs.clone(), [9u8; 32], PAGE, RealmId::new([1; 16]))
             .await
@@ -122,15 +121,9 @@ async fn quota_writes_interleave_with_user_writes() {
         w.put(b"k1", b"v1").await.unwrap();
         w.commit().await.unwrap();
     }
-    db.set_realm_quotas(
-        RealmId::new([1; 16]),
-        RealmQuotas {
-            max_pages: Some(500),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(RealmId::new([1; 16]), quotas(|q| q.max_pages = Some(500)))
+        .await
+        .unwrap();
     {
         let mut w = db.begin_write().await.unwrap();
         w.put(b"k2", b"v2").await.unwrap();
@@ -146,15 +139,9 @@ async fn quota_writes_interleave_with_user_writes() {
 #[tokio::test(flavor = "current_thread")]
 async fn default_quotas_remove_caps() {
     let (db, _) = open().await;
-    db.set_realm_quotas(
-        RealmId::new([1; 16]),
-        RealmQuotas {
-            max_pages: Some(500),
-            ..RealmQuotas::default()
-        },
-    )
-    .await
-    .unwrap();
+    db.set_realm_quotas(RealmId::new([1; 16]), quotas(|q| q.max_pages = Some(500)))
+        .await
+        .unwrap();
     db.set_realm_quotas(RealmId::new([1; 16]), RealmQuotas::default())
         .await
         .unwrap();

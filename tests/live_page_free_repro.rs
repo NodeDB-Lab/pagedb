@@ -15,11 +15,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pagedb::options::RetainPolicy;
-use pagedb::recovery::run_deep_walk;
-use pagedb::segment::types::SegmentPageKind;
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, OpenOptions, RealmId, SegmentKind};
+use pagedb::{Db, OpenOptions, RealmId, RetainPolicy, SegmentKind, SegmentPageKind, run_deep_walk};
 
 const KEK: [u8; 32] = [0x2Au8; 32];
 const REALM: RealmId = RealmId::new([0x5Cu8; 16]);
@@ -62,7 +59,7 @@ fn lcg(state: &mut u64) -> u64 {
 }
 
 /// Seal a small segment and return its meta (grows the catalog tree when linked).
-async fn make_segment(db: &Db<MemVfs>, gn: u32) -> pagedb::catalog::codec::SegmentMeta {
+async fn make_segment(db: &Db<MemVfs>, gn: u32) -> pagedb::SegmentMeta {
     let mut w = db
         .create_segment(REALM, SegmentKind::Unspecified)
         .await

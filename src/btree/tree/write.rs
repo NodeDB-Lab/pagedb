@@ -43,9 +43,7 @@ impl<V: Vfs> BTree<V> {
                 }
                 self.free_page(unused_cow_page);
             }
-            overflow::ReleaseResult::Decremented {
-                new_root_page_id: _,
-            } => self.free_page(old_root),
+            overflow::ReleaseResult::Decremented => self.free_page(old_root),
         }
     }
 

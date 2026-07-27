@@ -75,6 +75,10 @@ pub struct ApplyJournalRecord {
 }
 
 /// Encode the record (without the stream-length prefix) into its wire bytes.
+///
+/// Only the native-only `apply_incremental` write path builds journal
+/// records; wasm32 never writes one, so this is unreachable there.
+#[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn encode_record(record: &ApplyJournalRecord) -> Vec<u8> {
     let actions_len: usize = record
@@ -114,6 +118,10 @@ pub fn encode_record(record: &ApplyJournalRecord) -> Vec<u8> {
 /// `body_capacity(page_size)` bytes, ready to stage as sidecar pages 0..N.
 /// The first four bytes of the stream are the record length; the tail of the
 /// final page is zero-padded.
+///
+/// Native-only: feeds `Pager::stage_journal_page`, which only the native-only
+/// `apply_incremental` write path calls.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn encode_journal_pages(record: &ApplyJournalRecord, page_size: usize) -> Result<Vec<Vec<u8>>> {
     let cap = body_capacity(page_size);
     if cap <= STREAM_PREFIX_LEN {
@@ -223,6 +231,11 @@ pub fn decode_record(buf: &[u8]) -> Result<ApplyJournalRecord> {
 
 /// Pack a 16-byte journal id into the header's two `apply_journal_root` u64
 /// fields (`page_id` = bytes 0..8, `version` = bytes 8..16).
+///
+/// Native-only: only `apply_incremental` mints a fresh journal id to encode;
+/// the corresponding `decode_journal_id` remains reachable everywhere since
+/// every `Db::open` reads the header fields back to detect an in-flight apply.
+#[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn encode_journal_id(journal_id: &[u8; 16]) -> (u64, u64) {
     let mut lo = [0u8; 8];
@@ -284,10 +297,17 @@ pub async fn replay_apply_journal<V: Vfs + Clone>(
     Ok(Some(decode_journal_stream(&stream)?))
 }
 
-/// Execute journal actions idempotently when no live reader-pins need to be
-/// considered (for example, standalone recovery). Required directory creation,
-/// renames, and directory syncs are all fallible. The live `Db` uses its
-/// pin-aware reconciliation path instead.
+/// Execute journal actions idempotently against the VFS, with no reader-pin
+/// policy applied. Required directory creation, renames, and directory syncs
+/// are all fallible.
+///
+/// Every replay reaches the filesystem through the live `Db`, which must
+/// consult reader pins before a tombstone rename and can therefore defer one;
+/// there is no pin-free opener to call this. It survives as the fixture the
+/// crash tests use to assert the rename semantics — promote is a no-op when
+/// live already exists, tombstone is a no-op when live is already gone — that
+/// the pin-aware path is built on top of.
+#[cfg(test)]
 pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction]) -> Result<()> {
     vfs.mkdir_all("seg").await?;
     vfs.mkdir_all("seg/.staging").await?;
@@ -322,6 +342,7 @@ pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction])
     vfs.sync_dir("seg/.tombstone").await
 }
 
+#[cfg(test)]
 async fn path_exists<V: Vfs>(vfs: &V, path: &str) -> Result<bool> {
     match vfs.open(path, crate::vfs::types::OpenMode::Read).await {
         Ok(_) => Ok(true),

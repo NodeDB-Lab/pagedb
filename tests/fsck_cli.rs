@@ -3,9 +3,8 @@
 use std::{collections::BTreeMap, path::Path, process::Command};
 
 use pagedb::options::{OpenOptions, RetainPolicy};
-use pagedb::segment::types::SegmentPageKind;
 use pagedb::vfs::tokio_backend::TokioVfs;
-use pagedb::{Db, RealmId, SegmentKind};
+use pagedb::{Db, RealmId, SegmentKind, SegmentPageKind};
 
 const KEK: [u8; 32] = [0xA5; 32];
 const KEK_HEX: &str = "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5";

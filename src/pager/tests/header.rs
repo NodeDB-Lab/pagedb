@@ -1,9 +1,9 @@
-use pagedb::crypto::kdf::{derive_hk, derive_mk};
-use pagedb::pager::header::{ActiveSlot, bootstrap_header, commit_header, open_header};
-use pagedb::pager::structural_header::{MainDbHeaderFields, encode_main_db_header};
-use pagedb::vfs::memory::MemVfs;
-use pagedb::vfs::{OpenMode, Vfs, VfsFile};
-use pagedb::{CommitId, PagedbError};
+use crate::crypto::kdf::{derive_hk, derive_mk};
+use crate::pager::header::{ActiveSlot, bootstrap_header, commit_header, open_header};
+use crate::pager::structural_header::{MainDbHeaderFields, encode_main_db_header};
+use crate::vfs::memory::MemVfs;
+use crate::vfs::{OpenMode, Vfs, VfsFile};
+use crate::{CommitId, PagedbError};
 
 fn sample(seq: u64, page_size_log2: u8, anchor: u64) -> MainDbHeaderFields {
     MainDbHeaderFields {
@@ -32,7 +32,7 @@ fn sample(seq: u64, page_size_log2: u8, anchor: u64) -> MainDbHeaderFields {
     }
 }
 
-fn hk() -> pagedb::crypto::DerivedKey {
+fn hk() -> crate::crypto::DerivedKey {
     let mk = derive_mk(&[7u8; 32], &[0u8; 16], 0).unwrap();
     derive_hk(&mk).unwrap()
 }

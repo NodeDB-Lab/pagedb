@@ -1,9 +1,9 @@
 /// Verify apply-journal encode/decode round-trips and idempotent action replay.
 /// These tests exercise the journal machinery at the level of the public
 /// encode/decode API and the VFS rename layer without requiring a full crash.
-use pagedb::recovery::journal::{ApplyJournalRecord, JournalAction, decode_record, encode_record};
-use pagedb::vfs::Vfs;
-use pagedb::vfs::memory::MemVfs;
+use crate::recovery::journal::{ApplyJournalRecord, JournalAction, decode_record, encode_record};
+use crate::vfs::Vfs;
+use crate::vfs::memory::MemVfs;
 
 #[test]
 fn encode_promote_then_decode() {
@@ -61,8 +61,8 @@ fn encode_mixed_actions_then_decode() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn promote_action_is_idempotent_when_live_exists() {
-    use pagedb::recovery::journal::execute_journal_actions;
-    use pagedb::vfs::types::OpenMode;
+    use crate::recovery::journal::execute_journal_actions;
+    use crate::vfs::types::OpenMode;
 
     let vfs = MemVfs::new();
     let segment_id = [0xCC; 16];
@@ -81,7 +81,7 @@ async fn promote_action_is_idempotent_when_live_exists() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn promote_action_propagates_missing_staging() {
-    use pagedb::recovery::journal::execute_journal_actions;
+    use crate::recovery::journal::execute_journal_actions;
 
     let vfs = MemVfs::new();
     let actions = vec![JournalAction::Promote {
@@ -92,9 +92,9 @@ async fn promote_action_propagates_missing_staging() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn promote_action_renames_staging_to_live() {
-    use pagedb::recovery::journal::execute_journal_actions;
-    use pagedb::vfs::VfsFile;
-    use pagedb::vfs::types::OpenMode;
+    use crate::recovery::journal::execute_journal_actions;
+    use crate::vfs::VfsFile;
+    use crate::vfs::types::OpenMode;
 
     let vfs = MemVfs::new();
     let seg_id: [u8; 16] = [0xDD; 16];
@@ -136,7 +136,7 @@ async fn promote_action_renames_staging_to_live() {
 #[tokio::test(flavor = "current_thread")]
 async fn tombstone_action_is_idempotent_when_live_absent() {
     // If the live file is absent, the tombstone rename is a no-op.
-    use pagedb::recovery::journal::execute_journal_actions;
+    use crate::recovery::journal::execute_journal_actions;
     let vfs = MemVfs::new();
     let actions = vec![JournalAction::Tombstone {
         segment_id: [0xEE; 16],

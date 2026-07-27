@@ -51,14 +51,11 @@ impl DekLru {
         }
     }
 
-    #[must_use]
+    /// Number of cached entries. Only the eviction tests read this — the cache
+    /// enforces its own bound internally against `capacity`.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 
     /// Remove every cached cipher state derived from one retired epoch/cipher.

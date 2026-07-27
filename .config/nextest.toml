@@ -15,10 +15,8 @@ test-threads = "num-cpus"
 filter = """
     binary(crash_basic)
     | binary(recovery_basic)
-    | binary(rekey_basic)
     | binary(fsck_deep)
     | binary(durability)
-    | binary(snapshot_basic)
     | binary(compaction_basic)
     | binary(compaction_incremental)
     | binary(deferred_free_reclaim)
@@ -26,6 +24,7 @@ filter = """
     | (binary(pagedb) & (
         test(/crash/) | test(/recover/) | test(/rekey/)
         | test(/anchor/) | test(/torn/) | test(/journal/) | test(/replay/)
+        | test(/snapshot/) | test(/metadata_errors/)
     ))
 """
 test-group = "serial"

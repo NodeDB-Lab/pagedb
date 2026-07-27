@@ -6,10 +6,15 @@
 
 use crate::Result;
 use crate::crypto::keys::DerivedKey;
-use crate::errors::{CorruptionDetail, PagedbError};
-use crate::pager::format::structural_header::{
-    MainDbHeaderFields, decode_main_db_header, encode_main_db_header,
-};
+// `decode_main_db_header` and the corruption detail it reports are needed only
+// by `open_header`, which is test-only: production openers decode per slot
+// because the HK has to be derived from each slot's own salt and epoch.
+#[cfg(test)]
+use crate::errors::CorruptionDetail;
+use crate::errors::PagedbError;
+#[cfg(test)]
+use crate::pager::format::structural_header::decode_main_db_header;
+use crate::pager::format::structural_header::{MainDbHeaderFields, encode_main_db_header};
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile, read_exact_at, write_all_at};
 
@@ -108,6 +113,13 @@ pub(crate) async fn read_header_slot<F: VfsFile + ?Sized>(
 /// greater `seq`. If only one verifies, it wins. If neither verifies, returns
 /// `Corruption(HeaderUnverifiable)` — unrecoverable from inside the header
 /// layer.
+///
+/// Takes an already-derived HK, which an opener cannot have: the KEK salt and
+/// MK epoch that derive it live inside the slot bytes, and a counterpart KEK
+/// may have to be tried as well. Open therefore reads the slots itself via
+/// [`read_header_slot`] and derives per slot. This entry point remains as the
+/// executable statement of the slot-selection rule the A/B tests pin down.
+#[cfg(test)]
 pub async fn open_header<V: Vfs>(
     vfs: &V,
     path: &str,

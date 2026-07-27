@@ -9,12 +9,12 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pagedb::options::{OpenOptions, RetainPolicy};
-use pagedb::recovery::{JournalAction, execute_journal_actions};
-use pagedb::vfs::memory::MemVfs;
-use pagedb::vfs::traits::{Vfs, VfsFile};
-use pagedb::vfs::types::{OpenMode, ReadReq, WriteReq};
-use pagedb::{Db, PagedbError, RealmId, Result, SegmentKind, SegmentPageKind};
+use crate::options::{OpenOptions, RetainPolicy};
+use crate::recovery::journal::{JournalAction, execute_journal_actions};
+use crate::vfs::memory::MemVfs;
+use crate::vfs::traits::{Vfs, VfsFile};
+use crate::vfs::types::{OpenMode, ReadReq, WriteReq};
+use crate::{Db, PagedbError, RealmId, Result, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([1u8; 16]);

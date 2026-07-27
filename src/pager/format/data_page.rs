@@ -19,17 +19,6 @@ const OFF_MK_EPOCH: usize = 4;
 const OFF_NONCE: usize = 12;
 // body starts at HEADER_LEN; tag is at end-TAG_LEN.
 
-/// Parsed header view (fields that the caller cares about after a successful
-/// `open_data_page`).
-#[derive(Debug, Clone)]
-pub struct DataPageHeader {
-    pub cipher_id: CipherId,
-    pub page_kind: PageKind,
-    pub flags: u16,
-    pub mk_epoch: u64,
-    pub nonce: Nonce,
-}
-
 /// Number of usable body bytes in a `page_size`-byte page.
 #[must_use]
 pub const fn body_capacity(page_size: usize) -> usize {
@@ -116,10 +105,16 @@ pub fn extract_page_kind(page_buf: &[u8]) -> Result<PageKind> {
     PageKind::from_byte(page_buf[OFF_PAGE_KIND])
 }
 
-/// Open a data page in place. On success, returns the parsed header and the
-/// body slot of `page_buf` holds the decrypted plaintext. On failure
-/// (`ChecksumFailure`), the body slot is in an unspecified state and the
-/// caller must discard the page.
+/// Open a data page in place. On success the body slot of `page_buf` holds the
+/// decrypted plaintext and the authenticated `page_kind` is returned. On
+/// failure (`ChecksumFailure`), the body slot is in an unspecified state and
+/// the caller must discard the page.
+///
+/// Only the kind is handed back: every other header field is either already
+/// checked here against the caller's own inputs (`cipher_id` against the
+/// cipher, `page_kind` against the AAD) or is a decryption input the caller
+/// supplied in the first place, so returning it would only invite a second,
+/// weaker check downstream.
 ///
 /// `expected_aad` must be constructed from the same identity fields the
 /// caller expects this page to carry. AAD mismatch surfaces as
@@ -129,18 +124,12 @@ pub fn open_data_page(
     page_buf: &mut [u8],
     expected_aad: &Aad,
     cipher: &Cipher,
-) -> Result<DataPageHeader> {
+) -> Result<PageKind> {
     if page_buf.len() < ENVELOPE_OVERHEAD + 1 {
         return Err(PagedbError::PayloadTooLarge);
     }
     let cipher_id = CipherId::from_byte(page_buf[OFF_CIPHER_ID])?;
     let page_kind = PageKind::from_byte(page_buf[OFF_PAGE_KIND])?;
-    let mut flags_buf = [0u8; 2];
-    flags_buf.copy_from_slice(&page_buf[OFF_FLAGS..OFF_FLAGS + 2]);
-    let flags = u16::from_le_bytes(flags_buf);
-    let mut mk_buf = [0u8; 8];
-    mk_buf.copy_from_slice(&page_buf[OFF_MK_EPOCH..OFF_MK_EPOCH + 8]);
-    let mk_epoch = u64::from_le_bytes(mk_buf);
     let mut nonce_buf = [0u8; 12];
     nonce_buf.copy_from_slice(&page_buf[OFF_NONCE..OFF_NONCE + 12]);
     let mut file_id6 = [0u8; 6];
@@ -148,7 +137,7 @@ pub fn open_data_page(
     let mut counter_buf = [0u8; 8];
     counter_buf[..6].copy_from_slice(&nonce_buf[6..]);
     let counter = u64::from_le_bytes(counter_buf);
-    let nonce = Nonce::from_parts(&file_id6, counter);
+    let nonce = Nonce::from_parts(file_id6, counter);
     // Defense in depth: cipher.id() must match the byte in the header.
     if cipher.id() != cipher_id {
         return Err(PagedbError::ChecksumFailure);
@@ -165,13 +154,7 @@ pub fn open_data_page(
     tag.copy_from_slice(&page_buf[body_end..body_end + TAG_LEN]);
     let body = &mut page_buf[HEADER_LEN..body_end];
     cipher.decrypt(&nonce, expected_aad, body, &tag)?;
-    Ok(DataPageHeader {
-        cipher_id,
-        page_kind,
-        flags,
-        mk_epoch,
-        nonce,
-    })
+    Ok(page_kind)
 }
 
 #[cfg(test)]
@@ -200,7 +183,7 @@ mod tests {
             realm_id: realm,
             segment_id: MAIN_DB_SEGMENT_ID,
         });
-        let nonce = Nonce::from_parts(&[0xAB; 6], 7);
+        let nonce = Nonce::from_parts([0xAB; 6], 7);
         (cipher, aad, nonce)
     }
 
@@ -213,8 +196,8 @@ mod tests {
         seal_data_page(&mut buf, PageKind::BTreeLeaf, 0, 0, &nonce, &aad, &cipher).unwrap();
         // Plaintext "hello" should NOT be visible at the body offset after seal under AEAD.
         assert_ne!(&buf[HEADER_LEN..HEADER_LEN + 5], b"hello");
-        let header = open_data_page(&mut buf, &aad, &cipher).unwrap();
-        assert_eq!(header.page_kind, PageKind::BTreeLeaf);
+        let page_kind = open_data_page(&mut buf, &aad, &cipher).unwrap();
+        assert_eq!(page_kind, PageKind::BTreeLeaf);
         assert_eq!(&body(&buf)[..5], b"hello");
     }
 
@@ -231,7 +214,7 @@ mod tests {
             realm_id: RealmId([0; 16]),
             segment_id: MAIN_DB_SEGMENT_ID,
         });
-        let nonce = Nonce::from_parts(&[0xCD; 6], 1);
+        let nonce = Nonce::from_parts([0xCD; 6], 1);
         let mut buf = vec![0u8; PAGE];
         body_mut(&mut buf)[..5].copy_from_slice(b"plain");
         seal_data_page(&mut buf, PageKind::BTreeLeaf, 0, 0, &nonce, &aad, &cipher).unwrap();

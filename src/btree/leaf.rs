@@ -301,11 +301,6 @@ impl<'a> LeafAccessor<'a> {
         })
     }
 
-    #[must_use]
-    pub fn slot_count(&self) -> usize {
-        self.slot_count
-    }
-
     fn prefix(&self) -> &'a [u8] {
         &self.body[HEADER_LEN..HEADER_LEN + self.prefix_len]
     }
@@ -361,7 +356,8 @@ impl<'a> LeafAccessor<'a> {
 
     /// Decode the value at slot `idx`. Inline values borrow from the page body;
     /// overflow values return only the chain root + total length.
-    pub fn value_at(&self, idx: usize) -> Result<LeafValueRef<'a>> {
+    #[must_use]
+    pub fn value_at(&self, idx: usize) -> LeafValueRef<'a> {
         let off = slot_offset(self.body, self.prefix_len, idx);
         let suffix_len = read_u16_le(self.body, off) as usize;
         let after_key = off + 2 + suffix_len;
@@ -369,15 +365,13 @@ impl<'a> LeafAccessor<'a> {
         if value_len_raw == OVERFLOW_SENTINEL {
             let total_len = read_u64_le(self.body, after_key + 2);
             let root_page_id = read_u64_le(self.body, after_key + 2 + 8);
-            Ok(LeafValueRef::Overflow {
+            LeafValueRef::Overflow {
                 total_len,
                 root_page_id,
-            })
+            }
         } else {
             let vlen = value_len_raw as usize;
-            Ok(LeafValueRef::Inline(
-                &self.body[after_key + 2..after_key + 2 + vlen],
-            ))
+            LeafValueRef::Inline(&self.body[after_key + 2..after_key + 2 + vlen])
         }
     }
 }

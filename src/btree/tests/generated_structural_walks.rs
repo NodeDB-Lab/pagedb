@@ -17,15 +17,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pagedb::RealmId;
-use pagedb::btree::BTree;
-use pagedb::btree::internal::{Internal, InternalEntry};
-use pagedb::btree::leaf::{Leaf, LeafValue};
-use pagedb::btree::node::body_capacity;
-use pagedb::crypto::CipherId;
-use pagedb::crypto::kdf::derive_mk;
-use pagedb::pager::{PageKind, Pager, PagerConfig};
-use pagedb::vfs::memory::MemVfs;
+use crate::RealmId;
+use crate::btree::BTree;
+use crate::btree::internal::{Internal, InternalEntry};
+use crate::btree::leaf::{Leaf, LeafValue};
+use crate::btree::node::body_capacity;
+use crate::crypto::CipherId;
+use crate::crypto::kdf::derive_mk;
+use crate::pager::{PageKind, Pager, PagerConfig};
+use crate::vfs::memory::MemVfs;
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseResult, TestRunner};
 

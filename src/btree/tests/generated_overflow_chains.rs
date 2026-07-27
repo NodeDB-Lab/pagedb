@@ -16,16 +16,16 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pagedb::RealmId;
-use pagedb::btree::overflow::{
+use crate::RealmId;
+use crate::btree::overflow::{
     OVERFLOW_ROOT_HEADER_LEN, collect_chain, decode_overflow, encode_overflow,
     overflow_page_capacity, overflow_root_capacity, read_chain, read_root_page,
 };
-use pagedb::crypto::CipherId;
-use pagedb::crypto::kdf::derive_mk;
-use pagedb::pager::format::data_page::ENVELOPE_OVERHEAD;
-use pagedb::pager::{PageKind, Pager, PagerConfig};
-use pagedb::vfs::memory::MemVfs;
+use crate::crypto::CipherId;
+use crate::crypto::kdf::derive_mk;
+use crate::pager::format::data_page::ENVELOPE_OVERHEAD;
+use crate::pager::{PageKind, Pager, PagerConfig};
+use crate::vfs::memory::MemVfs;
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseResult, TestRunner};
 

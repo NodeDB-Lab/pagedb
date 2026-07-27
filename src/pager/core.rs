@@ -12,7 +12,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::crypto::aad::{AadFields, MAIN_DB_SEGMENT_ID};
 use crate::crypto::key_manager::DekLru;
 use crate::crypto::keys::MasterKey;
-use crate::crypto::nonce::{DEFAULT_ANCHOR_BUDGET, MainDbNonceGen, SegmentNonceGen};
+#[cfg(test)]
+use crate::crypto::nonce::DEFAULT_ANCHOR_BUDGET;
+use crate::crypto::nonce::{MainDbNonceGen, SegmentNonceGen};
 use crate::crypto::{Aad, CipherId, Nonce};
 use crate::errors::PagedbError;
 use crate::pager::cache::{Page, PageCache};
@@ -52,6 +54,10 @@ pub struct PagerConfig {
 }
 
 impl PagerConfig {
+    /// Every production open site builds a `PagerConfig` field by field from
+    /// `OpenOptions`, so the defaulted constructor survives only for tests that
+    /// need a working pager without an `OpenOptions` in hand.
+    #[cfg(test)]
     pub fn with_defaults(
         page_size: usize,
         cipher_id: CipherId,
@@ -99,11 +105,6 @@ impl PageGuard {
     #[must_use]
     pub fn body_ref(&self) -> &[u8] {
         body(&self.page.bytes)
-    }
-
-    #[must_use]
-    pub fn page_id(&self) -> u64 {
-        self.key.1
     }
 }
 
@@ -382,6 +383,14 @@ impl<V: Vfs> Pager<V> {
     }
 
     /// Read a segment page. Decrypts on cache miss; pins the result.
+    ///
+    /// Layer 3b owns its own file framing: `SegmentReader` reads and
+    /// authenticates segment bytes directly against the pager's key material,
+    /// so no production path routes segment pages through the page cache. The
+    /// cache-backed trio here (`read_segment_page`, `append_segment_page`,
+    /// `flush_segment`) is retained as the cache/AEAD round-trip fixture the
+    /// pager's own tests drive.
+    #[cfg(test)]
     pub async fn read_segment_page(
         &self,
         segment_id: [u8; 16],
@@ -430,7 +439,8 @@ impl<V: Vfs> Pager<V> {
 
     /// Append a fresh segment page; returns the assigned `page_id` (1-based;
     /// page 0 is the segment header, allocated separately by the segment
-    /// writer in a later slice).
+    /// writer in a later slice). Test-only; see [`Self::read_segment_page`].
+    #[cfg(test)]
     #[allow(clippy::unused_async)]
     pub async fn append_segment_page(
         &self,
@@ -469,6 +479,11 @@ impl<V: Vfs> Pager<V> {
 
     /// Stage an apply-journal sidecar page into the cache as dirty. `page_id`
     /// is the 0-based page index within `applyjournal/<hex(journal_id)>`.
+    ///
+    /// Only the `apply_incremental` write path calls this, and that path is
+    /// native-only (filesystem-backed VFS root); on wasm32 it never compiles
+    /// in, leaving this unreachable there.
+    #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::unused_async)]
     pub async fn stage_journal_page(
         &self,
@@ -488,6 +503,10 @@ impl<V: Vfs> Pager<V> {
     }
 
     /// Flush all dirty pages of an apply-journal sidecar to disk and fsync.
+    ///
+    /// Native-only: paired with `stage_journal_page` in the native-only
+    /// `apply_incremental` write path.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn flush_journal(&self, journal_id: [u8; 16], realm_id: RealmId) -> Result<()> {
         self.flush_file(
             FileKey::ApplyJournal(journal_id),
@@ -572,6 +591,8 @@ impl<V: Vfs> Pager<V> {
     }
 
     /// Flush all dirty pages for one segment to the VFS in physical-id order.
+    /// Test-only; see [`Self::read_segment_page`].
+    #[cfg(test)]
     pub async fn flush_segment(&self, segment_id: [u8; 16], realm_id: RealmId) -> Result<()> {
         self.flush_file(FileKey::Segment(segment_id), realm_id, segment_id, None)
             .await
@@ -808,7 +829,7 @@ impl<V: Vfs> Pager<V> {
                 }
             };
             match decrypt_result {
-                Ok(_header) => {
+                Ok(_page_kind) => {
                     let page = Arc::new(Page::new_with_meta(buf, auth_kind.as_byte(), realm_id.0));
                     let mut cache = self.inner.cache_for_key(file).lock();
                     let _ = cache.insert((file, page_id), page.clone());

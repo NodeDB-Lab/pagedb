@@ -16,15 +16,13 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pagedb::RealmId;
-use pagedb::crypto::CipherId;
-use pagedb::crypto::kdf::derive_mk;
-use pagedb::pager::format::data_page::body_capacity;
-use pagedb::pager::freelist::{
-    chain_capacity, count_chain, read_chain, rewrite_chain, write_chain,
-};
-use pagedb::pager::{PageKind, Pager, PagerConfig};
-use pagedb::vfs::memory::MemVfs;
+use crate::RealmId;
+use crate::crypto::CipherId;
+use crate::crypto::kdf::derive_mk;
+use crate::pager::format::data_page::body_capacity;
+use crate::pager::freelist::{chain_capacity, count_chain, read_chain, rewrite_chain, write_chain};
+use crate::pager::{PageKind, Pager, PagerConfig};
+use crate::vfs::memory::MemVfs;
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestCaseResult, TestRunner};
 

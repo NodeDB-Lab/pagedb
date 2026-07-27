@@ -1,4 +1,4 @@
-use pagedb::errors::PagedbError;
+use pagedb::PagedbError;
 use pagedb::vfs::memory::MemVfs;
 use pagedb::vfs::{OpenMode, ReadReq, Vfs, VfsFile, WriteReq};
 

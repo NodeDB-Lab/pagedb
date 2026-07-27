@@ -39,20 +39,15 @@ pub struct Page {
 }
 
 impl Page {
+    /// Metadata-less page. Every page the Pager inserts carries a realm, so
+    /// this exists only for cache-policy tests, which exercise eviction order
+    /// without building envelopes.
+    #[cfg(test)]
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
             kind_byte: 0,
-            realm_id_bytes: None,
-        }
-    }
-
-    #[must_use]
-    pub fn new_with_kind(bytes: Vec<u8>, kind_byte: u8) -> Self {
-        Self {
-            bytes,
-            kind_byte,
             realm_id_bytes: None,
         }
     }
@@ -112,18 +107,8 @@ impl PageCache {
     }
 
     #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 
     /// Lookup. Sets the `visited` bit on hit; does not touch the FIFO order.
@@ -251,22 +236,12 @@ impl PageCache {
         }
     }
 
-    #[must_use]
-    pub fn is_pinned(&self, key: (FileKey, u64)) -> bool {
-        self.pins.get(&key).copied().unwrap_or(0) > 0
-    }
-
     pub fn mark_dirty(&mut self, key: (FileKey, u64)) {
         self.dirty.insert(key);
     }
 
     pub fn clear_dirty(&mut self, key: (FileKey, u64)) {
         self.dirty.remove(&key);
-    }
-
-    #[must_use]
-    pub fn is_dirty(&self, key: (FileKey, u64)) -> bool {
-        self.dirty.contains(&key)
     }
 
     /// How many entries are currently dirty, across every file.

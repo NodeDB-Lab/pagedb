@@ -24,6 +24,7 @@ use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
 
 /// A single page-level issue found during deep walk.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PageIssue {
     pub page_id: u64,
@@ -31,6 +32,7 @@ pub struct PageIssue {
 }
 
 /// An issue found in a segment file during deep walk.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SegmentIssue {
     pub segment_id: [u8; 16],
@@ -38,6 +40,7 @@ pub struct SegmentIssue {
 }
 
 /// A catalog-vs-disk discrepancy.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DriftIssue {
     pub segment_id: [u8; 16],
@@ -45,6 +48,7 @@ pub struct DriftIssue {
 }
 
 /// Full report produced by [`run_deep_walk`].
+#[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct DeepWalkReport {
     /// Pages whose AEAD verification failed or whose structure is invalid.

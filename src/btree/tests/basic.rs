@@ -2,17 +2,17 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use pagedb::btree::BTree;
-use pagedb::btree::internal::{Internal, InternalEntry};
-use pagedb::btree::leaf::{Leaf, LeafValue};
-use pagedb::btree::node::body_capacity;
-use pagedb::btree::overflow::encode_overflow;
-use pagedb::crypto::CipherId;
-use pagedb::crypto::kdf::derive_mk;
-use pagedb::errors::CorruptionDetail;
-use pagedb::pager::{PageKind, Pager, PagerConfig};
-use pagedb::vfs::memory::MemVfs;
-use pagedb::{PagedbError, RealmId};
+use crate::btree::BTree;
+use crate::btree::internal::{Internal, InternalEntry};
+use crate::btree::leaf::{Leaf, LeafValue};
+use crate::btree::node::body_capacity;
+use crate::btree::overflow::encode_overflow;
+use crate::crypto::CipherId;
+use crate::crypto::kdf::derive_mk;
+use crate::errors::CorruptionDetail;
+use crate::pager::{PageKind, Pager, PagerConfig};
+use crate::vfs::memory::MemVfs;
+use crate::{PagedbError, RealmId};
 
 const PAGE: usize = 4096;
 
@@ -377,7 +377,7 @@ async fn read_node_rejects_authenticated_envelope_body_kind_mismatch() {
 /// the body was structurally validated at parse time.
 #[tokio::test(flavor = "current_thread")]
 async fn malformed_node_body_reports_corruption_instead_of_panicking() {
-    use pagedb::btree::node::{HEADER_LEN, NodeKind, write_header, write_slot_offset};
+    use crate::btree::node::{HEADER_LEN, NodeKind, write_header, write_slot_offset};
 
     let capacity = body_capacity(PAGE);
 

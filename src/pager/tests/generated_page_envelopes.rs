@@ -9,20 +9,20 @@
 //! regression can enumerate. Every case here asserts the same contract: a typed
 //! `PagedbError` or a value, never a panic.
 
-use pagedb::CommitId;
-use pagedb::RealmId;
-use pagedb::crypto::aad::{AadFields, MAIN_DB_SEGMENT_ID};
-use pagedb::crypto::kdf::{derive_dek, derive_hk, derive_mk};
-use pagedb::crypto::{Aad, Cipher, CipherId, Nonce};
-use pagedb::pager::PageKind;
-use pagedb::pager::format::data_page::{
+use crate::CommitId;
+use crate::RealmId;
+use crate::crypto::aad::{AadFields, MAIN_DB_SEGMENT_ID};
+use crate::crypto::kdf::{derive_dek, derive_hk, derive_mk};
+use crate::crypto::{Aad, Cipher, CipherId, Nonce};
+use crate::pager::PageKind;
+use crate::pager::format::data_page::{
     ENVELOPE_OVERHEAD, body_mut, extract_page_header_ids, extract_page_kind, open_data_page,
     seal_data_page,
 };
-use pagedb::pager::format::segment_footer::{
+use crate::pager::format::segment_footer::{
     SegmentFooterFields, decode_segment_footer, encode_segment_footer,
 };
-use pagedb::pager::format::structural_header::{
+use crate::pager::format::structural_header::{
     MainDbHeaderFields, SegmentHeaderFields, decode_main_db_header, decode_segment_header,
     encode_main_db_header, encode_segment_header,
 };
@@ -58,7 +58,7 @@ fn perturb(mut bytes: Vec<u8>, edits: &[(usize, u8)]) -> Vec<u8> {
     bytes
 }
 
-fn master_key() -> pagedb::crypto::MasterKey {
+fn master_key() -> crate::crypto::MasterKey {
     derive_mk(&[0x31; 32], &[0u8; 16], 0).unwrap()
 }
 
@@ -80,7 +80,7 @@ fn data_page_aad(page_kind: PageKind, page_id: u64) -> Aad {
 fn sealed_data_page(page_kind: PageKind, page_id: u64, plaintext: &[u8]) -> Vec<u8> {
     let cipher = data_page_cipher();
     let aad = data_page_aad(page_kind, page_id);
-    let nonce = Nonce::from_parts(&[0xC1; 6], 7);
+    let nonce = Nonce::from_parts([0xC1; 6], 7);
     let mut page = vec![0u8; PAGE];
     let body = body_mut(&mut page);
     let take = plaintext.len().min(body.len());

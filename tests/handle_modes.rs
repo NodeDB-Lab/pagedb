@@ -122,7 +122,6 @@ async fn open_standalone_succeeds_and_reports_mode() {
     assert_eq!(db.mode(), DbMode::Standalone);
     assert!(db.is_writer());
     assert!(!db.can_apply_incremental());
-    assert!(!db.can_rekey_into_writer());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -220,7 +219,6 @@ async fn open_read_only_succeeds_when_no_writer() {
     .unwrap();
     assert_eq!(db.mode(), DbMode::ReadOnly);
     assert!(!db.is_writer());
-    assert!(db.can_rekey_into_writer());
 }
 
 #[tokio::test(flavor = "current_thread")]

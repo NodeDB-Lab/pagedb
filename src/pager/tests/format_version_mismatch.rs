@@ -5,14 +5,14 @@
 //! format_version bytes in the VFS buffer to an unsupported version (99),
 //! and confirms that the decoder returns `PagedbError::Unsupported`.
 
-use pagedb::CommitId;
-use pagedb::errors::PagedbError;
-use pagedb::pager::format::structural_header::{
+use crate::CommitId;
+use crate::errors::PagedbError;
+use crate::pager::format::structural_header::{
     MainDbHeaderFields, decode_main_db_header, encode_main_db_header,
 };
 
-use pagedb::crypto::kdf::{derive_hk, derive_mk};
-use pagedb::crypto::keys::DerivedKey;
+use crate::crypto::kdf::{derive_hk, derive_mk};
+use crate::crypto::keys::DerivedKey;
 
 const PAGE: usize = 4096;
 

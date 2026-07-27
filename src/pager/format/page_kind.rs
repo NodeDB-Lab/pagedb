@@ -23,9 +23,11 @@ pub enum PageKind {
     /// promotions and tombstones that must be completed after the swap.
     ApplyJournal = 0x08,
     /// v2 overflow root page. Carries a `refcount: u32` in its body header
-    /// before the `next` pointer, enabling reference counting for shared
-    /// overflow chains. Chain pages (not the root) continue to use
-    /// `PageKind::Overflow`.
+    /// before the `next` pointer. Chain pages (not the root) continue to use
+    /// `PageKind::Overflow`. This crate always writes the count as 1 —
+    /// snapshot lifetime comes from commit-tagged page reclamation — but the
+    /// release path still honours a larger count so a root produced elsewhere
+    /// decodes correctly.
     OverflowRoot = 0x09,
     SegmentData = 0x10,
     SegmentIndex = 0x11,

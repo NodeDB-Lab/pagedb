@@ -1,12 +1,12 @@
 //! `BTree` — the `CoW` shadow-paging B+ tree.
 
-pub mod bulk;
-pub mod core;
-pub mod flush;
-pub mod maintenance;
-pub mod navigate;
-pub mod read;
-pub mod scan;
-pub mod write;
+pub(crate) mod bulk;
+pub(crate) mod core;
+pub(crate) mod flush;
+pub(crate) mod maintenance;
+pub(crate) mod navigate;
+pub(crate) mod read;
+pub(crate) mod scan;
+pub(crate) mod write;
 
 pub use core::BTree;

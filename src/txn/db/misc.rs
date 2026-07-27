@@ -4,7 +4,6 @@
 use crate::Result;
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, CatalogRowKind};
-use crate::crypto::SecretKey;
 use crate::errors::PagedbError;
 use crate::observability::DbStats;
 use crate::vfs::types::OpenMode;
@@ -34,20 +33,6 @@ impl<V: Vfs + Clone> Db<V> {
     /// (Follower mode only).
     pub fn can_apply_incremental(&self) -> bool {
         matches!(self.mode, DbMode::Follower)
-    }
-
-    /// Returns `true` iff `rekey_into_writer` is callable on this handle
-    /// (`ReadOnly` or Follower).
-    pub fn can_rekey_into_writer(&self) -> bool {
-        matches!(self.mode, DbMode::ReadOnly | DbMode::Follower)
-    }
-
-    /// Stub: rekey a restored `Db` (`ReadOnly` or Follower) into a Standalone writer.
-    /// Full implementation is out of scope for this slice.
-    pub fn rekey_into_writer(self, new_kek: impl Into<SecretKey>) -> Result<Self> {
-        let _new_kek = new_kek.into();
-        self.ensure_usable()?;
-        Err(crate::errors::PagedbError::Unsupported)
     }
 
     /// Return the `next_page_id` from the current writer state.

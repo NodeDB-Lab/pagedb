@@ -1,5 +1,4 @@
-use pagedb::errors::{CorruptionDetail, Evictable, PagedbError, QuotaKind};
-use pagedb::{CommitId, RealmId};
+use pagedb::{CommitId, CorruptionDetail, Evictable, PagedbError, QuotaKind, RealmId};
 
 #[test]
 fn corruption_constructor_round_trips() {

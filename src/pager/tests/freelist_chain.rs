@@ -8,12 +8,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use pagedb::RealmId;
-use pagedb::crypto::CipherId;
-use pagedb::crypto::kdf::derive_mk;
-use pagedb::pager::freelist::{chain_capacity, read_chain, rewrite_chain};
-use pagedb::pager::{Pager, PagerConfig};
-use pagedb::vfs::memory::MemVfs;
+use crate::RealmId;
+use crate::crypto::CipherId;
+use crate::crypto::kdf::derive_mk;
+use crate::pager::freelist::{chain_capacity, read_chain, rewrite_chain};
+use crate::pager::{Pager, PagerConfig};
+use crate::vfs::memory::MemVfs;
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([1; 16]);

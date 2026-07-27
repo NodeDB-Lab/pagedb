@@ -4,9 +4,12 @@
 //! `next` pointer (page id, 0 = end of chain) followed by raw data bytes.
 //!
 //! - Root page (`PageKind::OverflowRoot`): `refcount[4] || next[8] || data_len[4] || data`.
-//!   The `refcount: u32` enables shared chains — `increment_ref` CoW-copies the
-//!   root with `refcount + 1`; `release` CoW-copies it with `refcount - 1` and,
-//!   when it reaches 0, frees the entire chain.
+//!   `release` CoW-copies the root with `refcount - 1` and, when it reaches 0,
+//!   frees the entire chain. Snapshot lifetime does not rely on the count:
+//!   copy-on-write leaves that still name a chain are protected because commit
+//!   tags every freed page and reclamation waits until no retained root or live
+//!   reader can reach it. Nothing in this crate raises a count above 1, so the
+//!   decrement branch only fires for a root written by some other producer.
 //! - Chain page (`PageKind::Overflow`): `next[8] || data_len[4] || data`.
 //!
 //! The two layouts differ only in the root's 4-byte `refcount` prefix, so the
@@ -218,37 +221,11 @@ pub async fn write_chain<V: Vfs>(
     Ok(page_ids[0])
 }
 
-/// Increment the reference count of an overflow root page. Writes a new `CoW`
-/// copy of the root at `new_page_id` with `refcount + 1`. The caller is
-/// responsible for allocating `new_page_id` and freeing the old root page when
-/// appropriate.
-///
-/// Returns the new root page id (`new_page_id`).
-pub async fn increment_ref<V: Vfs>(
-    pager: &Pager<V>,
-    realm_id: RealmId,
-    root_page_id: u64,
-    new_page_id: u64,
-) -> Result<u64> {
-    let page_size = pager.page_size();
-    let info = read_root_page(pager, realm_id, root_page_id).await?;
-    let new_refcount = info
-        .refcount
-        .checked_add(1)
-        .ok_or_else(|| PagedbError::Io(std::io::Error::other("overflow refcount overflow")))?;
-    let mut body = vec![0u8; page_size - ENVELOPE_OVERHEAD];
-    encode_overflow_root(&mut body, new_refcount, info.next, &info.root_data)?;
-    pager
-        .write_main_page(new_page_id, realm_id, PageKind::OverflowRoot, &body)
-        .await?;
-    Ok(new_page_id)
-}
-
 /// The result of a `release` call.
 pub enum ReleaseResult {
-    /// Refcount decremented; new root page written at `new_root_page_id`.
-    /// The caller must free `old_root_page_id`.
-    Decremented { new_root_page_id: u64 },
+    /// Refcount decremented; the decremented root was written to the caller's
+    /// `new_page_id`. The caller must free the old root page.
+    Decremented,
     /// Refcount reached 0; all chain pages are listed in `freed_pages`
     /// (including the original root). The caller must free them all.
     Freed { freed_pages: Vec<u64> },
@@ -297,9 +274,7 @@ pub async fn release<V: Vfs>(
     pager
         .write_main_page(new_page_id, realm_id, PageKind::OverflowRoot, &body)
         .await?;
-    Ok(ReleaseResult::Decremented {
-        new_root_page_id: new_page_id,
-    })
+    Ok(ReleaseResult::Decremented)
 }
 
 /// Read a value's overflow chain via the Pager. Follows `next` pointers until 0.

@@ -14,9 +14,9 @@
 //! out-of-bounds index. A `proptest` failure here is the panic being reported
 //! with the smallest input that still triggers it.
 
-use pagedb::btree::internal::{Internal, InternalEntry};
-use pagedb::btree::leaf::{Leaf, LeafValue};
-use pagedb::btree::node::{
+use crate::btree::internal::{Internal, InternalEntry};
+use crate::btree::leaf::{Leaf, LeafValue};
+use crate::btree::node::{
     HEADER_LEN, NodeKind, OFF_PREFIX_LEN, OFF_SLOT_COUNT, body_capacity, validate_node_body,
 };
 use proptest::prelude::*;

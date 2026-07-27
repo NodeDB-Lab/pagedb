@@ -1,9 +1,7 @@
 use std::time::Duration;
 
-use pagedb::errors::PagedbError;
-use pagedb::options::{OpenOptions, RetainPolicy};
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{CommitId, Db, RealmId};
+use pagedb::{CommitId, Db, OpenOptions, PagedbError, RealmId, RetainPolicy};
 
 const PAGE: usize = 4096;
 const KEK: [u8; 32] = [7u8; 32];

@@ -4,7 +4,9 @@
 //! against held handles.
 
 pub mod file;
-pub mod port;
+// Raw completion-port plumbing — an internal detail of this backend, never
+// something an embedder drives directly.
+pub(crate) mod port;
 pub mod vfs;
 
 pub use file::IocpFile;

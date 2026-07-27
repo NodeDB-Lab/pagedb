@@ -104,7 +104,7 @@ async fn vectored_write_rejects_invalid_offset_without_partial_write() {
         .write_at_vectored(&writes)
         .await
         .expect_err("an invalid io_uring offset must reject the entire batch");
-    assert!(matches!(error, pagedb::errors::PagedbError::Io(_)));
+    assert!(matches!(error, pagedb::PagedbError::Io(_)));
 
     let mut actual = [0xff; 8];
     assert_eq!(file.read_at(0, &mut actual).await.unwrap(), 0);
@@ -144,7 +144,7 @@ async fn vectored_read_rejects_invalid_offset_without_touching_buffers() {
         .read_at_vectored(&mut reads)
         .await
         .expect_err("an invalid io_uring offset must reject before reading");
-    assert!(matches!(error, pagedb::errors::PagedbError::Io(_)));
+    assert!(matches!(error, pagedb::PagedbError::Io(_)));
     assert_eq!(first, [0x55; 8]);
     assert_eq!(second, [0x66; 1]);
     std::fs::remove_dir_all(&dir).ok();
@@ -207,7 +207,7 @@ async fn rejects_parent_directory_escape() {
         Err(error) => error,
     };
     match error {
-        pagedb::errors::PagedbError::Io(error) => {
+        pagedb::PagedbError::Io(error) => {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -226,7 +226,7 @@ async fn equivalent_lock_paths_share_one_domain() {
         Ok(_) => panic!("equivalent logical paths must share one lock domain"),
         Err(error) => error,
     };
-    assert!(matches!(error, pagedb::errors::PagedbError::AlreadyLocked));
+    assert!(matches!(error, pagedb::PagedbError::AlreadyLocked));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -292,7 +292,7 @@ async fn read_only_rejects_writes() {
     let mut g = vfs.open("/ro", OpenMode::Read).await.unwrap();
     assert!(matches!(
         g.write_at(0, b"x").await,
-        Err(pagedb::errors::PagedbError::ReadOnly)
+        Err(pagedb::PagedbError::ReadOnly)
     ));
 
     std::fs::remove_dir_all(&dir).ok();

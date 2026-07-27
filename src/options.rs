@@ -97,7 +97,7 @@ pub struct OpenOptions {
     /// `AtomicU64` `fetch_add` per main-db page read on the hot path; disable
     /// when the embedder doesn't read [`DbStats`]. Default: `true`.
     ///
-    /// [`DbStats`]: crate::observability::DbStats
+    /// [`DbStats`]: crate::DbStats
     pub metrics_enabled: bool,
 
     /// Maximum number of nonces the main-db Pager may issue between A/B

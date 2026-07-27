@@ -67,11 +67,11 @@ async fn truncate_len_and_read_only_contract() {
     let mut reader = vfs.open("/truncate", OpenMode::Read).await.unwrap();
     assert!(matches!(
         reader.write_at(0, b"x").await,
-        Err(pagedb::errors::PagedbError::ReadOnly)
+        Err(pagedb::PagedbError::ReadOnly)
     ));
     assert!(matches!(
         reader.truncate(0).await,
-        Err(pagedb::errors::PagedbError::ReadOnly)
+        Err(pagedb::PagedbError::ReadOnly)
     ));
     assert!(!reader.supports_direct_io());
 }
@@ -95,7 +95,7 @@ async fn rejects_parent_directory_escape() {
         Err(error) => error,
     };
     match error {
-        pagedb::errors::PagedbError::Io(error) => {
+        pagedb::PagedbError::Io(error) => {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -113,5 +113,5 @@ async fn equivalent_lock_paths_share_one_domain() {
         Ok(_) => panic!("equivalent logical paths must share one lock domain"),
         Err(error) => error,
     };
-    assert!(matches!(error, pagedb::errors::PagedbError::AlreadyLocked));
+    assert!(matches!(error, pagedb::PagedbError::AlreadyLocked));
 }

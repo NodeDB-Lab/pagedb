@@ -83,7 +83,7 @@ pub fn encode_segment_footer(
         .ok_or(PagedbError::NonceCounterExhausted)?;
     let mut file_id = [0u8; 6];
     file_id.copy_from_slice(&fields.segment_id[..6]);
-    let nonce = Nonce::from_parts(&file_id, nonce_counter);
+    let nonce = Nonce::from_parts(file_id, nonce_counter);
     let manifest_end = cleartext_end
         .checked_add(manifest.len())
         .ok_or_else(|| PagedbError::arithmetic_overflow("footer manifest end"))?;

@@ -19,9 +19,9 @@ impl Nonce {
     /// machine has already permitted the value. Use `MainDbNonceGen` /
     /// `SegmentNonceGen` to obtain counters safely.
     #[must_use]
-    pub fn from_parts(file_id6: &[u8; 6], counter: u64) -> Self {
+    pub fn from_parts(file_id6: [u8; 6], counter: u64) -> Self {
         let mut out = [0u8; 12];
-        out[..6].copy_from_slice(file_id6);
+        out[..6].copy_from_slice(&file_id6);
         let le = counter.to_le_bytes();
         out[6..].copy_from_slice(&le[..6]);
         Self(out)
@@ -115,7 +115,7 @@ impl MainDbNonceGen {
             // Caller must commit the anchor first.
             return Err(PagedbError::Aborted);
         }
-        let n = Nonce::from_parts(&self.file_id6, self.next);
+        let n = Nonce::from_parts(self.file_id6, self.next);
         self.next += 1;
         Ok(n)
     }
@@ -137,11 +137,6 @@ impl MainDbNonceGen {
         }
         self.durable_anchor = persisted;
         Ok(())
-    }
-
-    #[must_use]
-    pub fn durable_anchor(&self) -> u64 {
-        self.durable_anchor
     }
 }
 
@@ -173,12 +168,17 @@ impl SegmentNonceGen {
         if self.next > Nonce::COUNTER_MAX {
             return Err(PagedbError::NonceCounterExhausted);
         }
-        let n = Nonce::from_parts(&self.file_id6, self.next);
+        let n = Nonce::from_parts(self.file_id6, self.next);
         self.next += 1;
         Ok(n)
     }
 
     /// The counter value the next `next_nonce()` call would consume.
+    ///
+    /// The segment writer derives page ids from its own append cursor, so the
+    /// only remaining consumers are tests and the pager's cache-backed segment
+    /// append path, which is itself test-only.
+    #[cfg(test)]
     #[must_use]
     pub fn peek_counter(&self) -> u64 {
         self.next
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn nonce_layout_matches_spec() {
-        let n = Nonce::from_parts(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11], 0x0102_0304_0506);
+        let n = Nonce::from_parts([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11], 0x0102_0304_0506);
         let bytes = n.as_bytes();
         assert_eq!(&bytes[..6], &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11]);
         // Little-endian 48-bit counter: 0x06 0x05 0x04 0x03 0x02 0x01

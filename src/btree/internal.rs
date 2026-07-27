@@ -125,19 +125,6 @@ impl Internal {
         Ok(())
     }
 
-    /// Descend selection: returns the child `page_id` covering `key`.
-    #[must_use]
-    pub fn child_for(&self, key: &[u8]) -> u64 {
-        // Binary search for the rightmost entry where entry.key <= key.
-        // Using partition_point: find the first index where entry.key > key.
-        let pos = self.entries.partition_point(|e| e.key.as_slice() <= key);
-        if pos == 0 {
-            self.leftmost_child
-        } else {
-            self.entries[pos - 1].right_child
-        }
-    }
-
     #[must_use]
     pub fn fits(&self, page_size: usize) -> bool {
         let cap = body_capacity(page_size);
@@ -222,8 +209,9 @@ impl<'a> InternalAccessor<'a> {
         read_u64_le(self.body, off + 2 + key_len)
     }
 
-    /// Descend selection: returns the child `page_id` covering `query`. Matches
-    /// the semantics of [`Internal::child_for`] but operates on borrowed bytes.
+    /// Descend selection: returns the child `page_id` covering `query`. Reads
+    /// the slot directory in place, so descending a spine never materializes
+    /// the node's keys.
     #[must_use]
     pub fn child_for(&self, query: &[u8]) -> u64 {
         // Rightmost index where entry.key <= query. Use partition_point logic

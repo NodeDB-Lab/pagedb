@@ -6,13 +6,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use pagedb::options::RetainPolicy;
-use pagedb::snapshot::export::{
+use crate::options::RetainPolicy;
+use crate::snapshot::export::{
     SnapshotManifest, decode_manifest, derive_snapshot_hk_key, encode_manifest, open_manifest,
 };
-use pagedb::vfs::tokio_backend::{TokioFile, TokioLockHandle, TokioVfs};
-use pagedb::vfs::{OpenMode, Vfs};
-use pagedb::{
+use crate::vfs::tokio_backend::{TokioFile, TokioLockHandle, TokioVfs};
+use crate::vfs::{OpenMode, Vfs};
+use crate::{
     ApplyStats, CommitId, Db, DbMode, OpenOptions, PagedbError, RealmId, SegmentKind,
     SegmentPageKind, SnapshotStats, run_deep_walk,
 };
@@ -59,15 +59,15 @@ impl Vfs for RenameFaultVfs {
     type File = TokioFile;
     type LockHandle = TokioLockHandle;
 
-    async fn open(&self, path: &str, mode: OpenMode) -> pagedb::Result<Self::File> {
+    async fn open(&self, path: &str, mode: OpenMode) -> crate::Result<Self::File> {
         self.inner.open(path, mode).await
     }
 
-    async fn remove(&self, path: &str) -> pagedb::Result<()> {
+    async fn remove(&self, path: &str) -> crate::Result<()> {
         self.inner.remove(path).await
     }
 
-    async fn rename(&self, from: &str, to: &str) -> pagedb::Result<()> {
+    async fn rename(&self, from: &str, to: &str) -> crate::Result<()> {
         if self.fail_renames.load(Ordering::SeqCst) {
             return Err(PagedbError::Io(std::io::Error::other(
                 "injected persistent rename failure",
@@ -76,23 +76,23 @@ impl Vfs for RenameFaultVfs {
         self.inner.rename(from, to).await
     }
 
-    async fn list_dir(&self, path: &str) -> pagedb::Result<Vec<String>> {
+    async fn list_dir(&self, path: &str) -> crate::Result<Vec<String>> {
         self.inner.list_dir(path).await
     }
 
-    async fn mkdir_all(&self, path: &str) -> pagedb::Result<()> {
+    async fn mkdir_all(&self, path: &str) -> crate::Result<()> {
         self.inner.mkdir_all(path).await
     }
 
-    async fn sync_dir(&self, path: &str) -> pagedb::Result<()> {
+    async fn sync_dir(&self, path: &str) -> crate::Result<()> {
         self.inner.sync_dir(path).await
     }
 
-    async fn lock_exclusive(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+    async fn lock_exclusive(&self, path: &str) -> crate::Result<Self::LockHandle> {
         self.inner.lock_exclusive(path).await
     }
 
-    async fn lock_shared(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+    async fn lock_shared(&self, path: &str) -> crate::Result<Self::LockHandle> {
         self.inner.lock_shared(path).await
     }
 
@@ -149,27 +149,27 @@ impl Vfs for FailStagingSyncTokioVfs {
     type File = TokioFile;
     type LockHandle = TokioLockHandle;
 
-    async fn open(&self, path: &str, mode: OpenMode) -> pagedb::Result<Self::File> {
+    async fn open(&self, path: &str, mode: OpenMode) -> crate::Result<Self::File> {
         self.inner.open(path, mode).await
     }
 
-    async fn remove(&self, path: &str) -> pagedb::Result<()> {
+    async fn remove(&self, path: &str) -> crate::Result<()> {
         self.inner.remove(path).await
     }
 
-    async fn rename(&self, from: &str, to: &str) -> pagedb::Result<()> {
+    async fn rename(&self, from: &str, to: &str) -> crate::Result<()> {
         self.inner.rename(from, to).await
     }
 
-    async fn list_dir(&self, path: &str) -> pagedb::Result<Vec<String>> {
+    async fn list_dir(&self, path: &str) -> crate::Result<Vec<String>> {
         self.inner.list_dir(path).await
     }
 
-    async fn mkdir_all(&self, path: &str) -> pagedb::Result<()> {
+    async fn mkdir_all(&self, path: &str) -> crate::Result<()> {
         self.inner.mkdir_all(path).await
     }
 
-    async fn sync_dir(&self, path: &str) -> pagedb::Result<()> {
+    async fn sync_dir(&self, path: &str) -> crate::Result<()> {
         if path == "seg/.staging" && self.fail_staging_sync.swap(false, Ordering::SeqCst) {
             return Err(PagedbError::Io(std::io::Error::other(
                 "injected staging sync fault",
@@ -178,11 +178,11 @@ impl Vfs for FailStagingSyncTokioVfs {
         self.inner.sync_dir(path).await
     }
 
-    async fn lock_exclusive(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+    async fn lock_exclusive(&self, path: &str) -> crate::Result<Self::LockHandle> {
         self.inner.lock_exclusive(path).await
     }
 
-    async fn lock_shared(&self, path: &str) -> pagedb::Result<Self::LockHandle> {
+    async fn lock_shared(&self, path: &str) -> crate::Result<Self::LockHandle> {
         self.inner.lock_shared(path).await
     }
 

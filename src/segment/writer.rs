@@ -18,7 +18,6 @@ use crate::pager::format::structural_header::{SegmentHeaderFields, encode_segmen
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile, write_all_at};
 use crate::{RealmId, Result};
-use tracing;
 
 use super::types::{EXTENT_INDEX_ENTRY_LEN, ExtentIndexEntry, ExtentRef, PageId, SegmentPageKind};
 

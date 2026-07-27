@@ -2,9 +2,6 @@
 //! are partitioned by a leading row-kind byte: 0x00 = quota row, 0x01 =
 //! segment row.
 
-pub mod codec;
-
-pub use codec::{
-    Catalog, CatalogRowKind, LegacyRekeyState, RekeyIntent, RekeySegmentProgress,
-    RekeySegmentProgressState, RekeyStage, RekeyStateRow,
-};
+pub(crate) mod codec;
+#[cfg(test)]
+mod tests;

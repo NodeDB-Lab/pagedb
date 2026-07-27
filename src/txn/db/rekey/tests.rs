@@ -1,8 +1,14 @@
 //! Rekey integration tests: main-db and immutable-segment transitions.
+//!
+//! These live beside the implementation rather than in `tests/` because they
+//! re-derive DEKs and re-open page envelopes directly to prove the epoch
+//! transition rewrote what it claimed — key derivation and the page envelope
+//! are both crate-internal.
+#![allow(clippy::pedantic)]
 
-use pagedb::options::RetainPolicy;
-use pagedb::vfs::memory::MemVfs;
-use pagedb::{
+use crate::options::RetainPolicy;
+use crate::vfs::memory::MemVfs;
+use crate::{
     Db, Evictable, OpenOptions, PagedbError, RealmId, RealmQuotas, SegmentKind, SegmentPageKind,
 };
 
@@ -264,13 +270,13 @@ async fn rekey_with_segments() {
 /// by the AEAD binding.
 #[tokio::test(flavor = "current_thread")]
 async fn rekey_aad_misroute_across_epoch() {
-    use pagedb::CipherId;
-    use pagedb::crypto::aad::{Aad, AadFields, MAIN_DB_SEGMENT_ID};
-    use pagedb::crypto::cipher::Cipher;
-    use pagedb::crypto::kdf::{derive_dek, derive_mk};
-    use pagedb::crypto::nonce::MainDbNonceGen;
-    use pagedb::pager::format::data_page::{open_data_page, seal_data_page};
-    use pagedb::pager::format::page_kind::PageKind;
+    use crate::CipherId;
+    use crate::crypto::aad::{Aad, AadFields, MAIN_DB_SEGMENT_ID};
+    use crate::crypto::cipher::Cipher;
+    use crate::crypto::kdf::{derive_dek, derive_mk};
+    use crate::crypto::nonce::MainDbNonceGen;
+    use crate::pager::format::data_page::{open_data_page, seal_data_page};
+    use crate::pager::format::page_kind::PageKind;
 
     let file_id = [0xABu8; 16];
     let kek_salt = [0xCDu8; 16];
@@ -449,7 +455,7 @@ async fn rekey_preserves_durable_free_list_across_reopen() {
         .await
         .unwrap();
     assert!(reopened.stats().await.unwrap().free_list_pending_entries > 0);
-    let report = pagedb::recovery::deep_walk::run_deep_walk(&reopened)
+    let report = crate::recovery::deep_walk::run_deep_walk(&reopened)
         .await
         .unwrap();
     assert!(report.is_clean(), "free-list rekey report: {report:?}");
@@ -549,7 +555,7 @@ async fn rekey_reseals_a_catalog_larger_than_one_page() {
     let reopened = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options)
         .await
         .unwrap();
-    let report = pagedb::recovery::deep_walk::run_deep_walk(&reopened)
+    let report = crate::recovery::deep_walk::run_deep_walk(&reopened)
         .await
         .unwrap();
     assert!(
@@ -595,7 +601,7 @@ async fn rekey_leaves_no_leaked_pages() {
     drop(db);
 
     let reopened = Db::open_existing(vfs, KEK0, PAGE, REALM).await.unwrap();
-    let report = pagedb::recovery::deep_walk::run_deep_walk(&reopened)
+    let report = crate::recovery::deep_walk::run_deep_walk(&reopened)
         .await
         .unwrap();
     assert!(report.is_clean(), "repeated rekey report: {report:?}");

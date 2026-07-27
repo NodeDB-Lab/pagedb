@@ -31,6 +31,10 @@ use super::nonce::Nonce;
 
 /// On-wire `cipher_id` byte values. The numeric values are stable and part of
 /// the persisted format.
+///
+/// Cipher-agility means this set grows; it is `#[non_exhaustive]` so adding a
+/// mode is not a breaking change for embedders that match on it.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CipherId {
@@ -204,7 +208,7 @@ mod tests {
             realm_id: RealmId([1; 16]),
             segment_id: [0; 16],
         });
-        let nonce = Nonce::from_parts(&[0xDE; 6], 1);
+        let nonce = Nonce::from_parts([0xDE; 6], 1);
         (aes, cc, pt, aad, nonce)
     }
 

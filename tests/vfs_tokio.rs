@@ -2,7 +2,7 @@
 
 //! Integration tests for `TokioVfs` — real disk I/O under a temporary directory.
 
-use pagedb::errors::PagedbError;
+use pagedb::PagedbError;
 use pagedb::vfs::tokio_backend::TokioVfs;
 use pagedb::vfs::{OpenMode, ReadReq, Vfs, VfsFile, WriteReq};
 

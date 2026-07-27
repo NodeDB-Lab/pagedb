@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pagedb::RealmId;
-use pagedb::btree::BTree;
-use pagedb::crypto::CipherId;
-use pagedb::crypto::kdf::derive_mk;
-use pagedb::pager::{Pager, PagerConfig};
-use pagedb::vfs::memory::MemVfs;
+use crate::RealmId;
+use crate::btree::BTree;
+use crate::crypto::CipherId;
+use crate::crypto::kdf::derive_mk;
+use crate::pager::{Pager, PagerConfig};
+use crate::vfs::memory::MemVfs;
 
 const PAGE: usize = 4096;
 

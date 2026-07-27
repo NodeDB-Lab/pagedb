@@ -47,7 +47,7 @@ fn lock_holder_helper() {
 
 #[cfg(unix)]
 async fn assert_conflict(lock_path: &str, holder_kind: &str) {
-    use pagedb::errors::PagedbError;
+    use pagedb::PagedbError;
     use pagedb::vfs::Vfs;
     use pagedb::vfs::tokio_backend::TokioVfs;
 

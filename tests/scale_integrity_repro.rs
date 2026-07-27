@@ -14,10 +14,8 @@
 //! wrong/absent value on read-back, an AEAD/MAC verification error, or an
 //! unbounded `next_page_id`.
 
-use pagedb::options::{OpenOptions, RetainPolicy};
-use pagedb::recovery::run_deep_walk;
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, RealmId};
+use pagedb::{Db, OpenOptions, RealmId, RetainPolicy, run_deep_walk};
 
 const KEK: [u8; 32] = [0x2Au8; 32];
 const REALM: RealmId = RealmId::new([0x5Cu8; 16]);

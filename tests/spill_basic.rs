@@ -6,10 +6,9 @@
 
 #![allow(clippy::drop_non_drop)]
 
-use pagedb::errors::QuotaKind;
 use pagedb::vfs::memory::MemVfs;
 use pagedb::vfs::{OpenMode, Vfs};
-use pagedb::{Db, OpenOptions, PagedbError, RealmId};
+use pagedb::{Db, OpenOptions, PagedbError, QuotaKind, RealmId};
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([1u8; 16]);

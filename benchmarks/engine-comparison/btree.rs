@@ -21,12 +21,10 @@ use fluxbench::prelude::*;
 use fluxbench::{bench, compare, synthetic, verify};
 use tokio::sync::Mutex as AsyncMutex;
 
-use pagedb::crypto::CipherId;
-use pagedb::options::{OpenOptions, RetainPolicy};
 use pagedb::vfs::Vfs;
 use pagedb::vfs::memory::MemVfs;
 use pagedb::vfs::tokio_backend::TokioVfs;
-use pagedb::{Db, RealmId};
+use pagedb::{CipherId, Db, OpenOptions, RealmId, RetainPolicy};
 
 const PAGE: usize = 4096;
 /// Working-set size: number of keys preloaded for read benches and the

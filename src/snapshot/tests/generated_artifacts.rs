@@ -12,9 +12,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use pagedb::pager::is_reserved;
-use pagedb::snapshot::apply::apply_delta_pages;
-use pagedb::snapshot::export::{SnapshotManifest, decode_manifest, encode_manifest};
+use crate::pager::page_space::is_reserved;
+use crate::snapshot::apply::apply_delta_pages;
+use crate::snapshot::export::{SnapshotManifest, decode_manifest, encode_manifest};
 use proptest::prelude::*;
 
 /// Deliberately small: the delta path is byte-for-byte generic in page size,
