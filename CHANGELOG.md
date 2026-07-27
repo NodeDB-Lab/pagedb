@@ -53,7 +53,10 @@ version, since none exists yet.
 - Single-writer per database; multi-writer cross-process is not supported.
 - Writes carry per-page AEAD and copy-on-write overhead; for throughput-bound
   plaintext KV workloads a generic store may be faster.
-- An incremental snapshot cannot always be applied: if the producer recycled a
-  page the follower's own free-list chain or commit-history tree still hosts,
-  apply reports `PagedbError::SnapshotBasePageReused` and the follower needs a
-  full snapshot or a nearer base commit.
+- An incremental snapshot cannot always be applied: if the producer recycled any
+  page the follower's base state still holds, apply reports
+  `PagedbError::SnapshotBasePageReused` and the follower needs a full snapshot or
+  a nearer base commit. Copy-on-write recycles page ids continuously, so a
+  follower should expect this within a few deltas under ordinary write churn and
+  must be able to fall back to a full snapshot. The refusal is checked before any
+  page is written, so it leaves the follower unchanged.
