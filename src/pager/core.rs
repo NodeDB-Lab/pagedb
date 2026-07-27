@@ -872,6 +872,11 @@ impl<V: Vfs> Pager<V> {
 
     /// Evict unpinned clean main.db pages so later reads fetch and authenticate
     /// durable bytes without discarding in-flight writes.
+    ///
+    /// Compiled only for the crate's own tests, matching the handle-level
+    /// accessor that is its sole caller: correctness never depends on whether a
+    /// page is warm, so nothing in the shipped crate should be steering that.
+    #[cfg(test)]
     pub fn evict_clean_main_pages(&self, _realm_id: crate::RealmId) {
         self.inner
             .buffer_pool

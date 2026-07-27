@@ -220,6 +220,39 @@ mod tests {
     const REALM: RealmId = RealmId::new([0xA5; 16]);
 
     #[tokio::test(flavor = "current_thread")]
+    async fn evict_main_pages_forces_next_read_to_miss_cache() {
+        let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
+            .await
+            .unwrap();
+        {
+            let mut txn = db.begin_write().await.unwrap();
+            txn.put(b"hello", b"world").await.unwrap();
+            txn.commit().await.unwrap();
+        }
+        {
+            let reader = db.begin_read().await.unwrap();
+            assert_eq!(
+                reader.get(b"hello").await.unwrap().as_deref(),
+                Some(b"world".as_slice())
+            );
+        }
+        let before = db.stats().await.unwrap();
+
+        db.evict_main_pages(REALM);
+
+        let reader = db.begin_read().await.unwrap();
+        assert_eq!(
+            reader.get(b"hello").await.unwrap().as_deref(),
+            Some(b"world".as_slice())
+        );
+        let after = db.stats().await.unwrap();
+        assert!(
+            after.buffer_pool_misses > before.buffer_pool_misses,
+            "eviction must force a VFS-backed cache miss: before={before:?}, after={after:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn stats_surfaces_malformed_segment_catalog_row() {
         let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
             .await

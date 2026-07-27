@@ -270,6 +270,22 @@ impl PageCache {
     /// when compaction replaces the backing file (the cached pages no longer
     /// match what is on disk). Pinned entries are left untouched.
     pub fn clear_file(&mut self, file: FileKey) {
+        self.clear_file_entries(file, false);
+    }
+
+    /// Drop every unpinned clean entry for `file`, leaving dirty entries
+    /// available for a later flush and pinned entries available to readers.
+    /// Used to force a re-read of the durable bytes without discarding the
+    /// in-flight writes that have not reached them yet.
+    #[cfg(test)]
+    pub fn clear_clean_file(&mut self, file: FileKey) {
+        self.clear_file_entries(file, true);
+    }
+
+    /// Shared body of the two `clear_*` entry points. Pinned entries are always
+    /// spared: a reader holds them. `keep_dirty` decides whether an unflushed
+    /// entry is spared as well, or dropped along with its dirty marker.
+    fn clear_file_entries(&mut self, file: FileKey, keep_dirty: bool) {
         let keys: Vec<(FileKey, u64)> = self
             .map
             .keys()
@@ -280,32 +296,7 @@ impl PageCache {
             if self.pins.get(&key).copied().unwrap_or(0) > 0 {
                 continue;
             }
-            if let Some(idx) = self.map.remove(&key) {
-                let (prev, next) = {
-                    let node = self.slab[idx].as_ref().expect("indexed node alive");
-                    (node.prev, node.next)
-                };
-                if self.hand == Some(idx) {
-                    self.hand = next;
-                }
-                self.unlink_node(idx, prev, next);
-                self.free_node(idx);
-            }
-            self.dirty.remove(&key);
-        }
-    }
-
-    /// Drop every unpinned clean entry for `file`, leaving dirty entries
-    /// available for a later flush and pinned entries available to readers.
-    pub fn clear_clean_file(&mut self, file: FileKey) {
-        let keys: Vec<(FileKey, u64)> = self
-            .map
-            .keys()
-            .filter(|(f, _)| *f == file)
-            .copied()
-            .collect();
-        for key in keys {
-            if self.pins.get(&key).copied().unwrap_or(0) > 0 || self.dirty.contains(&key) {
+            if keep_dirty && self.dirty.contains(&key) {
                 continue;
             }
             if let Some(idx) = self.map.remove(&key) {
@@ -318,6 +309,9 @@ impl PageCache {
                 }
                 self.unlink_node(idx, prev, next);
                 self.free_node(idx);
+            }
+            if !keep_dirty {
+                self.dirty.remove(&key);
             }
         }
     }
@@ -407,7 +401,7 @@ mod tests {
 
         assert!(c.get((FileKey::Main, 1)).is_none());
         assert!(c.get((FileKey::Main, 2)).is_some());
-        assert!(c.is_dirty((FileKey::Main, 2)));
+        assert_eq!(c.dirty_for_file(FileKey::Main), vec![2]);
     }
 
     #[test]
