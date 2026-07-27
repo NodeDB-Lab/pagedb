@@ -36,10 +36,17 @@ async fn make_db(root: &std::path::Path) -> Db<TokioVfs> {
         .unwrap()
 }
 
+/// A `TokioVfs` whose renames can be made to fail, per destination class.
+///
+/// An apply renames twice: once to swap its staged image over `main.db` — its
+/// commit point — and once per segment during journal replay, which is only
+/// reachable when that swap already succeeded. The two are separately
+/// selectable so a test can name the boundary it is interrupting.
 #[derive(Clone)]
 struct RenameFaultVfs {
     inner: TokioVfs,
     fail_renames: Arc<AtomicBool>,
+    fail_main_db_renames: Arc<AtomicBool>,
 }
 
 impl RenameFaultVfs {
@@ -47,11 +54,16 @@ impl RenameFaultVfs {
         Self {
             inner: TokioVfs::new(root),
             fail_renames: Arc::new(AtomicBool::new(false)),
+            fail_main_db_renames: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn fail_renames(&self, fail: bool) {
         self.fail_renames.store(fail, Ordering::SeqCst);
+    }
+
+    fn fail_main_db_renames(&self, fail: bool) {
+        self.fail_main_db_renames.store(fail, Ordering::SeqCst);
     }
 }
 
@@ -68,7 +80,10 @@ impl Vfs for RenameFaultVfs {
     }
 
     async fn rename(&self, from: &str, to: &str) -> crate::Result<()> {
-        if self.fail_renames.load(Ordering::SeqCst) {
+        let destination = to.trim_start_matches('/');
+        let refused = (destination.starts_with("seg/") && self.fail_renames.load(Ordering::SeqCst))
+            || (destination == "main.db" && self.fail_main_db_renames.load(Ordering::SeqCst));
+        if refused {
             return Err(PagedbError::Io(std::io::Error::other(
                 "injected persistent rename failure",
             )));
@@ -3451,11 +3466,11 @@ async fn concurrent_incremental_applies_are_serialized_before_raw_page_writes() 
     }
 }
 
-/// Applying an incremental delta writes raw pages directly to `main.db`,
-/// bypassing the normal write-txn path that the free-list accounting relies
-/// on elsewhere. That makes it its own place where a page could end up
-/// reachable from neither a live root nor the free list — a leak the deep
-/// walk's orphan check exists to catch.
+/// Applying an incremental delta installs whole pages by absolute id, bypassing
+/// the normal write-txn path that the free-list accounting relies on elsewhere.
+/// That makes it its own place where a page could end up reachable from neither
+/// a live root nor the free list — a leak the deep walk's orphan check exists to
+/// catch.
 #[tokio::test(flavor = "current_thread")]
 async fn apply_incremental_leaves_no_orphan_pages_on_the_follower() {
     let src_dir = tempdir();
@@ -3521,15 +3536,14 @@ async fn apply_incremental_leaves_no_orphan_pages_on_the_follower() {
     std::fs::remove_dir_all(&dst_dir).ok();
 }
 
-/// Folding a reclaimed chain into the follower's free list can bump-allocate
-/// past pages the producer never touched, pushing the follower's visible
-/// `next_page_id` ahead of the producer's own cursor. `apply_incremental`
-/// requires the next delta's `next_page_id_at_target` to be `>=` the
-/// follower's current cursor, so if the fold-in ever runs the follower ahead
-/// of the producer, a second chained delta would be rejected and the
-/// follower could never catch up. Apply two deltas back-to-back, the second
-/// chained onto the first delta's own target commit, to prove that door
-/// stays open.
+/// An apply allocates ids the producer never had — the rewritten free-list
+/// chain, and the commit-history tree when a delta claims the pages hosting it
+/// — so the follower's visible `next_page_id` can end up ahead of the producer's
+/// own cursor. A follower that runs ahead must still be able to take the next
+/// delta: nothing about a smaller `next_page_id_at_target` makes a delta
+/// inapplicable, because the published cursor is the larger of the two. Apply
+/// two deltas back-to-back, the second chained onto the first delta's own target
+/// commit, to prove that door stays open.
 #[tokio::test(flavor = "current_thread")]
 async fn chained_incremental_applies_keep_the_follower_able_to_advance() {
     let src_dir = tempdir();
@@ -3655,19 +3669,23 @@ async fn chained_incremental_applies_keep_the_follower_able_to_advance() {
     std::fs::remove_dir_all(&dst_dir).ok();
 }
 
-/// The follower keeps its own free-list chain and commit-history tree across
-/// an apply, and those pages are invisible to the producer, which can neither
+/// The follower keeps its own free-list chain and commit-history tree across an
+/// apply, and those pages are invisible to the producer, which can neither
 /// predict nor avoid them. When the producer's allocator later recycles one of
 /// those same ids into its own live tree, the resulting delta ships that id by
-/// number and `apply_delta_pages` refuses it outright as `SnapshotBasePageReused`
-/// -- fail-closed, before `main.db` is ever opened for writing. That refusal is
-/// not a bug to work around; it is the contract. This proves the refusal is
-/// both precise (the exact error variant, not any old error) and side-effect
-/// free (the follower's commit, its key/value state, and its page graph are
-/// bit-for-bit what they were before the doomed apply was attempted), and that
-/// the documented remedy -- a full snapshot instead of a delta -- still works.
+/// number.
+///
+/// That used to be inapplicable by construction: pages went straight into the
+/// live `main.db` before the header swap, so overwriting one would have
+/// destroyed base state while the only durable header still pointed at it, and
+/// the apply refused rather than risk it. The target is now assembled in a
+/// staged image and this handle's own metadata is relocated out of the incoming
+/// page space before the swap, so the delta applies — and this proves it applies
+/// *correctly*: the follower lands on the target commit, every key reads back as
+/// the source has it, its page graph deep-walks clean, and it agrees with a
+/// follower built from a full snapshot of the same commit.
 #[tokio::test(flavor = "current_thread")]
-async fn an_inapplicable_delta_is_refused_without_touching_the_follower() {
+async fn a_delta_that_recycles_follower_private_page_ids_applies_cleanly() {
     let src_dir = tempdir();
     let snap_dir = tempdir();
     let dst_dir = tempdir();
@@ -3697,21 +3715,6 @@ async fn an_inapplicable_delta_is_refused_without_touching_the_follower() {
 
     let base = source.latest_commit();
 
-    // Record the follower's full state before the doomed apply so the
-    // "nothing changed" assertions below have something concrete to compare
-    // against, rather than just "it still looks fine".
-    let pre_apply_commit = follower.latest_commit();
-    let pre_apply_values: Vec<(String, Option<Vec<u8>>)> = {
-        let rtxn = follower.begin_read().await.unwrap();
-        let mut values = Vec::with_capacity(512);
-        for i in 0u32..512 {
-            let key = format!("k{i:05}");
-            let value = rtxn.get(key.as_bytes()).await.unwrap();
-            values.push((key, value));
-        }
-        values
-    };
-
     // Free half the working set -- interior pages go onto the source's
     // durable free list.
     {
@@ -3739,47 +3742,58 @@ async fn an_inapplicable_delta_is_refused_without_touching_the_follower() {
     source
         .snapshot_incremental_to(base, &delta_dir)
         .await
-        .expect("exporting the delta itself must succeed; the guard lives on the apply side");
+        .expect("exporting the delta itself must succeed");
 
-    let err = follower
+    follower
         .apply_incremental(&delta_dir)
         .await
-        .expect_err("a delta that reuses a follower-private page id must be refused, not applied");
-    assert!(
-        matches!(err, PagedbError::SnapshotBasePageReused { .. }),
-        "expected PagedbError::SnapshotBasePageReused, got a different error: {err:?}"
-    );
+        .expect("a delta that recycles a follower-private page id must apply");
 
-    // The load-bearing assertions: the rejection must be a pure no-op on the
-    // follower. Nothing about its commit, its data, or its page graph may have
-    // moved, because the write path bails before `main.db` is opened.
     assert_eq!(
         follower.latest_commit(),
-        pre_apply_commit,
-        "a refused apply must not advance the follower's commit"
+        target,
+        "the apply must land on the delta's target commit"
     );
     {
         let rtxn = follower.begin_read().await.unwrap();
-        for (key, expected) in &pre_apply_values {
+        for i in 0u32..256 {
             assert_eq!(
-                &rtxn.get(key.as_bytes()).await.unwrap(),
-                expected,
-                "key {key} must read back exactly as it did before the refused apply"
+                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                Some(vec![0xBBu8; 128]),
+                "refilled key k{i:05} must reflect the source's current state"
+            );
+        }
+        for i in 256u32..512 {
+            assert_eq!(
+                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                Some(vec![0xAAu8; 128]),
+                "untouched key k{i:05} must reflect the source's current state"
             );
         }
     }
     let report = run_deep_walk(&follower).await.unwrap();
     assert!(
         report.orphan_page_ids.is_empty(),
-        "a refused apply must not leave orphan pages, got {:?}",
+        "an applied delta must not leave orphan pages, got {:?}",
         report.orphan_page_ids
     );
     assert!(
         report.is_clean(),
-        "a refused apply must leave the follower's deep-walk report clean: {report:?}"
+        "an applied delta must leave the follower's deep-walk report clean: {report:?}"
+    );
+    // The commit-history tree the follower carries is relocated when the delta
+    // claims its pages; either way it must still be walkable afterwards.
+    assert!(matches!(
+        follower.begin_read_at(base).await,
+        Ok(_) | Err(PagedbError::CommitGone { .. })
+    ));
+    assert!(
+        !dst_dir.join("main.db.applying").exists(),
+        "a completed apply must leave no staged image behind"
     );
 
-    // The documented remedy: fall back to a full snapshot instead of a delta.
+    // The same commit reached the other way round: a full snapshot. The two
+    // followers must agree key for key.
     source.snapshot_to(&full_snap_dir).await.unwrap();
     let full_restored =
         Db::<TokioVfs>::restore_from(&full_snap_dir, &full_dst_dir, OpenOptions::default(), KEK)
@@ -3788,31 +3802,21 @@ async fn an_inapplicable_delta_is_refused_without_touching_the_follower() {
     let full_follower = full_restored.promote_to_follower().await.unwrap();
     assert_eq!(full_follower.latest_commit(), target);
     {
-        let rtxn = full_follower.begin_read().await.unwrap();
-        for i in 0u32..256 {
+        let delta_read = follower.begin_read().await.unwrap();
+        let full_read = full_follower.begin_read().await.unwrap();
+        for i in 0u32..512 {
+            let key = format!("k{i:05}");
             assert_eq!(
-                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                Some(vec![0xBBu8; 128]),
-                "full-snapshot remedy: refilled key k{i:05} must reflect the source's current state"
-            );
-        }
-        for i in 256u32..512 {
-            assert_eq!(
-                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                Some(vec![0xAAu8; 128]),
-                "full-snapshot remedy: untouched key k{i:05} must reflect the source's current state"
+                delta_read.get(key.as_bytes()).await.unwrap(),
+                full_read.get(key.as_bytes()).await.unwrap(),
+                "delta-applied and full-snapshot followers disagree on {key}"
             );
         }
     }
     let full_report = run_deep_walk(&full_follower).await.unwrap();
     assert!(
-        full_report.orphan_page_ids.is_empty(),
-        "full-snapshot remedy follower must have no orphan pages, got {:?}",
-        full_report.orphan_page_ids
-    );
-    assert!(
         full_report.is_clean(),
-        "full-snapshot remedy follower must deep-walk clean: {full_report:?}"
+        "full-snapshot follower must deep-walk clean: {full_report:?}"
     );
 
     drop(full_follower);
@@ -3826,20 +3830,147 @@ async fn an_inapplicable_delta_is_refused_without_touching_the_follower() {
     std::fs::remove_dir_all(&full_dst_dir).ok();
 }
 
-/// This is a genuine architectural limit, not a defect to be papered over:
-/// `protected_page_ids` is the follower's whole published base page set, and
-/// `apply_delta_pages` writes pages before the header swap, so once the
-/// producer recycles ANY id the follower's base still holds, that delta can
-/// never be applied -- overwriting it first would destroy the base with no
-/// valid header left to recover from on a crash. Ordinary churn (delete some
-/// keys, refill, overwrite the rest -- CoW recycles pages on overwrite exactly
-/// as deletes do, so there is no churn shape that reliably dodges this) will
-/// eventually recycle such an id. A real replication client must therefore
-/// treat `SnapshotBasePageReused` as an expected outcome of chaining deltas,
-/// not a bug: fall back to a full snapshot and keep going. This test drives 12
-/// rounds of that ordinary churn and, on every round, accepts exactly two
-/// outcomes -- clean apply, or refusal-plus-full-snapshot-remedy -- and fails
-/// loudly on anything else.
+/// Chaining deltas is not a two-delta trick: an ordinary write-churn workload
+/// must keep replicating by delta indefinitely.
+///
+/// Each round frees half the working set, refills it, and overwrites the
+/// surviving half in place — the shape that recycles page ids fastest, including
+/// the ids hosting the follower's own free-list chain and commit-history tree.
+/// Every round must apply, land on that round's commit, read back that round's
+/// generation, and deep-walk clean. A single refusal fails the test: needing a
+/// full snapshot to get past ordinary churn is the defect this asserts against.
+#[tokio::test(flavor = "current_thread")]
+async fn chained_deltas_survive_many_rounds_of_delete_and_refill_churn() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for i in 0u32..512 {
+            write
+                .put(format!("k{i:05}").as_bytes(), &[0xAA; 128])
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    source.snapshot_to(&snap_dir).await.unwrap();
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let mut delta_target = source.latest_commit();
+    let mut cleanup_dirs = vec![src_dir.clone(), snap_dir.clone(), dst_dir.clone()];
+
+    for round in 0u32..12 {
+        let round_base = delta_target;
+        {
+            let mut write = source.begin_write().await.unwrap();
+            for i in 0u32..256 {
+                write.delete(format!("k{i:05}").as_bytes()).await.unwrap();
+            }
+            write.commit().await.unwrap();
+        }
+        {
+            let mut write = source.begin_write().await.unwrap();
+            for i in 0u32..256 {
+                write
+                    .put(format!("k{i:05}").as_bytes(), &[round as u8; 128])
+                    .await
+                    .unwrap();
+            }
+            write.commit().await.unwrap();
+        }
+        {
+            let mut write = source.begin_write().await.unwrap();
+            for i in 256u32..512 {
+                write
+                    .put(format!("k{i:05}").as_bytes(), &[round as u8; 128])
+                    .await
+                    .unwrap();
+            }
+            write.commit().await.unwrap();
+        }
+
+        delta_target = source.latest_commit();
+        let delta_dir = tempdir();
+        cleanup_dirs.push(delta_dir.clone());
+        source
+            .snapshot_incremental_to(round_base, &delta_dir)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: incremental export must succeed: {e:?}"));
+
+        follower
+            .apply_incremental(&delta_dir)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: chained delta must apply: {e:?}"));
+
+        assert_eq!(
+            follower.latest_commit(),
+            delta_target,
+            "round {round}: the apply must land on the delta's target commit"
+        );
+        let report = run_deep_walk(&follower).await.unwrap();
+        assert!(
+            report.orphan_page_ids.is_empty(),
+            "round {round}: no orphan pages, got {:?}",
+            report.orphan_page_ids
+        );
+        assert!(
+            report.is_clean(),
+            "round {round}: deep-walk report must be clean: {report:?}"
+        );
+        let rtxn = follower.begin_read().await.unwrap();
+        for i in 0u32..512 {
+            assert_eq!(
+                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
+                Some(vec![round as u8; 128]),
+                "round {round}: key k{i:05} should reflect this round's generation"
+            );
+        }
+        drop(rtxn);
+        assert!(
+            !dst_dir.join("main.db.applying").exists(),
+            "round {round}: a completed apply must leave no staged image behind"
+        );
+
+        // Re-applying a delta the follower has already absorbed must fail on the
+        // manifest's base commit, not silently redo the work.
+        let replay = follower.apply_incremental(&delta_dir).await;
+        assert!(
+            matches!(
+                replay,
+                Err(PagedbError::SnapshotIncompatible { field }) if field == "base_commit"
+            ),
+            "round {round}: replaying a completed delta must fail on base_commit, got {replay:?}"
+        );
+    }
+
+    drop(follower);
+    drop(source);
+    for dir in cleanup_dirs {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// A replication client's error handling must survive being right either way.
+///
+/// `SnapshotBasePageReused` is still a reachable refusal -- a delta record that
+/// names a page the base commit is still reading through is not something any
+/// well-formed export produces, and it is refused before anything is staged.
+/// Ordinary churn is no longer a cause of it (see
+/// `chained_deltas_survive_many_rounds_of_delete_and_refill_churn`, which
+/// requires every round to apply), so a client that treats the refusal as fatal
+/// and a client that falls back to a full snapshot must both stay consistent.
+/// This test drives 12 rounds of that churn and, on every round, accepts exactly
+/// two outcomes -- clean apply, or refusal-plus-full-snapshot-remedy -- and
+/// fails loudly on anything else, so the fallback path keeps being exercised
+/// end-to-end without pinning which branch a given build takes.
 #[tokio::test(flavor = "current_thread")]
 async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snapshot() {
     let src_dir = tempdir();
@@ -4052,14 +4183,14 @@ async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snap
 
     // Neither branch is required to occur. Which rounds apply and which are
     // refused depends on the ids the producer's allocator happens to recycle,
-    // and that shifts with build configuration: every round is refused under
-    // `PAGEDB_INVARIANT_CHECKS`, and none is refused without it. Asserting a
-    // count here would pin a scheduling accident, so this test asserts only the
-    // property that must hold either way — every round ends applied-and-clean or
+    // and that shifts with build configuration. Asserting a count here would pin
+    // a scheduling accident, so this test asserts only the property that must
+    // hold either way — every round ends applied-and-clean or
     // refused-and-unchanged, never anything else, and the follower is
     // consistent at the end. Each branch is proved deterministically on its own:
-    // the clean apply by `chained_incremental_applies_keep_the_follower_able_to_advance`,
-    // the refusal by `an_inapplicable_delta_is_refused_without_touching_the_follower`.
+    // the clean apply by `chained_deltas_survive_many_rounds_of_delete_and_refill_churn`,
+    // the refusal by
+    // `apply_incremental_refuses_to_overwrite_a_base_live_page_without_mutating_base`.
     assert_eq!(
         ok_rounds + refused_rounds,
         12,
@@ -4073,12 +4204,13 @@ async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snap
     }
 }
 
-/// A `TokioVfs` whose `main.db` A/B header slots can be made unwritable.
+/// A `TokioVfs` whose A/B header slots — in `main.db` or in the staged image an
+/// apply builds beside it — can be made unwritable.
 ///
-/// The delta pages an incremental apply writes land at page 4 and above, so
-/// rejecting writes below that boundary stops an apply exactly between "the
-/// target pages are on disk" and "the header names them" — the apply's commit
-/// point.
+/// The delta pages and relocated metadata an incremental apply writes land at
+/// page 4 and above, so rejecting writes below that boundary stops an apply
+/// exactly between "the target image is fully assembled" and "its header names
+/// the target", which is the last durable boundary before the swap.
 #[derive(Clone)]
 struct HeaderFaultVfs {
     inner: TokioVfs,
@@ -4109,7 +4241,7 @@ impl Vfs for HeaderFaultVfs {
     async fn open(&self, path: &str, mode: OpenMode) -> crate::Result<Self::File> {
         Ok(HeaderFaultFile {
             inner: self.inner.open(path, mode).await?,
-            is_main_db: path == "/main.db",
+            is_main_db: path == "/main.db" || path == "/main.db.applying",
             fail_header_writes: self.fail_header_writes.clone(),
         })
     }
@@ -4154,10 +4286,14 @@ struct HeaderFaultFile {
 }
 
 impl HeaderFaultFile {
-    fn rejects(&self, offset: u64) -> bool {
+    /// A single-page write into slot A or B. The length test matters: cloning
+    /// the base into the staged image also writes over those offsets, in
+    /// multi-page chunks, and that copy is not the boundary under test.
+    fn rejects(&self, offset: u64, len: usize) -> bool {
         self.is_main_db
             && self.fail_header_writes.load(Ordering::SeqCst)
             && offset < 2 * PAGE as u64
+            && len == PAGE
     }
 }
 
@@ -4171,14 +4307,17 @@ impl VfsFile for HeaderFaultFile {
     }
 
     async fn write_at(&mut self, offset: u64, buf: &[u8]) -> crate::Result<usize> {
-        if self.rejects(offset) {
+        if self.rejects(offset, buf.len()) {
             return Err(HeaderFaultVfs::injected());
         }
         self.inner.write_at(offset, buf).await
     }
 
     async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> crate::Result<()> {
-        if reqs.iter().any(|req| self.rejects(req.offset)) {
+        if reqs
+            .iter()
+            .any(|req| self.rejects(req.offset, req.buf.len()))
+        {
             return Err(HeaderFaultVfs::injected());
         }
         self.inner.write_at_vectored(reqs).await
@@ -4205,13 +4344,133 @@ impl VfsFile for HeaderFaultFile {
     }
 }
 
-/// An incremental apply interrupted at its header swap leaves the follower
-/// wholly at the base commit, and a later apply of the very same delta carries
-/// it all the way to the target.
+/// An apply interrupted at its commit point — the rename of the fully sealed
+/// staged image over `main.db` — leaves the follower wholly at the base commit.
 ///
-/// The delta pages are already on disk when the swap is refused, so the two
-/// halves of the property are what matter: nothing of the target may be
-/// observable while its header is not durable, and the pages left behind must
+/// This is the boundary that matters most: on the far side of it the target is
+/// complete on disk, header and all, and only the rename decides which of the
+/// two states the store is. Nothing of the target may be observable until it
+/// lands, and the retry must be able to run the whole apply again from the base.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_interrupted_at_the_image_swap_stays_at_the_base_commit_then_retries_through() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+    {
+        let mut txn = source.begin_write().await.unwrap();
+        txn.put(b"base", b"base-value").await.unwrap();
+        txn.commit().await.unwrap();
+    }
+    let base_commit = source.latest_commit();
+    source.snapshot_to(&snap_dir).await.unwrap();
+    {
+        let mut txn = source.begin_write().await.unwrap();
+        txn.put(b"target", b"target-value").await.unwrap();
+        txn.commit().await.unwrap();
+    }
+    let target_commit = source.latest_commit();
+    source
+        .snapshot_incremental_to(base_commit, &delta_dir)
+        .await
+        .unwrap();
+    drop(source);
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    drop(restored);
+
+    let fault_vfs = RenameFaultVfs::new(&dst_dir);
+    let follower = Db::open_read_only(fault_vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap()
+        .promote_to_follower()
+        .await
+        .unwrap();
+    fault_vfs.fail_main_db_renames(true);
+    assert!(
+        follower.apply_incremental(&delta_dir).await.is_err(),
+        "a refused image swap must fail the apply"
+    );
+    fault_vfs.fail_main_db_renames(false);
+    drop(follower);
+
+    let reopened = Db::<TokioVfs>::open_read_only(
+        TokioVfs::new(&dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.latest_commit(),
+        base_commit,
+        "an unswapped image leaves the follower at its base commit"
+    );
+    {
+        let read = reopened.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(b"base").await.unwrap().as_deref(),
+            Some(b"base-value".as_slice())
+        );
+        assert!(
+            read.get(b"target").await.unwrap().is_none(),
+            "no part of the target commit may be observable before the swap"
+        );
+    }
+    let report = run_deep_walk(&reopened).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "interrupted apply left the follower unsound: {report:?}"
+    );
+
+    let retried = reopened.promote_to_follower().await.unwrap();
+    retried.apply_incremental(&delta_dir).await.unwrap();
+    assert_eq!(
+        retried.latest_commit(),
+        target_commit,
+        "the retry must carry the follower to the delta's target"
+    );
+    {
+        let read = retried.begin_read().await.unwrap();
+        assert_eq!(
+            read.get(b"target").await.unwrap().as_deref(),
+            Some(b"target-value".as_slice())
+        );
+        assert_eq!(
+            read.get(b"base").await.unwrap().as_deref(),
+            Some(b"base-value".as_slice())
+        );
+    }
+    let report = run_deep_walk(&retried).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "completed apply after an interrupted swap: {report:?}"
+    );
+    assert!(
+        !dst_dir.join("main.db.applying").exists(),
+        "a completed apply must leave no staged image behind"
+    );
+
+    drop(retried);
+    for dir in [&src_dir, &snap_dir, &delta_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// An incremental apply interrupted while sealing its staged image leaves the
+/// follower wholly at the base commit, and a later apply of the very same delta
+/// carries it all the way to the target.
+///
+/// The whole target is already assembled in the scratch when its header write is
+/// refused — the last durable boundary before the rename that commits it — so
+/// the two halves of the property are what matter: nothing of the target may be
+/// observable while no durable header names it, and the scratch left behind must
 /// not block the retry that finishes the transfer.
 #[tokio::test(flavor = "current_thread")]
 async fn apply_interrupted_at_the_header_swap_stays_at_the_base_commit_then_retries_through() {
@@ -4315,6 +4574,10 @@ async fn apply_interrupted_at_the_header_swap_stays_at_the_base_commit_then_retr
     assert!(
         report.is_clean(),
         "completed apply after an interruption: {report:?}"
+    );
+    assert!(
+        !dst_dir.join("main.db.applying").exists(),
+        "a completed apply must leave no staged image behind"
     );
 
     drop(retried);

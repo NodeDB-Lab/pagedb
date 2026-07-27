@@ -123,7 +123,7 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) vfs: Arc<V>,
     pub(crate) writer: Arc<AsyncMutex<WriterState>>,
     /// Serializes the complete incremental-apply protocol, including manifest
-    /// validation, journal recovery, raw page writes, and segment staging.
+    /// validation, journal recovery, image staging, and segment staging.
     /// Its sole consumer, `snapshot::apply_incremental`, is native-only
     /// (`#![cfg(not(target_arch = "wasm32"))]`), so the field itself is gated
     /// the same way.

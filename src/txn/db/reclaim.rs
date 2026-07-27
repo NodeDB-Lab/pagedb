@@ -1,29 +1,35 @@
-//! Making an incremental apply's header describe a state `main.db` actually
+//! Making an incremental apply's header describe a state its image actually
 //! contains: folding the reclaim set into the Follower's durable free list, and
 //! backing the allocation cursor the apply publishes with real file extent.
 //!
 //! An apply installs the producer's roots wholesale. Every page those roots
 //! stopped referencing — reachable from the base commit, absent from the
-//! target — is dead the instant the new header is durable, and the only place
-//! that can record it is this handle's own free-list chain, since the producer
+//! target — is dead the instant the new image is live, and the only place that
+//! can record it is this handle's own free-list chain, since the producer
 //! neither owns nor can see it. Without this the pages are reachable from no
 //! root and named by no free-list entry: space that never returns.
 //!
-//! The reclaim set is the *only* thing folded here, and deliberately so. Ids
-//! below the published cursor that no root reaches are the producer's free
-//! space: the follower replicates that page space but does not own it and never
-//! allocates from it, so pulling those ids into follower-owned structures would
-//! claim an authority this handle does not have. It would also be actively
-//! harmful — chain pages join the published base set that an apply refuses to
-//! overwrite, so a longer chain means more ids the producer's next delta
-//! collides with, trading a phantom leak for real replication failures.
+//! The caller's reclaim set is the *only* thing folded here, and deliberately
+//! so. Ids below the published cursor that no root reaches are the producer's
+//! free space: the follower replicates that page space but does not own it and
+//! never allocates from it, so pulling those ids into follower-owned structures
+//! would claim an authority this handle does not have.
+//!
+//! The chain itself is rebuilt on the same terms as any other follower-local
+//! structure. The producer cannot see it, so its allocator recycles the ids
+//! hosting it into the target's trees and the delta ships them by number. That
+//! is no longer a reason to refuse the delta — the target image is staged, so
+//! the old chain is still readable from the untouched base while the new one is
+//! being built — but it does mean a chain whose pages the target has claimed
+//! must be rewritten rather than republished, and that entries naming pages the
+//! target now reaches must be dropped.
 //!
 //! The rewrite mirrors the one a normal commit performs: entries carry the
 //! commit that freed them, the chain is hosted only on pages already free and
-//! below the reclamation floor, and the new head reaches disk with the same
-//! header swap that installs the roots. Nothing here is reachable from the
-//! still-durable old header, so an apply interrupted before that swap leaves
-//! the previous chain intact and the retry redoes the fold from scratch.
+//! below the reclamation floor, and the new head reaches disk in the same staged
+//! image that carries the target roots. Nothing here touches the live file, so
+//! an apply interrupted before the swap leaves the previous chain intact and the
+//! retry redoes the fold from scratch.
 
 use std::collections::BTreeSet;
 
@@ -48,7 +54,8 @@ impl<V: Vfs + Clone> Db<V> {
     /// `reclaimed` is the set of base-reachable pages the target no longer
     /// reaches, `target_page_ids` the target's reachable set, and
     /// `freeing_commit_id` the commit the apply is installing. Chain pages are
-    /// written through the Pager; the caller flushes and commits the header.
+    /// written through the Pager; the caller flushes them into the staged image
+    /// and publishes the returned head in that image's header.
     pub(super) async fn stage_reclaimed_free_list(
         &self,
         state: &WriterState,
@@ -75,7 +82,15 @@ impl<V: Vfs + Clone> Db<V> {
         let reallocated = existing
             .iter()
             .any(|(_, page_id)| target_page_ids.contains(page_id));
-        if reclaimed.is_empty() && !reallocated {
+        // A chain page the target claims is about to hold the target's bytes in
+        // the staged image. Republishing the old head would point the new
+        // header at a page that is no longer a chain page at all, so the chain
+        // has to be rewritten onto ids the target does not touch — even when
+        // nothing else about the free set changed.
+        let hosted_on_target_pages = old_chain_pages
+            .iter()
+            .any(|page_id| target_page_ids.contains(page_id));
+        if reclaimed.is_empty() && !reallocated && !hosted_on_target_pages {
             return Ok(StagedFreeList {
                 free_list_root_page_id: state.free_list_root_page_id,
                 next_page_id: alloc_cursor,
@@ -123,9 +138,12 @@ impl<V: Vfs + Clone> Db<V> {
                 .iter()
                 .map(|&page_id| (freeing_commit_id, page_id)),
         );
+        // A vacated chain page the target reaches belongs to the target now, so
+        // recording it as free would give one page id two owners.
         entries.extend(
             old_chain_pages
                 .iter()
+                .filter(|page_id| !target_page_ids.contains(page_id))
                 .map(|&page_id| (CHAIN_METADATA_CID, page_id)),
         );
 
@@ -146,7 +164,12 @@ impl<V: Vfs + Clone> Db<V> {
         })
     }
 
-    /// Grow `main.db` so every page id below `next_page_id` is readable.
+    /// Grow the image at `image_path` so every page id below `next_page_id` is
+    /// readable.
+    ///
+    /// An apply passes the staged image it is about to rename over `main.db`,
+    /// never the live file: the invariant below has to hold of the image that
+    /// becomes durable, and the live file must not be touched before the swap.
     ///
     /// The invariant: a published allocation cursor must never describe pages
     /// the file does not contain. An apply adopts the producer's cursor, but it
@@ -164,16 +187,17 @@ impl<V: Vfs + Clone> Db<V> {
     /// producer's free space, which this handle replicates without owning, so
     /// the deep walk deliberately does not hold a replicating handle to account
     /// for them.
-    pub(super) async fn ensure_main_db_covers_cursor(&self, next_page_id: u64) -> Result<()> {
+    pub(super) async fn ensure_image_covers_cursor(
+        &self,
+        image_path: &str,
+        next_page_id: u64,
+    ) -> Result<()> {
         let page_size = u64::try_from(self.page_size)
             .map_err(|_| PagedbError::arithmetic_overflow("page size"))?;
         let required = next_page_id
             .checked_mul(page_size)
             .ok_or_else(|| PagedbError::arithmetic_overflow("main.db extent"))?;
-        let mut file = self
-            .vfs
-            .open(&self.main_db_path, OpenMode::CreateOrOpen)
-            .await?;
+        let mut file = self.vfs.open(image_path, OpenMode::CreateOrOpen).await?;
         if file.len().await? >= required {
             return Ok(());
         }

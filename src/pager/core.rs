@@ -224,6 +224,59 @@ impl KindBinding {
     }
 }
 
+impl<V: Vfs + Clone> Pager<V> {
+    /// A read-only Pager over an alternate main.db image at `image_path`.
+    ///
+    /// An incremental apply builds the target image in a scratch file and has to
+    /// authenticate the producer's trees *inside* that image before the rename
+    /// that makes it live. The live Pager cannot serve those reads: it is still
+    /// answering base-image reads for concurrent Follower readers, and
+    /// repointing it would hand them target bytes for a state no durable header
+    /// names yet.
+    ///
+    /// The view carries a snapshot of the epoch keyring, so a page sealed under
+    /// any epoch the live handle can decrypt opens here too. It is read-only, so
+    /// it can never issue a nonce or write to the image — the single nonce
+    /// counter stays with the live Pager, and no page is ever sealed twice.
+    ///
+    /// The view's buffer pool is sized by the same `OpenOptions` budget as the
+    /// live one. Callers drop cached main pages before opening a view and drop
+    /// the view before the swap, so the two pools are not resident at full size
+    /// at the same time.
+    // Only the incremental-apply staging path opens a view, and that path is
+    // native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn open_main_view(&self, image_path: String) -> Self {
+        let mut cfg = self.cfg.clone();
+        cfg.main_db_path = image_path;
+        let inner = Arc::new(PagerInner {
+            buffer_pool: parking_lot::Mutex::new(PageCache::with_capacity(cfg.buffer_pool_pages)),
+            // A view exists to walk main-db trees; no caller routes a segment or
+            // journal page through it, so its second cache class is given the
+            // smallest legal budget rather than a copy of the configured one.
+            segment_cache: parking_lot::Mutex::new(PageCache::with_capacity(1)),
+            buffer_pool_hits: AtomicU64::new(0),
+            buffer_pool_misses: AtomicU64::new(0),
+            metrics_enabled: false,
+        });
+        let main_nonce = MainDbNonceGen::new(&cfg.main_db_file_id, cfg.anchor_budget);
+        Self {
+            dek_lru: parking_lot::Mutex::new(DekLru::with_capacity(cfg.dek_lru_capacity)),
+            main_nonce: parking_lot::Mutex::new(main_nonce),
+            segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
+            journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
+            files: AsyncMutex::new(BTreeMap::new()),
+            inner,
+            active_epoch: AtomicU64::new(self.active_epoch.load(AtomOrd::SeqCst)),
+            read_only: AtomicBool::new(true),
+            keyring: self.keyring.duplicate(),
+            observer_retry_count: self.observer_retry_count,
+            vfs: self.vfs.clone(),
+            cfg,
+        }
+    }
+}
+
 impl<V: Vfs> Pager<V> {
     pub(crate) fn page_size(&self) -> usize {
         self.cfg.page_size

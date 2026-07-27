@@ -56,14 +56,23 @@ pub enum PagedbError {
     #[error("incremental snapshot is incompatible: {field}")]
     SnapshotIncompatible { field: &'static str },
 
-    /// The target state reuses a page the base commit still hosts, so the delta
-    /// cannot be expressed without overwriting state a follower on that base
-    /// still depends on.
+    /// A delta record names a page the base commit's readers can still reach.
     ///
-    /// Not a corruption: both states are internally sound. They simply cannot be
-    /// related by a page delta, and the correct remedy is a full snapshot or a
-    /// nearer base commit — which is why this is distinct from
-    /// [`CorruptionDetail::SnapshotArtifactInvalid`].
+    /// A delta is defined as target-reachable minus base-reader-visible, so no
+    /// well-formed export produces such a record: the pages both sides of the
+    /// protocol can name are exactly the ones it must not carry. Raised before
+    /// anything is staged.
+    ///
+    /// Recycling ids the *follower's own* free-list chain or commit-history tree
+    /// occupies is not this condition and never raises it. The producer cannot
+    /// see those pages, so it cannot avoid them; the apply relocates both
+    /// structures out of the incoming page space instead of refusing an
+    /// otherwise-healthy delta.
+    ///
+    /// Not a corruption of this store: both states are internally sound, they
+    /// simply cannot be related by this delta — which is why this is distinct
+    /// from [`CorruptionDetail::SnapshotArtifactInvalid`]. The remedy is a full
+    /// snapshot or a nearer base commit.
     #[error("incremental snapshot would overwrite base-live page {page_id}")]
     SnapshotBasePageReused { page_id: u64 },
 

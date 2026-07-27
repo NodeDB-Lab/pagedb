@@ -34,6 +34,23 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         }
     }
 
+    // An incremental apply assembles its target beside `main.db` and renames it
+    // in. A scratch that outlived its apply is an apply that never reached that
+    // rename, so the live file is authoritative and the scratch is a full-size
+    // copy of a state nothing names. Removing it needs write authority, which
+    // is why it is gated rather than done unconditionally.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if capabilities.applies_interrupted_apply() {
+            let staged = crate::snapshot::apply::staged_image_path(&db.main_db_path);
+            match db.vfs.remove(&staged).await {
+                Ok(()) => {}
+                Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     if rekey_in_flight {
         if !capabilities.runs_standalone_recovery() {
             return Err(crate::errors::PagedbError::Unsupported);

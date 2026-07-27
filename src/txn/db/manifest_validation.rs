@@ -58,9 +58,16 @@ impl<V: Vfs + Clone> Db<V> {
         if manifest.target_commit <= manifest.base_commit {
             return Err(PagedbError::snapshot_incompatible("target_commit"));
         }
-        if manifest.next_page_id_at_target < visible_snapshot.next_page_id
-            || manifest.next_page_id_at_target < FIRST_ALLOCATABLE_PAGE_ID
-        {
+        // Deliberately not compared against this handle's own allocation
+        // cursor. The follower allocates ids the producer never had — the
+        // rewritten free-list chain, and the commit-history tree when a delta
+        // claims the pages hosting it — so its cursor legitimately runs ahead of
+        // the producer's, and a delta is not malformed for stopping where the
+        // producer's page space stops. Nothing downstream needs the two to be
+        // ordered: the apply publishes `max(target cursor, own cursor)`, so the
+        // cursor never moves backwards, and the target's own roots and every
+        // delta record are separately bounded by the target cursor.
+        if manifest.next_page_id_at_target < FIRST_ALLOCATABLE_PAGE_ID {
             return Err(PagedbError::snapshot_incompatible("next_page_id_at_target"));
         }
         if !valid_root_page(

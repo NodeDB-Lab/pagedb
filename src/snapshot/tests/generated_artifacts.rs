@@ -5,16 +5,18 @@
 //! HK-MAC'd, but the delta stream's per-record page ids are structural claims
 //! that no MAC can make sensible — a record may name a reserved page, a page
 //! beyond the target's allocation, or the same page twice. The delta path is
-//! also the one place where a partially-valid artifact could leave the
-//! follower's `main.db` half-written, so these properties assert both halves of
-//! the contract: never panic, and never mutate `main.db` on a rejected stream.
+//! also the one that decides what lands in the follower's store, so these
+//! properties assert both halves of the contract: never panic,
+//! and never touch the live `main.db` — accepted or rejected, a delta stream
+//! only ever reaches the staged image that the apply's rename commits.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::pager::page_space::is_reserved;
-use crate::snapshot::apply::apply_delta_pages;
+use crate::snapshot::apply::{plan_delta_stream, write_delta_into_image};
 use crate::snapshot::export::{SnapshotManifest, decode_manifest, encode_manifest};
+use crate::vfs::tokio_backend::TokioVfs;
 use proptest::prelude::*;
 
 /// Deliberately small: the delta path is byte-for-byte generic in page size,
@@ -142,8 +144,7 @@ proptest! {
     fn random_delta_bytes_never_panic_and_never_write(
         bytes in prop::collection::vec(any::<u8>(), 0..=(4 * (8 + DELTA_PAGE_SIZE) + 8)),
         // Bounded deliberately: an unbounded allocation ceiling would let an
-        // accepted record seek to a petabyte offset and materialise a sparse
-        // file the assertion then has to read back. The framing, alignment and
+        // accepted record claim a petabyte offset. The framing, alignment and
         // page-id checks under test are all reached well below this.
         target_next_page_id in 0u64..1024,
     ) {
@@ -152,22 +153,16 @@ proptest! {
         let main_db = dir.path().join("main.db");
         let before = write_follower_main_db(&main_db);
 
-        let outcome = block_on(apply_delta_pages(
+        let _ = block_on(plan_delta_stream(
             dir.path(),
-            &main_db,
             DELTA_PAGE_SIZE,
             &BTreeSet::new(),
             target_next_page_id,
         ));
 
-        if outcome.is_err() {
-            let after = std::fs::read(&main_db).unwrap();
-            prop_assert_eq!(
-                after,
-                before,
-                "a rejected delta stream must leave main.db untouched"
-            );
-        }
+        // Planning is pure inspection: whatever it decided, nothing moved.
+        let after = std::fs::read(&main_db).unwrap();
+        prop_assert_eq!(after, before, "planning a delta stream must write nothing");
     }
 
     /// Structurally plausible streams: correctly framed records whose page ids
@@ -185,7 +180,7 @@ proptest! {
             0..=6,
         ),
         target_next_page_id in 0u64..(FOLLOWER_PAGE_COUNT as u64 + 8),
-        protected in prop::collection::vec(0u64..16, 0..=3),
+        base_live in prop::collection::vec(0u64..16, 0..=3),
         filler in any::<u8>(),
     ) {
         let dir = tempfile::tempdir().unwrap();
@@ -196,35 +191,58 @@ proptest! {
         std::fs::write(dir.path().join("pages.delta"), &stream).unwrap();
         let main_db = dir.path().join("main.db");
         let before = write_follower_main_db(&main_db);
-        let protected: BTreeSet<u64> = protected.into_iter().collect();
+        let base_live: BTreeSet<u64> = base_live.into_iter().collect();
 
-        let outcome = block_on(apply_delta_pages(
+        let outcome = block_on(plan_delta_stream(
             dir.path(),
-            &main_db,
             DELTA_PAGE_SIZE,
-            &protected,
+            &base_live,
             target_next_page_id,
         ));
 
-        match outcome {
-            Ok(applied) => {
-                // Acceptance implies every record named a page the target both
-                // allocated and does not reserve.
-                prop_assert_eq!(applied.pages_applied as usize, page_ids.len());
-                for page_id in &applied.page_ids {
-                    prop_assert!(!is_reserved(*page_id));
-                    prop_assert!(*page_id < target_next_page_id);
-                    prop_assert!(!protected.contains(page_id));
+        if let Ok(plan) = outcome {
+            // Acceptance implies every record named a page the target both
+            // allocated and does not reserve, and that no record claimed a page
+            // the base commit is still reading through.
+            prop_assert_eq!(plan.record_count as usize, page_ids.len());
+            for page_id in &plan.page_ids {
+                prop_assert!(!is_reserved(*page_id));
+                prop_assert!(*page_id < target_next_page_id);
+                prop_assert!(!base_live.contains(page_id));
+            }
+
+            // Writing an accepted plan still leaves the live file alone: every
+            // record lands in the staged image the apply renames into place.
+            let vfs = TokioVfs::new(dir.path());
+            block_on(write_delta_into_image(
+                &vfs,
+                "/main.db.applying",
+                dir.path(),
+                DELTA_PAGE_SIZE,
+                &plan,
+            )).unwrap();
+            let after = std::fs::read(&main_db).unwrap();
+            prop_assert_eq!(after, before, "an applied delta must not touch main.db");
+
+            if !plan.page_ids.is_empty() {
+                let staged = std::fs::read(dir.path().join("main.db.applying")).unwrap();
+                for page_id in &plan.page_ids {
+                    let offset = usize::try_from(*page_id).unwrap() * DELTA_PAGE_SIZE;
+                    prop_assert_eq!(
+                        &staged[offset..offset + DELTA_PAGE_SIZE],
+                        &vec![filler; DELTA_PAGE_SIZE][..],
+                        "delta page {} must be present in the staged image",
+                        page_id
+                    );
                 }
             }
-            Err(_) => {
-                let after = std::fs::read(&main_db).unwrap();
-                prop_assert_eq!(
-                    after,
-                    before,
-                    "a rejected delta stream must leave main.db untouched"
-                );
-            }
+        } else {
+            let after = std::fs::read(&main_db).unwrap();
+            prop_assert_eq!(
+                after,
+                before,
+                "a rejected delta stream must leave main.db untouched"
+            );
         }
     }
 }
