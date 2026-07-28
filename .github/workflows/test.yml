@@ -79,8 +79,13 @@ jobs:
       - name: Clippy (engine comparison)
         run: cargo clippy -p pagedb-engine-comparison --all-targets -- -D warnings
 
+      # Warnings are denied because the failures that matter here are silent:
+      # a link to a crate-private item renders as plain text rather than
+      # erroring, so the published docs lose it and nothing reports why.
       - name: Build docs
         run: cargo doc -p pagedb --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
       - name: Run doctests
         run: cargo test -p pagedb --doc --all-features
