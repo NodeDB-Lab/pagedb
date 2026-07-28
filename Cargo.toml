@@ -44,6 +44,7 @@ bytes = "1"
 tracing = "0.1"
 parking_lot = "0.12"
 rayon = "1"
+rustc-hash = "2"
 # `std` is required (not just `js`): `PagedbError::Randomness(#[from]
 # getrandom::Error)` relies on `getrandom::Error: std::error::Error`, which
 # getrandom only provides under `std`. In the workspace a sibling crate enabled
@@ -168,6 +169,11 @@ test = false
 
 [[bench]]
 name = "authenticated_node_read"
+harness = false
+test = false
+
+[[bench]]
+name = "read_path"
 harness = false
 test = false
 

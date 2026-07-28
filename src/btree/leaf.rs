@@ -2,11 +2,13 @@
 
 use crate::Result;
 use crate::errors::PagedbError;
+use crate::pager::PageGuard;
 use crate::pager::page_space::is_reserved;
 
 use super::node::{
     HEADER_LEN, NodeHeader, NodeKind, OVERFLOW_SENTINEL, body_capacity, read_u16_le, read_u64_le,
-    slot_offset, validate_node_body, write_header, write_slot_offset, write_u16_le, write_u64_le,
+    slot_offset, validate_node_body, validate_node_body_memoised, write_header, write_slot_offset,
+    write_u16_le, write_u64_le,
 };
 
 /// Value stored in a leaf record — either inline bytes or a pointer to an
@@ -287,10 +289,19 @@ pub struct LeafAccessor<'a> {
 }
 
 impl<'a> LeafAccessor<'a> {
-    /// Parse the leaf header and return an accessor borrowing `body`. Performs
-    /// no record allocations and does not touch the slot directory or records.
-    pub fn new(body: &'a [u8]) -> Result<Self> {
-        let h = validate_node_body(body)?;
+    /// Parse the leaf header and return an accessor borrowing the guard's
+    /// body, reusing that page's validation memo so a warm re-read skips the
+    /// `O(slot_count)` extent walk. Performs no record allocations and does
+    /// not touch the slot directory or records.
+    pub fn from_guard(guard: &'a PageGuard) -> Result<Self> {
+        let body = guard.body_ref();
+        Self::from_header(
+            body,
+            validate_node_body_memoised(body, guard.extents_validated())?,
+        )
+    }
+
+    fn from_header(body: &'a [u8], h: NodeHeader) -> Result<Self> {
         if h.kind != NodeKind::Leaf {
             return Err(PagedbError::node_kind_mismatch(None, "leaf", "internal"));
         }

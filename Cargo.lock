@@ -1189,6 +1189,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rayon",
+ "rustc-hash",
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",

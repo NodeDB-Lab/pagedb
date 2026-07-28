@@ -1,5 +1,7 @@
 //! Node layout shared by leaf and internal pages.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::Result;
 use crate::errors::PagedbError;
 use crate::pager::format::data_page::ENVELOPE_OVERHEAD;
@@ -155,6 +157,25 @@ pub fn validate_node_body(body: &[u8]) -> Result<NodeHeader> {
             NodeKind::Internal => validate_internal_record(body, offset)?,
         }
     }
+    Ok(header)
+}
+
+/// [`validate_node_body`], skipped when `memo` records that this exact buffer
+/// already passed the check.
+///
+/// The scan is `O(slot_count)` and runs on every accessor construction, so on a
+/// warm cache the same immutable page pays it again on every single lookup.
+/// `memo` belongs to the cached page (see
+/// [`Page::extents_validated`](crate::pager::cache::Page::extents_validated)),
+/// whose bytes cannot change while it lives, so one proof covers every later
+/// reader. The cheap fixed-size header read still happens each time — only the
+/// per-record extent walk is elided.
+pub fn validate_node_body_memoised(body: &[u8], memo: &AtomicBool) -> Result<NodeHeader> {
+    if memo.load(Ordering::Relaxed) {
+        return read_header(body);
+    }
+    let header = validate_node_body(body)?;
+    memo.store(true, Ordering::Relaxed);
     Ok(header)
 }
 

@@ -6,8 +6,11 @@
 //! walks a "hand" through a FIFO of insertions, clearing `visited` bits and
 //! evicting the first unvisited (and unpinned, undirty) entry.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use rustc_hash::FxHashMap;
 
 /// File-identity discriminator for the cache key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -36,6 +39,15 @@ pub struct Page {
     /// pages, which the Pager read path must reject rather than treat as a
     /// cache hit.
     pub realm_id_bytes: Option<[u8; 16]>,
+    /// Set once a structural extent check has proven this buffer's slot
+    /// directory and records lie in bounds.
+    ///
+    /// Sound to memoise precisely because `bytes` is immutable for the page's
+    /// cache lifetime (see above): a mutation installs a *new* `Arc<Page>`,
+    /// which starts out unvalidated. The check is extent-only and depends on
+    /// nothing but these bytes, so proving it once proves it for every later
+    /// reader of the same buffer.
+    pub extents_validated: AtomicBool,
 }
 
 impl Page {
@@ -49,6 +61,7 @@ impl Page {
             bytes,
             kind_byte: 0,
             realm_id_bytes: None,
+            extents_validated: AtomicBool::new(false),
         }
     }
 
@@ -58,6 +71,7 @@ impl Page {
             bytes,
             kind_byte,
             realm_id_bytes: Some(realm_id_bytes),
+            extents_validated: AtomicBool::new(false),
         }
     }
 }
@@ -76,7 +90,11 @@ struct Node {
 /// skipped by the eviction hand.
 pub struct PageCache {
     capacity: usize,
-    map: HashMap<(FileKey, u64), usize>,
+    /// Keys are `(FileKey, u64)` page identities, never attacker-chosen in a
+    /// way that could be ground into collisions, so the DoS-resistant `SipHash`
+    /// default buys nothing here and costs a measurable slice of every warm
+    /// page hit. `FxHashMap` is the same map with a cheap integer hash.
+    map: FxHashMap<(FileKey, u64), usize>,
     /// Slab of nodes. `None` slots are free and recorded in `free`.
     slab: Vec<Option<Node>>,
     free: Vec<usize>,
@@ -85,7 +103,7 @@ pub struct PageCache {
     /// SIEVE hand. Walks tail→head via `next`. `None` means "start from tail
     /// on next eviction"; after wrapping past head it is reset to `None`.
     hand: Option<usize>,
-    pins: HashMap<(FileKey, u64), u32>,
+    pins: FxHashMap<(FileKey, u64), u32>,
     dirty: BTreeSet<(FileKey, u64)>,
 }
 
@@ -95,13 +113,13 @@ impl PageCache {
         let cap = capacity.max(1);
         Self {
             capacity: cap,
-            map: HashMap::with_capacity(cap),
+            map: FxHashMap::with_capacity_and_hasher(cap, rustc_hash::FxBuildHasher),
             slab: Vec::with_capacity(cap),
             free: Vec::new(),
             head: None,
             tail: None,
             hand: None,
-            pins: HashMap::new(),
+            pins: FxHashMap::default(),
             dirty: BTreeSet::new(),
         }
     }

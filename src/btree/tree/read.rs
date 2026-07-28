@@ -90,7 +90,7 @@ impl<V: Vfs> BTree<V> {
                     .extract_leaf_value(key, start_page_id, start_guard)
                     .await;
             }
-            NodeKind::Internal => InternalAccessor::new(start_guard.body_ref())?.child_for(key),
+            NodeKind::Internal => InternalAccessor::from_guard(start_guard)?.child_for(key),
         };
         // Descend from the first child onward. Subsequent guards are owned.
         let mut seen = SeenPageIds::new("btree_descent");
@@ -107,7 +107,7 @@ impl<V: Vfs> BTree<V> {
             match kind {
                 NodeKind::Leaf => return self.extract_leaf_value(key, page_id, &guard).await,
                 NodeKind::Internal => {
-                    let next = InternalAccessor::new(guard.body_ref())?.child_for(key);
+                    let next = InternalAccessor::from_guard(&guard)?.child_for(key);
                     drop(guard);
                     page_id = next;
                 }
@@ -143,7 +143,7 @@ impl<V: Vfs> BTree<V> {
                 }
             };
         }
-        let leaf = LeafAccessor::new(leaf_guard.body_ref())?;
+        let leaf = LeafAccessor::from_guard(leaf_guard)?;
         let Some(idx) = leaf.find(key) else {
             return Ok(None);
         };

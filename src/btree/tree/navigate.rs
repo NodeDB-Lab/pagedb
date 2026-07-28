@@ -209,7 +209,7 @@ impl<V: Vfs> BTree<V> {
             if kind == NodeKind::Leaf {
                 return Ok(path);
             }
-            let next = InternalAccessor::new(guard.body_ref())?.child_for(key);
+            let next = InternalAccessor::from_guard(&guard)?.child_for(key);
             drop(guard);
             page_id = next;
         }

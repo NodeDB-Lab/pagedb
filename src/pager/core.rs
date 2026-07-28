@@ -109,6 +109,14 @@ impl PageGuard {
     pub fn body_ref(&self) -> &[u8] {
         body(&self.page.bytes)
     }
+
+    /// Per-page memo for the structural extent check run by decoders over
+    /// [`body_ref`](Self::body_ref). Scoped to the pinned cache entry, so it is
+    /// discarded whenever the page is replaced or evicted.
+    #[must_use]
+    pub fn extents_validated(&self) -> &std::sync::atomic::AtomicBool {
+        &self.page.extents_validated
+    }
 }
 
 impl Drop for PageGuard {
