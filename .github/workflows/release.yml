@@ -68,12 +68,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: crates.io
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       # The verifying publish compiles the packaged lib + the pagedb-fsck bin
       # against crates.io deps. The io-uring VFS backend needs nothing extra,
@@ -121,7 +121,7 @@ jobs:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
@@ -148,7 +148,7 @@ jobs:
             "$(git rev-parse HEAD)"
 
       - name: Download fsck artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "fsck-*"
           run-id: ${{ inputs.prepare_run_id }}
@@ -164,7 +164,7 @@ jobs:
           bash scripts/ci/verify_release_artifacts.sh ./artifacts "$VERSION"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ inputs.tag }}
           name: pagedb ${{ needs.validate-version.outputs.version }}
