@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluxbench::prelude::*;
-use fluxbench::{bench, compare};
+use fluxbench::{TrackingAllocator, bench, compare};
 use rocksdb::{IteratorMode, OptimisticTransactionDB, SingleThreaded};
 use rusqlite::Connection;
 use tokio::sync::Mutex as AsyncMutex;
@@ -28,6 +28,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use pagedb::options::{OpenOptions, RetainPolicy};
 use pagedb::vfs::{DefaultVfs as BenchVfs, open_default};
 use pagedb::{Db, RealmId};
+
+/// `flux.toml` turns allocation tracking on; without the tracking allocator
+/// installed here every benchmark in this binary reports zero bytes.
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
 
 // --- workload parameters (scaled-down redb defaults) ------------------------
 
@@ -37,6 +42,14 @@ const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
 const RNG_SEED: u64 = 3;
 const SCAN_LEN: usize = 10;
+// Every read bench below is annotated `samples = 500` rather than left to the
+// default warmup/measurement timing. Each one preloads PRELOAD rows before it
+// can measure anything, and that setup runs inside the harness's wall-clock
+// budget — which left each read bench with exactly *one* measured iteration: a
+// single cold-cache sample, reported with a stddev of zero and no confidence
+// interval worth the name. A fixed count bypasses the time-based schedule and
+// measures the operation the stated number of times. The macro takes an
+// integer literal only, so the value is repeated at each site.
 
 // --- shared RNG helpers -----------------------------------------------------
 
@@ -669,7 +682,7 @@ struct CmpBatchWrite;
 // random_read: one get per iter against a preloaded DB.
 // ============================================================================
 
-#[bench(group = "compare/random_read")]
+#[bench(group = "compare/random_read", samples = 500)]
 fn random_read_pagedb(b: &mut Bencher) {
     let bench = pagedb_preloaded();
     let keys = preloaded_keys();
@@ -687,7 +700,7 @@ fn random_read_pagedb(b: &mut Bencher) {
     });
 }
 
-#[bench(group = "compare/random_read")]
+#[bench(group = "compare/random_read", samples = 500)]
 fn random_read_redb(b: &mut Bencher) {
     let bench = redb_preloaded();
     let keys = preloaded_keys();
@@ -701,7 +714,7 @@ fn random_read_redb(b: &mut Bencher) {
     });
 }
 
-#[bench(group = "compare/random_read")]
+#[bench(group = "compare/random_read", samples = 500)]
 fn random_read_rocksdb(b: &mut Bencher) {
     let bench = rocksdb_preloaded();
     let keys = preloaded_keys();
@@ -714,7 +727,7 @@ fn random_read_rocksdb(b: &mut Bencher) {
     });
 }
 
-#[bench(group = "compare/random_read")]
+#[bench(group = "compare/random_read", samples = 500)]
 fn random_read_sqlite(b: &mut Bencher) {
     let bench = sqlite_preloaded();
     let conn = sqlite_conn(&bench);
@@ -749,11 +762,10 @@ struct CmpRandomRead;
 // range_read: scan SCAN_LEN entries starting from a random key.
 // ============================================================================
 
-#[bench(group = "compare/range_read")]
+#[bench(group = "compare/range_read", samples = 500)]
 fn range_read_pagedb(b: &mut Bencher) {
     let bench = pagedb_preloaded();
     let keys = preloaded_keys();
-    let end = [0xFFu8; KEY_SIZE];
     let mut i = 0usize;
     b.iter(|| {
         let k = keys[i % keys.len()];
@@ -762,14 +774,18 @@ fn range_read_pagedb(b: &mut Bencher) {
             rt.block_on(async {
                 let g = bench.db.lock().await;
                 let r = g.begin_read_non_abortable().await.unwrap();
-                let rows = r.scan(&k, &end).await.unwrap();
-                black_box(rows.into_iter().take(SCAN_LEN).count())
+                // Bounded by SCAN_LEN, matching the lazy iterators the other
+                // engines stop after SCAN_LEN steps. `scan` would instead
+                // materialise every record from `k` to the end of the keyspace
+                // — ~PRELOAD/2 rows — and time a different workload entirely.
+                let rows = r.scan_from(&k, SCAN_LEN).await.unwrap();
+                black_box(rows.len())
             })
         })
     });
 }
 
-#[bench(group = "compare/range_read")]
+#[bench(group = "compare/range_read", samples = 500)]
 fn range_read_redb(b: &mut Bencher) {
     let bench = redb_preloaded();
     let keys = preloaded_keys();
@@ -792,7 +808,7 @@ fn range_read_redb(b: &mut Bencher) {
     });
 }
 
-#[bench(group = "compare/range_read")]
+#[bench(group = "compare/range_read", samples = 500)]
 fn range_read_rocksdb(b: &mut Bencher) {
     let bench = rocksdb_preloaded();
     let keys = preloaded_keys();
@@ -806,7 +822,7 @@ fn range_read_rocksdb(b: &mut Bencher) {
     });
 }
 
-#[bench(group = "compare/range_read")]
+#[bench(group = "compare/range_read", samples = 500)]
 fn range_read_sqlite(b: &mut Bencher) {
     let bench = sqlite_preloaded();
     let conn = sqlite_conn(&bench);
