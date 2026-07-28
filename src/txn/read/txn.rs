@@ -105,9 +105,59 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
         tree.get_with_cached_root(key, root_guard, *root_kind).await
     }
 
+    /// Forward range scan: `start` inclusive, `end` exclusive.
+    ///
+    /// Materialising: every record in `[start, end)` is decoded into the
+    /// returned `Vec` before the caller sees any of it, so both time and peak
+    /// memory scale with the range, not with what the caller ends up reading.
+    /// To take the first few rows at or after a key, use
+    /// [`scan_from`](Self::scan_from) — bounding by count there is what keeps a
+    /// short read short.
     pub async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_abort()?;
         self.tree().collect_range(start, end).await
+    }
+
+    /// Forward scan of at most `limit` records at or after `start`, in
+    /// ascending key order.
+    ///
+    /// The bounded counterpart to [`scan`](Self::scan). Prefer it whenever the
+    /// caller only needs the first few rows at or after a key: `scan` is
+    /// materialising — it decodes and returns every record in the range before
+    /// the caller sees any of them — so bounding by count is the difference
+    /// between reading `limit` records and reading the rest of the tree.
+    ///
+    /// Deliberately has no upper key bound. Keys are arbitrary byte strings
+    /// with no reserved sentinel and no length ceiling, so no concrete maximum
+    /// key lies outside the valid domain and any invented one would silently
+    /// drop records at the top of the keyspace.
+    ///
+    /// Resume by passing the last returned key with a `0x00` byte appended:
+    /// that is its immediate successor in the key ordering, so paging this way
+    /// never skips a record and never returns one twice. A batch shorter than
+    /// `limit` means the tree ended.
+    pub async fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_abort()?;
+        self.tree().collect_batch_from(start, limit).await
+    }
+
+    /// Forward scan of at most `limit` records at or after `start` whose keys
+    /// still carry `prefix`, in ascending key order.
+    ///
+    /// The bounded counterpart to [`scan_prefix`](Self::scan_prefix). Rows
+    /// sharing a prefix sort contiguously, so the first key outside it ends the
+    /// range. Pass `prefix` as `start` to begin at the first matching row, and
+    /// resume exactly as in [`scan_from`](Self::scan_from).
+    pub async fn scan_prefix_from(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_abort()?;
+        self.tree()
+            .collect_prefix_batch_from(prefix, start, limit)
+            .await
     }
 
     pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

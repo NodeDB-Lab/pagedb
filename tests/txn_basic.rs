@@ -194,3 +194,98 @@ async fn reader_stall_policy_settable() {
     db.set_reader_stall_policy(ReaderStallPolicy::Unbounded);
     assert_eq!(db.reader_stall_policy(), ReaderStallPolicy::Unbounded);
 }
+
+/// Rows for the bounded-scan tests: `row:0000`..`row:0049`, all one realm.
+async fn open_db_with_rows(count: usize) -> Db<MemVfs> {
+    let db = open_db().await;
+    let mut w = db.begin_write().await.unwrap();
+    for i in 0..count {
+        w.put(format!("row:{i:04}").as_bytes(), b"v").await.unwrap();
+    }
+    w.commit().await.unwrap();
+    db
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scan_from_stops_at_limit() {
+    let db = open_db_with_rows(50).await;
+    let r = db.begin_read().await.unwrap();
+    let rows = r.scan_from(b"row:0000", 10).await.unwrap();
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0].0, b"row:0000");
+    assert_eq!(rows[9].0, b"row:0009");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scan_from_starts_at_or_after_key() {
+    let db = open_db_with_rows(50).await;
+    let r = db.begin_read().await.unwrap();
+    // Start key need not exist: the scan lands on the first row at or after it.
+    let rows = r.scan_from(b"row:0020", 3).await.unwrap();
+    assert_eq!(rows[0].0, b"row:0020");
+    let rows = r.scan_from(b"row:0019z", 1).await.unwrap();
+    assert_eq!(rows[0].0, b"row:0020");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scan_from_short_batch_means_end_of_tree() {
+    let db = open_db_with_rows(50).await;
+    let r = db.begin_read().await.unwrap();
+    let rows = r.scan_from(b"row:0045", 10).await.unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[4].0, b"row:0049");
+    assert!(r.scan_from(b"zzz", 10).await.unwrap().is_empty());
+    assert!(r.scan_from(b"row:0000", 0).await.unwrap().is_empty());
+}
+
+/// The documented resume protocol — append `0x00` to the last key returned —
+/// must page the whole tree exactly once, skipping and repeating nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn scan_from_resume_protocol_pages_every_row_once() {
+    let db = open_db_with_rows(50).await;
+    let r = db.begin_read().await.unwrap();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+    loop {
+        let batch = r.scan_from(&cursor, 7).await.unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch.last().unwrap().0.clone();
+        cursor.push(0x00);
+        seen.extend(batch.into_iter().map(|(k, _)| k));
+    }
+    assert_eq!(seen.len(), 50);
+    let mut expected: Vec<Vec<u8>> = (0..50)
+        .map(|i| format!("row:{i:04}").into_bytes())
+        .collect();
+    expected.sort();
+    assert_eq!(seen, expected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scan_from_agrees_with_materialising_scan() {
+    let db = open_db_with_rows(50).await;
+    let r = db.begin_read().await.unwrap();
+    let bounded = r.scan_from(b"row:0010", 8).await.unwrap();
+    let eager = r.scan(b"row:0010", b"row:0018").await.unwrap();
+    assert_eq!(bounded, eager);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scan_prefix_from_stops_at_prefix_boundary() {
+    let db = open_db().await;
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0..5 {
+            w.put(format!("a:{i}").as_bytes(), b"v").await.unwrap();
+            w.put(format!("b:{i}").as_bytes(), b"v").await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+    let r = db.begin_read().await.unwrap();
+    // Limit is generous; the prefix boundary is what ends the range.
+    let rows = r.scan_prefix_from(b"a:", b"a:", 100).await.unwrap();
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|(k, _)| k.starts_with(b"a:")));
+}
