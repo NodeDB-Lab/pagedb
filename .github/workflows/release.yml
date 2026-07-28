@@ -126,9 +126,11 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
 
-      - name: Read prepare run metadata
+      # Runs before the download so a wrong, unfinished, or foreign run is
+      # rejected without its archives ever reaching the runner.
+      - name: Verify prepare run
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
           PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
         run: |
           set -euo pipefail
@@ -136,12 +138,14 @@ jobs:
             echo "::error::prepare_run_id must be numeric"
             exit 1
           }
-          curl --fail --location --silent --show-error \
+          gh api \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${PREPARE_RUN_ID}" \
-            --output "$RUNNER_TEMP/prepare-run.json"
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PREPARE_RUN_ID}" \
+            >"$RUNNER_TEMP/prepare-run.json"
+          bash scripts/ci/verify_prepare_run.sh \
+            "$RUNNER_TEMP/prepare-run.json" \
+            "$(git rev-parse HEAD)"
 
       - name: Download fsck artifacts
         uses: actions/download-artifact@v8
@@ -152,16 +156,12 @@ jobs:
           path: ./artifacts
           merge-multiple: true
 
-      - name: Verify prepared release
+      - name: Verify release artifacts
         env:
           VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
           set -euo pipefail
-          bash scripts/ci/verify_release_artifacts.sh \
-            "$RUNNER_TEMP/prepare-run.json" \
-            ./artifacts \
-            "$VERSION" \
-            "$(git rev-parse HEAD)"
+          bash scripts/ci/verify_release_artifacts.sh ./artifacts "$VERSION"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
