@@ -188,8 +188,12 @@ mod imp {
         /// discipline `PageReadVerifyFailure` already uses, so one bug landed
         /// once still collapses to one report under fuzzing.
         grouping_key: String,
-        /// Full `Debug` rendering of the detail, for a report that is
-        /// diagnosable on its own.
+        /// `Debug` rendering of the detail, for a report that is diagnosable
+        /// on its own — with embedder-chosen text redacted. A report may be
+        /// shipped to crash telemetry, and a segment name is application data
+        /// (a tenant id, a user's collection name) that diagnosis never needs:
+        /// the identity that locates the file is the `segment_id`, which is
+        /// kept. See [`redacted_debug`].
         detail_debug: String,
     }
 
@@ -202,6 +206,31 @@ mod imp {
         }
         fn to_json(&self) -> faultbox::serde_json::Value {
             faultbox::serde_json::json!({ "detail": self.detail_debug })
+        }
+    }
+
+    /// Render a [`CorruptionDetail`] for a report, replacing any
+    /// embedder-chosen string with its length.
+    ///
+    /// Every field in the taxonomy is either a `&'static str` this crate
+    /// wrote, a numeric id, or a raw identity — none of which is application
+    /// data — except the segment `name` carried by
+    /// [`CorruptionDetail::SegmentMissing`], which is whatever the embedder
+    /// passed to `link_segment`. That one is replaced here rather than
+    /// suppressed at the call site, so a future variant that adds a name gets
+    /// the same treatment by extending this one function.
+    fn redacted_debug(detail: &CorruptionDetail) -> String {
+        match detail {
+            CorruptionDetail::SegmentMissing {
+                realm_id,
+                name,
+                segment_id,
+            } => format!(
+                "SegmentMissing {{ realm_id: {realm_id:?}, name: <redacted, {} bytes>, \
+                 segment_id: {segment_id:?} }}",
+                name.len()
+            ),
+            other => format!("{other:?}"),
         }
     }
 
@@ -332,7 +361,7 @@ mod imp {
         let ctx = CorruptionConstructed {
             kind,
             grouping_key,
-            detail_debug: format!("{detail:?}"),
+            detail_debug: redacted_debug(detail),
         };
         let _ = faultbox::Capture::new(
             faultbox::EventKind::Corruption,
