@@ -194,6 +194,15 @@ pub struct Db<V: Vfs + Clone> {
     /// policy. Checked at the start of every `ReadTxn` operation; the entry is
     /// removed once the reader observes the abort.
     pub(crate) aborted_readers: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    /// Whether [`Self::aborted_readers`] currently holds anything.
+    ///
+    /// Aborting a reader is rare; checking whether one was aborted happens at
+    /// the head of every read operation. Without this the common answer — "no"
+    /// — costs a mutex acquisition and a hash lookup. A reader that races an
+    /// abort landing just after its load observes it on its next operation,
+    /// which is already the guarantee: the abort is delivered to the reader's
+    /// *next* call, not to one in flight.
+    pub(crate) any_reader_aborted: std::sync::atomic::AtomicBool,
     /// Sentinel-lock handles acquired at open. Released (dropped) when the `Db` drops.
     pub(crate) sentinel_locks: Vec<<V as Vfs>::LockHandle>,
     /// Set only by open paths that actually run the sentinel-lock acquisition

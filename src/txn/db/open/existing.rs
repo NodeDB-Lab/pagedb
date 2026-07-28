@@ -278,6 +278,7 @@ impl<V: Vfs + Clone> Db<V> {
             orphaned_spill_paths: parking_lot::Mutex::new(Vec::new()),
             mode,
             aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            any_reader_aborted: std::sync::atomic::AtomicBool::new(false),
             sentinel_locks: Vec::new(),
             // Direct callers of `open_existing`/`open_existing_with_options`
             // bypass locking on purpose (they're meant to be reached through

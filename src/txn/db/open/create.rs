@@ -113,6 +113,7 @@ impl<V: Vfs + Clone> Db<V> {
             orphaned_spill_paths: parking_lot::Mutex::new(Vec::new()),
             mode: DbMode::Standalone,
             aborted_readers: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            any_reader_aborted: std::sync::atomic::AtomicBool::new(false),
             sentinel_locks: Vec::new(),
             // Callers of the unlocked constructor (this fn) are responsible
             // for setting `lock_required`/`sentinel_locks` on the returned

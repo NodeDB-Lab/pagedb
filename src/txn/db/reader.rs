@@ -158,7 +158,16 @@ impl<V: Vfs + Clone> Db<V> {
     /// Removes the entry from the abort set (one-shot: the reader observes the
     /// abort exactly once).
     pub(crate) fn take_reader_abort(&self, entry_id: u64) -> bool {
-        self.aborted_readers.lock().remove(&entry_id)
+        // Fast path: nothing has been aborted, so there is nothing to take and
+        // no reason to touch the mutex. See `Db::any_reader_aborted`.
+        if !self.any_reader_aborted.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut aborted = self.aborted_readers.lock();
+        let taken = aborted.remove(&entry_id);
+        self.any_reader_aborted
+            .store(!aborted.is_empty(), Ordering::Relaxed);
+        taken
     }
 
     /// Evaluate the reader stall policy against the current deferred-free queue
@@ -200,7 +209,12 @@ impl<V: Vfs + Clone> Db<V> {
                 if let Some(v) = victim {
                     let eid = v.entry_id;
                     drop(readers);
-                    self.aborted_readers.lock().insert(eid);
+                    let mut aborted = self.aborted_readers.lock();
+                    aborted.insert(eid);
+                    // Published while the set is still held, so no reader can
+                    // see the flag set against a set that has not been updated.
+                    self.any_reader_aborted.store(true, Ordering::Relaxed);
+                    drop(aborted);
                     Ok(())
                 } else {
                     // All blocking readers are non-abortable → fall through to Reject.
