@@ -29,9 +29,50 @@ pub struct Ring {
 
 impl Ring {
     pub fn new() -> Result<Self> {
-        let ring = IoUring::new(RING_DEPTH).map_err(PagedbError::Io)?;
+        let ring = IoUring::new(RING_DEPTH).map_err(setup_failed)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(ring)),
         })
+    }
+}
+
+/// Explain a failed `io_uring_setup` instead of surfacing a bare errno.
+///
+/// The raw failure is uninformative in exactly the environments where it
+/// happens: `ENOMEM` here almost never means the machine is out of memory — a
+/// ring is charged against `RLIMIT_MEMLOCK`, which is commonly 8 MB and is
+/// exhausted by a handful of concurrent stores. `EPERM`/`ENOSYS` usually mean a
+/// sandbox blocked the syscall rather than that anything is broken. Callers who
+/// see this error directly get the cause; [`crate::vfs::open_default`] does not
+/// surface it at all, because it falls back to the thread-pool backend.
+fn setup_failed(error: std::io::Error) -> PagedbError {
+    PagedbError::Io(std::io::Error::new(
+        error.kind(),
+        RingSetupError { source: error },
+    ))
+}
+
+/// Carries the failed `io_uring_setup` errno as its `source` so nothing about
+/// the original failure is lost.
+#[derive(Debug)]
+struct RingSetupError {
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for RingSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "io_uring setup failed ({}); likely causes: RLIMIT_MEMLOCK too low \
+             for another ring (each ring is charged against it), a seccomp \
+             profile blocking io_uring_setup, or a kernel older than 5.1",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RingSetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }

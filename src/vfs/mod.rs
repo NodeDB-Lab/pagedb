@@ -19,8 +19,17 @@ pub mod iocp;
 ))]
 pub mod iouring;
 pub mod memory;
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", not(target_arch = "arm")),
+))]
+pub mod native;
 #[cfg(feature = "opfs")]
 pub mod opfs;
+// The advisory-lock protocol every native backend shares. Internal for the same
+// reason as `traits`: only its handle type is part of the surface.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod oslock;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokio_backend;
 // The backend contract is re-exported from `vfs` itself rather than published
@@ -42,8 +51,15 @@ pub use iocp::{IocpFile, IocpVfs};
     all(target_os = "android", not(target_arch = "arm")),
 ))]
 pub use iouring::{IouringFile, IouringVfs};
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", not(target_arch = "arm")),
+))]
+pub use native::{NativeFile, NativeVfs};
 #[cfg(feature = "opfs")]
 pub use opfs::OpfsVfs;
+#[cfg(not(target_arch = "wasm32"))]
+pub use oslock::NativeLockHandle;
 pub use traits::{Vfs, VfsFile};
 pub(crate) use traits::{
     checked_read_progress, read_exact_at, read_exact_at_borrowed, write_all_at,
@@ -54,7 +70,8 @@ pub use wasi::WasiVfs;
 /// The default native VFS backend for the current target. Selected at
 /// compile-time per platform to use the best async-I/O primitive available:
 ///
-/// - Linux (and 64-bit Android): `IouringVfs` — `io_uring`.
+/// - Linux (and 64-bit Android): `NativeVfs` — `io_uring`, or Tokio's thread
+///   pool where the kernel will not grant a ring (see [`native`]).
 /// - Windows: `IocpVfs` — IOCP overlapped I/O.
 /// - macOS / iOS / iPadOS: `GcdVfs` — `dispatch_io`.
 /// - Android (32-bit, legacy): `AndroidVfs` — thread-pool.
@@ -66,7 +83,7 @@ pub use wasi::WasiVfs;
     target_os = "linux",
     all(target_os = "android", not(target_arch = "arm")),
 ))]
-pub type DefaultVfs = IouringVfs;
+pub type DefaultVfs = NativeVfs;
 
 #[cfg(target_os = "windows")]
 pub type DefaultVfs = IocpVfs;
@@ -91,6 +108,11 @@ pub type DefaultVfs = tokio_backend::TokioVfs;
 /// care which backend they're using (benchmarks, CLI tools, embedders that
 /// just want "the right thing") should use this — it picks the platform's
 /// fastest async-I/O primitive without leaking `cfg` into call sites.
+///
+/// On Linux the choice is additionally a run-time one: if the kernel refuses an
+/// `io_uring` instance the thread-pool backend is used instead and a warning is
+/// logged, rather than failing an open that has nothing wrong with it. See
+/// [`native::open_native`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_default<P: AsRef<std::path::Path>>(path: P) -> crate::Result<DefaultVfs> {
     #[cfg(any(
@@ -98,7 +120,7 @@ pub fn open_default<P: AsRef<std::path::Path>>(path: P) -> crate::Result<Default
         all(target_os = "android", not(target_arch = "arm")),
     ))]
     {
-        IouringVfs::new(path.as_ref())
+        Ok(native::open_native(path.as_ref()))
     }
     #[cfg(target_os = "windows")]
     {

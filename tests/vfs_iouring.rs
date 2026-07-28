@@ -263,6 +263,27 @@ async fn exclusive_lock_conflicts() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Two independent `IouringVfs` instances over the same directory have separate
+/// in-process lock tables, so only the OS-level lock can stop them
+/// double-opening the same store. The backend uses an OFD lock, which conflicts
+/// across open file descriptions even within one process; a classic `F_SETLK`
+/// lock would not (it is process-owned and self-non-conflicting) and both
+/// instances would "acquire" the writer sentinel.
+#[tokio::test(flavor = "current_thread")]
+async fn exclusive_lock_conflicts_across_vfs_instances_same_process() {
+    let dir = tempdir("lock_instances");
+    let vfs_a = IouringVfs::new(&dir).unwrap();
+    let vfs_b = IouringVfs::new(&dir).unwrap();
+
+    let _held = vfs_a.lock_exclusive("/db.lock").await.unwrap();
+    assert!(
+        vfs_b.lock_exclusive("/db.lock").await.is_err(),
+        "a second instance must not be able to take the same sentinel"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn shared_locks_coexist() {
     let dir = tempdir("lock_shared");

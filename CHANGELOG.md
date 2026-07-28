@@ -31,7 +31,12 @@ version, since none exists yet.
   tokio thread-pool fallback and an in-memory backend, with format-bit identity
   across targets. Backends may complete a positional read or write in several
   calls; PageDB finishes the caller's whole buffer before treating authenticated
-  metadata as present or durable.
+  metadata as present or durable. On Linux the backend choice is made at run
+  time: where the kernel refuses an `io_uring` ring — `RLIMIT_MEMLOCK`
+  exhausted, seccomp blocking `io_uring_setup`, a kernel older than 5.1 — the
+  open logs a warning and continues on the thread pool rather than failing.
+  Every native backend shares one advisory-lock implementation, so processes on
+  different backends still exclude each other on the same store.
 - **Snapshots** — `snapshot_to`, `restore_from`, and incremental apply, each
   authenticated against the exact state its manifest describes. Destinations
   must be empty; malformed or incomplete artifacts fail closed.

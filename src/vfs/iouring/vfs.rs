@@ -1,19 +1,15 @@
 //! `IouringVfs`: Linux io_uring-backed VFS rooted at a directory.
-//! Advisory path locking uses a two-layer protocol: an in-process state
-//! machine for single-process exclusion and `fcntl(F_SETLK)` for
-//! cross-process exclusion, exactly mirroring `TokioVfs`.
+//! Advisory path locking is the shared two-layer protocol from
+//! [`crate::vfs::NativeLockHandle`] — the identical code `TokioVfs` runs, so a process on
+//! this backend and one that fell back to the thread pool still exclude each
+//! other over the same store.
 //!
 //! The ring covers file I/O only. Path operations and directory sync are plain
 //! blocking syscalls, so they run on the blocking pool; only path validation
 //! and the in-process lock table stay on the executor.
-#![allow(unsafe_code)]
 
-use std::collections::BTreeMap;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use parking_lot::Mutex;
 
 use crate::Result;
 use crate::errors::PagedbError;
@@ -21,115 +17,14 @@ use crate::errors::PagedbError;
 use super::file::IouringFile;
 use super::ring::Ring;
 use crate::vfs::blocking::offload;
+use crate::vfs::oslock::{LockKind, LockTable};
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
 
-// ---------------------------------------------------------------------------
-// In-process lock state machine
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-enum LockState {
-    Free,
-    Exclusive,
-    Shared(u32),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LockKind {
-    Exclusive,
-    Shared,
-}
-
-struct InProcLockEntry {
-    state: Mutex<LockState>,
-}
-
-// ---------------------------------------------------------------------------
-// OS-level cross-process lock via fcntl(F_SETLK)
-// ---------------------------------------------------------------------------
-
-/// Holds an open file descriptor whose `F_SETLK` advisory lock is released
-/// when this struct is dropped (fd close releases the lock on Linux).
-struct OsFcntlHandle {
-    _file: std::fs::File,
-}
-
-impl OsFcntlHandle {
-    fn try_acquire(path: &std::path::Path, kind: LockKind) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(PagedbError::Io)?;
-
-        let fd = file.as_raw_fd();
-        // SAFETY: F_WRLCK and F_RDLCK are small positive constants defined by
-        // libc that always fit in i16 on all Linux targets.
-        #[allow(clippy::cast_possible_truncation)]
-        let l_type = match kind {
-            LockKind::Exclusive => libc::F_WRLCK as libc::c_short,
-            LockKind::Shared => libc::F_RDLCK as libc::c_short,
-        };
-        // SAFETY: SEEK_SET == 0, always fits in i16.
-        #[allow(clippy::cast_possible_truncation)]
-        let flock = libc::flock {
-            l_type,
-            l_whence: libc::SEEK_SET as libc::c_short,
-            l_start: 0,
-            l_len: 0,
-            l_pid: 0,
-        };
-        // SAFETY: `fd` is valid and owned by `file` which lives past this call;
-        // `flock` is a plain C struct fully initialised above. F_SETLK is
-        // non-blocking: EAGAIN/EACCES signals another process holds a
-        // conflicting lock.
-        let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &flock) };
-        if rc == -1 {
-            let err = std::io::Error::last_os_error();
-            let raw = err.raw_os_error().unwrap_or(0);
-            if raw == libc::EAGAIN || raw == libc::EACCES {
-                return Err(PagedbError::AlreadyLocked);
-            }
-            return Err(PagedbError::Io(err));
-        }
-        Ok(Self { _file: file })
-    }
-}
-
-// SAFETY: The raw fd is valid across threads; the struct is moved as a whole
-// and is never shared between threads simultaneously.
-unsafe impl Send for OsFcntlHandle {}
-
-// ---------------------------------------------------------------------------
-// Public lock handle
-// ---------------------------------------------------------------------------
-
 /// RAII advisory lock handle returned by `IouringVfs::lock_exclusive` /
-/// `lock_shared`. Holds both an in-process state guard and an OS-level
-/// `fcntl` lock.
-pub struct IouringLockHandle {
-    lock_ref: Arc<InProcLockEntry>,
-    kind: LockKind,
-    _os_lock: OsFcntlHandle,
-}
-
-impl Drop for IouringLockHandle {
-    fn drop(&mut self) {
-        let mut s = self.lock_ref.state.lock();
-        match (self.kind, *s) {
-            (LockKind::Exclusive, LockState::Exclusive)
-            | (LockKind::Shared, LockState::Shared(1)) => *s = LockState::Free,
-            (LockKind::Shared, LockState::Shared(n)) if n > 1 => {
-                *s = LockState::Shared(n - 1);
-            }
-            _ => {}
-        }
-        // `_os_lock` is dropped automatically after this, releasing the fcntl lock.
-    }
-}
+/// `lock_shared`. The one native handle type, shared with every other
+/// filesystem-backed backend.
+pub use crate::vfs::oslock::NativeLockHandle as IouringLockHandle;
 
 // ---------------------------------------------------------------------------
 // IouringVfs
@@ -138,7 +33,7 @@ impl Drop for IouringLockHandle {
 struct IouringInner {
     root: PathBuf,
     ring: Ring,
-    locks: Mutex<BTreeMap<String, Arc<InProcLockEntry>>>,
+    locks: LockTable,
 }
 
 /// VFS rooted at a directory, using `io_uring` for file I/O and `std::fs` /
@@ -159,7 +54,7 @@ impl IouringVfs {
             inner: Arc::new(IouringInner {
                 root: root.into(),
                 ring,
-                locks: Mutex::new(BTreeMap::new()),
+                locks: LockTable::new(),
             }),
         })
     }
@@ -168,59 +63,10 @@ impl IouringVfs {
         resolve_native_path(&self.inner.root, path)
     }
 
-    fn lookup_or_create_entry(&self, path: &str) -> Arc<InProcLockEntry> {
-        let mut locks = self.inner.locks.lock();
-        locks
-            .entry(path.to_string())
-            .or_insert_with(|| {
-                Arc::new(InProcLockEntry {
-                    state: Mutex::new(LockState::Free),
-                })
-            })
-            .clone()
-    }
-
     async fn do_lock(&self, path: &str, kind: LockKind) -> Result<IouringLockHandle> {
         let logical_path = canonical_native_path(path)?;
-        let entry = self.lookup_or_create_entry(&logical_path);
-        // In-process guard first.
-        {
-            let mut s = entry.state.lock();
-            match (kind, *s) {
-                (LockKind::Exclusive, LockState::Free) => *s = LockState::Exclusive,
-                (LockKind::Shared, LockState::Free) => *s = LockState::Shared(1),
-                (LockKind::Shared, LockState::Shared(n)) => *s = LockState::Shared(n + 1),
-                _ => return Err(PagedbError::AlreadyLocked),
-            }
-        }
         let lock_path = self.resolve(&logical_path)?;
-        // `F_SETLK` never waits on a conflict, but creating the sentinel file
-        // can still stall on the filesystem, so the pair goes to the pool.
-        let acquired = offload(move || {
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            OsFcntlHandle::try_acquire(&lock_path, kind)
-        })
-        .await;
-        match acquired {
-            Ok(os_lock) => Ok(IouringLockHandle {
-                lock_ref: entry,
-                kind,
-                _os_lock: os_lock,
-            }),
-            Err(e) => {
-                // Roll back the in-process guard.
-                let mut s = entry.state.lock();
-                match (kind, *s) {
-                    (LockKind::Exclusive, LockState::Exclusive)
-                    | (LockKind::Shared, LockState::Shared(1)) => *s = LockState::Free,
-                    (LockKind::Shared, LockState::Shared(n)) => *s = LockState::Shared(n - 1),
-                    _ => {}
-                }
-                Err(e)
-            }
-        }
+        crate::vfs::oslock::acquire(&self.inner.locks, &logical_path, lock_path, kind).await
     }
 }
 
