@@ -102,8 +102,11 @@ jobs:
             exit 1
           fi
 
+      - name: Shellcheck release scripts
+        run: shellcheck scripts/ci/*.sh
+
       - name: Release artifact verification
-        run: bash scripts/test-release-artifacts.sh
+        run: bash scripts/ci/test_release_verifiers.sh
 
   # ─────────────────────────────────────────────────────────────────────────
   test:
