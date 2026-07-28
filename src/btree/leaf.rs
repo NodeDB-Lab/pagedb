@@ -271,11 +271,18 @@ impl Default for Leaf {
     }
 }
 
-/// Borrowed view of one leaf value (zero-copy).
-#[derive(Debug)]
-pub enum LeafValueRef<'a> {
-    Inline(&'a [u8]),
-    Overflow { total_len: u64, root_page_id: u64 },
+/// Where slot `idx`'s value lives, without reading it.
+///
+/// Inline values report their extent rather than their bytes so the read path
+/// can slice the pinned page instead of copying out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeafValueLoc {
+    /// Body range holding the value.
+    Inline(std::ops::Range<usize>),
+    Overflow {
+        total_len: u64,
+        root_page_id: u64,
+    },
 }
 
 /// Zero-allocation accessor over an encoded leaf page body. Used on the read
@@ -365,24 +372,22 @@ impl<'a> LeafAccessor<'a> {
         None
     }
 
-    /// Decode the value at slot `idx`. Inline values borrow from the page body;
-    /// overflow values return only the chain root + total length.
+    /// Locate the value at slot `idx` without reading it: an inline value's
+    /// extent within the body, or an overflow chain's root and total length.
     #[must_use]
-    pub fn value_at(&self, idx: usize) -> LeafValueRef<'a> {
+    pub fn value_loc(&self, idx: usize) -> LeafValueLoc {
         let off = slot_offset(self.body, self.prefix_len, idx);
         let suffix_len = read_u16_le(self.body, off) as usize;
         let after_key = off + 2 + suffix_len;
         let value_len_raw = read_u16_le(self.body, after_key);
         if value_len_raw == OVERFLOW_SENTINEL {
-            let total_len = read_u64_le(self.body, after_key + 2);
-            let root_page_id = read_u64_le(self.body, after_key + 2 + 8);
-            LeafValueRef::Overflow {
-                total_len,
-                root_page_id,
+            LeafValueLoc::Overflow {
+                total_len: read_u64_le(self.body, after_key + 2),
+                root_page_id: read_u64_le(self.body, after_key + 2 + 8),
             }
         } else {
-            let vlen = value_len_raw as usize;
-            LeafValueRef::Inline(&self.body[after_key + 2..after_key + 2 + vlen])
+            let start = after_key + 2;
+            LeafValueLoc::Inline(start..start + value_len_raw as usize)
         }
     }
 }

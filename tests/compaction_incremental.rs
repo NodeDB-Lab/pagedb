@@ -157,7 +157,7 @@ async fn writes_between_steps_do_not_corrupt() {
             assert!(got.is_none(), "{key} should be deleted");
         } else {
             assert_eq!(
-                got.unwrap().as_slice(),
+                got.unwrap().as_ref(),
                 b"initial-value",
                 "{key} value mismatch"
             );
@@ -167,7 +167,7 @@ async fn writes_between_steps_do_not_corrupt() {
     for j in 0..extra_writes {
         let key = format!("new-{j:04}");
         let got = txn.get(key.as_bytes()).await.unwrap();
-        assert_eq!(got.unwrap().as_slice(), b"new-value", "{key} missing");
+        assert_eq!(got.unwrap().as_ref(), b"new-value", "{key} missing");
     }
 }
 
@@ -210,7 +210,7 @@ async fn compact_now_completes_fully() {
         let key = format!("full-{i:04}");
         let got = txn.get(key.as_bytes()).await.unwrap();
         assert_eq!(
-            got.unwrap().as_slice(),
+            got.unwrap().as_ref(),
             b"full-value",
             "{key} missing after compact_now"
         );

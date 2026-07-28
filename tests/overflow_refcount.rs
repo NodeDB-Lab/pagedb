@@ -39,7 +39,7 @@ async fn large_value_write_read() {
 
     let txn = db.begin_read().await.unwrap();
     let got = txn.get(b"big-key").await.unwrap().unwrap();
-    assert_eq!(got.as_slice(), value.as_slice());
+    assert_eq!(got.as_ref(), value.as_slice());
 }
 
 // ─── Test 2: Overwrite frees old overflow chain ───────────────────────────────
@@ -65,7 +65,7 @@ async fn overwrite_frees_old_chain() {
 
     let txn = db.begin_read().await.unwrap();
     let got = txn.get(b"key").await.unwrap().unwrap();
-    assert_eq!(got.as_slice(), value_b.as_slice());
+    assert_eq!(got.as_ref(), value_b.as_slice());
 }
 
 // ─── Test 3: Delete frees overflow chain ─────────────────────────────────────
@@ -112,11 +112,11 @@ async fn inline_and_overflow_coexist() {
 
     let txn = db.begin_read().await.unwrap();
     assert_eq!(
-        txn.get(b"small").await.unwrap().unwrap().as_slice(),
+        txn.get(b"small").await.unwrap().unwrap().as_ref(),
         small.as_ref()
     );
     assert_eq!(
-        txn.get(b"large").await.unwrap().unwrap().as_slice(),
+        txn.get(b"large").await.unwrap().unwrap().as_ref(),
         large.as_slice()
     );
 }
@@ -140,7 +140,7 @@ async fn overflow_chain_three_pages() {
 
     let txn = db.begin_read().await.unwrap();
     let got = txn.get(b"three-page").await.unwrap().unwrap();
-    assert_eq!(got.as_slice(), value.as_slice());
+    assert_eq!(got.as_ref(), value.as_slice());
 }
 
 // ─── Test 6: Many overflow writes and deletes do not corrupt other keys ───────
@@ -181,7 +181,7 @@ async fn many_overflow_writes_no_corruption() {
             assert!(got.is_none(), "key {key} should be deleted");
         } else {
             assert_eq!(
-                got.unwrap().as_slice(),
+                got.unwrap().as_ref(),
                 large.as_slice(),
                 "key {key} value mismatch"
             );

@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
 /// File-identity discriminator for the cache key.
@@ -30,8 +31,13 @@ pub enum FileKey {
 /// `bytes` is logically immutable for the page's cache lifetime — set once at
 /// insert, never mutated. Mutation happens by replacing the whole `Arc<Page>`
 /// in the cache map.
+///
+/// Held as [`Bytes`] rather than `Vec<u8>` so a reader can hand out a slice of
+/// a value without copying it: the slice shares this buffer's refcount and
+/// keeps it alive on its own. That the buffer never changes is what makes such
+/// a slice a stable snapshot even after the page leaves the cache.
 pub struct Page {
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
     /// Page kind recorded at write time; used by the Pager flush path to
     /// reconstruct the correct AAD for each dirty page.
     pub kind_byte: u8,
@@ -58,17 +64,18 @@ impl Page {
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
-            bytes,
+            bytes: Bytes::from(bytes),
             kind_byte: 0,
             realm_id_bytes: None,
             extents_validated: AtomicBool::new(false),
         }
     }
 
+    /// `bytes` is moved into a [`Bytes`], not copied.
     #[must_use]
     pub fn new_with_meta(bytes: Vec<u8>, kind_byte: u8, realm_id_bytes: [u8; 16]) -> Self {
         Self {
-            bytes,
+            bytes: Bytes::from(bytes),
             kind_byte,
             realm_id_bytes: Some(realm_id_bytes),
             extents_validated: AtomicBool::new(false),

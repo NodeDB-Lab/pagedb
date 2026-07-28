@@ -36,7 +36,7 @@ async fn begin_read_at_recent_commit() {
     for (i, &cid) in ids.iter().enumerate() {
         let rtxn = db.begin_read_at(cid).await.unwrap();
         let val = rtxn.get(b"k").await.unwrap().expect("key must exist");
-        let stored = u64::from_le_bytes(val.try_into().unwrap());
+        let stored = u64::from_le_bytes(val.as_ref().try_into().unwrap());
         assert_eq!(stored, i as u64, "commit {cid:?} should see value {i}");
         assert_eq!(rtxn.commit_id(), cid);
     }

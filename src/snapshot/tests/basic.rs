@@ -3736,8 +3736,11 @@ async fn chained_incremental_applies_keep_the_follower_able_to_advance() {
         let rtxn = follower.begin_read().await.unwrap();
         for i in 0u32..200 {
             assert_eq!(
-                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                Some(vec![4u8; 128]),
+                rtxn.get(format!("k{i:05}").as_bytes())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(vec![4u8; 128].as_slice()),
                 "key k{i:05} should reflect generation 4 after the first delta"
             );
         }
@@ -3767,8 +3770,11 @@ async fn chained_incremental_applies_keep_the_follower_able_to_advance() {
         let rtxn = follower.begin_read().await.unwrap();
         for i in 0u32..200 {
             assert_eq!(
-                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                Some(vec![9u8; 128]),
+                rtxn.get(format!("k{i:05}").as_bytes())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(vec![9u8; 128].as_slice()),
                 "key k{i:05} should reflect generation 9 after the second delta"
             );
         }
@@ -3871,15 +3877,21 @@ async fn a_delta_that_recycles_follower_private_page_ids_applies_cleanly() {
         let rtxn = follower.begin_read().await.unwrap();
         for i in 0u32..256 {
             assert_eq!(
-                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                Some(vec![0xBBu8; 128]),
+                rtxn.get(format!("k{i:05}").as_bytes())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(vec![0xBBu8; 128].as_slice()),
                 "refilled key k{i:05} must reflect the source's current state"
             );
         }
         for i in 256u32..512 {
             assert_eq!(
-                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                Some(vec![0xAAu8; 128]),
+                rtxn.get(format!("k{i:05}").as_bytes())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(vec![0xAAu8; 128].as_slice()),
                 "untouched key k{i:05} must reflect the source's current state"
             );
         }
@@ -4041,8 +4053,11 @@ async fn chained_deltas_survive_many_rounds_of_delete_and_refill_churn() {
         let rtxn = follower.begin_read().await.unwrap();
         for i in 0u32..512 {
             assert_eq!(
-                rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                Some(vec![round as u8; 128]),
+                rtxn.get(format!("k{i:05}").as_bytes())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(vec![round as u8; 128].as_slice()),
                 "round {round}: key k{i:05} should reflect this round's generation"
             );
         }
@@ -4121,7 +4136,7 @@ async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snap
         // Pre-round follower state, needed only if this round's delta gets
         // refused -- the refusal must be a pure no-op.
         let pre_round_commit = follower.latest_commit();
-        let pre_round_values: Vec<(String, Option<Vec<u8>>)> = {
+        let pre_round_values: Vec<(String, Option<bytes::Bytes>)> = {
             let rtxn = follower.begin_read().await.unwrap();
             let mut values = Vec::with_capacity(512);
             for i in 0u32..512 {
@@ -4193,8 +4208,11 @@ async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snap
                 let rtxn = follower.begin_read().await.unwrap();
                 for i in 0u32..512 {
                     assert_eq!(
-                        rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                        Some(vec![round as u8; 128]),
+                        rtxn.get(format!("k{i:05}").as_bytes())
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(vec![round as u8; 128].as_slice()),
                         "round {round}: key k{i:05} should reflect this round's generation after a successful apply"
                     );
                 }
@@ -4278,8 +4296,11 @@ async fn a_follower_stays_consistent_across_churn_by_falling_back_to_a_full_snap
                 let rtxn = new_follower.begin_read().await.unwrap();
                 for i in 0u32..512 {
                     assert_eq!(
-                        rtxn.get(format!("k{i:05}").as_bytes()).await.unwrap(),
-                        Some(vec![round as u8; 128]),
+                        rtxn.get(format!("k{i:05}").as_bytes())
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(vec![round as u8; 128].as_slice()),
                         "round {round}: key k{i:05} should reflect this round's generation on the remedy follower"
                     );
                 }

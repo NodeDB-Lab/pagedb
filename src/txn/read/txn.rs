@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use tokio::sync::OnceCell;
 
 use crate::btree::BTree;
@@ -92,7 +93,15 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
         Ok(())
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Look up `key` in this snapshot.
+    ///
+    /// The value is returned as [`Bytes`] sharing the cached page's buffer
+    /// rather than copied out of it, so a hit allocates nothing. The handle
+    /// keeps that buffer alive on its own and the bytes never change under it,
+    /// so it stays valid and consistent after the transaction ends. It does
+    /// hold the whole page though: code retaining one small value from each of
+    /// many pages should copy it out with `to_vec`.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.check_abort()?;
         if self.root_page_id == 0 {
             return Ok(None);

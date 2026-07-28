@@ -232,8 +232,8 @@ async fn random_100k_ops_match_ground_truth() {
             let got = tree.get(&key).await.unwrap();
             let expected = truth.get(&key).cloned();
             assert_eq!(
-                got,
-                expected,
+                got.as_deref(),
+                expected.as_deref(),
                 "op {op} key {:?}",
                 String::from_utf8_lossy(&key)
             );

@@ -4,6 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use tokio::sync::{MutexGuard, RwLockWriteGuard};
 
 use crate::btree::BTree;
@@ -218,7 +219,13 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         })
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Look up `key`, seeing this transaction's own uncommitted writes.
+    ///
+    /// Returns [`Bytes`] on the same terms as
+    /// [`ReadTxn::get`](crate::ReadTxn::get), except that a value written
+    /// earlier in this transaction is copied rather than shared: it has no
+    /// committed page to borrow from yet.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.btree.get(key).await
     }
 

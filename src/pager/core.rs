@@ -114,6 +114,23 @@ impl PageGuard {
         body(&self.page.bytes)
     }
 
+    /// Slice `range` of the body as an owned [`Bytes`] sharing this page's
+    /// buffer — a refcount bump, not a copy.
+    ///
+    /// The returned handle keeps the buffer alive by itself, so it stays valid
+    /// after the guard drops and after the page leaves the cache. The bytes it
+    /// sees never change: a write installs a new page rather than mutating this
+    /// one, which makes the slice a snapshot of the version that was read.
+    ///
+    /// It does pin the whole page for as long as it lives. A caller keeping a
+    /// small value from each of many pages should copy it out instead.
+    #[must_use]
+    pub fn body_slice(&self, range: std::ops::Range<usize>) -> Bytes {
+        let start = HEADER_LEN + range.start;
+        let end = HEADER_LEN + range.end;
+        self.page.bytes.slice(start..end)
+    }
+
     /// Per-page memo for the structural extent check run by decoders over
     /// [`body_ref`](Self::body_ref). Scoped to the pinned cache entry, so it is
     /// discarded whenever the page is replaced or evicted.

@@ -6,8 +6,10 @@ use crate::pager::{PageGuard, Pager};
 use crate::vfs::Vfs;
 use crate::{RealmId, Result};
 
+use bytes::Bytes;
+
 use crate::btree::internal::InternalAccessor;
-use crate::btree::leaf::{Leaf, LeafAccessor, LeafValue, LeafValueRef};
+use crate::btree::leaf::{Leaf, LeafAccessor, LeafValue, LeafValueLoc};
 use crate::btree::node::NodeKind;
 use crate::btree::overflow;
 
@@ -18,10 +20,11 @@ impl<V: Vfs> BTree<V> {
     ///
     /// Zero-allocation tree descent: each level reads the page through a
     /// [`PageGuard`], builds a borrowed accessor over the decrypted body, and
-    /// either descends or extracts the value. The only allocation on the hit
-    /// path is the final owned `Vec<u8>` copy of the inline value (or the
-    /// overflow chain reassembly for large values).
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// either descends or extracts the value. An inline value is returned as a
+    /// slice sharing the cached page's buffer, so the hit path allocates
+    /// nothing; only an overflow chain, which is reassembled from several
+    /// pages, needs a buffer of its own.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         if self.root_page_id == 0 {
             return Ok(None);
         }
@@ -42,16 +45,18 @@ impl<V: Vfs> BTree<V> {
         realm_id: RealmId,
         leaf: &Leaf,
         key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Bytes>> {
         match leaf.get(key) {
             None => Ok(None),
-            Some(LeafValue::Inline(v)) => Ok(Some(v.clone())),
+            // Uncommitted, so it lives in the decoded leaf rather than in any
+            // page a slice could borrow from.
+            Some(LeafValue::Inline(v)) => Ok(Some(Bytes::copy_from_slice(v))),
             Some(LeafValue::Overflow {
                 total_len,
                 root_page_id,
             }) => {
                 let v = overflow::read_chain(pager, realm_id, *root_page_id, *total_len).await?;
-                Ok(Some(v))
+                Ok(Some(Bytes::from(v)))
             }
         }
     }
@@ -64,7 +69,7 @@ impl<V: Vfs> BTree<V> {
         key: &[u8],
         root_guard: &PageGuard,
         root_kind: NodeKind,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Bytes>> {
         if self.root_page_id == 0 {
             return Ok(None);
         }
@@ -82,7 +87,7 @@ impl<V: Vfs> BTree<V> {
         start_page_id: u64,
         start_guard: &PageGuard,
         start_kind: NodeKind,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Bytes>> {
         // Handle the first level using the borrowed guard.
         let next_page_id = match start_kind {
             NodeKind::Leaf => {
@@ -120,7 +125,7 @@ impl<V: Vfs> BTree<V> {
         key: &[u8],
         leaf_page_id: u64,
         leaf_guard: &PageGuard,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Bytes>> {
         // Within a write txn, the dirty + fresh caches shadow the buffer-pool
         // bytes. The cached decoded form is the source of truth for any leaf
         // they hold.
@@ -131,7 +136,9 @@ impl<V: Vfs> BTree<V> {
         {
             return match leaf.get(key) {
                 None => Ok(None),
-                Some(LeafValue::Inline(v)) => Ok(Some(v.clone())),
+                // Uncommitted, so it lives in the decoded leaf rather than in
+                // any page a slice could borrow from.
+                Some(LeafValue::Inline(v)) => Ok(Some(Bytes::copy_from_slice(v))),
                 Some(LeafValue::Overflow {
                     total_len,
                     root_page_id,
@@ -139,7 +146,7 @@ impl<V: Vfs> BTree<V> {
                     let v =
                         overflow::read_chain(&self.pager, self.realm_id, *root_page_id, *total_len)
                             .await?;
-                    Ok(Some(v))
+                    Ok(Some(Bytes::from(v)))
                 }
             };
         }
@@ -147,15 +154,16 @@ impl<V: Vfs> BTree<V> {
         let Some(idx) = leaf.find(key) else {
             return Ok(None);
         };
-        match leaf.value_at(idx) {
-            LeafValueRef::Inline(v) => Ok(Some(v.to_vec())),
-            LeafValueRef::Overflow {
+        match leaf.value_loc(idx) {
+            // Shares the pinned page's buffer; no copy of the value at all.
+            LeafValueLoc::Inline(range) => Ok(Some(leaf_guard.body_slice(range))),
+            LeafValueLoc::Overflow {
                 total_len,
                 root_page_id,
             } => {
                 let v = overflow::read_chain(&self.pager, self.realm_id, root_page_id, total_len)
                     .await?;
-                Ok(Some(v))
+                Ok(Some(Bytes::from(v)))
             }
         }
     }
