@@ -1,19 +1,11 @@
-//! Cross-platform native VFS backed by `tokio::fs`. Advisory locks use a
-//! two-layer protocol: an in-process state machine provides fast single-process
-//! exclusion, and an OS-level lock backs each one for cross-process exclusion —
-//! `fcntl` OFD locks (`F_OFD_SETLK`) on Linux, classic `F_SETLK` on other Unix,
-//! and `LockFileEx` on Windows. On other targets only the in-process layer is
-//! used. The trait contract from `traits.rs` is the durable surface.
-//!
-//! `unsafe` is permitted here for platform lock primitives (fcntl on Unix,
-//! `LockFileEx` on Windows).
-#![allow(unsafe_code)]
+//! Cross-platform native VFS backed by `tokio::fs`. Advisory locking is the
+//! shared two-layer protocol from [`super::oslock`], so this backend and every
+//! other native backend exclude each other over the same directory. The trait
+//! contract from `traits.rs` is the durable surface.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -21,33 +13,17 @@ use crate::Result;
 use crate::errors::PagedbError;
 
 use super::blocking::offload;
+use super::oslock::{LockKind, LockTable};
 use super::traits::{Vfs, VfsFile, canonical_native_path, resolve_native_path};
 use super::types::{OpenMode, ReadReq, WriteReq};
 
-// ---------------------------------------------------------------------------
-// In-process lock state machine (guards single-process re-entry for all
-// targets, and is the only guard on non-Unix targets).
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-enum LockState {
-    Free,
-    Exclusive,
-    Shared(u32),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LockKind {
-    Exclusive,
-    Shared,
-}
-
-struct InProcLockEntry {
-    state: Mutex<LockState>,
-}
+/// RAII advisory lock handle returned by `TokioVfs::lock_exclusive` /
+/// `lock_shared`. The one native handle type, shared with every other
+/// filesystem-backed backend.
+pub use super::oslock::NativeLockHandle as TokioLockHandle;
 
 // ---------------------------------------------------------------------------
-// Unix cross-process lock via fcntl(F_SETLK).
+// TokioVfs
 // ---------------------------------------------------------------------------
 
 /// On Unix, holds an open file descriptor whose advisory lock is released when
