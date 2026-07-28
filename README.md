@@ -130,52 +130,80 @@ PageDB-owned benches and the isolated cross-engine suite with:
 cargo bench --bench segment
 cargo bench --bench compaction
 cargo bench --bench authenticated_node_read
+cargo bench --bench read_path
 cargo bench -p pagedb-engine-comparison --bench btree
 cargo bench -p pagedb-engine-comparison --bench comparison
 ```
 
 `authenticated_node_read` evicts the main-page cache before each lookup through
 a multi-level tree, measuring cold authenticated leaf/internal kind discovery
-without resolving or compiling an external database engine.
+without resolving or compiling an external database engine. `read_path`
+decomposes a warm lookup into transaction open/close versus tree descent.
 
 The comparison suite is a non-default workspace package under
 [`benchmarks/engine-comparison`](./benchmarks/engine-comparison). Normal
 `cargo test` and `cargo nextest` runs for the `pagedb` package therefore do not
 resolve or compile RocksDB, redb, or SQLite.
 
-### vs. redb (B+ tree, in-process)
+Both cross-engine suites disable pagedb's commit-history index. redb has no
+equivalent, so retaining it would compare different feature surfaces.
 
-| Workload                       |      pagedb |    redb | Speedup vs redb |
-| ------------------------------ | ----------: | ------: | --------------: |
-| Point get (per-txn)            |  **204 ns** |  416 ns |       **2.04×** |
-| Batched insert (1000 keys/txn) |  **711 µs** | 1.76 ms |       **2.47×** |
-| Per-txn insert (in-memory)     | **20.3 µs** |  975 µs |         **48×** |
-| Per-txn insert (file, AEAD on) |    147.7 µs |  975 µs |        **6.6×** |
+### vs. redb (B+ tree, in-process, 1 000-key tree)
 
-AEAD overhead on reads is **~1.00×** — encryption is effectively free on hot reads thanks to in-cache plaintext.
+| Workload                        |   pagedb |    redb | vs redb        |
+| ------------------------------- | -------: | ------: | -------------- |
+| Point get (per-txn, AEAD)       |   507 ns |  412 ns | 1.23× slower   |
+| Batched insert (1 000 keys/txn) | **674 µs** | 1.80 ms | **2.67× faster** |
+| Per-txn insert (in-memory)      |  25.7 µs | 13.2 µs | 1.95× slower   |
+| Per-txn insert (file, AEAD on)  | 120.3 µs | 13.2 µs | 9.1× slower    |
 
-### vs. redb / RocksDB / SQLite (full comparison suite)
+AEAD overhead on reads is **~1.02×** (507 ns vs 495 ns plaintext+MAC) —
+encryption really is close to free on hot reads, because the buffer pool holds
+decrypted plaintext and a warm hit re-authenticates nothing.
+
+### vs. redb / RocksDB / SQLite (full comparison suite, 100 000 rows)
 
 | Workload                       |     pagedb |       redb |     RocksDB |     SQLite |
 | ------------------------------ | ---------: | ---------: | ----------: | ---------: |
-| **Random point read**          | **383 ns** |     1.3 µs |      2.0 µs |    13.2 µs |
-| **Range scan**                 | **529 ns** |     1.9 µs |      4.6 µs |    32.2 µs |
-| Individual write (fsync-bound) |    71.2 µs |    23.7 µs |  **7.4 µs** |    58.4 µs |
-| Batch write                    |    9.31 ms |    3.39 ms | **1.97 ms** |    5.00 ms |
-| Bulk load                      |     626 ms | **124 ms** |      265 ms |     169 ms |
-| Sorted bulk load               |     349 ms |     113 ms |      146 ms | **102 ms** |
+| Random point read              |     5.3 µs | **2.3 µs** |      5.8 µs |    23.3 µs |
+| Range scan (10 entries)        |     9.2 µs | **3.8 µs** |      4.2 µs |    72.4 µs |
+| Individual write (fsync-bound) |   265.4 µs |    68.1 µs | **20.6 µs** |    72.9 µs |
+| Batch write (1 000 keys/txn)   |   17.32 ms |    5.72 ms | **3.27 ms** |    7.22 ms |
+| Bulk load (100 000 rows/txn)   |     2.85 s | **233 ms** |      476 ms |     322 ms |
+| Sorted bulk load               |     1.17 s | **136 ms** |      235 ms |     161 ms |
 
-**pagedb wins reads decisively** (3.3× redb on point reads, 3.7× on range scans) and **trails on writes**. The write gap is the deliberate price of AEAD on every page, CoW shadow paging with A/B headers, async I/O, and per-realm AAD binding — none of which redb or RocksDB carry. Write-throughput optimization is on the roadmap (group-commit tuning, write-coalescing, vectored fsync), but reads are where the architecture pays off today.
+**Reads are competitive; writes trail, and bulk load trails badly.** pagedb is
+within ~1.2× of redb on a warm 1 000-key tree and ~2.3× behind on a 100 000-row
+working set, where it beats RocksDB on point reads. On writes it is 1.9× behind
+redb per in-memory transaction and ~12× behind on bulk load. Part of that gap is
+the deliberate price of AEAD on every page, CoW shadow paging with A/B headers,
+and per-realm AAD binding — none of which redb or RocksDB carry — but the
+bulk-load gap is larger than that price explains and is a genuine weakness, not
+a design tax. Write-throughput work (group-commit tuning, write-coalescing,
+vectored fsync) is where the remaining headroom is.
+
+Scans return owned `Vec`s, so a 10-row scan costs ~91 allocations against
+redb's ~14 — a lazy borrowing cursor is the obvious next read-path win.
 
 ### Segment writer (append + seal)
 
 | Path                            |       mean | Notes                               |
 | ------------------------------- | ---------: | ----------------------------------- |
-| Raw AES-GCM only (memory)       |     300 µs | baseline: encryption cost alone     |
-| **pagedb `append_seal`**        | **525 µs** | full path: write, seal, fsync, link |
-| Raw `tokio::fs` write + AES-GCM |    1.50 ms | what you'd write yourself, badly    |
+| Raw AES-GCM only (memory)       |   306.5 µs | baseline: encryption cost alone     |
+| **pagedb `append_seal`**        | **632.7 µs** | full path: write, seal, fsync, link |
+| Raw `tokio::fs` write + AES-GCM |    1.52 ms | what you'd write yourself, badly    |
 
-pagedb's segment writer adds **~1.74× over raw AEAD** but is **2.9× faster than a hand-rolled `fs::write` + AES-GCM** baseline — because pagedb batches, vectorizes, and uses the platform's best async primitive.
+pagedb's segment writer adds **~2.06× over raw AEAD** but is **2.4× faster than a hand-rolled `fs::write` + AES-GCM** baseline — because pagedb batches, vectorizes, and uses the platform's best async primitive.
+
+### Read-path decomposition
+
+| Step                              |   mean |
+| --------------------------------- | -----: |
+| `begin_read` + drop               | 157 ns |
+| Warm `get` (transaction reused)   | 457 ns |
+| Warm `get` (one transaction each) | 707 ns |
+| Cold authenticated node read      | 7.0 µs |
+| Dense repack (compaction)         | 314 µs |
 
 ---
 
@@ -202,7 +230,12 @@ Every pagedb commit pays for:
 3. **Per-realm AAD binding** on every page (cross-tenant misroute protection at runtime).
 4. **Async I/O** — every write goes through the runtime, not a blocking syscall.
 
-redb skips all of this. The trade is deliberate, not a bug. Read-heavy workloads come out ahead; write-heavy workloads pay the safety/portability tax until further write-path tuning lands.
+redb skips all of this. The trade is deliberate, not a bug — but be clear about
+where it lands: reads come out roughly level with redb (~1.2× behind warm,
+~2.3× on a 100 000-row set), not ahead, and write-heavy workloads pay the
+safety/portability tax until further write-path tuning lands. Bulk load is the
+weakest path by a wide margin; if your workload is dominated by loading large
+batches, measure before committing.
 
 ### "Why is there no mmap of encrypted bytes?"
 
