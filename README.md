@@ -131,6 +131,7 @@ cargo bench --bench segment
 cargo bench --bench compaction
 cargo bench --bench authenticated_node_read
 cargo bench --bench read_path
+cargo bench --bench write_path
 cargo bench -p pagedb-engine-comparison --bench btree
 cargo bench -p pagedb-engine-comparison --bench comparison
 ```
@@ -139,6 +140,8 @@ cargo bench -p pagedb-engine-comparison --bench comparison
 a multi-level tree, measuring cold authenticated leaf/internal kind discovery
 without resolving or compiling an external database engine. `read_path`
 decomposes a warm lookup into transaction open/close versus tree descent.
+`write_path` reports per-row allocation totals and per-row cost against
+transaction size.
 
 The comparison suite is a non-default workspace package under
 [`benchmarks/engine-comparison`](./benchmarks/engine-comparison). Normal
@@ -150,40 +153,37 @@ equivalent, so retaining it would compare different feature surfaces.
 
 ### vs. redb (B+ tree, in-process, 1 000-key tree)
 
-| Workload                        |   pagedb |    redb | vs redb        |
-| ------------------------------- | -------: | ------: | -------------- |
-| Point get (per-txn, AEAD)       |   507 ns |  412 ns | 1.23× slower   |
-| Batched insert (1 000 keys/txn) | **674 µs** | 1.80 ms | **2.67× faster** |
-| Per-txn insert (in-memory)      |  25.7 µs | 13.2 µs | 1.95× slower   |
-| Per-txn insert (file, AEAD on)  | 120.3 µs | 13.2 µs | 9.1× slower    |
+| Workload                        |     pagedb |    redb | vs redb          |
+| ------------------------------- | ---------: | ------: | ---------------- |
+| Point get (per-txn, AEAD)       |     692 ns |  679 ns | 1.02× slower     |
+| Batched insert (1 000 keys/txn) | **722 µs** | 2.10 ms | **2.91× faster** |
+| Per-txn insert (in-memory)      |    29.1 µs | 14.5 µs | 2.01× slower     |
+| Per-txn insert (file, AEAD on)  |   140.1 µs | 14.5 µs | 9.7× slower      |
 
-AEAD overhead on reads is **~1.02×** (507 ns vs 495 ns plaintext+MAC) —
-encryption really is close to free on hot reads, because the buffer pool holds
-decrypted plaintext and a warm hit re-authenticates nothing.
+AEAD overhead on reads is **~0.9–1.0×** (692 ns AEAD vs 787 ns plaintext+MAC,
+i.e. inside run-to-run noise) — encryption really is free on hot reads, because
+the buffer pool holds decrypted plaintext and a warm hit re-authenticates
+nothing.
 
 ### vs. redb / RocksDB / SQLite (full comparison suite, 100 000 rows)
 
-| Workload                       |     pagedb |       redb |     RocksDB |     SQLite |
-| ------------------------------ | ---------: | ---------: | ----------: | ---------: |
-| Random point read              |     5.3 µs | **2.3 µs** |      5.8 µs |    23.3 µs |
-| Range scan (10 entries)        |     9.2 µs | **3.8 µs** |      4.2 µs |    72.4 µs |
-| Individual write (fsync-bound) |   265.4 µs |    68.1 µs | **20.6 µs** |    72.9 µs |
-| Batch write (1 000 keys/txn)   |   17.32 ms |    5.72 ms | **3.27 ms** |    7.22 ms |
-| Bulk load (100 000 rows/txn)   |     2.85 s | **233 ms** |      476 ms |     322 ms |
-| Sorted bulk load               |     1.17 s | **136 ms** |      235 ms |     161 ms |
+| Workload                       |     pagedb |       redb |    RocksDB |     SQLite |
+| ------------------------------ | ---------: | ---------: | ---------: | ---------: |
+| Random point read              |     1.1 µs | **934 ns** |     951 ns |    10.5 µs |
+| Range scan (10 entries)        |     5.8 µs | **1.8 µs** |     2.3 µs |    30.8 µs |
+| Individual write (fsync-bound) |   183.0 µs |    23.9 µs | **4.7 µs** |    48.9 µs |
+| Batch write (1 000 keys/txn)   |    8.34 ms |    3.62 ms | **1.91 ms** |    4.84 ms |
+| Bulk load (100 000 rows/txn)   |     194 ms | **122 ms** |     267 ms |     168 ms |
+| Sorted bulk load               |     104 ms |     115 ms |     138 ms |  **98 ms** |
 
-**Reads are competitive; writes trail, and bulk load trails badly.** pagedb is
-within ~1.2× of redb on a warm 1 000-key tree and ~2.3× behind on a 100 000-row
-working set, where it beats RocksDB on point reads. On writes it is 1.9× behind
-redb per in-memory transaction and ~12× behind on bulk load. Part of that gap is
-the deliberate price of AEAD on every page, CoW shadow paging with A/B headers,
-and per-realm AAD binding — none of which redb or RocksDB carry — but the
-bulk-load gap is larger than that price explains and is a genuine weakness, not
-a design tax. Write-throughput work (group-commit tuning, write-coalescing,
-vectored fsync) is where the remaining headroom is.
-
-Scans return owned `Vec`s, so a 10-row scan costs ~91 allocations against
-redb's ~14 — a lazy borrowing cursor is the obvious next read-path win.
+**Reads and bulk load are competitive; single-key writes trail.** pagedb is
+level with redb on a warm 1 000-key tree and within ~1.2× on a 100 000-row
+working set. Bulk load is 1.6× behind redb and ahead of RocksDB; sorted bulk
+load is slightly ahead of redb. The gap is the fsync-bound single-key commit,
+where every transaction pays AEAD on each dirty page, a CoW shadow-page A/B
+header swap, and per-realm AAD binding — none of which redb or RocksDB carry.
+Batching amortises it; group-commit tuning and vectored fsync are the remaining
+headroom.
 
 ### Segment writer (append + seal)
 
@@ -230,12 +230,10 @@ Every pagedb commit pays for:
 3. **Per-realm AAD binding** on every page (cross-tenant misroute protection at runtime).
 4. **Async I/O** — every write goes through the runtime, not a blocking syscall.
 
-redb skips all of this. The trade is deliberate, not a bug — but be clear about
-where it lands: reads come out roughly level with redb (~1.2× behind warm,
-~2.3× on a 100 000-row set), not ahead, and write-heavy workloads pay the
-safety/portability tax until further write-path tuning lands. Bulk load is the
-weakest path by a wide margin; if your workload is dominated by loading large
-batches, measure before committing.
+redb skips all of this. The trade is deliberate, not a bug. Reads come out level
+with redb and bulk load is competitive; the cost lands on the fsync-bound
+single-key commit, since all four items are paid per transaction. Batch your
+writes and it amortises.
 
 ### "Why is there no mmap of encrypted bytes?"
 
