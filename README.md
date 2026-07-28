@@ -155,55 +155,62 @@ equivalent, so retaining it would compare different feature surfaces.
 
 | Workload                        |     pagedb |    redb | vs redb          |
 | ------------------------------- | ---------: | ------: | ---------------- |
-| Point get (per-txn, AEAD)       |     692 ns |  679 ns | 1.02× slower     |
-| Batched insert (1 000 keys/txn) | **722 µs** | 2.10 ms | **2.91× faster** |
-| Per-txn insert (in-memory)      |    29.1 µs | 14.5 µs | 2.01× slower     |
-| Per-txn insert (file, AEAD on)  |   140.1 µs | 14.5 µs | 9.7× slower      |
+| Point get (per-txn, AEAD)       |     491 ns |  374 ns | 1.31× slower     |
+| Batched insert (1 000 keys/txn) | **663 µs** | 1.76 ms | **2.66× faster** |
+| Per-txn insert (in-memory)      |    25.2 µs | 13.0 µs | 1.94× slower     |
+| Per-txn insert (file, AEAD on)  |   115.7 µs | 13.0 µs | 8.9× slower      |
 
-AEAD overhead on reads is **~0.9–1.0×** (692 ns AEAD vs 787 ns plaintext+MAC,
-i.e. inside run-to-run noise) — encryption really is free on hot reads, because
-the buffer pool holds decrypted plaintext and a warm hit re-authenticates
-nothing.
+AEAD overhead on reads is **~1.00×** (491 ns AEAD vs 489 ns plaintext+MAC) —
+encryption really is free on hot reads, because the buffer pool holds decrypted
+plaintext and a warm hit re-authenticates nothing.
 
 ### vs. redb / RocksDB / SQLite (full comparison suite, 100 000 rows)
 
 | Workload                       |     pagedb |       redb |    RocksDB |     SQLite |
 | ------------------------------ | ---------: | ---------: | ---------: | ---------: |
-| Random point read              |     1.1 µs | **934 ns** |     951 ns |    10.5 µs |
-| Range scan (10 entries)        |     5.8 µs | **1.8 µs** |     2.3 µs |    30.8 µs |
-| Individual write (fsync-bound) |   183.0 µs |    23.9 µs | **4.7 µs** |    48.9 µs |
-| Batch write (1 000 keys/txn)   |    8.34 ms |    3.62 ms | **1.91 ms** |    4.84 ms |
-| Bulk load (100 000 rows/txn)   |     194 ms | **122 ms** |     267 ms |     168 ms |
-| Sorted bulk load               |     104 ms |     115 ms |     138 ms |  **98 ms** |
+| Random point read              |     931 ns |     902 ns | **851 ns** |     9.9 µs |
+| Range scan (10 entries)        |     3.6 µs | **1.7 µs** |     2.2 µs |    28.4 µs |
+| Individual write (fsync-bound) |   184.5 µs |    28.2 µs | **4.9 µs** |    51.3 µs |
+| Batch write (1 000 keys/txn)   |    9.61 ms |    3.70 ms | **1.95 ms** |    4.94 ms |
+| Bulk load (100 000 rows/txn)   |     203 ms | **128 ms** |     289 ms |     176 ms |
+| Sorted bulk load               | **109 ms** |     116 ms |     158 ms |     100 ms |
 
-**Reads and bulk load are competitive; single-key writes trail.** pagedb is
-level with redb on a warm 1 000-key tree and within ~1.2× on a 100 000-row
-working set. Bulk load is 1.6× behind redb and ahead of RocksDB; sorted bulk
-load is slightly ahead of redb. The gap is the fsync-bound single-key commit,
+**Reads and bulk load are competitive; single-key writes trail.** Point reads
+are level with redb and RocksDB on a 100 000-row set; range scans are ~2×
+behind redb. Bulk load is 1.6× behind redb and ahead of RocksDB, and sorted
+bulk load edges ahead of redb. The gap is the fsync-bound single-key commit,
 where every transaction pays AEAD on each dirty page, a CoW shadow-page A/B
 header swap, and per-realm AAD binding — none of which redb or RocksDB carry.
 Batching amortises it; group-commit tuning and vectored fsync are the remaining
 headroom.
 
+Figures are the fastest observed run of several, on a shared host. Contention
+only ever adds time, so the minimum is the closest estimate of what the code
+itself costs; averaging over a loaded run inflates every engine, by amounts
+that differ between them.
+
 ### Segment writer (append + seal)
 
-| Path                            |       mean | Notes                               |
+| Path                            |       time | Notes                               |
 | ------------------------------- | ---------: | ----------------------------------- |
-| Raw AES-GCM only (memory)       |   306.5 µs | baseline: encryption cost alone     |
-| **pagedb `append_seal`**        | **632.7 µs** | full path: write, seal, fsync, link |
-| Raw `tokio::fs` write + AES-GCM |    1.52 ms | what you'd write yourself, badly    |
+| Raw AES-GCM only (memory)       |   300.7 µs | baseline: encryption cost alone     |
+| **pagedb `append_seal`**        | **560.1 µs** | full path: write, seal, fsync, link |
+| Raw `tokio::fs` write + AES-GCM |    1.40 ms | what you'd write yourself, badly    |
 
-pagedb's segment writer adds **~2.06× over raw AEAD** but is **2.4× faster than a hand-rolled `fs::write` + AES-GCM** baseline — because pagedb batches, vectorizes, and uses the platform's best async primitive.
+pagedb's segment writer adds **~1.86× over raw AEAD** but is **2.5× faster than a hand-rolled `fs::write` + AES-GCM** baseline — because pagedb batches, vectorizes, and uses the platform's best async primitive.
 
 ### Read-path decomposition
 
-| Step                              |   mean |
+| Step                              |   time |
 | --------------------------------- | -----: |
-| `begin_read` + drop               | 157 ns |
-| Warm `get` (transaction reused)   | 457 ns |
-| Warm `get` (one transaction each) | 707 ns |
-| Cold authenticated node read      | 7.0 µs |
-| Dense repack (compaction)         | 314 µs |
+| `begin_read` + drop               | 141 ns |
+| Warm `get` (transaction reused)   | 369 ns |
+| Warm `get` (one transaction each) | 434 ns |
+| Cold authenticated node read      | 6.8 µs |
+| Dense repack (compaction)         | 306 µs |
+
+A warm `get` allocates nothing: the value is a slice of the cached page, not a
+copy of it.
 
 ---
 
