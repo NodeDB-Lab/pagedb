@@ -81,6 +81,10 @@ impl Page {
 struct Node {
     key: (FileKey, u64),
     page: Arc<Page>,
+    /// Outstanding `PageGuard`s over this entry. Lives on the node rather than
+    /// in a side table so a lookup that already resolved the slab index does
+    /// not pay a second hash to pin, nor a third to unpin on drop.
+    pins: u32,
     visited: bool,
     prev: Option<usize>,
     next: Option<usize>,
@@ -103,7 +107,6 @@ pub struct PageCache {
     /// SIEVE hand. Walks tail→head via `next`. `None` means "start from tail
     /// on next eviction"; after wrapping past head it is reset to `None`.
     hand: Option<usize>,
-    pins: FxHashMap<(FileKey, u64), u32>,
     dirty: BTreeSet<(FileKey, u64)>,
 }
 
@@ -119,7 +122,6 @@ impl PageCache {
             head: None,
             tail: None,
             hand: None,
-            pins: FxHashMap::default(),
             dirty: BTreeSet::new(),
         }
     }
@@ -137,14 +139,59 @@ impl PageCache {
         Some(node.page.clone())
     }
 
+    /// [`get`](Self::get) that also pins, returning the slab index to release
+    /// it with. One hash lookup serves the read, the `visited` bit, and the
+    /// pin — the read path's hottest operation, so the separate `pin` call it
+    /// replaces was a second hash of the same key.
+    pub fn get_and_pin(&mut self, key: (FileKey, u64)) -> Option<(Arc<Page>, usize)> {
+        let idx = *self.map.get(&key)?;
+        let node = self.slab[idx].as_mut().expect("indexed node alive");
+        node.visited = true;
+        node.pins = node.pins.saturating_add(1);
+        Some((node.page.clone(), idx))
+    }
+
+    /// Pin the entry at `idx`, which the caller must have just obtained from
+    /// [`insert_and_index`](Self::insert_and_index) or
+    /// [`get_and_pin`](Self::get_and_pin).
+    pub fn pin_at(&mut self, idx: usize) {
+        let node = self.slab[idx].as_mut().expect("indexed node alive");
+        node.pins = node.pins.saturating_add(1);
+    }
+
+    /// Release a pin taken at `idx`. `key` identifies the entry the pin was
+    /// taken on: slab slots are recycled, so a stale index could otherwise
+    /// decrement an unrelated entry's count. Every removal path spares pinned
+    /// entries, so for a live pin the check always passes — it is there to keep
+    /// that a checked invariant rather than an assumed one.
+    pub fn unpin_at(&mut self, idx: usize, key: (FileKey, u64)) {
+        let Some(node) = self.slab.get_mut(idx).and_then(Option::as_mut) else {
+            return;
+        };
+        if node.key != key {
+            return;
+        }
+        node.pins = node.pins.saturating_sub(1);
+    }
+
     /// Insert `(key, page)`. Evicts one unpinned, undirty, unvisited entry
     /// (per SIEVE) if at capacity. Returns the evicted key if any.
     pub fn insert(&mut self, key: (FileKey, u64), page: Arc<Page>) -> Option<(FileKey, u64)> {
+        self.insert_and_index(key, page).0
+    }
+
+    /// [`insert`](Self::insert), additionally returning the slab index of the
+    /// inserted entry so a caller that pins immediately does not re-hash.
+    pub fn insert_and_index(
+        &mut self,
+        key: (FileKey, u64),
+        page: Arc<Page>,
+    ) -> (Option<(FileKey, u64)>, usize) {
         // Update in place if key already present (preserve list position).
         if let Some(&idx) = self.map.get(&key) {
             let node = self.slab[idx].as_mut().expect("indexed node alive");
             node.page = page;
-            return None;
+            return (None, idx);
         }
         let evicted = if self.map.len() >= self.capacity {
             self.evict_one()
@@ -154,6 +201,7 @@ impl PageCache {
         let idx = self.alloc_node(Node {
             key,
             page,
+            pins: 0,
             visited: false,
             prev: self.head,
             next: None,
@@ -167,7 +215,7 @@ impl PageCache {
         }
         self.head = Some(idx);
         self.map.insert(key, idx);
-        evicted
+        (evicted, idx)
     }
 
     fn evict_one(&mut self) -> Option<(FileKey, u64)> {
@@ -182,11 +230,11 @@ impl PageCache {
                 cur = self.tail;
                 continue;
             };
-            let (key, next_idx, visited, prev_idx) = {
+            let (key, next_idx, visited, prev_idx, pins) = {
                 let node = self.slab[idx].as_ref().expect("hand on live node");
-                (node.key, node.next, node.visited, node.prev)
+                (node.key, node.next, node.visited, node.prev, node.pins)
             };
-            let pinned = self.pins.get(&key).copied().unwrap_or(0) > 0;
+            let pinned = pins > 0;
             let is_dirty = self.dirty.contains(&key);
             if pinned || is_dirty {
                 // Skip without touching the visited bit.
@@ -237,21 +285,6 @@ impl PageCache {
             self.slab[n].as_mut().expect("next alive").prev = prev;
         } else {
             self.head = prev;
-        }
-    }
-
-    pub fn pin(&mut self, key: (FileKey, u64)) {
-        *self.pins.entry(key).or_insert(0) += 1;
-    }
-
-    pub fn unpin(&mut self, key: (FileKey, u64)) {
-        if let Some(count) = self.pins.get_mut(&key) {
-            if *count > 0 {
-                *count -= 1;
-            }
-            if *count == 0 {
-                self.pins.remove(&key);
-            }
         }
     }
 
@@ -311,7 +344,12 @@ impl PageCache {
             .copied()
             .collect();
         for key in keys {
-            if self.pins.get(&key).copied().unwrap_or(0) > 0 {
+            let pinned = self
+                .map
+                .get(&key)
+                .and_then(|&idx| self.slab[idx].as_ref())
+                .is_some_and(|node| node.pins > 0);
+            if pinned {
                 continue;
             }
             if keep_dirty && self.dirty.contains(&key) {
@@ -386,14 +424,71 @@ mod tests {
     #[test]
     fn pinned_pages_survive_eviction() {
         let mut c = PageCache::with_capacity(2);
-        c.insert((FileKey::Main, 1), page(1));
-        c.pin((FileKey::Main, 1));
+        let (_, pinned) = c.insert_and_index((FileKey::Main, 1), page(1));
+        c.pin_at(pinned);
         c.insert((FileKey::Main, 2), page(2));
         let evicted = c.insert((FileKey::Main, 3), page(3));
         assert_eq!(evicted, Some((FileKey::Main, 2)));
         assert!(
             c.get((FileKey::Main, 1)).is_some(),
             "pinned page must survive"
+        );
+    }
+
+    #[test]
+    fn releasing_the_last_pin_makes_an_entry_evictable_again() {
+        let mut c = PageCache::with_capacity(2);
+        let key = (FileKey::Main, 1);
+        let (_, idx) = c.insert_and_index(key, page(1));
+        c.pin_at(idx);
+        c.insert((FileKey::Main, 2), page(2));
+        assert_eq!(
+            c.insert((FileKey::Main, 3), page(3)),
+            Some((FileKey::Main, 2))
+        );
+
+        c.unpin_at(idx, key);
+        // Unpinned and never re-read, so it is now the eviction hand's victim.
+        assert_eq!(c.insert((FileKey::Main, 4), page(4)), Some(key));
+    }
+
+    #[test]
+    fn nested_pins_each_need_releasing() {
+        let mut c = PageCache::with_capacity(2);
+        let key = (FileKey::Main, 1);
+        let (_, idx) = c.insert_and_index(key, page(1));
+        c.pin_at(idx);
+        c.pin_at(idx);
+
+        c.unpin_at(idx, key);
+        c.insert((FileKey::Main, 2), page(2));
+        assert_eq!(
+            c.insert((FileKey::Main, 3), page(3)),
+            Some((FileKey::Main, 2)),
+            "one outstanding pin still protects the entry"
+        );
+    }
+
+    /// Slab slots are recycled, so an index outliving its entry must not
+    /// decrement whatever now occupies the slot.
+    #[test]
+    fn unpinning_a_recycled_slot_leaves_the_new_occupant_pinned() {
+        let mut c = PageCache::with_capacity(1);
+        let old_key = (FileKey::Main, 1);
+        let (_, idx) = c.insert_and_index(old_key, page(1));
+        assert_eq!(c.insert((FileKey::Main, 2), page(2)), Some(old_key));
+
+        // The slot now belongs to page 2. Pin it, then replay the stale
+        // release for page 1 against the same index.
+        let new_key = (FileKey::Main, 2);
+        let (_, new_idx) = c.insert_and_index(new_key, page(2));
+        c.pin_at(new_idx);
+        c.unpin_at(idx, old_key);
+
+        c.insert((FileKey::Main, 3), page(3));
+        assert!(
+            c.get(new_key).is_some(),
+            "the stale release must not have unpinned the new occupant"
         );
     }
 
@@ -457,8 +552,8 @@ mod tests {
 
         for id in 1u8..=4 {
             let key = (FileKey::Main, u64::from(id));
-            c.insert(key, page(id));
-            c.pin(key);
+            let (_, idx) = c.insert_and_index(key, page(id));
+            c.pin_at(idx);
         }
         c.insert((FileKey::Main, 5), page(5));
         assert_eq!(c.len(), 5, "pinned pages may force temporary growth");

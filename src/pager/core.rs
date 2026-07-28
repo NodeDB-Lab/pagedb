@@ -90,6 +90,10 @@ impl PagerConfig {
 pub struct PageGuard {
     page: Arc<Page>,
     key: (FileKey, u64),
+    /// Slab index of the pinned entry, so releasing it on drop costs an
+    /// indexed load rather than another hash of `key`. `key` still identifies
+    /// the entry the pin was taken on; the cache verifies the two agree.
+    slot: usize,
     inner: Arc<PagerInner>,
 }
 
@@ -122,7 +126,7 @@ impl PageGuard {
 impl Drop for PageGuard {
     fn drop(&mut self) {
         let mut cache = self.inner.cache_for_key(self.key.0).lock();
-        cache.unpin(self.key);
+        cache.unpin_at(self.slot, self.key);
     }
 }
 
@@ -941,8 +945,9 @@ impl<V: Vfs> Pager<V> {
         // Cache fast-path: verify realm matches to prevent cross-realm hits.
         {
             let mut cache = self.inner.cache_for_key(file).lock();
-            if let Some(page) = cache.get((file, page_id)) {
+            if let Some((page, slot)) = cache.get_and_pin((file, page_id)) {
                 if page.realm_id_bytes != Some(realm_id.0) {
+                    cache.unpin_at(slot, (file, page_id));
                     return Err(PagedbError::ChecksumFailure);
                 }
                 // Resolve the page kind under the caller's binding. A `Fixed`
@@ -953,13 +958,19 @@ impl<V: Vfs> Pager<V> {
                 // after the write that caused it. A `Node` binding instead
                 // trusts the page's own (authenticated) kind byte and returns
                 // it, restricted to the two B+ tree node kinds.
-                let kind = binding.resolve_cached(page.kind_byte)?;
+                let kind = match binding.resolve_cached(page.kind_byte) {
+                    Ok(kind) => kind,
+                    Err(error) => {
+                        cache.unpin_at(slot, (file, page_id));
+                        return Err(error);
+                    }
+                };
                 self.inner.record_hit(file);
-                cache.pin((file, page_id));
                 return Ok((
                     PageGuard {
                         page,
                         key: (file, page_id),
+                        slot,
                         inner: self.inner.clone(),
                     },
                     kind,
@@ -1046,12 +1057,13 @@ impl<V: Vfs> Pager<V> {
                 Ok(_page_kind) => {
                     let page = Arc::new(Page::new_with_meta(buf, auth_kind.as_byte(), realm_id.0));
                     let mut cache = self.inner.cache_for_key(file).lock();
-                    let _ = cache.insert((file, page_id), page.clone());
-                    cache.pin((file, page_id));
+                    let (_evicted, slot) = cache.insert_and_index((file, page_id), page.clone());
+                    cache.pin_at(slot);
                     return Ok((
                         PageGuard {
                             page,
                             key: (file, page_id),
+                            slot,
                             inner: self.inner.clone(),
                         },
                         auth_kind,
