@@ -23,37 +23,36 @@
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
-use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types::Fd;
-use parking_lot::Mutex;
 
 use crate::Result;
 use crate::errors::PagedbError;
 use crate::vfs::blocking::offload;
+use crate::vfs::iouring::ring::{SharedRing, SubmitError};
 use crate::vfs::traits::{
-    VfsFile, checked_indexed_completion, checked_iouring_positioned_offset, checked_read_count,
-    checked_signed_file_len, write_all_at,
+    VfsFile, checked_iouring_positioned_offset, checked_read_count, checked_signed_file_len,
+    write_all_at,
 };
 use crate::vfs::types::{ReadReq, WriteReq};
 
 /// Per-file handle backed by an `std::fs::File` fd and the shared `io_uring`.
 ///
 /// `Send` and `Sync` are both derived, not asserted: `Arc<std::fs::File>` is
-/// thread-safe, and `io_uring::IoUring` is `Send + Sync`, so `Arc<Mutex<_>>`
-/// around it is too. Nothing about this type needs a hand-written auto-trait
-/// impl, and it must not grow one — a manual impl would silently keep holding
-/// once a future field stopped qualifying.
+/// thread-safe, and `SharedRing` wraps the ring in a `Mutex`, so an `Arc` of
+/// it is too. Nothing about this type needs a hand-written auto-trait impl,
+/// and it must not grow one — a manual impl would silently keep holding once a
+/// future field stopped qualifying.
 pub struct IouringFile {
     /// Shared so a blocking-pool call can own a reference to the descriptor
     /// for its whole duration, independently of when this handle drops.
     file: Arc<std::fs::File>,
     writable: bool,
-    ring: Arc<Mutex<IoUring>>,
+    ring: Arc<SharedRing>,
 }
 
 impl IouringFile {
-    pub(crate) fn new(file: std::fs::File, writable: bool, ring: Arc<Mutex<IoUring>>) -> Self {
+    pub(crate) fn new(file: std::fs::File, writable: bool, ring: Arc<SharedRing>) -> Self {
         Self {
             file: Arc::new(file),
             writable,
@@ -63,7 +62,7 @@ impl IouringFile {
 
     /// The two owned handles a blocking-pool cycle needs. Both are `Arc`
     /// clones, and both keep their target alive for as long as the cycle runs.
-    fn shared(&self) -> (Arc<std::fs::File>, Arc<Mutex<IoUring>>) {
+    fn shared(&self) -> (Arc<std::fs::File>, Arc<SharedRing>) {
         (Arc::clone(&self.file), Arc::clone(&self.ring))
     }
 
@@ -91,121 +90,32 @@ impl IouringFile {
             .map_err(|_| PagedbError::Io(std::io::Error::other("buffer too large for u32")))
     }
 
-    /// Submit a single SQE, wait for exactly one CQE with matching
-    /// `user_data`, and return the CQE result.
+    /// Run one submit + drain cycle, translating the ring's memory-safety
+    /// verdict into a plain error while leaking whatever the kernel may still
+    /// own.
     ///
-    /// # Safety
-    ///
-    /// The caller must ensure that any buffers referenced by the SQE remain
-    /// valid for the duration of this call (i.e. until `submit_and_wait`
-    /// returns and the CQE is drained). Because the ring lock is held across
-    /// the entire submit+drain sequence and we wait for the exact CQE before
-    /// returning, this invariant is satisfied for any buffer whose lifetime
-    /// outlasts this function.
-    unsafe fn submit_one(
-        ring: &mut IoUring,
-        entry: &io_uring::squeue::Entry,
-        user_data: u64,
-    ) -> std::io::Result<i32> {
-        // SAFETY: caller guarantees the buffers referenced by `entry` are live.
-        unsafe {
-            ring.submission()
-                .push(entry)
-                .map_err(|_| std::io::Error::other("submission queue full"))?;
-        }
-        ring.submit_and_wait(1)?;
-        let mut result = None;
-        {
-            let mut cq = ring.completion();
-            cq.sync();
-            for cqe in cq.by_ref() {
-                if cqe.user_data() == user_data {
-                    result = Some(cqe.result());
-                    break;
-                }
-                // Stale CQEs from prior submissions are discarded.
-            }
-        }
-        let res =
-            result.ok_or_else(|| std::io::Error::other("io_uring: expected CQE not found"))?;
-        if res < 0 {
-            Err(std::io::Error::from_raw_os_error(-res))
-        } else {
-            Ok(res)
-        }
-    }
-
-    /// Submit a batch of SQEs and wait for all of them. Each SQE must carry
-    /// its index (0..n) as `user_data`. Returns CQE results in submission order.
-    ///
-    /// # Safety
-    ///
-    /// All buffers referenced by every entry in `entries` must remain valid
-    /// until this function returns (same contract as `submit_one`).
-    unsafe fn submit_batch(
-        ring: &mut IoUring,
+    /// `buffers` is every allocation the SQEs point at. On the abandoned path
+    /// it is forgotten rather than dropped: entries are still outstanding, and
+    /// the kernel writing into reclaimed memory is the one outcome that must
+    /// not be possible. Leaking a bounded amount on a failing device is the
+    /// cheap side of that trade.
+    fn run_cycle<B>(
+        ring: &SharedRing,
         entries: &[io_uring::squeue::Entry],
-    ) -> std::io::Result<Vec<i32>> {
-        let total = entries.len();
-        if total == 0 {
-            return Ok(Vec::new());
+        buffers: B,
+    ) -> Result<(Vec<i32>, B)> {
+        // SAFETY: `buffers` owns every allocation the entries reference and is
+        // moved into this function, so the buffers outlive the call; on the
+        // `Abandoned` path it is leaked instead of dropped, which extends that
+        // lifetime for the rest of the process as the contract requires.
+        match unsafe { ring.submit_and_collect(entries) } {
+            Ok(results) => Ok((results, buffers)),
+            Err(SubmitError::Settled(error)) => Err(PagedbError::Io(error)),
+            Err(abandoned @ SubmitError::Abandoned(_)) => {
+                std::mem::forget(buffers);
+                Err(PagedbError::Io(abandoned.into_io()))
+            }
         }
-        // Cap each submission at the ring's SQ depth. Larger callers
-        // (a full B+ tree flush) get chunked across multiple ring round-trips.
-        // Each chunk re-tags `user_data` with the index within the chunk so
-        // the CQE drain can match results into the global results vector.
-        let chunk_size = crate::vfs::iouring::ring::RING_DEPTH as usize;
-        let mut results = vec![0i32; total];
-        let mut base = 0usize;
-        while base < total {
-            let end = (base + chunk_size).min(total);
-            let chunk_len = end - base;
-            {
-                let mut sq = ring.submission();
-                for (i, entry) in entries[base..end].iter().enumerate() {
-                    // Re-tag with the in-chunk index. The caller-assigned
-                    // `user_data` is overwritten because the outer `for cqe`
-                    // loop needs a stable 0..chunk_len keyspace.
-                    let tagged = entry.clone().user_data(i as u64);
-                    // SAFETY: caller guarantees buffers are live for `entries`.
-                    unsafe {
-                        sq.push(&tagged)
-                            .map_err(|_| std::io::Error::other("submission queue full"))?;
-                    }
-                }
-            }
-            ring.submit_and_wait(chunk_len)?;
-            let mut chunk_results = vec![None; chunk_len];
-            let mut found = 0usize;
-            {
-                let mut cq = ring.completion();
-                cq.sync();
-                for cqe in cq.by_ref() {
-                    if checked_indexed_completion(&mut chunk_results, cqe.user_data(), cqe.result())
-                        .map_err(|error| match error {
-                            PagedbError::Io(io) => io,
-                            other => std::io::Error::other(other.to_string()),
-                        })?
-                    {
-                        found += 1;
-                    }
-                    if found == chunk_len {
-                        break;
-                    }
-                }
-            }
-            if found < chunk_len {
-                return Err(std::io::Error::other(
-                    "io_uring: fewer CQEs returned than submitted",
-                ));
-            }
-            for (index, result) in chunk_results.into_iter().enumerate() {
-                results[base + index] = result
-                    .ok_or_else(|| std::io::Error::other("io_uring: missing indexed CQE result"))?;
-            }
-            base = end;
-        }
-        Ok(results)
     }
 }
 
@@ -227,15 +137,9 @@ impl VfsFile for IouringFile {
                 .offset(offset)
                 .build()
                 .user_data(0);
-            let n = {
-                let mut guard = ring.lock();
-                // SAFETY: `scratch` is owned by this closure and outlives the
-                // submit+drain below, and the ring lock is held across both, so
-                // the kernel is finished with the buffer before this returns.
-                unsafe { IouringFile::submit_one(&mut guard, &entry, 0) }
-            }
-            .map_err(PagedbError::Io)?;
-            // n >= 0 guaranteed by submit_one (negative becomes Err).
+            let (results, scratch) = IouringFile::run_cycle(&ring, &[entry], scratch)?;
+            let n = single_result(&results)?;
+            // `single_result` rejects a negative CQE, so this is non-negative.
             #[allow(clippy::cast_sign_loss)]
             let read = checked_read_count(n as usize, len)?;
             Ok((scratch, read))
@@ -273,15 +177,7 @@ impl VfsFile for IouringFile {
                 );
             }
 
-            let results = {
-                let mut guard = ring.lock();
-                // SAFETY: every buffer referenced by `entries` lives in
-                // `buffers`, owned by this closure, and the ring lock is held
-                // across submit+drain so the kernel cannot touch them after
-                // `submit_batch` returns.
-                unsafe { IouringFile::submit_batch(&mut guard, &entries) }
-            }
-            .map_err(PagedbError::Io)?;
+            let (results, buffers) = IouringFile::run_cycle(&ring, &entries, buffers)?;
             drop(entries); // buf raw-ptrs no longer needed
 
             let mut out: Vec<(Vec<u8>, usize)> = Vec::with_capacity(plan.len());
@@ -328,14 +224,10 @@ impl VfsFile for IouringFile {
                 .offset(offset)
                 .build()
                 .user_data(0);
-            let n = {
-                let mut guard = ring.lock();
-                // SAFETY: `data` is owned by this closure and outlives the
-                // submit+drain below; the ring lock is held across both.
-                unsafe { IouringFile::submit_one(&mut guard, &entry, 0) }
-            }
-            .map_err(PagedbError::Io)?;
-            // n >= 0 guaranteed by submit_one.
+            let (results, data) = IouringFile::run_cycle(&ring, &[entry], data)?;
+            let n = single_result(&results)?;
+            drop(data);
+            // `single_result` rejects a negative CQE, so this is non-negative.
             #[allow(clippy::cast_sign_loss)]
             let written = n as usize;
             Ok(written)
@@ -388,14 +280,7 @@ impl VfsFile for IouringFile {
                 );
             }
 
-            let results = {
-                let mut guard = ring.lock();
-                // SAFETY: every buffer referenced by `entries` lives in `plan`,
-                // owned by this closure, and the ring lock is held across
-                // submit+drain.
-                unsafe { IouringFile::submit_batch(&mut guard, &entries) }
-            }
-            .map_err(PagedbError::Io)?;
+            let (results, plan) = IouringFile::run_cycle(&ring, &entries, plan)?;
             drop(entries);
 
             let mut short_writes = Vec::new();
@@ -448,13 +333,11 @@ impl VfsFile for IouringFile {
         offload(move || {
             let fd = Fd(file.as_raw_fd());
             let entry = opcode::Fsync::new(fd).build().user_data(0);
-            let completed = {
-                let mut guard = ring.lock();
-                // SAFETY: `Fsync` carries no buffer pointer; there is nothing
-                // to alias. The `Arc` keeps the fd open for the whole call.
-                unsafe { IouringFile::submit_one(&mut guard, &entry, 0) }
-            };
-            completed.map_err(PagedbError::Io)?;
+            // `Fsync` carries no buffer pointer, so there is nothing the
+            // kernel could still be reading; the unit payload makes that
+            // explicit rather than leaving an empty allocation to leak.
+            let (results, ()) = IouringFile::run_cycle(&ring, &[entry], ())?;
+            single_result(&results)?;
             Ok(())
         })
         .await
@@ -494,4 +377,15 @@ impl VfsFile for IouringFile {
     fn supports_direct_io(&self) -> bool {
         true
     }
+}
+
+/// Unwrap a one-entry cycle's result, turning a negative CQE into its errno.
+fn single_result(results: &[i32]) -> Result<i32> {
+    let result = *results
+        .first()
+        .ok_or_else(|| PagedbError::Io(std::io::Error::other("io_uring: no CQE for entry")))?;
+    if result < 0 {
+        return Err(PagedbError::Io(std::io::Error::from_raw_os_error(-result)));
+    }
+    Ok(result)
 }
