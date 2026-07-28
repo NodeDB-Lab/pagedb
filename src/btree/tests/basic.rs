@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::btree::BTree;
 use crate::btree::internal::{Internal, InternalEntry};
 use crate::btree::leaf::{Leaf, LeafValue};
@@ -328,7 +330,7 @@ async fn read_node_rejects_authenticated_envelope_body_kind_mismatch() {
     let realm = RealmId::new([1; 16]);
 
     let mut leaf = Leaf::new();
-    leaf.upsert(b"k", LeafValue::Inline(b"v".to_vec()));
+    leaf.upsert(b"k", LeafValue::Inline(b"v".as_slice().into()));
     let mut leaf_body = vec![0u8; body_capacity(PAGE)];
     leaf.encode(&mut leaf_body).unwrap();
 
@@ -468,7 +470,7 @@ fn delete_range_rejects_leaf_sibling_cycle_without_hanging() {
 
             let mut leaf = Leaf::new();
             leaf.right_sibling = leaf_page_id;
-            leaf.upsert(b"k", LeafValue::Inline(b"v".to_vec()));
+            leaf.upsert(b"k", LeafValue::Inline(b"v".as_slice().into()));
             let mut body = vec![0u8; body_capacity(PAGE)];
             leaf.encode(&mut body).unwrap();
             pager
@@ -607,7 +609,7 @@ fn collect_all_rejects_alternating_leaf_successors_without_hanging() {
 
             for (page_id, key) in [(left_leaf, b"a"), (right_leaf, b"b")] {
                 let mut leaf = Leaf::new();
-                leaf.upsert(key, LeafValue::Inline(b"v".to_vec()));
+                leaf.upsert(key, LeafValue::Inline(b"v".as_slice().into()));
                 let mut body = vec![0u8; body_capacity(PAGE)];
                 leaf.encode(&mut body).unwrap();
                 pager
@@ -674,8 +676,8 @@ fn bulk_load_rejects_separator_that_cannot_fit_without_hanging() {
             let mut tree = fresh_tree(pager);
             let key_len = body_capacity(PAGE) - 32;
             tree.bulk_load(vec![
-                (vec![b'a'; key_len], Vec::new()),
-                (vec![b'b'; key_len], Vec::new()),
+                (vec![b'a'; key_len], Bytes::new()),
+                (vec![b'b'; key_len], Bytes::new()),
             ])
             .await
         });
@@ -693,12 +695,12 @@ fn bulk_load_rejects_separator_that_cannot_fit_without_hanging() {
 async fn bulk_load_rejects_non_strict_key_order_without_poisoning_tree() {
     let cases = [
         vec![
-            (b"b".to_vec(), b"two".to_vec()),
-            (b"a".to_vec(), b"one".to_vec()),
+            (b"b".to_vec(), Bytes::from_static(b"two")),
+            (b"a".to_vec(), Bytes::from_static(b"one")),
         ],
         vec![
-            (b"a".to_vec(), b"one".to_vec()),
-            (b"a".to_vec(), b"two".to_vec()),
+            (b"a".to_vec(), Bytes::from_static(b"one")),
+            (b"a".to_vec(), Bytes::from_static(b"two")),
         ],
     ];
 
@@ -717,8 +719,8 @@ async fn bulk_load_rejects_non_strict_key_order_without_poisoning_tree() {
         assert_eq!(tree.next_page_id(), 4);
 
         tree.bulk_load(vec![
-            (b"a".to_vec(), b"one".to_vec()),
-            (b"b".to_vec(), b"two".to_vec()),
+            (b"a".to_vec(), b"one".as_slice().into()),
+            (b"b".to_vec(), b"two".as_slice().into()),
         ])
         .await
         .unwrap();
@@ -743,9 +745,12 @@ async fn bulk_loader_rejects_non_increasing_keys_across_pushes() {
         let mut tree = fresh_tree(pager);
         {
             let mut loader = tree.bulk_loader().unwrap();
-            loader.push(b"b".to_vec(), b"one".to_vec()).await.unwrap();
+            loader
+                .push(b"b".to_vec(), b"one".as_slice().into())
+                .await
+                .unwrap();
             let error = loader
-                .push(second_key.to_vec(), b"two".to_vec())
+                .push(second_key.to_vec(), b"two".as_slice().into())
                 .await
                 .expect_err("descending and duplicate keys must both be rejected");
             assert!(
@@ -769,7 +774,7 @@ async fn bulk_loader_rejects_oversized_key_before_allocating() {
     {
         let mut loader = tree.bulk_loader().unwrap();
         let error = loader
-            .push(vec![b'a'; key_len], Vec::new())
+            .push(vec![b'a'; key_len], Bytes::new())
             .await
             .expect_err("a key too large to separate must be rejected");
         assert!(matches!(error, PagedbError::PayloadTooLarge));
@@ -800,7 +805,7 @@ async fn bulk_loader_builds_a_multi_level_tree_that_scans_in_order() {
         for i in 0..n {
             let value = if i % 11 == 0 { &spilled } else { &inline };
             loader
-                .push(format!("k-{i:05}").into_bytes(), value.clone())
+                .push(format!("k-{i:05}").into_bytes(), value.clone().into())
                 .await
                 .unwrap();
         }

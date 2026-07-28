@@ -187,7 +187,7 @@ async fn lay_out_graph(pager: &Arc<Pager<MemVfs>>, specs: &[PageSpec]) {
                 leaf.left_sibling = slot_to_page_id(*left_sibling);
                 leaf.right_sibling = slot_to_page_id(*right_sibling);
                 for key in keys {
-                    leaf.upsert(&[*key], LeafValue::Inline(vec![*key; 4]));
+                    leaf.upsert(&[*key], LeafValue::Inline(vec![*key; 4].into()));
                 }
                 if leaf.encode(&mut body).is_err() {
                     continue;

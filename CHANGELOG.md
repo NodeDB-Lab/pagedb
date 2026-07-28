@@ -14,7 +14,8 @@ version, since none exists yet.
 
 - **B+ tree surface** — sorted `bytes → bytes` store with copy-on-write shadow
   paging, A/B headers, ACID transactions, range scans, monotonic append, and
-  bulk load.
+  bulk load. Reads return `Bytes` borrowed from the page cache; scans come
+  bounded (`scan_from`, `scan_prefix_from`) or materialising.
 - **Segment File API** — engine-owned, append-mostly, atomically sealed
   encrypted files for formats that own their own layout (vectors, columnar
   blocks, FTS postings, R-trees).

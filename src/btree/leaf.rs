@@ -1,5 +1,7 @@
 //! Leaf node operations.
 
+use bytes::Bytes;
+
 use crate::Result;
 use crate::errors::PagedbError;
 use crate::pager::PageGuard;
@@ -15,8 +17,14 @@ use super::node::{
 /// overflow chain.
 #[derive(Debug, Clone)]
 pub enum LeafValue {
-    Inline(Vec<u8>),
-    Overflow { total_len: u64, root_page_id: u64 },
+    /// Held as [`Bytes`] so a value read out of one page and written into
+    /// another — a repack, a history relocation, a rekey — moves by refcount
+    /// instead of being copied at each hop.
+    Inline(Bytes),
+    Overflow {
+        total_len: u64,
+        root_page_id: u64,
+    },
 }
 
 /// Bytes an overflow reference occupies in an encoded record body: the
@@ -78,8 +86,8 @@ impl Leaf {
                 }
             } else {
                 let vlen = value_len_raw as usize;
-                let v = body[off + 2 + suffix_len + 2..off + 2 + suffix_len + 2 + vlen].to_vec();
-                LeafValue::Inline(v)
+                let start = off + 2 + suffix_len + 2;
+                LeafValue::Inline(Bytes::copy_from_slice(&body[start..start + vlen]))
             };
             // Reconstruct full key by prepending the common prefix.
             let mut full_key = prefix_bytes.clone();
@@ -439,14 +447,14 @@ mod tests {
     #[test]
     fn inline_round_trip() {
         let mut leaf = Leaf::new();
-        leaf.upsert(b"hello", LeafValue::Inline(b"world".to_vec()));
-        leaf.upsert(b"hello2", LeafValue::Inline(b"world2".to_vec()));
+        leaf.upsert(b"hello", LeafValue::Inline(b"world".as_slice().into()));
+        leaf.upsert(b"hello2", LeafValue::Inline(b"world2".as_slice().into()));
         let mut body = make_body();
         leaf.encode(&mut body).unwrap();
         let decoded = Leaf::decode(&body).unwrap();
         assert_eq!(decoded.records.len(), 2);
         match &decoded.records[0].1 {
-            LeafValue::Inline(v) => assert_eq!(v, b"world"),
+            LeafValue::Inline(v) => assert_eq!(v.as_ref(), b"world"),
             LeafValue::Overflow { .. } => panic!("expected inline"),
         }
     }
@@ -479,9 +487,9 @@ mod tests {
     #[test]
     fn prefix_compression_applied() {
         let mut leaf = Leaf::new();
-        leaf.upsert(b"prefix/aaa", LeafValue::Inline(b"v1".to_vec()));
-        leaf.upsert(b"prefix/bbb", LeafValue::Inline(b"v2".to_vec()));
-        leaf.upsert(b"prefix/ccc", LeafValue::Inline(b"v3".to_vec()));
+        leaf.upsert(b"prefix/aaa", LeafValue::Inline(b"v1".as_slice().into()));
+        leaf.upsert(b"prefix/bbb", LeafValue::Inline(b"v2".as_slice().into()));
+        leaf.upsert(b"prefix/ccc", LeafValue::Inline(b"v3".as_slice().into()));
         let mut body = make_body();
         leaf.encode(&mut body).unwrap();
         // Check prefix_len in header is 7 ("prefix/")
@@ -497,11 +505,11 @@ mod tests {
     fn lcp_edge_cases() {
         let records: Vec<(Vec<u8>, LeafValue)> = Vec::new();
         assert_eq!(lcp(&records), b"");
-        let one = vec![(b"hello".to_vec(), LeafValue::Inline(vec![]))];
+        let one = vec![(b"hello".to_vec(), LeafValue::Inline(Bytes::new()))];
         assert_eq!(lcp(&one), b"hello");
         let two = vec![
-            (b"abc".to_vec(), LeafValue::Inline(vec![])),
-            (b"abd".to_vec(), LeafValue::Inline(vec![])),
+            (b"abc".to_vec(), LeafValue::Inline(Bytes::new())),
+            (b"abd".to_vec(), LeafValue::Inline(Bytes::new())),
         ];
         assert_eq!(lcp(&two), b"ab");
     }

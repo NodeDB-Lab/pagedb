@@ -256,7 +256,9 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         self.btree.delete(key).await
     }
 
-    pub async fn put_batch(&mut self, sorted: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+    /// Takes the same row shape the scans return, so read output feeds
+    /// straight back in without a conversion.
+    pub async fn put_batch(&mut self, sorted: Vec<(Bytes, Bytes)>) -> Result<()> {
         self.btree.put_batch(sorted).await
     }
 

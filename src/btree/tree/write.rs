@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::Result;
 use crate::errors::PagedbError;
 use crate::vfs::Vfs;
@@ -102,7 +104,7 @@ impl<V: Vfs> BTree<V> {
                 root_page_id,
             })
         } else {
-            Ok(LeafValue::Inline(value.to_vec()))
+            Ok(LeafValue::Inline(Bytes::copy_from_slice(value)))
         }
     }
 
@@ -378,7 +380,7 @@ impl<V: Vfs> BTree<V> {
     ///
     /// Per-leaf batching (amortising `CoW`) is a deferred performance
     /// optimisation; this implementation is correct for all inputs.
-    pub async fn put_batch(&mut self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+    pub async fn put_batch(&mut self, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
         for (k, v) in pairs {
             self.put(&k, &v).await?;
         }

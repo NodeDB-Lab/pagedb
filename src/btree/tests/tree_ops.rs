@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::RealmId;
 use crate::btree::BTree;
 use crate::crypto::CipherId;
@@ -124,13 +126,18 @@ async fn put_batch_inserts_all() {
     let pager = fresh_pager().await;
     let mut tree = fresh_tree(pager);
     let v = vec![0u8; 16];
-    let batch: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
-        .map(|i| (format!("k{i:04}").into_bytes(), v.clone()))
+    let batch: Vec<(Bytes, Bytes)> = (0..200u32)
+        .map(|i| {
+            (
+                Bytes::from(format!("k{i:04}").into_bytes()),
+                Bytes::from(v.clone()),
+            )
+        })
         .collect();
     tree.put_batch(batch.clone()).await.unwrap();
     for (k, expected) in &batch {
         let got = tree.get(k).await.unwrap();
-        assert_eq!(got.as_deref(), Some(expected.as_slice()));
+        assert_eq!(got.as_deref(), Some(expected.as_ref()));
     }
 }
 

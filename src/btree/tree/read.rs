@@ -48,9 +48,9 @@ impl<V: Vfs> BTree<V> {
     ) -> Result<Option<Bytes>> {
         match leaf.get(key) {
             None => Ok(None),
-            // Uncommitted, so it lives in the decoded leaf rather than in any
-            // page a slice could borrow from.
-            Some(LeafValue::Inline(v)) => Ok(Some(Bytes::copy_from_slice(v))),
+            // Uncommitted: held by the decoded leaf rather than by a page, but
+            // still shared rather than copied.
+            Some(LeafValue::Inline(v)) => Ok(Some(v.clone())),
             Some(LeafValue::Overflow {
                 total_len,
                 root_page_id,
@@ -136,9 +136,9 @@ impl<V: Vfs> BTree<V> {
         {
             return match leaf.get(key) {
                 None => Ok(None),
-                // Uncommitted, so it lives in the decoded leaf rather than in
-                // any page a slice could borrow from.
-                Some(LeafValue::Inline(v)) => Ok(Some(Bytes::copy_from_slice(v))),
+                // Uncommitted: held by the decoded leaf rather than by a page,
+                // but still shared rather than copied.
+                Some(LeafValue::Inline(v)) => Ok(Some(v.clone())),
                 Some(LeafValue::Overflow {
                     total_len,
                     root_page_id,
@@ -172,7 +172,8 @@ impl<V: Vfs> BTree<V> {
     /// needed.
     pub(super) async fn resolve_leaf_value(&self, v: &LeafValue) -> Result<Bytes> {
         match v {
-            LeafValue::Inline(b) => Ok(Bytes::copy_from_slice(b)),
+            // Refcount bump, not a copy.
+            LeafValue::Inline(b) => Ok(b.clone()),
             LeafValue::Overflow {
                 total_len,
                 root_page_id,

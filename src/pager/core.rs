@@ -99,12 +99,17 @@ pub struct PageGuard {
 
 impl PageGuard {
     /// Decrypted body bytes (slot directory + payload area of the page,
-    /// `page_size - 40` bytes), copied into an owned `Bytes`. Prefer
-    /// [`body_ref`](Self::body_ref) on the read path — `body()` is kept for
-    /// write/encode paths that need an owned buffer.
+    /// `page_size - 40` bytes) as an owned handle that outlives the guard.
+    ///
+    /// Shares the page's buffer rather than copying it, on the same terms as
+    /// [`body_slice`](Self::body_slice). Prefer [`body_ref`](Self::body_ref)
+    /// where a borrow will do.
     #[must_use]
     pub fn body(&self) -> Bytes {
-        Bytes::copy_from_slice(body(&self.page.bytes))
+        // Extent comes from the same helper `body_ref` uses, so the two cannot
+        // disagree about where the body ends.
+        let len = body(&self.page.bytes).len();
+        self.page.bytes.slice(HEADER_LEN..HEADER_LEN + len)
     }
 
     /// Zero-copy borrow of the decrypted body. Valid for the lifetime of the

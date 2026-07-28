@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::Result;
 use crate::errors::PagedbError;
 use crate::vfs::Vfs;
@@ -92,7 +94,10 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
     /// large for a leaf or a separator with `PayloadTooLarge`. Both checks run
     /// before this record allocates a page or touches the cache, so a rejected
     /// record leaves the tree exactly as it found it.
-    pub async fn push(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+    /// `value` is taken as [`Bytes`] so a repack, which reads each record out
+    /// of one page and stages it into another, moves it by refcount instead of
+    /// copying it at the boundary.
+    pub async fn push(&mut self, key: Vec<u8>, value: Bytes) -> Result<()> {
         if let Some(last) = &self.last_key {
             if key <= *last {
                 return Err(PagedbError::BulkLoadNotMonotonic);
@@ -287,7 +292,7 @@ impl<V: Vfs> BTree<V> {
     /// caller holding a whole input is the incremental-apply history carry,
     /// which is native-only.
     #[cfg(any(test, not(target_arch = "wasm32")))]
-    pub async fn bulk_load(&mut self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+    pub async fn bulk_load(&mut self, pairs: Vec<(Vec<u8>, Bytes)>) -> Result<()> {
         let mut loader = self.bulk_loader()?;
         for (key, value) in pairs {
             loader.push(key, value).await?;

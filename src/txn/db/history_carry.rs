@@ -24,6 +24,8 @@
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
+
 use crate::Result;
 use crate::btree::BTree;
 use crate::vfs::Vfs;
@@ -80,13 +82,13 @@ impl<V: Vfs + Clone> Db<V> {
             return Ok(unmoved);
         }
 
-        // The loader stages these into pages it owns, so the scan's borrowed
-        // view is copied out here.
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = base_tree
+        // The staged record owns its key, so that is copied; the value carries
+        // through by refcount.
+        let rows: Vec<(Vec<u8>, Bytes)> = base_tree
             .collect_all()
             .await?
             .into_iter()
-            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .map(|(key, value)| (key.to_vec(), value))
             .collect();
         let entry_count = u64::try_from(rows.len()).ok();
         let mut relocated = BTree::open(

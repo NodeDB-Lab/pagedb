@@ -77,9 +77,9 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
             if !keep(&key) {
                 continue;
             }
-            // The loader owns what it stages into pages it is building, so the
-            // scan's borrowed view has to be copied out here.
-            loader.push(key.to_vec(), value.to_vec()).await?;
+            // The value carries through by refcount; only the key, which the
+            // staged record owns, is copied.
+            loader.push(key.to_vec(), value).await?;
             // A compacted page is written once and never read back, so flushing
             // it out mid-batch costs nothing and keeps the pool from growing
             // with the tree instead of with the budget.

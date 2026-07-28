@@ -78,7 +78,7 @@ fn encoded_leaf(records: &[(Vec<u8>, Vec<u8>)], overflow_every: Option<u64>) -> 
                 total_len: value.len() as u64,
                 root_page_id,
             },
-            _ => LeafValue::Inline(value.clone()),
+            _ => LeafValue::Inline(value.clone().into()),
         };
         leaf.upsert(key, value);
     }
