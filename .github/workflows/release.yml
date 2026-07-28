@@ -163,12 +163,36 @@ jobs:
           set -euo pipefail
           bash scripts/ci/verify_release_artifacts.sh ./artifacts "$VERSION"
 
+      # The changelog is the release notes. Auto-generated notes list commit
+      # subjects, which describe what was done to the code; the changelog
+      # describes what changed for the person upgrading. `validate-version`
+      # has already proved this section exists and is non-empty.
+      - name: Build release notes from the changelog
+        env:
+          TAG: ${{ inputs.tag }}
+          BASE: ${{ needs.validate-version.outputs.base_version }}
+        run: |
+          set -euo pipefail
+          PREVIOUS_TAG=$(git tag --sort=-v:refname 'v*' | grep -v "^${TAG}$" | head -n 1 || true)
+
+          bash scripts/ci/changelog_section.sh "$BASE" /tmp/changelog-section.md
+
+          {
+            cat /tmp/changelog-section.md
+            echo
+            if [[ -n "$PREVIOUS_TAG" ]]; then
+              echo "**Full diff:** https://github.com/nodedb-lab/pagedb/compare/${PREVIOUS_TAG}...${TAG}"
+            else
+              echo "**Tree:** https://github.com/nodedb-lab/pagedb/tree/${TAG}"
+            fi
+          } > /tmp/release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ inputs.tag }}
           name: pagedb ${{ needs.validate-version.outputs.version }}
-          generate_release_notes: true
+          body_path: /tmp/release-notes.md
           draft: false
           prerelease: ${{ needs.validate-version.outputs.is_full_release != 'true' }}
           files: artifacts/*

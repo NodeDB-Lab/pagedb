@@ -18,6 +18,9 @@ on:
       is_full_release:
         description: "true when the version carries no prerelease suffix"
         value: ${{ jobs.validate.outputs.is_full_release }}
+      base_version:
+        description: "Tag version with any prerelease suffix stripped — the CHANGELOG heading"
+        value: ${{ jobs.validate.outputs.base_version }}
 
 permissions:
   contents: read
@@ -29,6 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       is_full_release: ${{ steps.version.outputs.is_full_release }}
+      base_version: ${{ steps.version.outputs.base_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,3 +77,15 @@ jobs:
           fi
 
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "base_version=$TAG_BASE" >> "$GITHUB_OUTPUT"
+
+      # A release with no changelog entry is a release nobody can read. The gate
+      # lives here, in the shared validator, so the tag push and the dispatched
+      # publish cannot disagree about whether it was satisfied — and so it fails
+      # at the tag, before the suite runs, rather than after publishing.
+      #
+      # A prerelease is checked against its base version: `v0.1.0-beta.1` needs
+      # the `## [0.1.0]` section it is a candidate for, so the notes are written
+      # once and rehearsed by every beta.
+      - name: Require a changelog section
+        run: bash scripts/ci/changelog_section.sh "${{ steps.version.outputs.base_version }}"

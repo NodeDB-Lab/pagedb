@@ -68,11 +68,11 @@ pagedb's answer: **one substrate, two surfaces.** Engines that want their own fo
 ## Highlights
 
 - **Encryption-first.** AES-256-GCM or ChaCha20-Poly1305 by default; plaintext+MAC opt-in. **Integrity is always on** — no mode writes bytes without authentication. Per-page `cipher_id` for cipher agility (PQ-ready).
-- **Async all the way down.** Tokio on native, `gloo-worker` on WASM/OPFS. No blocking calls in async paths.
+- **Async all the way down.** Tokio on native; a `wasm-bindgen` worker over OPFS sync access handles in the browser. No blocking calls in async paths.
 - **WASM / OPFS first-class.** Browsers run pagedb with the same code that runs on Linux. Real durable encrypted storage in a tab.
 - **Parallel ingest.** One B+ tree writer + **unlimited concurrent segment writers**. A timeseries firehose, a columnar build, an FTS append, and a metadata commit can all run in parallel.
 - **Format-portable.** A directory created on any target opens byte-identically on every other target. Identity-keyed segment paths keep UTF-8 names out of the filesystem layer.
-- **Bounded memory.** Hard cap + CLOCK-Pro eviction. No mmap surprises, no uncapped OS page cache.
+- **Bounded memory.** Explicit `OpenOptions` budgets + SIEVE eviction. No mmap surprises, no uncapped OS page cache.
 - **Realms.** Per-realm DEK + AAD-bound `RealmId` for cryptographic multi-tenancy within one DB.
 - **Online rekey, online compact, incremental snapshots.** Throttled, cancellable, resumable.
 - **No `unsafe`** outside the VFS and the opt-in `mmap_view` over decrypted scratch.
@@ -105,8 +105,9 @@ cargo run --bin pagedb-fsck -- <path> --deep \
   --realm 00000000000000000000000000000000 <64-hex-character-kek>
 ```
 
-The KEK may instead come from `PAGEDB_KEK` and defaults to all zeros. The realm
-defaults to all ones; nodedb-lite stores use the all-zero realm shown above.
+The KEK is required — pass it positionally or in `PAGEDB_KEK`; there is no
+default key. The realm defaults to all ones; nodedb-lite stores use the
+all-zero realm shown above.
 Add `--page-size` for a store created at anything other than 4096 bytes, and
 `--help` for the full grammar. Inspection disables commit-history retention and
 does not rewrite authoritative `main.db` or segment bytes.
@@ -120,6 +121,74 @@ gets its own exit code so a caller can tell them apart:
 |    1 | An integrity problem was found                                    |
 |    2 | The command line was invalid; the store was never opened          |
 |    3 | The store could not be opened, or the report could not be written |
+
+## Security model
+
+pagedb is an encryption-first store, and the precise shape of that guarantee
+matters more than the adjective. What follows is what it does and does not
+defend against, stated plainly so nobody has to infer it.
+
+### What it protects
+
+- **Confidentiality of data at rest.** Every persistent page body is encrypted
+  under AES-256-GCM or ChaCha20-Poly1305 (or left cleartext, explicitly, in
+  `PlaintextMac` mode). Key material lives only in memory and is zeroized on
+  drop; `main.db` and segment files never contain the KEK.
+- **Integrity of every persistent byte.** No mode omits authentication. Page
+  bodies carry an AEAD tag; structural headers and segment footers carry an
+  HK-MAC. A flipped bit anywhere is a failed read, not a wrong answer.
+- **Binding, not just secrecy.** Each page's tag covers its `cipher_id`, page
+  kind, master-key epoch, page id, `RealmId`, and segment id. A page cannot be
+  moved to another offset, another realm, another segment, or reinterpreted as
+  another kind without failing verification.
+- **Key separation.** One key per `(realm, file, master-key epoch, cipher)`,
+  derived by HKDF-SHA-256 from the embedder's KEK. Because the nonce is
+  `file_identity[0..6] ‖ counter48`, scoping the key by the _full_ file identity
+  is what makes nonce reuse impossible by construction rather than merely
+  improbable — two files can never share a nonce space.
+- **Torn writes.** A crash mid-write cannot corrupt committed state: the B+
+  tree uses copy-on-write shadow paging behind alternating A/B headers, and a
+  segment is committed by its seal record or not at all.
+
+### What it does not protect against
+
+- **Rollback and replay.** A page's tag binds _where_ the page belongs, not
+  _when_ it was written. An attacker who can write to the store files can
+  substitute an older, genuine ciphertext for the same page — or restore an
+  entire older copy of the directory — and it will authenticate. pagedb detects
+  tampering, not reversion. If your threat model includes an adversary with
+  write access to your storage, you need freshness enforced above pagedb (a
+  signed external commit-id watermark, a trusted counter, or an append-only
+  medium).
+- **A compromised host process.** Keys, plaintext pages, and the buffer pool
+  are in your process's memory. Anything that can read that memory (a debugger,
+  a core dump, swap, another thread in your address space) has your data.
+  pagedb zeroizes what it owns on drop; it cannot defend a live process.
+- **Confidentiality in `PlaintextMac` mode.** That mode is integrity-only by
+  definition. It is opt-in and recorded in the header so an auditor can tell.
+- **Metadata and traffic analysis.** File sizes, page counts, segment counts,
+  access patterns, and commit frequency are all observable. Keys and values are
+  encrypted; the shape of your workload is not.
+- **Denial of service.** A caller who can hand pagedb a corrupt store can make
+  it refuse to open. That is the intended failure — fail closed, never serve
+  unauthenticated bytes.
+- **KEK management.** Deriving, storing, rotating, and destroying the KEK is
+  the embedder's job. pagedb takes 32 bytes and never persists them.
+
+### Operational notes
+
+- **A refused open is not a damaged store.** A wrong KEK reports
+  `PagedbError::KeyMismatch`, a wrong page size reports `PageSizeMismatch`, and
+  a wrong realm reports `RealmMismatch` — all of them before anything is read or
+  written, and none of them is evidence of corruption. Retry with the right
+  parameter; do not discard the directory.
+- **`main.db` is not reconstructible from `seg/`.** Segment files are
+  identity-keyed and the mapping from embedder name to segment id lives only in
+  the catalog inside `main.db`. Losing `main.db` while `seg/` survives is
+  unrecoverable: the next open bootstraps a fresh store, and the following open
+  tombstones the now-unreferenced segments. Back up the directory as a unit.
+- **Reporting a vulnerability.** See [SECURITY.md](SECURITY.md). Please do not
+  open a public issue for a security problem.
 
 ## Benchmarks
 
@@ -166,14 +235,14 @@ plaintext and a warm hit re-authenticates nothing.
 
 ### vs. redb / RocksDB / SQLite (full comparison suite, 100 000 rows)
 
-| Workload                       |     pagedb |       redb |    RocksDB |     SQLite |
-| ------------------------------ | ---------: | ---------: | ---------: | ---------: |
-| Random point read              |     931 ns |     902 ns | **851 ns** |     9.9 µs |
-| Range scan (10 entries)        |     3.6 µs | **1.7 µs** |     2.2 µs |    28.4 µs |
-| Individual write (fsync-bound) |   184.5 µs |    28.2 µs | **4.9 µs** |    51.3 µs |
-| Batch write (1 000 keys/txn)   |    9.61 ms |    3.70 ms | **1.95 ms** |    4.94 ms |
-| Bulk load (100 000 rows/txn)   |     203 ms | **128 ms** |     289 ms |     176 ms |
-| Sorted bulk load               | **109 ms** |     116 ms |     158 ms |     100 ms |
+| Workload                       |     pagedb |       redb |     RocksDB |  SQLite |
+| ------------------------------ | ---------: | ---------: | ----------: | ------: |
+| Random point read              |     931 ns |     902 ns |  **851 ns** |  9.9 µs |
+| Range scan (10 entries)        |     3.6 µs | **1.7 µs** |      2.2 µs | 28.4 µs |
+| Individual write (fsync-bound) |   184.5 µs |    28.2 µs |  **4.9 µs** | 51.3 µs |
+| Batch write (1 000 keys/txn)   |    9.61 ms |    3.70 ms | **1.95 ms** | 4.94 ms |
+| Bulk load (100 000 rows/txn)   |     203 ms | **128 ms** |      289 ms |  176 ms |
+| Sorted bulk load               | **109 ms** |     116 ms |      158 ms |  100 ms |
 
 **Reads and bulk load are competitive; single-key writes trail.** Point reads
 are level with redb and RocksDB on a 100 000-row set; range scans are ~2×
@@ -191,11 +260,11 @@ that differ between them.
 
 ### Segment writer (append + seal)
 
-| Path                            |       time | Notes                               |
-| ------------------------------- | ---------: | ----------------------------------- |
-| Raw AES-GCM only (memory)       |   300.7 µs | baseline: encryption cost alone     |
+| Path                            |         time | Notes                               |
+| ------------------------------- | -----------: | ----------------------------------- |
+| Raw AES-GCM only (memory)       |     300.7 µs | baseline: encryption cost alone     |
 | **pagedb `append_seal`**        | **560.1 µs** | full path: write, seal, fsync, link |
-| Raw `tokio::fs` write + AES-GCM |    1.40 ms | what you'd write yourself, badly    |
+| Raw `tokio::fs` write + AES-GCM |      1.40 ms | what you'd write yourself, badly    |
 
 pagedb's segment writer adds **~1.86× over raw AEAD** but is **2.5× faster than a hand-rolled `fs::write` + AES-GCM** baseline — because pagedb batches, vectorizes, and uses the platform's best async primitive.
 
@@ -256,7 +325,7 @@ Out of scope. The async runtime, AEAD context, and buffer pool put the floor at 
 
 ### "What's a 'realm'?"
 
-An opaque cryptographic isolation scope inside one DB. Each realm has its own DEK (AEAD modes) and is bound into the AAD of every page it owns, so a misrouted read fails tag verification at runtime. What a realm _means_ — tenant, user, device, database — is the embedder's call. pagedb doesn't care.
+An opaque cryptographic isolation scope inside one DB. Each realm has its own key (AEAD modes) and is bound into the AAD of every page it owns, so a misrouted read fails tag verification at runtime. The store also records its realm in the header, so opening under the wrong one is refused up front with `RealmMismatch` rather than surfacing later as an unreadable page. What a realm _means_ — tenant, user, device, database — is the embedder's call. pagedb doesn't care.
 
 ### "Why a directory instead of a single file?"
 
@@ -264,7 +333,7 @@ Because each engine owns its own segment files. A single file would force every 
 
 ### "How does encryption opt-out work?"
 
-`CipherPreference::PlaintextIntegrityOnly` at open time. The mode is recorded in the file header so any auditor can verify which mode a deployed file uses. **Integrity stays on** — corruption detection is non-negotiable. Use this for app config, game saves, public-data caches, dev tooling — anywhere you don't have a confidentiality threat model but still want corruption detection cheap.
+`OpenOptions::with_cipher(CipherId::PlaintextMac)` at open time. The mode is recorded in the file header so any auditor can verify which mode a deployed file uses. **Integrity stays on** — corruption detection is non-negotiable. Use this for app config, game saves, public-data caches, dev tooling — anywhere you don't have a confidentiality threat model but still want corruption detection cheap.
 
 ### "Can I migrate from redb?"
 
@@ -282,7 +351,19 @@ The API surface is intentionally redb-shaped. The lift is mostly sync→async �
 
 ## Status
 
-Pre-1.0. The format is stabilizing toward a freeze; expect format-version bumps until that lands. The on-disk format is versioned and cipher-agile by design, so future migration paths exist — but until 1.0, treat data as throwaway.
+Pre-1.0: the **API** may break in a minor bump. Your **data** is a separate promise, and it is in force from 0.1.0:
+
+- The on-disk format never changes within a minor line — every `0.1.x` reads what `0.1.0` wrote.
+- A format change lands only in a minor bump, and ships with a migration tool.
+- A store this build cannot read is refused by name at open, never reinterpreted.
+
+Reaching 1.0 is gated on evidence — the format holding still across two consecutive minors, a production consumer, a second independent security review, a fuzzing bar, and a clean field record — reviewed quarterly. See [VERSIONING.md](VERSIONING.md) for the full policy and what "locked" will mean.
+
+pagedb is still new. The design avoids known footguns and the failure paths are tested by interrupting the real code at its real seams, but there is no substitute for field hours. Use it where you can absorb that, and back the directory up.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the layering, the invariants a change has to hold, and the local gate. Security reports go through [SECURITY.md](SECURITY.md), never a public issue.
 
 ## License
 

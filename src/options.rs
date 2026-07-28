@@ -1,9 +1,13 @@
 //! `OpenOptions` — explicit memory budgets for a `Db` instance.
 //!
-//! Every budget is advisory at this stage: `scratch_bytes` is the only
-//! hard-enforced limit (spill arena cap). The buffer-pool and segment-cache
-//! page counts are plumbed into `PagerConfig` but not yet enforced above the
-//! Pager; `mmap_view_scratch_bytes` is wired up when the W slice lands.
+//! Three budgets are hard limits that refuse the operation crossing them:
+//! `scratch_bytes` (per-transaction spill arena), `mmap_view_scratch_bytes`
+//! (decrypted `mmap_view` scratch), and `reader_stall_threshold_pages`
+//! (deferred-free backlog). `buffer_pool_pages` and `segment_cache_pages` cap
+//! their caches by eviction rather than by refusal: a clean, unpinned page is
+//! evicted to stay within the count. Dirty pages are exempt from eviction
+//! until they are flushed, so a single very large write transaction can hold
+//! more than `buffer_pool_pages` resident between flushes.
 
 use std::time::Duration;
 
@@ -58,7 +62,7 @@ impl Default for RetainPolicy {
 /// | `scratch_bytes` | 64 MiB |
 /// | `buffer_pool_pages` | 1024 |
 /// | `segment_cache_pages` | 64 |
-/// | `mmap_view_scratch_bytes` | 0 (disabled) |
+/// | `mmap_view_scratch_bytes` | 0 (`mmap_view` refused) |
 /// | `commit_history_retain` | `Count(1024)` |
 /// | `reader_stall_threshold_pages` | 100_000 |
 /// | `observer_retry_count` | 3 |
@@ -78,7 +82,9 @@ pub struct OpenOptions {
     pub segment_cache_pages: usize,
 
     /// Maximum bytes of already-decrypted scratch that `mmap_view` may map at
-    /// once. Set to 0 (disabled) until the W slice lands.
+    /// once, across every live view on this handle. Defaults to 0, which
+    /// refuses every `mmap_view` call: mapping decrypted bytes is opt-in, so
+    /// an embedder that wants it states a budget for it.
     pub mmap_view_scratch_bytes: usize,
 
     /// How many historical commit entries the commit-history index retains.
