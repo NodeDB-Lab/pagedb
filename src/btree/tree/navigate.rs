@@ -114,19 +114,11 @@ impl<V: Vfs> BTree<V> {
             let mut child_new_chain = new_internal_page;
             for i in (0..levels_remaining - 1).rev() {
                 let p = path[i];
-                let mut node = self.read_internal(p).await?;
-                if node.leftmost_child == child_old_chain {
-                    node.leftmost_child = child_new_chain;
-                } else {
-                    for e in &mut node.entries {
-                        if e.right_child == child_old_chain {
-                            e.right_child = child_new_chain;
-                            break;
-                        }
-                    }
-                }
                 let new_p = self.allocate_page();
-                self.write_internal(new_p, &node).await?;
+                // Only the child link changes at this level; every separator is
+                // copied through untouched.
+                self.cow_internal_repointing_child(p, new_p, child_old_chain, child_new_chain)
+                    .await?;
                 self.free_page(p);
                 self.remap_dirty_parent_paths(p, new_p);
                 child_old_chain = p;

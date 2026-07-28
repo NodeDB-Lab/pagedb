@@ -215,9 +215,34 @@ impl<'a> InternalAccessor<'a> {
     }
 
     fn entry_right_child(&self, idx: usize) -> u64 {
+        read_u64_le(self.body, self.right_child_offset(idx))
+    }
+
+    /// Body offset of slot `idx`'s `right_child` field.
+    ///
+    /// Lets a caller that only needs to repoint one child patch those eight
+    /// bytes in a copy of the page, instead of decoding every separator into an
+    /// owned key just to re-encode them unchanged.
+    #[must_use]
+    pub fn right_child_offset(&self, idx: usize) -> usize {
         let off = slot_offset(self.body, 0, idx);
         let key_len = read_u16_le(self.body, off) as usize;
-        read_u64_le(self.body, off + 2 + key_len)
+        off + 2 + key_len
+    }
+
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+
+    #[must_use]
+    pub fn leftmost_child(&self) -> u64 {
+        self.leftmost_child
+    }
+
+    #[must_use]
+    pub fn right_child_at(&self, idx: usize) -> u64 {
+        self.entry_right_child(idx)
     }
 
     /// Descend selection: returns the child `page_id` covering `query`. Reads

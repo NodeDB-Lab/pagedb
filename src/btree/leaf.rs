@@ -234,7 +234,7 @@ impl Leaf {
     #[must_use]
     pub fn slice_fits(records: &[(Vec<u8>, LeafValue)], page_size: usize) -> bool {
         let cap = body_capacity(page_size);
-        let prefix_len = lcp(records).len();
+        let prefix_len = lcp_len(records);
         let record_bytes: usize = records
             .iter()
             .map(|(k, v)| {
@@ -392,19 +392,29 @@ impl<'a> LeafAccessor<'a> {
 /// `records.len() == 0`.
 #[must_use]
 pub fn lcp(records: &[(Vec<u8>, LeafValue)]) -> Vec<u8> {
+    match records.first() {
+        None => Vec::new(),
+        Some((first, _)) => first[..lcp_len(records)].to_vec(),
+    }
+}
+
+/// Length of [`lcp`] without materialising it.
+///
+/// The fit check runs on every `put` and only ever needed the length, so
+/// building and then dropping the prefix bytes was an allocation per insert.
+pub fn lcp_len(records: &[(Vec<u8>, LeafValue)]) -> usize {
     match records.len() {
-        0 => Vec::new(),
-        1 => records[0].0.clone(),
+        0 => 0,
+        1 => records[0].0.len(),
         _ => {
             let first = &records[0].0;
             let last = &records[records.len() - 1].0;
             // Since records are sorted, first and last bracket the range.
-            let common_len = first
+            first
                 .iter()
                 .zip(last.iter())
                 .take_while(|(a, b)| a == b)
-                .count();
-            first[..common_len].to_vec()
+                .count()
         }
     }
 }

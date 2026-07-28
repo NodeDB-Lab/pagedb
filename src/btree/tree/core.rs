@@ -1,7 +1,9 @@
 //! `BTree` — the `CoW` shadow-paging B+ tree.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use crate::errors::PagedbError;
 use crate::pager::format::page_kind::PageKind;
@@ -11,7 +13,7 @@ use crate::{RealmId, Result};
 
 use crate::btree::internal::{self, Internal};
 use crate::btree::leaf::Leaf;
-use crate::btree::node::{NodeKind, body_capacity, read_header};
+use crate::btree::node::{NodeKind, OFF_DUAL_USE, body_capacity, read_header, write_u64_le};
 use crate::btree::overflow;
 
 /// Encoded size a value of `value_len` bytes will occupy in a leaf record,
@@ -122,7 +124,10 @@ pub struct BTree<V: Vfs> {
     /// by the tree spine. All mutations happen in place; encode + spine
     /// redirect happens in batch at [`flush`](Self::flush). Splits are
     /// flushed eagerly (they alter the tree shape and must propagate up).
-    pub(super) dirty_leaves: HashMap<u64, Leaf>,
+    /// Keyed by `page_id`, so the DoS-resistant `SipHash` default costs a
+    /// measurable slice of every put and buys nothing. `FxHashMap` throughout
+    /// the write session's page-id maps.
+    pub(super) dirty_leaves: FxHashMap<u64, Leaf>,
     /// Old leaf `page_ids` that have been pulled into [`Self::dirty_leaves`] but
     /// not yet replaced by a fresh `CoW` page. These pages will be freed at
     /// flush time; [`Self::drain_freed`] reports them now so the deferred-free
@@ -132,7 +137,7 @@ pub struct BTree<V: Vfs> {
     /// For each dirty leaf, the path of internal `page_ids` from the root down
     /// to (but not including) the leaf. Captured at first-touch so flush can
     /// walk only the affected spine instead of scanning the whole tree.
-    pub(super) dirty_parent_paths: HashMap<u64, Vec<u64>>,
+    pub(super) dirty_parent_paths: FxHashMap<u64, Vec<u64>>,
     /// Leaves produced by splits during this write session. Keyed by the
     /// **fresh** `page_id` they will occupy on disk. Unlike `dirty_leaves`,
     /// no `CoW` is needed at flush time — they're already pinned to fresh
@@ -140,7 +145,7 @@ pub struct BTree<V: Vfs> {
     /// the encode work batches with the rest and lands in the pager's
     /// parallel-AEAD flush. In-place mutation by subsequent puts targeting
     /// the same leaf is allowed; no further allocation needed.
-    pub(super) fresh_leaves: HashMap<u64, Leaf>,
+    pub(super) fresh_leaves: FxHashMap<u64, Leaf>,
     /// Cross-commit pool of reusable page IDs, shared (via `Arc`) across the
     /// main, catalog, and history `BTree`s of one `Db`. Allocation pops from
     /// here before bumping `next_page_id`, recycling pages freed by earlier
@@ -184,10 +189,10 @@ impl<V: Vfs> BTree<V> {
             freed: Vec::new(),
             page_size,
             reuse_threshold: 0,
-            dirty_leaves: HashMap::new(),
+            dirty_leaves: FxHashMap::default(),
             scheduled_frees: Vec::new(),
-            dirty_parent_paths: HashMap::new(),
-            fresh_leaves: HashMap::new(),
+            dirty_parent_paths: FxHashMap::default(),
+            fresh_leaves: FxHashMap::default(),
             free_page_cache: None,
             free_page_consumed: None,
             append_last_key: None,
@@ -397,6 +402,49 @@ impl<V: Vfs> BTree<V> {
             .await?;
         let body = guard.body();
         Internal::decode(&body)
+    }
+
+    /// Copy the internal page at `old_page_id` to `new_page_id`, repointing the
+    /// single child link that referenced `child_old` at `child_new`.
+    ///
+    /// Propagating a split rewrites one child pointer per ancestor and leaves
+    /// every separator untouched. Going through `read_internal` to do that
+    /// decodes the whole node — an owned `Vec<u8>` per separator key — and then
+    /// re-encodes those same keys unchanged, which on a full node is well over a
+    /// hundred allocations to move eight bytes. Copy the body and patch the
+    /// field instead.
+    ///
+    /// Silently copies unchanged if no link matches, matching what the
+    /// decode-and-mutate path did: a spine that does not reference the child it
+    /// is being told about is a structural problem for the caller to detect, not
+    /// something to start failing here.
+    pub(super) async fn cow_internal_repointing_child(
+        &self,
+        old_page_id: u64,
+        new_page_id: u64,
+        child_old: u64,
+        child_new: u64,
+    ) -> Result<()> {
+        let guard = self
+            .pager
+            .read_main_page(old_page_id, self.realm_id, PageKind::BTreeInternal)
+            .await?;
+        let mut body = guard.body_ref().to_vec();
+        {
+            let accessor = internal::InternalAccessor::from_guard(&guard)?;
+            if accessor.leftmost_child() == child_old {
+                write_u64_le(&mut body, OFF_DUAL_USE, child_new);
+            } else if let Some(idx) =
+                (0..accessor.slot_count()).find(|&i| accessor.right_child_at(i) == child_old)
+            {
+                let offset = accessor.right_child_offset(idx);
+                write_u64_le(&mut body, offset, child_new);
+            }
+        }
+        drop(guard);
+        self.pager
+            .write_main_page(new_page_id, self.realm_id, PageKind::BTreeInternal, &body)
+            .await
     }
 
     pub(super) async fn write_leaf(&self, page_id: u64, leaf: &Leaf) -> Result<()> {
