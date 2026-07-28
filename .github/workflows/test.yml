@@ -102,6 +102,9 @@ jobs:
             exit 1
           fi
 
+      - name: Release artifact verification
+        run: bash scripts/test-release-artifacts.sh
+
   # ─────────────────────────────────────────────────────────────────────────
   test:
     name: Test (${{ matrix.os }})
