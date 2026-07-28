@@ -239,7 +239,7 @@ impl<V: Vfs + Clone> Db<V> {
         let hk = derive_hk(&mk)?;
 
         let initial = MainDbHeaderFields {
-            format_version: 1,
+            format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
             cipher_id: cipher_id.as_byte(),
             page_size_log2: page_size_log2(page_size)?,
             flags: 0,
@@ -261,6 +261,7 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id: 4,
             commit_retain_policy_tag: 0,
             commit_retain_policy_value: 0,
+            realm_id: realm,
         };
         bootstrap_header(&vfs, &main_db_path, &hk, &initial, page_size).await?;
 

@@ -286,8 +286,8 @@ async fn rekey_aad_misroute_across_epoch() {
     let mk1 = derive_mk(&KEK0, &kek_salt, 1).unwrap();
 
     let realm = REALM;
-    let dek0 = derive_dek(&mk0, realm).unwrap();
-    let dek1 = derive_dek(&mk1, realm).unwrap();
+    let dek0 = derive_dek(&mk0, realm, &file_id).unwrap();
+    let dek1 = derive_dek(&mk1, realm, &file_id).unwrap();
     let cipher0 = Cipher::new_aes_gcm(&dek0);
     let cipher1 = Cipher::new_aes_gcm(&dek1);
 

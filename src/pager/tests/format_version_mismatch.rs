@@ -6,9 +6,10 @@
 //! and confirms that the decoder returns `PagedbError::Unsupported`.
 
 use crate::CommitId;
+use crate::RealmId;
 use crate::errors::PagedbError;
 use crate::pager::format::structural_header::{
-    MainDbHeaderFields, decode_main_db_header, encode_main_db_header,
+    MAIN_FORMAT_VERSION, MainDbHeaderFields, decode_main_db_header, encode_main_db_header,
 };
 
 use crate::crypto::kdf::{derive_hk, derive_mk};
@@ -23,7 +24,7 @@ fn hk() -> DerivedKey {
 
 fn sample_header() -> MainDbHeaderFields {
     MainDbHeaderFields {
-        format_version: 1,
+        format_version: MAIN_FORMAT_VERSION,
         cipher_id: 1,
         page_size_log2: 12,
         flags: 0,
@@ -45,6 +46,7 @@ fn sample_header() -> MainDbHeaderFields {
         next_page_id: 4,
         commit_retain_policy_tag: 0,
         commit_retain_policy_value: 1024,
+        realm_id: RealmId::new([0x9E; 16]),
     }
 }
 
@@ -53,33 +55,35 @@ fn unsupported_format_version_rejected_in_main_db_header() {
     let hk = hk();
     let fields = sample_header();
 
-    // Encode a valid v1 header.
-    let mut buf = encode_main_db_header(&fields, &hk, PAGE).unwrap();
-
-    // Patch bytes 8..10 (format_version field, LE u16) to version 99.
-    let v: u16 = 99;
-    buf[8..10].copy_from_slice(&v.to_le_bytes());
-
-    // Re-encode the MAC over the patched buffer so the MAC check passes
-    // but the version check triggers. We need to recompute the MAC.
-    // Since we patch the fields before MAC computation, re-encode with the
-    // patched version using a modified MainDbHeaderFields.
+    // Re-encode with the patched version rather than patching the buffer, so
+    // the MAC still covers what it claims and the version check is what fires.
     let mut fields_v99 = fields.clone();
     fields_v99.format_version = 99;
     let buf_v99 = encode_main_db_header(&fields_v99, &hk, PAGE).unwrap();
 
+    // Named as a version this build does not read, with both numbers, so the
+    // operator knows a migration is the answer rather than a discard.
     let result = decode_main_db_header(&buf_v99, &hk, PAGE);
     assert!(
-        matches!(result, Err(PagedbError::Unsupported)),
-        "expected Unsupported for format_version=99, got: {result:?}"
+        matches!(
+            result,
+            Err(PagedbError::FormatVersionUnsupported {
+                stored: 99,
+                supported: MAIN_FORMAT_VERSION,
+            })
+        ),
+        "expected a version verdict for format_version=99, got: {result:?}"
     );
 }
 
 #[test]
-fn valid_format_version_1_accepted() {
+fn current_format_version_accepted() {
     let hk = hk();
     let fields = sample_header();
     let buf = encode_main_db_header(&fields, &hk, PAGE).unwrap();
     let decoded = decode_main_db_header(&buf, &hk, PAGE);
-    assert!(decoded.is_ok(), "format_version=1 must be accepted");
+    assert!(
+        decoded.is_ok(),
+        "the current format_version must be accepted"
+    );
 }

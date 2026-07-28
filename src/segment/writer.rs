@@ -70,7 +70,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let mut file = pager.vfs().open(&path, OpenMode::CreateNew).await?;
 
         let header_fields = SegmentHeaderFields {
-            format_version: 1,
+            format_version: crate::pager::format::structural_header::SEGMENT_FORMAT_VERSION,
             cipher_id,
             segment_kind: segment_kind as u8,
             segment_id,
@@ -160,6 +160,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             let mut lru = self.pager.dek_lru().lock();
             let cipher = lru.get_or_derive(
                 self.realm_id,
+                self.segment_id,
                 self.mk_epoch,
                 crate::crypto::CipherId::from_byte(self.cipher_id)?,
                 &pager_mk_append,
@@ -285,6 +286,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
                     let mut lru = self.pager.dek_lru().lock();
                     let cipher = lru.get_or_derive(
                         self.realm_id,
+                        self.segment_id,
                         self.mk_epoch,
                         crate::crypto::CipherId::from_byte(self.cipher_id)?,
                         &pager_mk_idx,
@@ -329,6 +331,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             let mut lru = self.pager.dek_lru().lock();
             let cipher = lru.get_or_derive(
                 self.realm_id,
+                self.segment_id,
                 self.mk_epoch,
                 crate::crypto::CipherId::from_byte(self.cipher_id)?,
                 &pager_mk_footer,

@@ -51,8 +51,11 @@ async fn check(args: CliArgs) -> ExitCode {
         kek_hex,
     } = args;
 
-    // An explicit positional key wins over the environment, which wins over
-    // the all-zero default.
+    // An explicit positional key wins over the environment. There is no
+    // default: a tool that silently assumes a key encourages treating that key
+    // as a real one, and an all-zero fallback turns "you did not supply the
+    // key" into "this store will not open", which is the one distinction this
+    // tool exists to preserve.
     let kek_hex = kek_hex.or_else(|| std::env::var("PAGEDB_KEK").ok());
     let kek = match kek_hex.as_deref().map(pagedb::hex::parse_hex::<32>) {
         Some(Some(kek)) => kek,
@@ -60,7 +63,14 @@ async fn check(args: CliArgs) -> ExitCode {
             eprintln!("pagedb-fsck: invalid hex KEK (must be 64 hex chars / 32 bytes)");
             return ExitCode::from(EXIT_USAGE);
         }
-        None => [0u8; 32],
+        None => {
+            eprintln!(
+                "pagedb-fsck: a KEK is required; pass it as the trailing positional \
+                 argument or in PAGEDB_KEK"
+            );
+            eprintln!("{}", cli::USAGE);
+            return ExitCode::from(EXIT_USAGE);
+        }
     };
 
     let realm = match realm_hex.as_deref().map(pagedb::hex::parse_hex::<16>) {

@@ -298,7 +298,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             encode_retain_policy(&self.db.options.commit_history_retain);
 
         let fields = MainDbHeaderFields {
-            format_version: 1,
+            format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
             cipher_id: self.db.cipher_id.as_byte(),
             page_size_log2: page_size_log2(self.db.page_size)?,
             flags: 0,
@@ -320,6 +320,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             next_page_id: new_next,
             commit_retain_policy_tag: policy_tag,
             commit_retain_policy_value: policy_value,
+            realm_id: self.db.realm_id,
         };
 
         let hk_clone = { self.db.hk.read().clone() };

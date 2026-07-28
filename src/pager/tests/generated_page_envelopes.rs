@@ -31,6 +31,8 @@ use proptest::prelude::*;
 const PAGE: usize = 4096;
 const PAGE_SIZE_LOG2: u8 = 12;
 const REALM: RealmId = RealmId::new([0x5A; 16]);
+/// The `file_id` `main_db_fields` records; data pages are keyed to it.
+const MAIN_FILE_ID: [u8; 16] = [0x11; 16];
 
 fn cases() -> u32 {
     std::env::var("PAGEDB_PROPTEST_CASES")
@@ -63,7 +65,7 @@ fn master_key() -> crate::crypto::MasterKey {
 }
 
 fn data_page_cipher() -> Cipher {
-    Cipher::new_aes_gcm(&derive_dek(&master_key(), REALM).unwrap())
+    Cipher::new_aes_gcm(&derive_dek(&master_key(), REALM, &MAIN_FILE_ID).unwrap())
 }
 
 fn data_page_aad(page_kind: PageKind, page_id: u64) -> Aad {
@@ -91,11 +93,11 @@ fn sealed_data_page(page_kind: PageKind, page_id: u64, plaintext: &[u8]) -> Vec<
 
 fn main_db_fields() -> MainDbHeaderFields {
     MainDbHeaderFields {
-        format_version: 1,
+        format_version: crate::pager::format::structural_header::MAIN_FORMAT_VERSION,
         cipher_id: CipherId::Aes256Gcm.as_byte(),
         page_size_log2: PAGE_SIZE_LOG2,
         flags: 0,
-        file_id: [0x11; 16],
+        file_id: MAIN_FILE_ID,
         kek_salt: [0x22; 16],
         mk_epoch: 0,
         seq: 3,
@@ -113,12 +115,13 @@ fn main_db_fields() -> MainDbHeaderFields {
         next_page_id: 64,
         commit_retain_policy_tag: 0,
         commit_retain_policy_value: 8,
+        realm_id: REALM,
     }
 }
 
 fn segment_header_fields() -> SegmentHeaderFields {
     SegmentHeaderFields {
-        format_version: 1,
+        format_version: crate::pager::format::structural_header::MAIN_FORMAT_VERSION,
         cipher_id: CipherId::Aes256Gcm.as_byte(),
         segment_kind: 0,
         segment_id: [0x77; 16],

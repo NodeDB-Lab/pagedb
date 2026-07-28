@@ -124,6 +124,69 @@ pub enum PagedbError {
     #[error("restored directory not promoted")]
     RestoredNotPromoted,
 
+    /// The store is a pagedb store, but no supplied KEK authenticated either
+    /// A/B header slot.
+    ///
+    /// **The store was not modified, and this is not evidence that it is
+    /// damaged.** Overwhelmingly the cause is the wrong key: a rotated KEK, a
+    /// key from a different store, or a key the caller assembled incorrectly.
+    /// A MAC cannot tell "wrong key" from "tampered bytes" apart by design, so
+    /// this variant reports what *is* known — both slots carried an intact
+    /// pagedb magic and a well-formed frame, and the MAC did not verify under
+    /// the key given.
+    ///
+    /// The distinction matters because the alternative reading is destructive:
+    /// told their database is corrupt, an operator may delete or re-create it,
+    /// which loses data that a correct key would have opened. Retry with the
+    /// right KEK (and, for an interrupted KEK-changing rekey, with
+    /// `Db::open_existing_with_counterpart_kek`) before treating the store as
+    /// damaged. Bytes that are not a pagedb header at all report
+    /// [`CorruptionDetail::HeaderUnverifiable`] instead.
+    #[error(
+        "no supplied key authenticated the main.db header; this is almost always the wrong KEK \
+         rather than damage — the store was not modified and must not be discarded"
+    )]
+    KeyMismatch,
+
+    /// The store's on-disk format version is not the one this build reads.
+    ///
+    /// pagedb reads exactly one format version. Supporting several would mean
+    /// keeping every retired layout — and every retired key schedule — live in
+    /// the library, which is both more code on the path that touches key
+    /// material and more ways to misread a store. Refusing by version instead
+    /// keeps that conversion in a separate, verifiable migration step.
+    ///
+    /// The version is cleartext in the header, so this is decided before any
+    /// key is derived. **The store was not modified.** A store from an older
+    /// release needs migrating, not discarding; a store from a *newer* release
+    /// needs a newer build.
+    #[error(
+        "store is at on-disk format version {stored}; this build reads version {supported} — \
+         the store was not modified, see the release notes for the migration path"
+    )]
+    FormatVersionUnsupported { stored: u16, supported: u16 },
+
+    /// The caller opened the store with a different page size than it was
+    /// created with.
+    ///
+    /// `page_size_log2` is cleartext in the header, so this is detected before
+    /// any key is derived and before a single page is read. Reopen with
+    /// `stored`.
+    #[error("store was created with page size {stored}, opened with {supplied}")]
+    PageSizeMismatch { stored: usize, supplied: usize },
+
+    /// The caller opened the store with a different [`RealmId`] than it was
+    /// created with.
+    ///
+    /// A realm is bound into the AAD of every page, so a mismatched realm
+    /// yields pages that will not authenticate. The realm is recorded in the
+    /// header and checked at open, which turns what would otherwise be a tag
+    /// failure on the first read — indistinguishable from corruption — into a
+    /// named mismatch before anything is read or written. Reopen with
+    /// `stored`.
+    #[error("store belongs to realm {stored:?}, opened with {supplied:?}")]
+    RealmMismatch { stored: RealmId, supplied: RealmId },
+
     /// `operation` is not authorized for a handle in `actual` mode; it
     /// requires a handle in `required` mode. The single answer to "this
     /// handle cannot do that right now", raised by every mode gate

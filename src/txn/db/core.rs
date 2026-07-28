@@ -521,6 +521,7 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id: params.next_page_id,
             commit_retain_policy_tag: 0,
             commit_retain_policy_value: 0,
+            realm_id: self.realm_id,
         })
     }
 }

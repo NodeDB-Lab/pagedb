@@ -2,7 +2,7 @@ use crate::RealmId;
 use crate::crypto::Cipher;
 use crate::crypto::kdf::{derive_dek, derive_hk, derive_mk};
 use crate::crypto::nonce::Nonce;
-use crate::errors::{CorruptionDetail, PagedbError};
+use crate::errors::PagedbError;
 
 use super::{
     FOOTER_CLEARTEXT_END, FOOTER_FIELDS_END, FORMAT_VERSION, SegmentFooterFields,
@@ -14,7 +14,7 @@ const PAGE_SIZE: usize = 4096;
 fn keys() -> (crate::crypto::keys::DerivedKey, Cipher) {
     let master = derive_mk(&[7; 32], &[0; 16], 0).unwrap();
     let header = derive_hk(&master).unwrap();
-    let data = derive_dek(&master, RealmId([3; 16])).unwrap();
+    let data = derive_dek(&master, RealmId([3; 16]), &[9; 16]).unwrap();
     (header, Cipher::new_aes_gcm(&data))
 }
 
@@ -78,19 +78,21 @@ fn rejects_footer_whose_declared_format_version_is_not_the_accepted_one() {
     let (header, cipher) = keys();
     let encoded =
         encode_segment_footer(&fields(), b"manifest", &header, &cipher, PAGE_SIZE).unwrap();
+    // A version this build does not read is a migration problem, not damage:
+    // the footer is refused by version rather than reported as bad framing, so
+    // an operator is not sent looking for corruption that is not there.
     for declared in [FORMAT_VERSION - 1, FORMAT_VERSION + 1, u16::MAX] {
         let mut forged = encoded.clone();
         forged[8..10].copy_from_slice(&declared.to_le_bytes());
         assert!(
             matches!(
                 decode_segment_footer(&forged, &header, &cipher, PAGE_SIZE),
-                Err(PagedbError::Corruption(
-                    CorruptionDetail::FooterFramingInvalid {
-                        field: "format_version"
-                    }
-                ))
+                Err(PagedbError::FormatVersionUnsupported {
+                    stored,
+                    supported: FORMAT_VERSION,
+                }) if stored == declared
             ),
-            "format_version={declared} must be rejected as unreadable framing"
+            "format_version={declared} must be refused by version"
         );
     }
 }

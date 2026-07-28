@@ -344,6 +344,26 @@ impl<V: Vfs> Pager<V> {
         self.cfg.main_db_file_id
     }
 
+    /// The 16-byte identity that partitions one file's nonce space, and
+    /// therefore scopes its encryption key.
+    ///
+    /// This is the single definition of "which file is this, cryptographically":
+    /// the nonce generator seeds from it (`next_nonce_for_flush`) and the key
+    /// derivation scopes by it (`DekLru::get_or_derive`). Deriving the two from
+    /// one function is what keeps them from drifting apart — a file whose key
+    /// said one identity while its nonce said another would be back to sharing
+    /// a nonce space across keys.
+    ///
+    /// Note this is *not* the AAD's `segment_id` field, which is all-zero for
+    /// `main.db`; that field names the segment a page belongs to, while this
+    /// names the file the page is written into.
+    pub(crate) fn file_identity(&self, file: FileKey) -> [u8; 16] {
+        match file {
+            FileKey::Main => self.cfg.main_db_file_id,
+            FileKey::Segment(id) | FileKey::ApplyJournal(id) => id,
+        }
+    }
+
     /// Lease the master key selected by an on-wire epoch/cipher pair.
     pub(crate) fn mk_for(&self, epoch: u64, cipher_id: CipherId) -> Result<MasterKey> {
         self.keyring.lease(epoch, cipher_id)
@@ -1068,7 +1088,13 @@ impl<V: Vfs> Pager<V> {
                 let mk_snapshot = self.mk_for(on_disk_epoch, on_disk_cipher_id);
                 let mut lru = self.dek_lru.lock();
                 let cipher_res = mk_snapshot.and_then(|mk| {
-                    lru.get_or_derive(realm_id, on_disk_epoch, on_disk_cipher_id, &mk)
+                    lru.get_or_derive(
+                        realm_id,
+                        self.file_identity(file),
+                        on_disk_epoch,
+                        on_disk_cipher_id,
+                        &mk,
+                    )
                 });
                 match cipher_res {
                     Ok(cipher) => open_data_page(&mut buf, &aad, cipher),
@@ -1246,7 +1272,13 @@ impl<V: Vfs> Pager<V> {
         let cipher: crate::crypto::Cipher = {
             let mk_snapshot = self.mk_for(flush_epoch, cipher_id)?;
             let mut lru = self.dek_lru.lock();
-            let derived = lru.get_or_derive(realm_id, flush_epoch, cipher_id, &mk_snapshot)?;
+            let derived = lru.get_or_derive(
+                realm_id,
+                self.file_identity(file),
+                flush_epoch,
+                cipher_id,
+                &mk_snapshot,
+            )?;
             // Clone the cipher (cheap; carries a derived key) so we drop the
             // LRU lock before the parallel section.
             match derived {

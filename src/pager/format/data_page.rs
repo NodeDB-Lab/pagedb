@@ -165,6 +165,8 @@ mod tests {
     use crate::crypto::aad::{AadFields, MAIN_DB_SEGMENT_ID};
     use crate::crypto::kdf::{derive_dek, derive_ik, derive_mk};
 
+    const TEST_FILE_ID: [u8; 16] = [0x7C; 16];
+
     const PAGE: usize = 4096;
 
     fn build_aead(
@@ -173,7 +175,7 @@ mod tests {
         mk: &crate::crypto::MasterKey,
         kind: PageKind,
     ) -> (Cipher, Aad, Nonce) {
-        let dek = derive_dek(mk, realm).unwrap();
+        let dek = derive_dek(mk, realm, &TEST_FILE_ID).unwrap();
         let cipher = Cipher::new_aes_gcm(&dek);
         let aad = Aad::from_fields(AadFields {
             cipher_id: cipher.id().as_byte(),
@@ -204,7 +206,7 @@ mod tests {
     #[test]
     fn plaintext_mac_round_trip_leaves_body_clear() {
         let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
-        let ik = derive_ik(&mk).unwrap();
+        let ik = derive_ik(&mk, RealmId([0; 16]), &TEST_FILE_ID).unwrap();
         let cipher = Cipher::new_plaintext_mac(ik);
         let aad = Aad::from_fields(AadFields {
             cipher_id: cipher.id().as_byte(),
@@ -278,7 +280,7 @@ mod tests {
         buf[OFF_CIPHER_ID] = CipherId::Aes256Gcm.as_byte();
         buf[OFF_PAGE_KIND] = 0x77; // invalid
         let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
-        let dek = derive_dek(&mk, RealmId([0; 16])).unwrap();
+        let dek = derive_dek(&mk, RealmId([0; 16]), &TEST_FILE_ID).unwrap();
         let cipher = Cipher::new_aes_gcm(&dek);
         let aad = Aad::from_fields(AadFields {
             cipher_id: cipher.id().as_byte(),

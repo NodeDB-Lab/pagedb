@@ -49,6 +49,13 @@ pub(super) async fn peek_restore_mode<V: Vfs + Clone>(
     read_header_slot(&mut f, page_size_u64, &mut buf_b).await?;
     drop(f);
 
+    // Same classification as the full open, for the same reason: this probe
+    // runs *before* it on the read-only modes, so a wrong page size or KEK
+    // would otherwise be reported here as damage and never reach the check
+    // that knows better.
+    super::open::header_probe::check_page_size(&buf_a, &buf_b, page_size)?;
+    super::open::header_probe::check_format_version(&buf_a, &buf_b)?;
+
     for buf in [&buf_a, &buf_b] {
         if buf.len() < 56 {
             continue;
@@ -70,7 +77,7 @@ pub(super) async fn peek_restore_mode<V: Vfs + Clone>(
             return Ok(fields.restore_mode);
         }
     }
-    Err(PagedbError::corruption(
-        crate::errors::CorruptionDetail::HeaderUnverifiable,
+    Err(super::open::header_probe::unverifiable_header_cause(
+        &buf_a, &buf_b, page_size,
     ))
 }

@@ -126,7 +126,7 @@ fn cleared_header_fields<V: Vfs + Clone>(
     counter_anchor: u64,
 ) -> Result<MainDbHeaderFields> {
     Ok(MainDbHeaderFields {
-        format_version: 1,
+        format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
         cipher_id: db.cipher_id.as_byte(),
         page_size_log2: page_size_log2(db.page_size)?,
         flags: 0,
@@ -148,5 +148,6 @@ fn cleared_header_fields<V: Vfs + Clone>(
         next_page_id: state.next_page_id,
         commit_retain_policy_tag: state.commit_retain_policy_tag,
         commit_retain_policy_value: state.commit_retain_policy_value,
+        realm_id: db.realm_id,
     })
 }

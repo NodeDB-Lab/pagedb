@@ -108,7 +108,13 @@ pub(crate) async fn authenticate_segment_metadata<V: Vfs + Clone>(
     }
     let (footer, manifest) = {
         let mut lru = pager.dek_lru().lock();
-        let cipher = lru.get_or_derive(meta.realm_id, meta.mk_epoch, cipher_id, &master_key)?;
+        let cipher = lru.get_or_derive(
+            meta.realm_id,
+            meta.segment_id,
+            meta.mk_epoch,
+            cipher_id,
+            &master_key,
+        )?;
         decode_segment_footer(&footer_bytes, &hk, cipher, page_size)?
     };
     validate_footer(&footer, meta, parent_file_id, footer_page_id)?;
@@ -135,7 +141,7 @@ fn validate_header(
     parent_file_id: [u8; 16],
     page_size: usize,
 ) -> Result<()> {
-    if header.format_version != 1 {
+    if header.format_version != crate::pager::format::structural_header::SEGMENT_FORMAT_VERSION {
         return Err(PagedbError::segment_metadata_mismatch(
             "header.format_version",
         ));
@@ -358,6 +364,7 @@ async fn collect_and_decode_index_page<V: Vfs + Clone>(
     let mut lru = context.pager.dek_lru().lock();
     let cipher = lru.get_or_derive(
         context.meta.realm_id,
+        context.meta.segment_id,
         context.meta.mk_epoch,
         cipher_id,
         context.master_key,

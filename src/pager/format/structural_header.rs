@@ -11,9 +11,20 @@ use crate::{CommitId, RealmId, Result};
 pub const MAGIC_MAIN: [u8; 8] = *b"PAGEDB\0\0";
 pub const MAGIC_SEGMENT: [u8; 8] = *b"PAGESEG\0";
 
-pub const MAIN_FIELDS_END: usize = 185;
+pub const MAIN_FIELDS_END: usize = 201;
 pub const SEGMENT_FIELDS_END: usize = 76;
 pub const MAC_LEN: usize = 16;
+
+/// On-disk format version of a `main.db` A/B header.
+///
+/// The single definition of the version every writer stamps and every reader
+/// requires; a literal at a construction site is how the two drift apart.
+pub const MAIN_FORMAT_VERSION: u16 = 1;
+
+/// On-disk format version of a segment header page 0. Moves in lockstep with
+/// [`MAIN_FORMAT_VERSION`] — a store and its segments are never at mixed
+/// versions, so they are bumped together or not at all.
+pub const SEGMENT_FORMAT_VERSION: u16 = 1;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -45,6 +56,16 @@ pub struct MainDbHeaderFields {
     /// Policy value: for Count, the count; for Age, the duration in seconds;
     /// for Unbounded, 0.
     pub commit_retain_policy_value: u64,
+    /// The realm every `main.db` page in this store is encrypted under.
+    ///
+    /// A realm is bound into the AAD of every page, so opening a store under
+    /// the wrong realm produces pages that will not authenticate. Recording it
+    /// here — MAC'd under HK like every other header field — turns that into a
+    /// mismatch the opener names, instead of a tag failure the caller meets on
+    /// its first read and reasonably mistakes for corruption. It also closes
+    /// the case that never failed at all: writing into a *freshly created*
+    /// store under a mistyped realm used to succeed and strand the data.
+    pub realm_id: RealmId,
 }
 
 /// All fields of a segment header page 0.
@@ -152,20 +173,25 @@ pub fn encode_main_db_header(
     buf[o] = fields.commit_retain_policy_tag;
     o += 1;
     buf[o..o + 8].copy_from_slice(&fields.commit_retain_policy_value.to_le_bytes());
-    // Bytes 185..page_size-MAC_LEN are the unused tail; remain zero.
+    o += 8;
+    debug_assert_eq!(o, 185);
+    buf[o..o + 16].copy_from_slice(&fields.realm_id.0);
+    // Bytes 201..page_size-MAC_LEN are the unused tail; remain zero.
     // MAC over bytes 0..page_size-MAC_LEN.
     let mac = mac_hk(hk, &buf[..page_size - MAC_LEN])?;
     buf[page_size - MAC_LEN..].copy_from_slice(&mac);
     Ok(buf)
 }
 
-/// Decode and verify a main.db A/B header. Returns `Corruption{StructuralHeaderInvalid}`
-/// on MAC failure or non-zero tail.
-pub fn decode_main_db_header(
-    bytes: &[u8],
-    hk: &DerivedKey,
-    page_size: usize,
-) -> Result<MainDbHeaderFields> {
+/// Authenticate a main.db A/B header slot: framing, then HK-MAC, then version.
+///
+/// Split from the field decode below so each half stays one job. The order is
+/// load-bearing: framing before the MAC because a slot that is not ours has no
+/// MAC to check, and the MAC before the version because the version is only
+/// trustworthy once the bytes carrying it are authenticated. (The *open* path
+/// also reads the version from cleartext, deliberately and only to refuse — see
+/// `txn::db::open::header_probe`.)
+fn authenticate_main_db_header(bytes: &[u8], hk: &DerivedKey, page_size: usize) -> Result<()> {
     if bytes.len() != page_size || page_size < MAIN_FIELDS_END + MAC_LEN {
         return Err(PagedbError::Unsupported);
     }
@@ -179,8 +205,11 @@ pub fn decode_main_db_header(
             "reserved_bytes",
         ));
     }
-    // Bytes 185..page_size-MAC_LEN are the unused tail and must be zero.
-    if !bytes[185..page_size - MAC_LEN].iter().all(|b| *b == 0) {
+    // Bytes 201..page_size-MAC_LEN are the unused tail and must be zero.
+    if !bytes[MAIN_FIELDS_END..page_size - MAC_LEN]
+        .iter()
+        .all(|b| *b == 0)
+    {
         return Err(PagedbError::structural_header_invalid(
             "main.db",
             "unused_tail",
@@ -190,12 +219,27 @@ pub fn decode_main_db_header(
     if !constant_time_eq(&expected, &bytes[page_size - MAC_LEN..]) {
         return Err(PagedbError::structural_header_invalid("main.db", "hk_mac"));
     }
+    let format_version = u16_le(&bytes[8..10]);
+    if format_version != MAIN_FORMAT_VERSION {
+        return Err(PagedbError::FormatVersionUnsupported {
+            stored: format_version,
+            supported: MAIN_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Decode and verify a main.db A/B header. Returns `Corruption{StructuralHeaderInvalid}`
+/// on MAC failure or non-zero tail.
+pub fn decode_main_db_header(
+    bytes: &[u8],
+    hk: &DerivedKey,
+    page_size: usize,
+) -> Result<MainDbHeaderFields> {
+    authenticate_main_db_header(bytes, hk, page_size)?;
     let mut o = 8; // past magic
     let format_version = u16_le(&bytes[o..o + 2]);
     o += 2;
-    if format_version != 1 {
-        return Err(PagedbError::Unsupported);
-    }
     let cipher_id = bytes[o];
     o += 1;
     let page_size_log2 = bytes[o];
@@ -239,6 +283,8 @@ pub fn decode_main_db_header(
     let commit_retain_policy_tag = bytes[o];
     o += 1;
     let commit_retain_policy_value = u64_le(&bytes[o..o + 8]);
+    o += 8;
+    let realm_id = RealmId(arr16(&bytes[o..o + 16]));
     Ok(MainDbHeaderFields {
         format_version,
         cipher_id,
@@ -262,6 +308,7 @@ pub fn decode_main_db_header(
         next_page_id,
         commit_retain_policy_tag,
         commit_retain_policy_value,
+        realm_id,
     })
 }
 
@@ -332,8 +379,11 @@ pub fn decode_segment_header(
     let mut o = 8;
     let format_version = u16_le(&bytes[o..o + 2]);
     o += 2;
-    if format_version != 1 {
-        return Err(PagedbError::Unsupported);
+    if format_version != SEGMENT_FORMAT_VERSION {
+        return Err(PagedbError::FormatVersionUnsupported {
+            stored: format_version,
+            supported: SEGMENT_FORMAT_VERSION,
+        });
     }
     let cipher_id = bytes[o];
     o += 1;
@@ -397,7 +447,7 @@ mod tests {
 
     fn sample_main() -> MainDbHeaderFields {
         MainDbHeaderFields {
-            format_version: 1,
+            format_version: MAIN_FORMAT_VERSION,
             cipher_id: 1,
             page_size_log2: 12,
             flags: 0,
@@ -419,12 +469,13 @@ mod tests {
             next_page_id: 4,
             commit_retain_policy_tag: 0,
             commit_retain_policy_value: 1024,
+            realm_id: RealmId([0x77; 16]),
         }
     }
 
     fn sample_segment() -> SegmentHeaderFields {
         SegmentHeaderFields {
-            format_version: 1,
+            format_version: SEGMENT_FORMAT_VERSION,
             cipher_id: 1,
             segment_kind: 0,
             segment_id: [9; 16],
@@ -466,7 +517,8 @@ mod tests {
         let hk = hk();
         let f = sample_main();
         let mut buf = encode_main_db_header(&f, &hk, 4096).unwrap();
-        // Pick a byte in the unused tail (after _reserved field at 161, before MAC at 4080).
+        // Pick a byte in the unused tail (after the fields end at 201, before
+        // the MAC at 4080).
         buf[300] = 0xAB;
         let err = decode_main_db_header(&buf, &hk, 4096).unwrap_err();
         assert!(matches!(err, PagedbError::Corruption(_)));

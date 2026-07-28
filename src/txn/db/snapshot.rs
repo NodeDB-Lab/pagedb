@@ -991,7 +991,7 @@ impl<V: Vfs + Clone> Db<V> {
         catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());
 
         let fields_with_journal = MainDbHeaderFields {
-            format_version: 1,
+            format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
             cipher_id: self.cipher_id.as_byte(),
             page_size_log2: page_size_log2(self.page_size)?,
             flags: 0,
@@ -1015,6 +1015,7 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id: new_next_page_id,
             commit_retain_policy_tag: state.commit_retain_policy_tag,
             commit_retain_policy_value: state.commit_retain_policy_value,
+            realm_id: self.realm_id,
         };
 
         // The target header goes into the staged image's inactive slot. The

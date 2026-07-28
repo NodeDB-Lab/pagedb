@@ -195,8 +195,9 @@ mod tests {
 
     fn fixture() -> (Cipher, Cipher, Cipher, Aad, Nonce) {
         let mk = derive_mk(&[7u8; 32], &[0xAB; 16], 0).unwrap();
-        let dek = derive_dek(&mk, RealmId([1; 16])).unwrap();
-        let ik = derive_ik(&mk).unwrap();
+        let file_id = [0x5A; 16];
+        let dek = derive_dek(&mk, RealmId([1; 16]), &file_id).unwrap();
+        let ik = derive_ik(&mk, RealmId([1; 16]), &file_id).unwrap();
         let aes = Cipher::new_aes_gcm(&dek);
         let cc = Cipher::new_chacha20(&dek);
         let pt = Cipher::new_plaintext_mac(ik);

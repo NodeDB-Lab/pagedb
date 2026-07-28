@@ -2,9 +2,13 @@
 #![cfg(feature = "diagnostics")]
 
 //! Proves the black-box wiring fires end to end: a page that fails AEAD/MAC
-//! verification on read (here via a cross-realm reopen, the same failure class
-//! as the freed-page use-after-free) produces a structured corruption report
-//! with pagedb's forensic domain context.
+//! verification on read produces a structured corruption report with pagedb's
+//! forensic domain context.
+//!
+//! The failure is induced by damaging a page's authentication tag on disk,
+//! which is the same failure class a freed-page use-after-free surfaces as —
+//! and, unlike a parameter mistake such as a wrong realm, one that genuinely
+//! has to be discovered at read time rather than refused at open.
 
 use pagedb::vfs::memory::MemVfs;
 use pagedb::{CipherId, CorruptionDetail, Db, OpenOptions, PagedbError, RealmId};
@@ -21,9 +25,10 @@ async fn read_verify_failure_emits_faultbox_corruption_report() {
     );
 
     let vfs = MemVfs::new();
-    // realm_a writes; a breadcrumb is recorded on commit.
-    {
-        let db_a = Db::open(
+    // Seed some data, then close the handle before touching its bytes
+    // underneath it.
+    let next_page_id = {
+        let db = Db::open(
             vfs.clone(),
             [9u8; 32],
             PAGE,
@@ -32,25 +37,54 @@ async fn read_verify_failure_emits_faultbox_corruption_report() {
         )
         .await
         .unwrap();
-        let mut w = db_a.begin_write().await.unwrap();
-        w.put(b"k", b"v").await.unwrap();
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0u64..10 {
+            w.put(format!("k{i:04}").as_bytes(), &[0xAB; 64])
+                .await
+                .unwrap();
+        }
         w.commit().await.unwrap();
+        let next_page_id = db.stats().await.unwrap().main_db_next_page_id;
+        assert!(
+            next_page_id > 4,
+            "the seed writes must allocate at least one data page"
+        );
+        next_page_id
+    };
+
+    // Flip the AEAD tag of every data page, so whichever page the read walks
+    // to is damaged regardless of where copy-on-write left the live root.
+    {
+        use pagedb::vfs::OpenMode;
+        use pagedb::vfs::{Vfs, VfsFile};
+        let mut f = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+        for page_id in 4..next_page_id {
+            let tag_offset = page_id * PAGE as u64 + (PAGE - 16) as u64;
+            let mut tag = [0u8; 16];
+            f.read_at(tag_offset, &mut tag).await.unwrap();
+            for byte in &mut tag {
+                *byte ^= 0xFF;
+            }
+            f.write_at(tag_offset, &tag).await.unwrap();
+        }
+        f.sync().await.unwrap();
     }
 
-    // realm_b reopens the same bytes: the B+ tree root was AAD'd under realm_a,
-    // so realm_b's read triggers a tag failure — routed through the wired
-    // `diag::page_read_verify_failed`.
-    let db_b = Db::open(
+    // A fresh handle has a cold buffer pool, so this reads the damaged bytes
+    // rather than the page the writer left warm.
+    let db = Db::open(
         vfs,
         [9u8; 32],
         PAGE,
-        RealmId::new([2; 16]),
+        RealmId::new([1; 16]),
         OpenOptions::default(),
     )
     .await
     .unwrap();
-    let r = db_b.begin_read().await.unwrap();
-    let err = r.get(b"k").await.err().unwrap();
+    let reader = db.begin_read().await.unwrap();
+    let Err(err) = reader.get(b"k0000").await else {
+        panic!("a damaged tag must fail the read");
+    };
     assert!(
         matches!(
             err,

@@ -90,7 +90,7 @@ async fn rewrite_first_index_page(
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes.copy_from_slice(&page[12..24]);
     let master = derive_mk(&KEK, &[0; 16], 0).unwrap();
-    let dek = derive_dek(&master, REALM).unwrap();
+    let dek = derive_dek(&master, REALM, &meta.segment_id).unwrap();
     let cipher = crate::crypto::Cipher::new_aes_gcm(&dek);
     let aad = Aad::from_fields(AadFields {
         cipher_id: CipherId::Aes256Gcm.as_byte(),
@@ -194,7 +194,7 @@ async fn rejects_invalid_v2_index_range_after_footer_authentication() {
     file.read_at(footer_offset, &mut footer).await.unwrap();
     let master = derive_mk(&KEK, &[0; 16], 0).unwrap();
     let hk = derive_hk(&master).unwrap();
-    let dek = derive_dek(&master, REALM).unwrap();
+    let dek = derive_dek(&master, REALM, &meta.segment_id).unwrap();
     let cipher = crate::crypto::Cipher::new_aes_gcm(&dek);
     let (mut fields, manifest) = decode_segment_footer(&footer, &hk, &cipher, PAGE_SIZE).unwrap();
     fields.index_start_page = meta.page_count - 1;
@@ -219,7 +219,7 @@ async fn rejects_v2_index_gap() {
     file.read_at(footer_offset, &mut footer).await.unwrap();
     let master = derive_mk(&KEK, &[0; 16], 0).unwrap();
     let hk = derive_hk(&master).unwrap();
-    let dek = derive_dek(&master, REALM).unwrap();
+    let dek = derive_dek(&master, REALM, &meta.segment_id).unwrap();
     let cipher = crate::crypto::Cipher::new_aes_gcm(&dek);
     let (mut fields, manifest) = decode_segment_footer(&footer, &hk, &cipher, PAGE_SIZE).unwrap();
     fields.index_start_page = 1;
@@ -311,7 +311,7 @@ async fn rejects_final_counter_that_matches_catalog_but_not_geometry() {
     file.read_at(footer_offset, &mut footer).await.unwrap();
     let master = derive_mk(&KEK, &[0; 16], 0).unwrap();
     let hk = derive_hk(&master).unwrap();
-    let dek = derive_dek(&master, REALM).unwrap();
+    let dek = derive_dek(&master, REALM, &meta.segment_id).unwrap();
     let cipher = crate::crypto::Cipher::new_aes_gcm(&dek);
     let (mut fields, manifest) = decode_segment_footer(&footer, &hk, &cipher, PAGE_SIZE).unwrap();
     fields.final_counter = fields.final_counter.checked_add(1).unwrap();

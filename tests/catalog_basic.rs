@@ -152,7 +152,9 @@ async fn reopen_with_wrong_kek_fails() {
     .await
     .err()
     .unwrap();
-    assert!(matches!(err, PagedbError::Corruption(_)));
+    // Named as a key problem, not as damage: the store is intact and a retry
+    // with the right KEK opens it. See `tests/open_parameter_mismatch.rs`.
+    assert!(matches!(err, PagedbError::KeyMismatch), "{err:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]

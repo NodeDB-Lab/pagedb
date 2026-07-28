@@ -192,7 +192,7 @@ mod tests {
 
     fn sample(seq: u64) -> MainDbHeaderFields {
         MainDbHeaderFields {
-            format_version: 1,
+            format_version: crate::pager::format::structural_header::MAIN_FORMAT_VERSION,
             cipher_id: 1,
             page_size_log2: 12,
             flags: 0,
@@ -214,6 +214,7 @@ mod tests {
             next_page_id: 4,
             commit_retain_policy_tag: 0,
             commit_retain_policy_value: 1024,
+            realm_id: crate::RealmId::new([0x42; 16]),
         }
     }
 

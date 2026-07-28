@@ -111,7 +111,7 @@ impl MainDbNonceGen {
         if self.next > Nonce::COUNTER_MAX {
             return Err(PagedbError::NonceCounterExhausted);
         }
-        if self.next > self.durable_anchor + self.budget {
+        if self.next > self.durable_anchor.saturating_add(self.budget) {
             // Caller must commit the anchor first.
             return Err(PagedbError::Aborted);
         }

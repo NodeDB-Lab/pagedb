@@ -348,8 +348,13 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
                 });
                 let mk_snapshot = db.pager.mk()?;
                 let mut lru = db.pager.dek_lru().lock();
-                let cipher_res =
-                    lru.get_or_derive(realm_id, on_disk_epoch, on_disk_cipher_id, &mk_snapshot);
+                let cipher_res = lru.get_or_derive(
+                    realm_id,
+                    db.pager.main_db_file_id(),
+                    on_disk_epoch,
+                    on_disk_cipher_id,
+                    &mk_snapshot,
+                );
                 match cipher_res {
                     Ok(cipher) => {
                         let mut buf2 = buf.clone();
@@ -538,8 +543,13 @@ async fn check_segment<V: Vfs + Clone>(
                     segment_id: meta.segment_id,
                 });
                 let mut lru = pager.dek_lru().lock();
-                let cipher_res =
-                    lru.get_or_derive(meta.realm_id, on_disk_epoch, on_disk_cipher_id, mk);
+                let cipher_res = lru.get_or_derive(
+                    meta.realm_id,
+                    meta.segment_id,
+                    on_disk_epoch,
+                    on_disk_cipher_id,
+                    mk,
+                );
                 match cipher_res {
                     Ok(cipher) => {
                         let mut b2 = buf.clone();

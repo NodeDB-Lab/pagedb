@@ -36,7 +36,7 @@ usage: pagedb-fsck <path> [--deep] [--page-size <bytes>] [--realm <hex16>] [<hex
   --deep               authenticate and walk every page, not just the header
   --page-size <bytes>  page size the store was created with (default 4096)
   --realm <hex16>      32 hex characters; default all-ones, nodedb-lite uses all-zeros
-  <hex-kek>            64 hex characters; also read from PAGEDB_KEK, default all-zeros
+  <hex-kek>            64 hex characters; required, or supply it in PAGEDB_KEK
   -h, --help           print this message
 
 No option may be repeated, and a path beginning with '-' must be written as

@@ -247,6 +247,7 @@ impl<V: Vfs + Clone> SegmentReader<V> {
         let mut lru = self.pager.dek_lru().lock();
         let cipher = lru.get_or_derive(
             self.meta.realm_id,
+            self.meta.segment_id,
             self.meta.mk_epoch,
             on_wire_cipher,
             &self.master_key,

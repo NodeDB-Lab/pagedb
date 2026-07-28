@@ -20,6 +20,7 @@ use crate::{RealmId, Result};
 use super::super::super::mode::DbMode;
 use super::super::super::policy::ReaderStallPolicy;
 use super::super::core::{Db, ReaderSnapshot, WriterState};
+use super::header_probe::{check_format_version, check_page_size, unverifiable_header_cause};
 use super::recovery::recover_open_state;
 
 impl<V: Vfs + Clone> Db<V> {
@@ -123,6 +124,17 @@ impl<V: Vfs + Clone> Db<V> {
         read_header_slot(&mut f, page_size_u64, &mut buf_b).await?;
         drop(f);
 
+        // Before deriving anything, settle the questions a MAC can only answer
+        // as "unverifiable" — and that a caller would then reasonably read as
+        // "my data is gone".
+        //
+        // Both are decided from cleartext framing that no key protects. Page
+        // size goes first because a wrong one makes every later check
+        // meaningless: the slot boundaries, the MAC extent, and slot B's offset
+        // are all derived from it.
+        check_page_size(&buf_a, &buf_b, page_size)?;
+        check_format_version(&buf_a, &buf_b)?;
+
         let try_decode = |buf: &[u8]| -> Option<(MainDbHeaderFields, bool)> {
             if buf.len() < 56 {
                 return None;
@@ -164,11 +176,23 @@ impl<V: Vfs + Clone> Db<V> {
             (Some(a), None) => (a.0, ActiveSlot::A, a.1),
             (None, Some(b)) => (b.0, ActiveSlot::B, b.1),
             (None, None) => {
-                return Err(PagedbError::corruption(
-                    crate::errors::CorruptionDetail::HeaderUnverifiable,
-                ));
+                // Neither slot verified. Whether that means "wrong key" or
+                // "damaged store" is not decidable from the MAC — but it is
+                // decidable from the framing around it, and the two demand
+                // opposite reactions from the operator.
+                return Err(unverifiable_header_cause(&buf_a, &buf_b, page_size));
             }
         };
+
+        // The realm is authenticated: it lives inside the slot the HK-MAC just
+        // covered, so a mismatch here is the caller's parameter and never a
+        // forged header.
+        if fields.realm_id != realm {
+            return Err(PagedbError::RealmMismatch {
+                stored: fields.realm_id,
+                supplied: realm,
+            });
+        }
 
         let cipher_id = CipherId::from_byte(fields.cipher_id)?;
         let mk_epoch = fields.mk_epoch;

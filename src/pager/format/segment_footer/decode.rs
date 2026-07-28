@@ -63,7 +63,12 @@ fn parse_cleartext(bytes: &[u8], page_size: usize) -> Result<ParsedFooter> {
     }
     let format_version = u16_le(&bytes[8..10]);
     if format_version != FORMAT_VERSION {
-        return Err(PagedbError::footer_framing_invalid("format_version"));
+        // A version this build does not read is a migration problem, not a
+        // damaged footer — say so, or an operator triages the wrong thing.
+        return Err(PagedbError::FormatVersionUnsupported {
+            stored: format_version,
+            supported: FORMAT_VERSION,
+        });
     }
     let mut offset = 10;
     let cipher_id = bytes[offset];
