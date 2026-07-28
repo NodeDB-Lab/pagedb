@@ -77,7 +77,9 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
             if !keep(&key) {
                 continue;
             }
-            loader.push(key, value).await?;
+            // The loader owns what it stages into pages it is building, so the
+            // scan's borrowed view has to be copied out here.
+            loader.push(key.to_vec(), value.to_vec()).await?;
             // A compacted page is written once and never read back, so flushing
             // it out mid-batch costs nothing and keeps the pool from growing
             // with the tree instead of with the budget.
@@ -136,7 +138,7 @@ pub(super) async fn segment_rows_from<V: Vfs + Clone>(
     let mut out = Vec::with_capacity(rows.len());
     for (key, value) in rows {
         let meta = Catalog::decode_segment_meta(&value)?;
-        out.push((key, meta));
+        out.push((key.to_vec(), meta));
     }
     Ok(out)
 }

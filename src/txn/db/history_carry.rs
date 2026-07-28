@@ -80,7 +80,14 @@ impl<V: Vfs + Clone> Db<V> {
             return Ok(unmoved);
         }
 
-        let rows = base_tree.collect_all().await?;
+        // The loader stages these into pages it owns, so the scan's borrowed
+        // view is copied out here.
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = base_tree
+            .collect_all()
+            .await?
+            .into_iter()
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
         let entry_count = u64::try_from(rows.len()).ok();
         let mut relocated = BTree::open(
             self.pager.clone(),

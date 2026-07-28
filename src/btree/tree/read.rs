@@ -170,13 +170,15 @@ impl<V: Vfs> BTree<V> {
 
     /// Resolve a `LeafValue` to its raw bytes. Follows overflow chains as
     /// needed.
-    pub(super) async fn resolve_leaf_value(&self, v: &LeafValue) -> Result<Vec<u8>> {
+    pub(super) async fn resolve_leaf_value(&self, v: &LeafValue) -> Result<Bytes> {
         match v {
-            LeafValue::Inline(b) => Ok(b.clone()),
+            LeafValue::Inline(b) => Ok(Bytes::copy_from_slice(b)),
             LeafValue::Overflow {
                 total_len,
                 root_page_id,
-            } => overflow::read_chain(&self.pager, self.realm_id, *root_page_id, *total_len).await,
+            } => overflow::read_chain(&self.pager, self.realm_id, *root_page_id, *total_len)
+                .await
+                .map(Bytes::from),
         }
     }
 }

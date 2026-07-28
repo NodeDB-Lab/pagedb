@@ -180,7 +180,7 @@ async fn forward_scan_returns_sorted() {
     let got = tree.collect_range(b"k0010", b"k0020").await.unwrap();
     let keys: Vec<String> = got
         .into_iter()
-        .map(|(k, _)| String::from_utf8(k).unwrap())
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
         .collect();
     let expected: Vec<String> = (10..20).map(|i| format!("k{i:04}")).collect();
     assert_eq!(keys, expected);
@@ -206,7 +206,7 @@ async fn collect_all_returns_every_key_including_the_top_of_the_keyspace() {
 
     let all = tree.collect_all().await.unwrap();
     assert_eq!(all.len(), 202);
-    let keys: Vec<&[u8]> = all.iter().map(|(k, _)| k.as_slice()).collect();
+    let keys: Vec<&[u8]> = all.iter().map(|(k, _)| k.as_ref()).collect();
     assert!(keys.windows(2).all(|w| w[0] < w[1]), "not ascending");
     assert_eq!(keys[200], &[0xFF; 256]);
     assert_eq!(keys[201], beyond.as_slice());
@@ -816,7 +816,7 @@ async fn bulk_loader_builds_a_multi_level_tree_that_scans_in_order() {
     let all = tree.collect_all().await.unwrap();
     assert_eq!(all.len(), n);
     for (i, (key, value)) in all.iter().enumerate() {
-        assert_eq!(key.as_slice(), format!("k-{i:05}").as_bytes());
+        assert_eq!(key.as_ref(), format!("k-{i:05}").as_bytes());
         let want = if i % 11 == 0 { &spilled } else { &inline };
         assert_eq!(value, want, "value mismatch at record {i}");
     }

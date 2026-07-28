@@ -100,7 +100,7 @@ async fn scan_rev_returns_descending() {
     let got = tree.scan_rev(b"k0010", b"k0020").await.unwrap();
     let keys: Vec<String> = got
         .into_iter()
-        .map(|(k, _)| String::from_utf8(k).unwrap())
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
         .collect();
     let expected: Vec<String> = (10..20).rev().map(|i| format!("k{i:04}")).collect();
     assert_eq!(keys, expected);
@@ -115,7 +115,7 @@ async fn scan_prefix_short_circuits() {
         tree.put(word.as_bytes(), &v).await.unwrap();
     }
     let got = tree.scan_prefix(b"app").await.unwrap();
-    let keys: Vec<&[u8]> = got.iter().map(|(k, _)| k.as_slice()).collect();
+    let keys: Vec<&[u8]> = got.iter().map(|(k, _)| k.as_ref()).collect();
     assert_eq!(keys, vec![b"apple".as_ref(), b"apply".as_ref()]);
 }
 

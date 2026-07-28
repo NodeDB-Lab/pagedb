@@ -500,7 +500,7 @@ impl<V: Vfs + Clone> Db<V> {
             .into_iter()
             .map(|(key, value)| {
                 Ok(SegmentEntry {
-                    key,
+                    key: key.to_vec(),
                     meta: Catalog::decode_segment_meta(&value)?,
                 })
             })

@@ -1,5 +1,7 @@
 //! Range, reverse, and prefix scans.
 
+use bytes::Bytes;
+
 use crate::Result;
 use crate::vfs::Vfs;
 
@@ -33,13 +35,13 @@ impl<V: Vfs> BTree<V> {
     /// lets the write path skip sibling-pointer `CoW` (saves ~2 leaf rewrites
     /// per put) at the cost of one extra internal-node lookup per leaf
     /// boundary crossed during a scan.
-    pub async fn collect_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn collect_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         if self.root_page_id == 0 {
             return Ok(Vec::new());
         }
         let mut path = self.path_to_leaf_for_key(start).await?;
         let mut seen_leaves = scan_guard();
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut out: Vec<(Bytes, Bytes)> = Vec::new();
         loop {
             let leaf_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_id)?;
@@ -50,7 +52,7 @@ impl<V: Vfs> BTree<V> {
                 }
                 if k.as_slice() >= start {
                     let val = self.resolve_leaf_value(v).await?;
-                    out.push((k.clone(), val));
+                    out.push((Bytes::copy_from_slice(k), val));
                 }
             }
             match self.next_leaf_after(&path).await? {
@@ -68,7 +70,7 @@ impl<V: Vfs> BTree<V> {
     /// bound is beyond the valid key domain: a bounded "scan everything" would
     /// silently drop records at the top of the keyspace (`[0xFF; N]` and any
     /// key extending it). Callers that need the whole tree must use this.
-    pub async fn collect_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn collect_all(&self) -> Result<Vec<(Bytes, Bytes)>> {
         if self.root_page_id == 0 {
             return Ok(Vec::new());
         }
@@ -76,14 +78,14 @@ impl<V: Vfs> BTree<V> {
         // the leftmost leaf.
         let mut path = self.path_to_leaf_for_key(&[]).await?;
         let mut seen_leaves = scan_guard();
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut out: Vec<(Bytes, Bytes)> = Vec::new();
         loop {
             let leaf_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_id)?;
             let leaf = self.read_leaf(leaf_id).await?;
             for (k, v) in &leaf.records {
                 let val = self.resolve_leaf_value(v).await?;
-                out.push((k.clone(), val));
+                out.push((Bytes::copy_from_slice(k), val));
             }
             match self.next_leaf_after(&path).await? {
                 Some(next_path) => path = next_path,
@@ -109,13 +111,13 @@ impl<V: Vfs> BTree<V> {
         &self,
         start: &[u8],
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Bytes, Bytes)>> {
         if self.root_page_id == 0 || limit == 0 {
             return Ok(Vec::new());
         }
         let mut path = self.path_to_leaf_for_key(start).await?;
         let mut seen_leaves = scan_guard();
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(limit);
+        let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit);
         loop {
             let leaf_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_id)?;
@@ -128,7 +130,7 @@ impl<V: Vfs> BTree<V> {
                     return Ok(out);
                 }
                 let val = self.resolve_leaf_value(v).await?;
-                out.push((k.clone(), val));
+                out.push((Bytes::copy_from_slice(k), val));
             }
             if out.len() == limit {
                 return Ok(out);
@@ -155,7 +157,7 @@ impl<V: Vfs> BTree<V> {
         prefix: &[u8],
         start: &[u8],
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Bytes, Bytes)>> {
         let mut batch = self.collect_batch_from(start, limit).await?;
         if let Some(end) = batch.iter().position(|(key, _)| !key.starts_with(prefix)) {
             batch.truncate(end);
@@ -179,7 +181,7 @@ impl<V: Vfs> BTree<V> {
 
     /// Reverse range scan: `start` inclusive, `end` exclusive. Returns results
     /// in descending key order. Collects matching records forward then reverses.
-    pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         let mut forward = self.collect_range(start, end).await?;
         forward.reverse();
         Ok(forward)
@@ -187,13 +189,13 @@ impl<V: Vfs> BTree<V> {
 
     /// Prefix scan: returns all records whose key starts with `prefix`, in
     /// ascending order.
-    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         if self.root_page_id == 0 {
             return Ok(Vec::new());
         }
         let mut path = self.path_to_leaf_for_key(prefix).await?;
         let mut seen_leaves = scan_guard();
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut out: Vec<(Bytes, Bytes)> = Vec::new();
         loop {
             let leaf_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_id)?;
@@ -208,7 +210,7 @@ impl<V: Vfs> BTree<V> {
                     break;
                 }
                 let val = self.resolve_leaf_value(v).await?;
-                out.push((k.clone(), val));
+                out.push((Bytes::copy_from_slice(k), val));
             }
             if past_prefix {
                 return Ok(out);

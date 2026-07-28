@@ -122,7 +122,7 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
     /// To take the first few rows at or after a key, use
     /// [`scan_from`](Self::scan_from) — bounding by count there is what keeps a
     /// short read short.
-    pub async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         self.check_abort()?;
         self.tree().collect_range(start, end).await
     }
@@ -145,7 +145,7 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
     /// that is its immediate successor in the key ordering, so paging this way
     /// never skips a record and never returns one twice. A batch shorter than
     /// `limit` means the tree ended.
-    pub async fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
         self.check_abort()?;
         self.tree().collect_batch_from(start, limit).await
     }
@@ -162,19 +162,19 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
         prefix: &[u8],
         start: &[u8],
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Bytes, Bytes)>> {
         self.check_abort()?;
         self.tree()
             .collect_prefix_batch_from(prefix, start, limit)
             .await
     }
 
-    pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         self.check_abort()?;
         self.tree().scan_rev(start, end).await
     }
 
-    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         self.check_abort()?;
         self.tree().scan_prefix(prefix).await
     }

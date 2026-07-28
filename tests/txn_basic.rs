@@ -212,8 +212,8 @@ async fn scan_from_stops_at_limit() {
     let r = db.begin_read().await.unwrap();
     let rows = r.scan_from(b"row:0000", 10).await.unwrap();
     assert_eq!(rows.len(), 10);
-    assert_eq!(rows[0].0, b"row:0000");
-    assert_eq!(rows[9].0, b"row:0009");
+    assert_eq!(rows[0].0.as_ref(), b"row:0000");
+    assert_eq!(rows[9].0.as_ref(), b"row:0009");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -222,9 +222,9 @@ async fn scan_from_starts_at_or_after_key() {
     let r = db.begin_read().await.unwrap();
     // Start key need not exist: the scan lands on the first row at or after it.
     let rows = r.scan_from(b"row:0020", 3).await.unwrap();
-    assert_eq!(rows[0].0, b"row:0020");
+    assert_eq!(rows[0].0.as_ref(), b"row:0020");
     let rows = r.scan_from(b"row:0019z", 1).await.unwrap();
-    assert_eq!(rows[0].0, b"row:0020");
+    assert_eq!(rows[0].0.as_ref(), b"row:0020");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -233,7 +233,7 @@ async fn scan_from_short_batch_means_end_of_tree() {
     let r = db.begin_read().await.unwrap();
     let rows = r.scan_from(b"row:0045", 10).await.unwrap();
     assert_eq!(rows.len(), 5);
-    assert_eq!(rows[4].0, b"row:0049");
+    assert_eq!(rows[4].0.as_ref(), b"row:0049");
     assert!(r.scan_from(b"zzz", 10).await.unwrap().is_empty());
     assert!(r.scan_from(b"row:0000", 0).await.unwrap().is_empty());
 }
@@ -251,9 +251,9 @@ async fn scan_from_resume_protocol_pages_every_row_once() {
         if batch.is_empty() {
             break;
         }
-        cursor = batch.last().unwrap().0.clone();
+        cursor = batch.last().unwrap().0.to_vec();
         cursor.push(0x00);
-        seen.extend(batch.into_iter().map(|(k, _)| k));
+        seen.extend(batch.into_iter().map(|(k, _)| k.to_vec()));
     }
     assert_eq!(seen.len(), 50);
     let mut expected: Vec<Vec<u8>> = (0..50)
