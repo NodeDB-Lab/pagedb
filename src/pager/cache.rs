@@ -108,6 +108,16 @@ pub struct PageCache {
     /// on next eviction"; after wrapping past head it is reset to `None`.
     hand: Option<usize>,
     dirty: BTreeSet<(FileKey, u64)>,
+    /// How many live entries are neither dirty nor pinned, i.e. how many the
+    /// eviction hand could actually take.
+    ///
+    /// A large write transaction dirties every page it touches, and dirty pages
+    /// are never evicted, so the cache legitimately grows past capacity with
+    /// nothing evictable in it. Without this the hand re-swept the whole list on
+    /// every insert only to fail — and the list it swept was the overgrown one,
+    /// so a single transaction's page inserts cost time quadratic in the pages
+    /// it wrote.
+    evictable: usize,
 }
 
 impl PageCache {
@@ -123,7 +133,15 @@ impl PageCache {
             tail: None,
             hand: None,
             dirty: BTreeSet::new(),
+            evictable: 0,
         }
+    }
+
+    /// Whether the entry at `idx` is currently a candidate for the hand.
+    fn is_evictable(&self, idx: usize) -> bool {
+        self.slab[idx]
+            .as_ref()
+            .is_some_and(|node| node.pins == 0 && !self.dirty.contains(&node.key))
     }
 
     #[must_use]
@@ -145,18 +163,27 @@ impl PageCache {
     /// replaces was a second hash of the same key.
     pub fn get_and_pin(&mut self, key: (FileKey, u64)) -> Option<(Arc<Page>, usize)> {
         let idx = *self.map.get(&key)?;
+        let was_evictable = self.is_evictable(idx);
         let node = self.slab[idx].as_mut().expect("indexed node alive");
         node.visited = true;
         node.pins = node.pins.saturating_add(1);
-        Some((node.page.clone(), idx))
+        let page = node.page.clone();
+        if was_evictable {
+            self.evictable -= 1;
+        }
+        Some((page, idx))
     }
 
     /// Pin the entry at `idx`, which the caller must have just obtained from
     /// [`insert_and_index`](Self::insert_and_index) or
     /// [`get_and_pin`](Self::get_and_pin).
     pub fn pin_at(&mut self, idx: usize) {
+        let was_evictable = self.is_evictable(idx);
         let node = self.slab[idx].as_mut().expect("indexed node alive");
         node.pins = node.pins.saturating_add(1);
+        if was_evictable {
+            self.evictable -= 1;
+        }
     }
 
     /// Release a pin taken at `idx`. `key` identifies the entry the pin was
@@ -172,6 +199,9 @@ impl PageCache {
             return;
         }
         node.pins = node.pins.saturating_sub(1);
+        if self.is_evictable(idx) {
+            self.evictable += 1;
+        }
     }
 
     /// Insert `(key, page)`. Evicts one unpinned, undirty, unvisited entry
@@ -215,11 +245,32 @@ impl PageCache {
         }
         self.head = Some(idx);
         self.map.insert(key, idx);
+        // Fresh entries are clean and unpinned; a caller that pins or dirties
+        // this one adjusts the count through those paths.
+        if !self.dirty.contains(&key) {
+            self.evictable += 1;
+        }
         (evicted, idx)
     }
 
     fn evict_one(&mut self) -> Option<(FileKey, u64)> {
         // Two passes are sufficient to clear visited bits and then evict.
+        // A drifted count would either skip a possible eviction (unbounded
+        // growth) or reintroduce the sweep it exists to avoid, and neither is
+        // visible without checking.
+        debug_assert_eq!(
+            self.evictable,
+            self.map
+                .values()
+                .filter(|&&idx| self.is_evictable(idx))
+                .count(),
+            "evictable count drifted from the live entries"
+        );
+        // Nothing clean and unpinned exists, so no sweep can succeed. Bailing
+        // here is what keeps a write transaction linear in the pages it dirties.
+        if self.evictable == 0 {
+            return None;
+        }
         // Use the live list length rather than the configured capacity because
         // pinned or dirty pages can temporarily grow the cache past capacity.
         let max_steps = self.map.len().saturating_mul(2).max(1);
@@ -252,6 +303,7 @@ impl PageCache {
             self.hand = next_idx;
             self.map.remove(&key);
             self.free_node(idx);
+            self.evictable -= 1;
             return Some(key);
         }
         // No evictable entry — capacity overrun is possible if everything is
@@ -289,11 +341,21 @@ impl PageCache {
     }
 
     pub fn mark_dirty(&mut self, key: (FileKey, u64)) {
+        let idx = self.map.get(&key).copied();
+        let was_evictable = idx.is_some_and(|i| self.is_evictable(i));
         self.dirty.insert(key);
+        if was_evictable {
+            self.evictable -= 1;
+        }
     }
 
     pub fn clear_dirty(&mut self, key: (FileKey, u64)) {
         self.dirty.remove(&key);
+        if let Some(idx) = self.map.get(&key).copied()
+            && self.is_evictable(idx)
+        {
+            self.evictable += 1;
+        }
     }
 
     /// How many entries are currently dirty, across every file.
@@ -355,7 +417,9 @@ impl PageCache {
             if keep_dirty && self.dirty.contains(&key) {
                 continue;
             }
-            if let Some(idx) = self.map.remove(&key) {
+            if let Some(&idx) = self.map.get(&key) {
+                let was_evictable = self.is_evictable(idx);
+                self.map.remove(&key);
                 let (prev, next) = {
                     let node = self.slab[idx].as_ref().expect("indexed node alive");
                     (node.prev, node.next)
@@ -365,6 +429,9 @@ impl PageCache {
                 }
                 self.unlink_node(idx, prev, next);
                 self.free_node(idx);
+                if was_evictable {
+                    self.evictable -= 1;
+                }
             }
             if !keep_dirty {
                 self.dirty.remove(&key);
@@ -490,6 +557,47 @@ mod tests {
             c.get(new_key).is_some(),
             "the stale release must not have unpinned the new occupant"
         );
+    }
+
+    /// An all-dirty cache must not re-sweep itself on every insert: that is
+    /// what made a large write transaction cost time quadratic in its pages.
+    #[test]
+    fn an_all_dirty_cache_reports_nothing_evictable() {
+        let mut c = PageCache::with_capacity(4);
+        for id in 1u8..=6 {
+            let key = (FileKey::Main, u64::from(id));
+            c.insert(key, page(id));
+            c.mark_dirty(key);
+        }
+        assert_eq!(c.evictable, 0);
+        assert_eq!(c.len(), 6, "dirty entries grow the cache past capacity");
+
+        // Cleaning one makes it — and only it — a candidate again.
+        c.clear_dirty((FileKey::Main, 3));
+        assert_eq!(c.evictable, 1);
+        assert_eq!(
+            c.insert((FileKey::Main, 7), page(7)),
+            Some((FileKey::Main, 3))
+        );
+        // Page 3 left, but page 7 arrived clean and is a candidate in its turn.
+        assert_eq!(c.evictable, 1);
+    }
+
+    #[test]
+    fn evictable_count_tracks_pin_and_dirty_transitions() {
+        let mut c = PageCache::with_capacity(8);
+        let key = (FileKey::Main, 1);
+        let (_, idx) = c.insert_and_index(key, page(1));
+        assert_eq!(c.evictable, 1, "a fresh clean entry is a candidate");
+
+        c.pin_at(idx);
+        assert_eq!(c.evictable, 0, "pinned");
+        c.mark_dirty(key);
+        assert_eq!(c.evictable, 0, "pinned and dirty");
+        c.unpin_at(idx, key);
+        assert_eq!(c.evictable, 0, "still dirty");
+        c.clear_dirty(key);
+        assert_eq!(c.evictable, 1, "clean and unpinned again");
     }
 
     #[test]

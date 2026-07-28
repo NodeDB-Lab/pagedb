@@ -31,6 +31,7 @@ use fluxbench::prelude::*;
 use fluxbench::{TrackingAllocator, bench};
 
 use pagedb::vfs::memory::MemVfs;
+use pagedb::vfs::tokio_backend::TokioVfs;
 use pagedb::{CipherId, Db, OpenOptions, RealmId, RetainPolicy};
 
 /// `flux.toml` turns allocation tracking on; without the tracking allocator
@@ -170,6 +171,112 @@ fn bulk_put_append(b: &mut Bencher) {
                     let mut w = db.begin_write().await.unwrap();
                     for i in 0..ROWS {
                         w.put_append(&monotonic_key(i), &v).await.unwrap();
+                    }
+                    w.commit().await.unwrap();
+                })
+            })
+        },
+    );
+}
+
+/// Per-row cost against transaction size.
+///
+/// A single transaction should cost time linear in the rows it carries, so
+/// dividing each result by its row count should give a flat line. A rising one
+/// means per-row work that grows with the rows already staged.
+#[bench(group = "btree/write-path/scaling", args = [2500, 5000, 10000, 20000], samples = 5)]
+fn scaling_uncommitted(b: &mut Bencher, rows: u32) {
+    let v = value();
+    let rows = rows as usize;
+    b.iter_with_setup(
+        || with_rt(|rt| rt.block_on(open_mem())),
+        |db| {
+            with_rt(|rt| {
+                rt.block_on(async {
+                    let mut w = db.begin_write().await.unwrap();
+                    for i in 0..rows {
+                        w.put(&scrambled_key(i), &v).await.unwrap();
+                    }
+                    w.abort().await;
+                })
+            })
+        },
+    );
+}
+
+/// Per-row cost against transaction size for the committed file-backed load —
+/// the shape the cross-engine bulk-load benchmark runs. Rising per-row cost
+/// here, where [`scaling_uncommitted`] stays flat, isolates the growth to
+/// commit rather than to the tree.
+#[bench(group = "btree/write-path/scaling", args = [10000, 25000, 50000, 100000], samples = 3)]
+fn scaling_file_committed(b: &mut Bencher, rows: u32) {
+    let v = value();
+    let rows = rows as usize;
+    b.iter_with_setup(
+        || {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = with_rt(|rt| {
+                rt.block_on(async {
+                    Db::open(
+                        TokioVfs::new(dir.path()),
+                        [7u8; 32],
+                        PAGE,
+                        RealmId::new([3u8; 16]),
+                        bench_opts(),
+                    )
+                    .await
+                    .unwrap()
+                })
+            });
+            (db, dir)
+        },
+        |(db, _keep)| {
+            with_rt(|rt| {
+                rt.block_on(async {
+                    let mut w = db.begin_write().await.unwrap();
+                    for i in 0..rows {
+                        w.put(&scrambled_key(i), &v).await.unwrap();
+                    }
+                    w.commit().await.unwrap();
+                })
+            })
+        },
+    );
+}
+
+/// The same load against a real file backend, so AEAD over every dirty page
+/// and the page writes themselves are in the measurement.
+///
+/// This is the shape that matches the cross-engine bulk-load workload. The
+/// `MemVfs` variants above isolate the in-memory tree; the distance between
+/// them and this one *is* the commit path.
+#[bench(group = "btree/write-path", samples = 10)]
+fn bulk_put_file(b: &mut Bencher) {
+    let v = value();
+    b.iter_with_setup(
+        || {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = with_rt(|rt| {
+                rt.block_on(async {
+                    Db::open(
+                        TokioVfs::new(dir.path()),
+                        [7u8; 32],
+                        PAGE,
+                        RealmId::new([3u8; 16]),
+                        bench_opts(),
+                    )
+                    .await
+                    .unwrap()
+                })
+            });
+            (db, dir)
+        },
+        |(db, _keep)| {
+            with_rt(|rt| {
+                rt.block_on(async {
+                    let mut w = db.begin_write().await.unwrap();
+                    for i in 0..ROWS {
+                        w.put(&scrambled_key(i), &v).await.unwrap();
                     }
                     w.commit().await.unwrap();
                 })
