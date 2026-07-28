@@ -1,10 +1,50 @@
-# pagedb
+<div align="center">
 
-**An encrypted, portable, embedded page store for Rust.** Pure Rust, async-native, no C dependencies, no `mmap` of encrypted bytes. Runs on Linux, macOS, Windows, iOS, Android, browsers (WASM/OPFS), and WASI — with format-bit-identity across every target.
+<h1>pagedb</h1>
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)]() [![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-orange.svg)]()
+<h3>An encrypted, portable, embedded page store for Rust.</h3>
 
----
+<p>
+  Pure Rust, async-native, no C dependencies, no <code>mmap</code> of encrypted bytes.
+  One cryptographic substrate under two purpose-built surfaces — a CoW B+ tree and an
+  engine-owned segment file API. Runs on Linux, macOS, Windows, iOS, Android, browsers
+  (WASM/OPFS), and WASI, with format-bit-identity across every target.
+</p>
+
+<p>
+  <a href="https://docs.rs/pagedb"><strong>API Docs</strong></a>
+  ·
+  <a href="https://crates.io/crates/pagedb"><strong>crates.io</strong></a>
+  ·
+  <a href="#position-in-the-stack"><strong>Architecture</strong></a>
+  ·
+  <a href="#benchmarks"><strong>Benchmarks</strong></a>
+  ·
+  <a href="#faq--questions-people-actually-ask"><strong>FAQ</strong></a>
+</p>
+
+<p>
+  <a href="https://github.com/nodedb-lab/pagedb/actions/workflows/ci.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/nodedb-lab/pagedb/ci.yml?branch=main&label=ci" alt="CI status">
+  </a>
+  <a href="https://crates.io/crates/pagedb">
+    <img src="https://img.shields.io/crates/v/pagedb" alt="crates.io version">
+  </a>
+  <a href="https://crates.io/crates/pagedb">
+    <img src="https://img.shields.io/crates/d/pagedb?label=downloads" alt="crates.io downloads">
+  </a>
+  <a href="https://docs.rs/pagedb">
+    <img src="https://img.shields.io/docsrs/pagedb" alt="docs.rs">
+  </a>
+  <a href="https://github.com/nodedb-lab/pagedb#license">
+    <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
+  </a>
+  <a href="https://github.com/nodedb-lab/pagedb/stargazers">
+    <img src="https://img.shields.io/github/stars/nodedb-lab/pagedb?style=social" alt="GitHub stars">
+  </a>
+</p>
+
+</div>
 
 ## What is pagedb?
 
@@ -74,12 +114,12 @@ does not rewrite authoritative `main.db` or segment bytes.
 Arguments are validated before the store is touched, and each failure class
 gets its own exit code so a caller can tell them apart:
 
-| Code | Meaning |
-| ---: | --- |
-| 0 | Opened cleanly; with `--deep`, the report was clean |
-| 1 | An integrity problem was found |
-| 2 | The command line was invalid; the store was never opened |
-| 3 | The store could not be opened, or the report could not be written |
+| Code | Meaning                                                           |
+| ---: | ----------------------------------------------------------------- |
+|    0 | Opened cleanly; with `--deep`, the report was clean               |
+|    1 | An integrity problem was found                                    |
+|    2 | The command line was invalid; the store was never opened          |
+|    3 | The store could not be opened, or the report could not be written |
 
 ## Benchmarks
 
