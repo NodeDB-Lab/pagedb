@@ -108,6 +108,17 @@ pub struct BTree<V: Vfs> {
     pub(super) root_page_id: u64,
     pub(super) next_page_id: u64,
     pub(super) freed: Vec<u64>,
+    /// The subset of pages freed this session that `allocate_page` may hand
+    /// back immediately — i.e. those that satisfied the reuse rule below at the
+    /// moment they were freed. Eligibility is decided once, in
+    /// [`Self::free_page`], because both inputs to that decision are
+    /// monotonic: `reuse_threshold` is fixed for the session and
+    /// `free_page_consumed` only grows. Deciding it here keeps allocation O(1);
+    /// evaluating it per allocation instead meant rescanning `freed` against
+    /// `free_page_consumed` on every call, which is quadratic in the number of
+    /// pages a flush touches and made large flushes effectively never finish.
+    /// Drained together with `freed` by `drain_freed`.
+    pub(super) freed_reusable: Vec<u64>,
     pub(super) page_size: usize,
     /// Minimum `page_id` that may be recycled from `freed` within this session.
     /// Pages below this threshold existed before the session began: they are
@@ -187,6 +198,7 @@ impl<V: Vfs> BTree<V> {
             root_page_id,
             next_page_id: next,
             freed: Vec::new(),
+            freed_reusable: Vec::new(),
             page_size,
             reuse_threshold: 0,
             dirty_leaves: FxHashMap::default(),
@@ -205,8 +217,21 @@ impl<V: Vfs> BTree<V> {
     /// deferred-queue promotion. Call with the session-start `next_page_id`:
     /// pages below it are still referenced by the last durable header and must
     /// keep their on-disk bytes until the header that frees them is durable.
+    ///
+    /// Re-partitions anything already freed, since eligibility is decided at
+    /// free time: callers normally set the threshold before the first free, so
+    /// this is a no-op walk over two empty vectors.
     pub fn set_reuse_threshold(&mut self, threshold: u64) {
         self.reuse_threshold = threshold;
+        let mut pending = std::mem::take(&mut self.freed);
+        pending.append(&mut self.freed_reusable);
+        for id in pending {
+            if self.is_reusable_in_session(id) {
+                self.freed_reusable.push(id);
+            } else {
+                self.freed.push(id);
+            }
+        }
     }
 
     /// Wire in the `Db`'s shared free-page cache. After this call,
@@ -263,28 +288,15 @@ impl<V: Vfs> BTree<V> {
         // content. Without this, every cache-drawn page freed by a later
         // in-session split is burned for the rest of the txn and allocation
         // falls through to bump growth.
-        if self.reuse_threshold == 0 {
-            if let Some(id) = self.freed.pop() {
-                assert!(
-                    id >= 4,
-                    "allocate_page recycled reserved page {id} from freed"
-                );
-                return id;
-            }
-        } else {
-            let consumed = self.free_page_consumed.as_ref().map(|c| c.lock());
-            let pos = self.freed.iter().rposition(|&id| {
-                id >= self.reuse_threshold || consumed.as_ref().is_some_and(|c| c.contains(&id))
-            });
-            drop(consumed);
-            if let Some(pos) = pos {
-                let id = self.freed.remove(pos);
-                assert!(
-                    id >= 4,
-                    "allocate_page recycled reserved page {id} from freed"
-                );
-                return id;
-            }
+        // `free_page` has already applied that rule to each freed page, so the
+        // eligible ones are exactly `freed_reusable` and this is a pop, not a
+        // search.
+        if let Some(id) = self.freed_reusable.pop() {
+            assert!(
+                id >= 4,
+                "allocate_page recycled reserved page {id} from freed"
+            );
+            return id;
         }
         // Then draw from the shared cross-commit cache. It is loaded at txn
         // begin with *only* free-list pages below the reclamation floor — pages
@@ -320,7 +332,26 @@ impl<V: Vfs> BTree<V> {
             page_id >= 4,
             "free_page called on reserved page {page_id} (use-after-free / wild pointer)"
         );
-        self.freed.push(page_id);
+        if self.is_reusable_in_session(page_id) {
+            self.freed_reusable.push(page_id);
+        } else {
+            self.freed.push(page_id);
+        }
+    }
+
+    /// Whether a page freed now may be recycled within this session. See
+    /// [`Self::allocate_page`] for the reasoning behind each arm: below the
+    /// threshold a page may still be live in the last durable header or a
+    /// pinned reader's snapshot, unless it was drawn from the shared free-page
+    /// cache this session, in which case the durable header references none of
+    /// its content.
+    fn is_reusable_in_session(&self, page_id: u64) -> bool {
+        if self.reuse_threshold == 0 || page_id >= self.reuse_threshold {
+            return true;
+        }
+        self.free_page_consumed
+            .as_ref()
+            .is_some_and(|c| c.lock().contains(&page_id))
     }
 
     pub(super) fn validate_insert_record_fits(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -461,5 +492,111 @@ impl<V: Vfs> BTree<V> {
         self.pager
             .write_main_page(page_id, self.realm_id, PageKind::BTreeInternal, &body)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::BTree;
+    use crate::RealmId;
+    use crate::crypto::CipherId;
+    use crate::crypto::kdf::derive_mk;
+    use crate::pager::{Pager, PagerConfig};
+    use crate::vfs::memory::MemVfs;
+
+    const PAGE: usize = 4096;
+
+    async fn fresh_tree() -> BTree<MemVfs> {
+        let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
+        let cfg = PagerConfig {
+            page_size: PAGE,
+            buffer_pool_pages: 256,
+            segment_cache_pages: 16,
+            cipher_id: CipherId::Aes256Gcm,
+            mk_epoch: 0,
+            main_db_file_id: [0xAB; 16],
+            main_db_path: "/main.db".into(),
+            anchor_budget: 100_000_000,
+            dek_lru_capacity: 16,
+            observer_retry_count: 0,
+            metrics_enabled: true,
+        };
+        let pager = Arc::new(Pager::open(MemVfs::new(), mk, cfg).await.unwrap());
+        BTree::open(pager, RealmId::new([1; 16]), 0, 4, PAGE)
+    }
+
+    /// Below-threshold frees must not be recycled in-session, above-threshold
+    /// ones must be, and a cache-drawn page recorded in `free_page_consumed`
+    /// must be recyclable even below the threshold. Same rule the per-allocation
+    /// scan used to apply; asserted here now that `free_page` decides it once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reuse_eligibility_matches_the_threshold_rule() {
+        let mut tree = fresh_tree().await;
+        let consumed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        tree.set_free_page_consumed(Arc::clone(&consumed));
+        tree.set_reuse_threshold(1000);
+
+        // Below threshold and never drawn from the cache: not recyclable now.
+        tree.free_page(500);
+        assert_eq!(tree.allocate_page(), 4, "bumped, not recycled");
+
+        // At or above the threshold: recyclable immediately.
+        tree.free_page(1500);
+        assert_eq!(tree.allocate_page(), 1500);
+
+        // Below threshold but drawn from the shared cache this session.
+        consumed.lock().push(600);
+        tree.free_page(600);
+        assert_eq!(tree.allocate_page(), 600);
+
+        // The one page held back is still reported as freed this session.
+        assert_eq!(tree.drain_freed(), vec![500]);
+    }
+
+    /// A page freed before the threshold was set is classified when it is set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn threshold_set_after_a_free_repartitions() {
+        let mut tree = fresh_tree().await;
+        tree.free_page(500);
+        tree.free_page(1500);
+        tree.set_reuse_threshold(1000);
+        assert_eq!(tree.allocate_page(), 1500, "above threshold stays reusable");
+        assert_eq!(tree.allocate_page(), 4, "below threshold was held back");
+        assert_eq!(tree.drain_freed(), vec![500]);
+    }
+
+    /// Allocation must not rescan the freed list. A hang detector, not a
+    /// benchmark: the bound is ~1000x the fixed cost, and only a return to a
+    /// per-allocation scan over `freed` x `free_page_consumed` can exceed it.
+    /// That scan is what pinned a core for 84 minutes inside one flush.
+    #[tokio::test(flavor = "current_thread")]
+    async fn allocation_cost_does_not_grow_with_the_freed_list() {
+        const N: u64 = 20_000;
+        let mut tree = fresh_tree().await;
+        let consumed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        tree.set_free_page_consumed(Arc::clone(&consumed));
+        tree.set_reuse_threshold(N * 2);
+
+        // Every one of these is ineligible, so each allocation below had to
+        // scan all of them (and, per entry, all of `consumed`) before the fix.
+        for id in 4..N {
+            tree.free_page(id);
+        }
+        for id in N..(N + 500) {
+            consumed.lock().push(id);
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            tree.allocate_page();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "{N} allocations against {N} held-back frees took {elapsed:?} — \
+             allocation is scanning the freed list again"
+        );
     }
 }
