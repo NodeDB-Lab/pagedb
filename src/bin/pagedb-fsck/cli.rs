@@ -28,14 +28,21 @@ const REALM_VALUE: &str = "a 32-character hex value";
 /// What `--page-size` accepts, quoted back in the diagnostic when it is missing.
 const PAGE_SIZE_VALUE: &str = "a positive decimal byte count";
 
+/// What `--provenance` accepts, quoted back in the diagnostic when it is missing.
+const PAGE_ID_VALUE: &str = "a decimal page id";
+
 /// The canonical grammar, printed on `--help` and after any parse failure.
 pub const USAGE: &str = "\
-usage: pagedb-fsck <path> [--deep] [--page-size <bytes>] [--realm <hex16>] [<hex-kek>]
+usage: pagedb-fsck <path> [--deep] [--page-size <bytes>] [--realm <hex16>]
+                          [--provenance <page>] [<hex-kek>]
 
   <path>               directory containing main.db and seg/
   --deep               authenticate and walk every page, not just the header
   --page-size <bytes>  page size the store was created with (default 4096)
   --realm <hex16>      32 hex characters; default all-ones, nodedb-lite uses all-zeros
+  --provenance <page>  report what the roots and free list say about one page:
+                       whether it is live, free, both (one page, two owners), or
+                       unreferenced by either
   <hex-kek>            64 hex characters; required, or supply it in PAGEDB_KEK
   -h, --help           print this message
 
@@ -75,6 +82,8 @@ pub enum CliError {
     NonUtf8Argument(usize),
     /// `--page-size` was handed something that is not a positive integer.
     InvalidPageSize(String),
+    /// `--provenance` was handed something that is not a page id.
+    InvalidPageId(String),
 }
 
 impl fmt::Display for CliError {
@@ -103,6 +112,9 @@ impl fmt::Display for CliError {
             Self::InvalidPageSize(value) => {
                 write!(f, "--page-size requires {PAGE_SIZE_VALUE}, found {value}")
             }
+            Self::InvalidPageId(value) => {
+                write!(f, "--provenance requires {PAGE_ID_VALUE}, found {value}")
+            }
         }
     }
 }
@@ -126,6 +138,14 @@ pub struct CliArgs {
     pub page_size: usize,
     pub realm_hex: Option<String>,
     pub kek_hex: Option<String>,
+    /// Report what the roots and the free list say about this page.
+    ///
+    /// The corruption errors this tool surfaces name page provenance as the
+    /// next question to ask, because it separates the two causes that look
+    /// identical in the bytes: a page handed to two owners, versus a page whose
+    /// own content is damaged. Without it here the only way to answer is to
+    /// write a program against the library.
+    pub provenance: Option<u64>,
 }
 
 /// Whether a token occupies an option slot rather than a value slot.
@@ -202,6 +222,7 @@ pub fn parse(argv: &[OsString]) -> Result<CliRequest, CliError> {
     let mut page_size = None;
     let mut realm_hex = None;
     let mut kek_hex = None;
+    let mut provenance = None;
 
     let mut index = 1;
     while index < rest.len() {
@@ -238,6 +259,17 @@ pub fn parse(argv: &[OsString]) -> Result<CliRequest, CliError> {
                 page_size = Some(parsed);
                 index += 2;
             }
+            "--provenance" => {
+                if provenance.is_some() {
+                    return Err(CliError::DuplicateOption("--provenance"));
+                }
+                let value = value_of("--provenance", PAGE_ID_VALUE, rest, index, position)?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| CliError::InvalidPageId(value.to_string()))?;
+                provenance = Some(parsed);
+                index += 2;
+            }
             _ if is_option(token) => {
                 return Err(CliError::UnknownOption(token.to_string()));
             }
@@ -257,6 +289,7 @@ pub fn parse(argv: &[OsString]) -> Result<CliRequest, CliError> {
         page_size: page_size.unwrap_or(DEFAULT_PAGE_SIZE),
         realm_hex,
         kek_hex,
+        provenance,
     }))
 }
 
@@ -292,6 +325,30 @@ mod tests {
     }
 
     #[test]
+    fn provenance_takes_a_page_id() {
+        assert_eq!(
+            check(&["/store", "--provenance", "362149"]).provenance,
+            Some(362_149)
+        );
+    }
+
+    #[test]
+    fn provenance_rejects_a_non_numeric_page_id() {
+        assert_eq!(
+            error(&["/store", "--provenance", "page-one"]),
+            CliError::InvalidPageId("page-one".to_string())
+        );
+    }
+
+    #[test]
+    fn provenance_rejects_repetition() {
+        assert_eq!(
+            error(&["/store", "--provenance", "1", "--provenance", "2"]),
+            CliError::DuplicateOption("--provenance")
+        );
+    }
+
+    #[test]
     fn a_bare_path_uses_every_default() {
         let args = check(&["/store"]);
         assert_eq!(
@@ -302,6 +359,7 @@ mod tests {
                 page_size: DEFAULT_PAGE_SIZE,
                 realm_hex: None,
                 kek_hex: None,
+                provenance: None,
             }
         );
     }
@@ -453,6 +511,7 @@ mod tests {
                 page_size: DEFAULT_PAGE_SIZE,
                 realm_hex: None,
                 kek_hex: None,
+                provenance: None,
             }))
         );
 

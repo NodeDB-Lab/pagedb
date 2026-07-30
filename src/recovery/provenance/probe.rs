@@ -41,6 +41,14 @@ pub enum PageStanding {
     Orphaned,
     /// At or above the allocation cursor: never allocated.
     BeyondCursor,
+    /// Reachable from no root, and the free list could not be read to say
+    /// whether it is free or leaked.
+    ///
+    /// Distinct from [`Self::Orphaned`] because the difference is a claim about
+    /// the allocator, and the structure that would support it is the damaged
+    /// one. What it does establish is the half that matters most: no live root
+    /// refers to this page, so nothing is reading it as data.
+    FreeListUnreadable,
 }
 
 /// What the store says about one page.
@@ -54,6 +62,11 @@ pub struct PageProvenance {
     pub reachable_from: Vec<&'static str>,
     /// Allocation cursor the answer was computed against.
     pub next_page_id: u64,
+    /// Whether the free-list half of the answer could be computed at all.
+    ///
+    /// `false` means the chain would not read, so `freed_by_commit` is `None`
+    /// for lack of evidence rather than because the page is not free.
+    pub free_list_readable: bool,
 }
 
 impl PageProvenance {
@@ -111,12 +124,25 @@ impl<V: Vfs + Clone> Db<V> {
             }
         }
 
-        let freed_by_commit = free_list_entry(self, self.realm_id, free_list_root, page_id).await?;
+        // The free-list half is best-effort. This runs precisely when something
+        // failed to authenticate, and one of the things that can fail is the
+        // free-list chain itself — including the page being asked about. Letting
+        // that error escape makes the probe unanswerable exactly when the answer
+        // matters, so an unreadable chain narrows the verdict instead of
+        // replacing it: root reachability alone still separates "live page that
+        // something also freed" from "page no root refers to".
+        let free_list = free_list_entry(self, self.realm_id, free_list_root, page_id).await;
+        let free_list_readable = free_list.is_ok();
+        let freed_by_commit = free_list.unwrap_or(None);
 
         let standing = match (reachable_from.is_empty(), freed_by_commit.is_some()) {
             (false, true) => PageStanding::LiveAndFree,
             (false, false) => PageStanding::Live,
             (true, true) => PageStanding::Free,
+            // Without a readable free list, "no root reaches it" cannot be
+            // sharpened into orphaned-versus-free: the structure that would
+            // distinguish them is the damaged one.
+            (true, false) if !free_list_readable => PageStanding::FreeListUnreadable,
             (true, false) if page_id >= next_page_id => PageStanding::BeyondCursor,
             (true, false) => PageStanding::Orphaned,
         };
@@ -127,6 +153,7 @@ impl<V: Vfs + Clone> Db<V> {
             freed_by_commit,
             reachable_from,
             next_page_id,
+            free_list_readable,
         })
     }
 }

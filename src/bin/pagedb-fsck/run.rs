@@ -42,6 +42,46 @@ pub async fn execute() -> ExitCode {
     }
 }
 
+/// Print what the store's roots and free list say about one page.
+///
+/// Separates the two causes that look identical in the bytes: a page handed to
+/// two owners is a structural fault that will recur, while a single-owner page
+/// that fails to authenticate is damage to its own content.
+async fn report_provenance<V: pagedb::vfs::Vfs + Clone>(
+    db: &Db<V>,
+    page_id: u64,
+) -> Result<(), ExitCode> {
+    let p = db.page_provenance(page_id).await.map_err(|error| {
+        eprintln!("pagedb-fsck: provenance of page {page_id} failed: {error}");
+        ExitCode::from(EXIT_OPERATIONAL)
+    })?;
+
+    println!("pagedb-fsck: provenance of page {page_id}");
+    println!("  standing        : {:?}", p.standing);
+    println!("  freed_by_commit : {:?}", p.freed_by_commit);
+    println!("  reachable_from  : {:?}", p.reachable_from);
+    println!("  next_page_id    : {}", p.next_page_id);
+    if !p.free_list_readable {
+        println!(
+            "  note            : the free list could not be read, so the free half of \
+             this answer is missing rather than negative"
+        );
+    }
+    if p.is_double_owned() {
+        println!(
+            "  VERDICT: this page is live AND free — the store handed one id to two \
+             owners. That is a structural fault which will recur, not damage to this \
+             page's bytes."
+        );
+    } else {
+        println!(
+            "  VERDICT: single owner. Nothing here explains the page's content, so the \
+             damage is to its own bytes."
+        );
+    }
+    Ok(())
+}
+
 async fn check(args: CliArgs) -> ExitCode {
     let CliArgs {
         path,
@@ -49,6 +89,7 @@ async fn check(args: CliArgs) -> ExitCode {
         page_size,
         realm_hex,
         kek_hex,
+        provenance,
     } = args;
 
     // An explicit positional key wins over the environment. There is no
@@ -105,6 +146,14 @@ async fn check(args: CliArgs) -> ExitCode {
 
     println!("pagedb-fsck: structural open OK");
     println!("  latest_commit = {:?}", db.latest_commit());
+
+    // Answered before the deep walk: it is the question a walk's findings send
+    // the operator back to ask, and it is cheap next to walking every page.
+    if let Some(page_id) = provenance
+        && let Err(code) = report_provenance(&db, page_id).await
+    {
+        return code;
+    }
 
     if !deep {
         println!("pagedb-fsck: OK");

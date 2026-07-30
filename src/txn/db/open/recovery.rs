@@ -121,5 +121,9 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     db.validate_counter_rows(catalog_root_page_id, next_page_id)
         .await?;
 
+    if capabilities.runs_standalone_recovery() {
+        db.drop_unreadable_free_list().await;
+    }
+
     Ok(())
 }
