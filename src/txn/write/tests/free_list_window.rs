@@ -8,7 +8,9 @@
 use std::collections::BTreeSet;
 
 use crate::options::RetainPolicy;
-use crate::pager::freelist::{WINDOW_PAGES, read_chain, read_chain_prefix, write_chain};
+use crate::pager::freelist::{
+    ChainTail, WINDOW_PAGES, read_chain, read_chain_prefix, read_chain_summary, write_chain,
+};
 use crate::vfs::memory::MemVfs;
 use crate::{Db, OpenOptions, PagedbError, ReaderStallPolicy, RealmId};
 
@@ -25,6 +27,8 @@ async fn open_with(options: OpenOptions) -> Db<MemVfs> {
 /// A hand-laid chain segment and the page ids it accounts for.
 struct LaidChain {
     head: u64,
+    /// This segment named as a tail, for a segment laid in front of it.
+    link: ChainTail,
     /// Pages the chain itself occupies.
     hosts: Vec<u64>,
     /// Pages the chain records as free.
@@ -56,25 +60,34 @@ async fn lay_chain(
     pages: usize,
     entries_per_page: usize,
     freed_at: u64,
-    tail: u64,
+    tail: ChainTail,
 ) -> LaidChain {
     let hosts: Vec<u64> = (0..pages as u64).map(|i| base + i).collect();
     let named: Vec<u64> = (0..(pages * entries_per_page) as u64)
         .map(|i| base + pages as u64 + i)
         .collect();
-    for (index, &host) in hosts.iter().enumerate() {
-        let next = hosts.get(index + 1).copied().unwrap_or(tail);
+    // Last page first: a page summarises the chain below it, so it cannot be
+    // written before the page it links to exists.
+    let mut link = tail;
+    for (index, &host) in hosts.iter().enumerate().rev() {
         let chunk: Vec<(u64, u64)> = named
             [index * entries_per_page..(index + 1) * entries_per_page]
             .iter()
             .map(|&page_id| (freed_at, page_id))
             .collect();
-        write_chain(&db.pager, db.realm_id, db.page_size, &[host], &chunk, next)
+        write_chain(&db.pager, db.realm_id, db.page_size, &[host], &chunk, link)
             .await
             .unwrap();
+        link = ChainTail {
+            head: host,
+            summary: read_chain_summary(&db.pager, db.realm_id, host)
+                .await
+                .unwrap(),
+        };
     }
     LaidChain {
         head: hosts[0],
+        link,
         hosts,
         named,
         next_free_id: base + (pages + pages * entries_per_page) as u64,
@@ -132,6 +145,64 @@ async fn live_page_ids(db: &Db<MemVfs>) -> BTreeSet<u64> {
     live
 }
 
+/// Chain pages the pager was asked for, cumulative since open. Hits and misses
+/// together: a walk that finds every page cached still walked it.
+fn page_lookups(db: &Db<MemVfs>) -> u64 {
+    use std::sync::atomic::Ordering;
+    db.pager.inner.buffer_pool_hits.load(Ordering::Relaxed)
+        + db.pager.inner.buffer_pool_misses.load(Ordering::Relaxed)
+}
+
+/// One commit against a chain of `tail_pages` pages, returning the page
+/// lookups that commit performed. The chain is laid entirely below the
+/// reclamation floor, so every entry in it is drainable and none is stuck —
+/// the answer the stall accounting is reaching for is zero regardless of how
+/// long the chain is.
+async fn lookups_for_a_commit_over_a_tail(tail_pages: usize) -> u64 {
+    let db =
+        open_with(OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled)).await;
+    let base = allocation_cursor(&db).await;
+    let laid = lay_chain(&db, base, tail_pages, 1, 0, ChainTail::EMPTY).await;
+    publish_chain(&db, laid.head, laid.next_free_id).await;
+
+    let before = page_lookups(&db);
+    let mut txn = db.begin_write().await.unwrap();
+    txn.put(b"live", b"value").await.unwrap();
+    txn.commit().await.unwrap();
+    page_lookups(&db) - before
+}
+
+/// A commit must cost what it changes, not what the store already holds.
+///
+/// The free list grows with the store: every copy-on-write frees a page, and
+/// entries the bounded window has not yet swept accumulate in the retained
+/// tail. Any per-commit walk of that tail therefore ties commit cost to store
+/// size, and the cost lands entirely on the one write that absorbs a flush —
+/// which is why it shows up as a climbing tail latency over a flat median
+/// rather than as a uniform slowdown.
+///
+/// Asserted in page lookups rather than wall-clock: the defect is the walk
+/// itself, and a machine fast enough to hide it still performs it.
+#[tokio::test(flavor = "current_thread")]
+async fn commit_cost_is_independent_of_the_retained_tail_length() {
+    // Both fixtures clear the window by a wide margin. The window walk is a
+    // fixed cost paid either way, but its cycle detector reads ahead, so a
+    // chain that ends close behind the window pays less of it — measuring that
+    // difference would be measuring the window, not the tail.
+    const SHORT: usize = WINDOW_PAGES * 4;
+    const LONG: usize = WINDOW_PAGES * 16;
+
+    let short = lookups_for_a_commit_over_a_tail(SHORT).await;
+    let long = lookups_for_a_commit_over_a_tail(LONG).await;
+
+    assert!(
+        long <= short + 8,
+        "a commit over a {LONG}-page chain performed {long} page lookups against \
+         {short} over a {SHORT}-page chain: commit cost scales with the retained \
+         tail, so it scales with the size of the store"
+    );
+}
+
 fn assert_no_duplicate_entries(entry_ids: &[u64], chain_pages: &BTreeSet<u64>) -> BTreeSet<u64> {
     let unique: BTreeSet<u64> = entry_ids.iter().copied().collect();
     assert_eq!(
@@ -154,7 +225,7 @@ async fn a_windowed_rewrite_preserves_the_retained_tail() {
     let db =
         open_with(OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled)).await;
     let base = allocation_cursor(&db).await;
-    let laid = lay_chain(&db, base, WINDOW_PAGES + 8, 1, 0, 0).await;
+    let laid = lay_chain(&db, base, WINDOW_PAGES + 8, 1, 0, ChainTail::EMPTY).await;
     let accounted = laid.accounted();
     publish_chain(&db, laid.head, laid.next_free_id).await;
 
@@ -191,7 +262,7 @@ async fn tail_compaction_sweeps_entries_stranded_beyond_the_window() {
     let db =
         open_with(OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled)).await;
     let base = allocation_cursor(&db).await;
-    let laid = lay_chain(&db, base, WINDOW_PAGES * 3 + 5, 1, 0, 0).await;
+    let laid = lay_chain(&db, base, WINDOW_PAGES * 3 + 5, 1, 0, ChainTail::EMPTY).await;
     let accounted = laid.accounted();
     publish_chain(&db, laid.head, laid.next_free_id).await;
 
@@ -199,7 +270,7 @@ async fn tail_compaction_sweeps_entries_stranded_beyond_the_window() {
         .await
         .unwrap();
     assert_ne!(
-        opening.tail, 0,
+        opening.tail.head, 0,
         "the fixture must start with a chain longer than one window"
     );
 
@@ -220,7 +291,7 @@ async fn tail_compaction_sweeps_entries_stranded_beyond_the_window() {
         let window = read_chain_prefix(&db.pager, db.realm_id, head, WINDOW_PAGES)
             .await
             .unwrap();
-        if window.tail == 0 {
+        if window.tail.head == 0 {
             swept = true;
             break;
         }
@@ -293,15 +364,15 @@ async fn the_stall_policy_counts_a_backlog_parked_beyond_the_window() {
     // drainable entries, so a rewrite that counted the window alone would see
     // no backlog at all.
     let base = allocation_cursor(&db).await;
-    let stuck = lay_chain(&db, base, 4, 10, u64::MAX, 0).await;
-    let window = lay_chain(&db, stuck.next_free_id, WINDOW_PAGES, 1, 0, stuck.head).await;
+    let stuck = lay_chain(&db, base, 4, 10, u64::MAX, ChainTail::EMPTY).await;
+    let window = lay_chain(&db, stuck.next_free_id, WINDOW_PAGES, 1, 0, stuck.link).await;
     publish_chain(&db, window.head, window.next_free_id).await;
 
     let scanned = read_chain_prefix(&db.pager, db.realm_id, window.head, WINDOW_PAGES)
         .await
         .unwrap();
     assert_ne!(
-        scanned.tail, 0,
+        scanned.tail.head, 0,
         "the fixture must park the backlog beyond the scan window"
     );
     assert!(
@@ -316,4 +387,49 @@ async fn the_stall_policy_counts_a_backlog_parked_beyond_the_window() {
         matches!(outcome, Err(PagedbError::DeferredFreeBacklog { .. })),
         "a backlog beyond the scan window must still trip the stall policy, got {outcome:?}"
     );
+}
+
+/// Pages held back by commit-history retention are not a reader stall.
+///
+/// Retention holds the reclamation floor down, so entries freed inside the
+/// retained window are not yet recyclable — but no reader is holding them, and
+/// aborting or rejecting a reader releases nothing. Measured against the
+/// reclamation floor, deep retention reads as an enormous reader backlog and
+/// the policy fires at a reader for something no reader did.
+///
+/// The reader here pins the newest commit, so the backlog it actually holds is
+/// nothing, while retention still holds every page freed since the store was
+/// created.
+#[tokio::test(flavor = "current_thread")]
+async fn retention_holding_pages_is_not_a_reader_stall() {
+    let options = OpenOptions::default()
+        .with_commit_history_retain(RetainPolicy::Count(4096))
+        // Above what the eight commits below can legitimately park behind the
+        // reader, and far below what sixty-four commits of retention holds.
+        .with_reader_stall_threshold_pages(120);
+    let db = open_with(options).await;
+    db.set_reader_stall_policy(ReaderStallPolicy::Reject);
+
+    // Build retention depth: nothing is pruned, so the history floor stays at
+    // the first commit and every page freed since then sits above it.
+    for i in 0..64u32 {
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(format!("k{i}").as_bytes(), b"v").await.unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    // Pin the newest commit. This reader holds nothing that was freed before
+    // it, which is the entire point.
+    let _pin = db.begin_read_non_abortable().await.unwrap();
+
+    for i in 0..8u32 {
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(format!("late{i}").as_bytes(), b"v").await.unwrap();
+        txn.commit().await.unwrap_or_else(|e| {
+            panic!(
+                "commit {i} was rejected while the only reader pins the newest commit: \
+                 retention depth is being charged to the reader ({e:?})"
+            )
+        });
+    }
 }

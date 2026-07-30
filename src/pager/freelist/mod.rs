@@ -29,12 +29,17 @@ mod tests;
 
 pub use budget::WINDOW_PAGES;
 pub use layout::CHAIN_METADATA_CID;
-pub use read::{ChainWalk, count_at_or_above_floor, count_chain, read_chain, read_chain_prefix};
+pub use read::{
+    ChainTail, ChainWalk, count_at_or_above_floor, count_chain, read_chain, read_chain_prefix,
+};
 pub use write::rewrite_chain;
 
 // Forging a chain by hand is a test-only need: production writes go through
-// `rewrite_chain`, which owns host selection and the tail splice.
+// `rewrite_chain`, which owns host selection and the tail splice — and reads a
+// chain's summary only as part of the window walk that precedes it.
 #[cfg(test)]
 pub use layout::chain_capacity;
+#[cfg(test)]
+pub use read::read_chain_summary;
 #[cfg(test)]
 pub use write::write_chain;

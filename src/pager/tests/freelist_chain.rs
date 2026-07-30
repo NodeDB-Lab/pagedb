@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::RealmId;
 use crate::crypto::CipherId;
 use crate::crypto::kdf::derive_mk;
-use crate::pager::freelist::{chain_capacity, read_chain, rewrite_chain};
+use crate::pager::freelist::{ChainTail, chain_capacity, read_chain, rewrite_chain};
 use crate::pager::{Pager, PagerConfig};
 use crate::vfs::memory::MemVfs;
 
@@ -50,9 +50,17 @@ async fn round_trip(total: u64, host_count: usize) {
         .collect();
     const BUMP_BASE: u64 = 500_000;
 
-    let (head, new_next) = rewrite_chain(&pager, REALM, PAGE, entries, hosts, BUMP_BASE, 0)
-        .await
-        .unwrap_or_else(|e| panic!("rewrite_chain(total={total}, hosts={host_count}): {e:?}"));
+    let (head, new_next) = rewrite_chain(
+        &pager,
+        REALM,
+        PAGE,
+        entries,
+        hosts,
+        BUMP_BASE,
+        ChainTail::EMPTY,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("rewrite_chain(total={total}, hosts={host_count}): {e:?}"));
 
     // The whole chain must read back cleanly — every linked page written.
     let (got, chain_pages) = read_chain(&pager, REALM, head)

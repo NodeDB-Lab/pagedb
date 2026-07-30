@@ -60,7 +60,7 @@ pub struct WriteTxn<'db, V: Vfs + Clone> {
     /// The `(commit_id, page_id)` entries carried by the bounded window of the
     /// durable free list that was scanned at begin. The commit path rewrites
     /// exactly that window (minus the pages reused this txn, plus the pages
-    /// freed this txn) and splices it onto [`Self::retained_tail_page_id`].
+    /// freed this txn) and splices it onto [`Self::retained_tail`].
     ///
     /// This is the *whole* set of page ids this transaction is allowed to hand
     /// to the allocator: an id the window did not name cannot be deleted from
@@ -69,15 +69,23 @@ pub struct WriteTxn<'db, V: Vfs + Clone> {
     /// Page ids the scanned window occupied at begin. They become free once
     /// this commit's new chain supersedes them.
     pub(crate) old_chain_pages: Vec<u64>,
-    /// Head of the part of the durable chain the window did not reach. It is
-    /// neither read nor rewritten: the fresh prefix's last page simply links to
-    /// it, and every page beyond carries its own `next` and count.
-    pub(crate) retained_tail_page_id: u64,
-    /// Reclamation floor at begin: free-list entries tagged below this are
-    /// drainable (no snapshot pins them). The reader-stall policy is evaluated
-    /// at commit against only the entries at/above it — the backlog genuinely
-    /// stuck behind a reader pin — not the drainable remainder.
-    pub(crate) reclaim_floor: u64,
+    /// The part of the durable chain the window did not reach, and what it
+    /// holds. It is neither read nor rewritten: the fresh prefix's last page
+    /// simply links to it, and every page beyond carries its own `next`, count
+    /// and suffix summary. Carrying its summary is what lets the rewrite encode
+    /// the prefix's summaries without ever descending into it.
+    pub(crate) retained_tail: crate::pager::freelist::ChainTail,
+    /// Oldest live reader pin at begin, or `u64::MAX` when nothing is tracked.
+    ///
+    /// The reader-stall policy is evaluated against the entries at or above
+    /// this — the backlog genuinely held by a reader — and deliberately not
+    /// against the reclamation floor. The floor also folds in commit-history
+    /// retention, and entries held back by retention are not something aborting
+    /// a reader can release: counting them would abort readers for a condition
+    /// no reader caused and no abort can relieve. It would also put the depth
+    /// of retention on the cost of every commit, since the count walks what it
+    /// reports.
+    pub(crate) reader_floor: u64,
 }
 
 impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
@@ -114,9 +122,13 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         };
         let reuse_threshold = guard.next_page_id;
 
-        // The reclamation floor: the older of the oldest live-reader pin and the
-        // oldest retained commit-history root. Free-list entries tagged below it
-        // are observable by no snapshot and safe to recycle now.
+        // The reclamation floor: the older of the oldest live-reader pin and
+        // the oldest retained commit-history root. Free-list entries tagged
+        // below it are observable by no snapshot and safe to recycle now.
+        //
+        // The reader pin is kept separately. Recycling has to respect both
+        // bounds, but the reader-stall policy is about readers alone — see
+        // [`WriteTxn::reader_floor`].
         let history_floor = db
             .oldest_retained_history_commit(guard.commit_history_root_page_id, guard.next_page_id)
             .await?;
@@ -220,8 +232,8 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
             spill_segments: Vec::new(),
             free_set_loaded: window.entries,
             old_chain_pages: window.chain_pages,
-            retained_tail_page_id: window.tail,
-            reclaim_floor: floor,
+            retained_tail: window.tail,
+            reader_floor: min_reader.unwrap_or(u64::MAX),
         })
     }
 

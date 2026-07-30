@@ -11,7 +11,10 @@ use crate::vfs::memory::MemVfs;
 use crate::{PagedbError, RealmId};
 
 use super::layout::chain_capacity;
-use super::read::{count_at_or_above_floor, count_chain, read_chain, read_chain_prefix};
+use super::read::{
+    ChainTail, count_at_or_above_floor, count_chain, read_chain, read_chain_prefix,
+    read_chain_summary,
+};
 use super::write::{rewrite_chain, write_chain};
 
 const PAGE: usize = 4096;
@@ -35,18 +38,26 @@ async fn test_pager() -> Arc<Pager<MemVfs>> {
     Arc::new(Pager::open(MemVfs::new(), mk, config).await.unwrap())
 }
 
-/// Hand-lay a chain of `pages.len()` pages, each carrying the entries it is
+/// Hand-lay a chain of `links.len()` pages, each carrying the entries it is
 /// paired with, linked in order. Returns the head. One `write_chain` call per
 /// page, so nothing is repacked and a sparse chain — the shape a real store
 /// accumulates — can be built exactly.
+///
+/// Laid last page first, threading each page's [`ChainTail`] into the one that
+/// links to it: a page summarises everything below it, so it cannot be written
+/// before its successor exists. Production builds a chain the same way.
 async fn lay_chain(pager: &Pager<MemVfs>, links: &[(u64, Vec<(u64, u64)>)]) -> u64 {
-    for (index, (host, entries)) in links.iter().enumerate() {
-        let next = links.get(index + 1).map_or(0, |(id, _)| *id);
-        write_chain(pager, REALM, PAGE, &[*host], entries, next)
+    let mut tail = ChainTail::EMPTY;
+    for (host, entries) in links.iter().rev() {
+        write_chain(pager, REALM, PAGE, &[*host], entries, tail)
             .await
             .unwrap();
+        tail = ChainTail {
+            head: *host,
+            summary: read_chain_summary(pager, REALM, *host).await.unwrap(),
+        };
     }
-    links.first().map_or(0, |(id, _)| *id)
+    tail.head
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -75,52 +86,81 @@ async fn read_chain_rejects_cycle_without_hanging() {
     );
 }
 
+/// `count_chain` answers from the head's suffix summary, so it reads one page
+/// however long the chain is. Asserted directly, because it is the property
+/// that keeps `Db::stats` — which an embedder may call per request — off the
+/// size of the store.
 #[tokio::test(flavor = "current_thread")]
-async fn count_chain_rejects_cycle_without_hanging() {
+async fn count_chain_reads_one_page_however_long_the_chain() {
     let pager = test_pager().await;
-    let mut body = vec![0u8; body_capacity(PAGE)];
-    body[0..8].copy_from_slice(&10u64.to_le_bytes());
-    pager
-        .write_main_page(10, REALM, PageKind::Free, &body)
-        .await
-        .unwrap();
+    let links: Vec<(u64, Vec<(u64, u64)>)> =
+        (0..24u64).map(|i| (20 + i, vec![(1, 500 + i)])).collect();
+    let head = lay_chain(&pager, &links).await;
 
-    let error = tokio::time::timeout(Duration::from_secs(1), count_chain(&pager, REALM, 10))
-        .await
-        .expect("cycle detection should end the walk before timeout")
-        .expect_err("free-list cycles must be corruption");
-    assert!(
-        matches!(
-            error,
-            PagedbError::Corruption(crate::errors::CorruptionDetail::PageChainCycle {
-                structure: "free_list",
-                page_id: 10,
-            })
-        ),
-        "expected a free-list PageChainCycle naming page 10, got {error:?}"
-    );
+    let before = pager
+        .inner
+        .buffer_pool_hits
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + pager
+            .inner
+            .buffer_pool_misses
+            .load(std::sync::atomic::Ordering::Relaxed);
+    let total = count_chain(&pager, REALM, head).await.unwrap();
+    let reads = pager
+        .inner
+        .buffer_pool_hits
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + pager
+            .inner
+            .buffer_pool_misses
+            .load(std::sync::atomic::Ordering::Relaxed)
+        - before;
+
+    assert_eq!(total, links.len() as u64, "one entry per laid page");
+    assert_eq!(reads, 1, "counting the chain must not walk it");
 }
 
 /// Rho shape: `20 → 21 → 22 → 21`. The head is not itself on the cycle, so
-/// comparing every link against the head never fires, and the cycle is
-/// longer than one link, so a self-loop check never fires either. Only a
-/// detector that tracks relative progress ends this walk.
+/// comparing every link against the head never fires, and the cycle is longer
+/// than one link, so a self-loop check never fires either. Only a detector that
+/// tracks relative progress ends this walk.
+///
+/// Asserted through the stall count rather than `count_chain`, which no longer
+/// traverses: the readers that still walk the chain are the ones that must
+/// terminate on a cycle. A backlog at or above the floor is what keeps this
+/// walk going past its early exit, which is also the case where a cycle would
+/// otherwise spin.
 #[tokio::test(flavor = "current_thread")]
-async fn count_chain_rejects_a_cycle_reached_through_a_tail() {
+async fn a_stall_count_rejects_a_cycle_reached_through_a_tail() {
     let pager = test_pager().await;
     for (page_id, next) in [(20u64, 21u64), (21, 22), (22, 21)] {
         let mut body = vec![0u8; body_capacity(PAGE)];
         body[0..8].copy_from_slice(&next.to_le_bytes());
+        // Two entries whose suffix straddles the floor, so neither summary
+        // shortcut fires and the walk descends page by page until the cycle
+        // detector stops it. A suffix wholly above or wholly below the floor is
+        // answered without descending, and could never spin.
+        body[8..12].copy_from_slice(&2u32.to_le_bytes());
+        body[12..20].copy_from_slice(&2u64.to_le_bytes());
+        body[20..28].copy_from_slice(&u64::MAX.to_le_bytes());
+        body[28..36].copy_from_slice(&0u64.to_le_bytes());
+        body[36..44].copy_from_slice(&u64::MAX.to_le_bytes());
+        body[44..52].copy_from_slice(&(500 + page_id).to_le_bytes());
+        body[52..60].copy_from_slice(&0u64.to_le_bytes());
+        body[60..68].copy_from_slice(&(600 + page_id).to_le_bytes());
         pager
             .write_main_page(page_id, REALM, PageKind::Free, &body)
             .await
             .unwrap();
     }
 
-    let error = tokio::time::timeout(Duration::from_secs(1), count_chain(&pager, REALM, 20))
-        .await
-        .expect("cycle detection should end the walk before timeout")
-        .expect_err("free-list cycles must be corruption");
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        count_at_or_above_floor(&pager, REALM, 20, 1),
+    )
+    .await
+    .expect("cycle detection should end the walk before timeout")
+    .expect_err("free-list cycles must be corruption");
     assert!(
         matches!(
             error,
@@ -133,10 +173,6 @@ async fn count_chain_rejects_a_cycle_reached_through_a_tail() {
     );
 }
 
-/// The bounded walk inherits the same detector: a cycle inside the scanned
-/// window must be corruption, not a window that silently reports the same
-/// pages (and the same page ids) over and over — every duplicate it returned
-/// would become an allocator-cache entry that the unscanned tail still names.
 #[tokio::test(flavor = "current_thread")]
 async fn read_chain_prefix_rejects_a_cycle_inside_the_window() {
     let pager = test_pager().await;
@@ -174,9 +210,16 @@ async fn count_chain_matches_read_chain_across_pages() {
     let cap = chain_capacity(PAGE);
     let entries: Vec<(u64, u64)> = (0..(cap * 2 + 3) as u64).map(|i| (i, i + 100)).collect();
     let chain_pages: Vec<u64> = vec![20, 21, 22];
-    let head = write_chain(&pager, REALM, PAGE, &chain_pages, &entries, 0)
-        .await
-        .unwrap();
+    let head = write_chain(
+        &pager,
+        REALM,
+        PAGE,
+        &chain_pages,
+        &entries,
+        ChainTail::EMPTY,
+    )
+    .await
+    .unwrap();
 
     let (read, _) = read_chain(&pager, REALM, head).await.unwrap();
     let counted = count_chain(&pager, REALM, head).await.unwrap();
@@ -196,7 +239,7 @@ async fn prefix_walk_stops_at_the_budget_and_names_the_retained_tail() {
     assert_eq!(prefix.chain_pages, vec![40, 41]);
     assert_eq!(prefix.entries, vec![(1, 900), (2, 901)]);
     assert_eq!(
-        prefix.tail, 42,
+        prefix.tail.head, 42,
         "the tail must name the first page the window did not scan"
     );
 }
@@ -281,9 +324,16 @@ async fn floor_counter_matches_a_full_materialised_scan() {
         .map(|i| (i % 11, i + 100))
         .collect();
     let chain_pages: Vec<u64> = vec![70, 71, 72, 73];
-    let head = write_chain(&pager, REALM, PAGE, &chain_pages, &entries, 0)
-        .await
-        .unwrap();
+    let head = write_chain(
+        &pager,
+        REALM,
+        PAGE,
+        &chain_pages,
+        &entries,
+        ChainTail::EMPTY,
+    )
+    .await
+    .unwrap();
 
     for floor in 0..12u64 {
         let streamed = count_at_or_above_floor(&pager, REALM, head, floor)

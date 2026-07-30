@@ -155,7 +155,7 @@ impl<V: Vfs + Clone> Db<V> {
             host_candidates,
             alloc_cursor,
             // The whole chain was read, so there is no retained tail to splice.
-            0,
+            freelist::ChainTail::EMPTY,
         )
         .await?;
         Ok(StagedFreeList {

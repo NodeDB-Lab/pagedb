@@ -7,19 +7,22 @@ use crate::pager::Pager;
 use crate::pager::format::data_page::body_capacity;
 use crate::pager::format::page_kind::PageKind;
 use crate::vfs::Vfs;
-use crate::{PagedbError, RealmId, Result};
+use crate::{RealmId, Result};
 
-use super::layout::{ENTRY_LEN, PAGE_HEADER_LEN, chain_capacity};
+use super::layout::{
+    ChainPageHeader, ENTRY_LEN, PAGE_HEADER_LEN, chain_capacity, encode_chain_header,
+};
+use super::read::ChainTail;
 
 /// Persist `entries` as a fresh chain prefix spliced onto `tail`, returning the
 /// new head page id and the updated `next_page` cursor.
 ///
-/// `tail` is the head of the part of the old chain that is *not* being
-/// rewritten (`0` when the whole chain is). Those pages keep their bytes and
-/// their links; the last fresh page simply points at the first of them. That
-/// works without any format change because a chain page names only page ids and
-/// carries its own `next` and count — no page encodes another page's offset,
-/// and the header publishes only the head.
+/// `tail` is the part of the old chain that is *not* being rewritten
+/// ([`ChainTail::EMPTY`] when the whole chain is), named together with what it
+/// holds. Those pages keep their bytes and their links; the last fresh page
+/// simply points at the first of them. No page encodes another page's offset —
+/// only its id — and the header publishes only the head, which is what lets a
+/// prefix be replaced without touching anything below it.
 ///
 /// Chain pages are drawn first from `host_candidates` — pages that are already
 /// free and observable by no snapshot, hence safe to overwrite — and only then
@@ -35,7 +38,7 @@ pub async fn rewrite_chain<V: Vfs + Clone>(
     mut entries: Vec<(u64, u64)>,
     host_candidates: Vec<u64>,
     next_page: u64,
-    tail: u64,
+    tail: ChainTail,
 ) -> Result<(u64, u64)> {
     let cap = chain_capacity(page_size);
     let total = entries.len();
@@ -95,23 +98,58 @@ pub async fn write_chain<V: Vfs + Clone>(
     page_size: usize,
     chain_pages: &[u64],
     entries: &[(u64, u64)],
-    tail: u64,
+    tail: ChainTail,
 ) -> Result<u64> {
     if entries.is_empty() {
-        return Ok(tail);
+        return Ok(tail.head);
     }
     let cap = chain_capacity(page_size);
     let body_len = body_capacity(page_size);
     debug_assert!(chain_pages.len() * cap >= entries.len());
-    let mut written = 0usize;
-    for (i, &page_id) in chain_pages.iter().enumerate() {
-        let chunk = &entries[written..(written + cap).min(entries.len())];
-        let next = chain_pages.get(i + 1).copied().unwrap_or(tail);
+
+    // Where each page's chunk starts, so the pages can be written last-first:
+    // a page's summary covers everything after it, so it cannot be encoded
+    // until the page it links to has one. The retained tail's summary seeds the
+    // fold, so the tail is never read here and never walked.
+    let mut chunk_starts: Vec<usize> = Vec::with_capacity(chain_pages.len());
+    let mut cursor = 0usize;
+    for _ in chain_pages {
+        chunk_starts.push(cursor);
+        cursor = (cursor + cap).min(entries.len());
+    }
+
+    let mut suffix_entries = tail.summary.entries;
+    let mut suffix_max_cid = tail.summary.max_cid;
+    let mut suffix_min_cid = tail.summary.min_cid;
+
+    for (i, &page_id) in chain_pages.iter().enumerate().rev() {
+        let start = chunk_starts[i];
+        let chunk = &entries[start..(start + cap).min(entries.len())];
+        let next = chain_pages.get(i + 1).copied().unwrap_or(tail.head);
+
+        suffix_entries = suffix_entries.saturating_add(chunk.len() as u64);
+        suffix_max_cid = chunk
+            .iter()
+            .map(|(cid, _)| *cid)
+            .max()
+            .map_or(suffix_max_cid, |page_max| page_max.max(suffix_max_cid));
+        suffix_min_cid = chunk
+            .iter()
+            .map(|(cid, _)| *cid)
+            .min()
+            .map_or(suffix_min_cid, |page_min| page_min.min(suffix_min_cid));
+
         let mut body = vec![0u8; body_len];
-        body[0..8].copy_from_slice(&next.to_le_bytes());
-        let chunk_len = u32::try_from(chunk.len())
-            .map_err(|_| PagedbError::Io(std::io::Error::other("free-list chunk_len overflow")))?;
-        body[8..12].copy_from_slice(&chunk_len.to_le_bytes());
+        encode_chain_header(
+            &mut body,
+            ChainPageHeader {
+                next,
+                count: chunk.len(),
+                suffix_entries,
+                suffix_max_cid,
+                suffix_min_cid,
+            },
+        )?;
         for (j, (cid, pid)) in chunk.iter().enumerate() {
             let off = PAGE_HEADER_LEN + j * ENTRY_LEN;
             body[off..off + 8].copy_from_slice(&cid.to_le_bytes());
@@ -120,8 +158,7 @@ pub async fn write_chain<V: Vfs + Clone>(
         pager
             .write_main_page(page_id, realm_id, PageKind::Free, &body)
             .await?;
-        written += chunk.len();
     }
-    let head = chain_pages.first().copied().unwrap_or(tail);
+    let head = chain_pages.first().copied().unwrap_or(tail.head);
     Ok(head)
 }

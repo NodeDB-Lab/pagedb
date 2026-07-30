@@ -158,7 +158,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .filter(|(_, pid)| !consumed.contains(pid))
             .collect();
         let old_chain: Vec<u64> = std::mem::take(&mut self.old_chain_pages);
-        let retained_tail = self.retained_tail_page_id;
+        let retained_tail = self.retained_tail;
 
         // Pages safe to *host* the rewritten chain: only those below the
         // reclamation floor and not reused — i.e. the remaining contents of the
@@ -193,36 +193,37 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // store (and, short of that, is severe write amplification).
         entries.extend(old_chain.iter().map(|&pid| (CHAIN_METADATA_CID, pid)));
 
-        // The reader-stall policy fires only on entries genuinely stuck behind
-        // a pin — those at/above the reclamation floor. Drainable entries (below
-        // it) are being recycled and must not count, or an inherited-but-
-        // drainable backlog would spuriously abort a reader on reopen. Evaluated
-        // before the chain write so a reject aborts cleanly: it returns without
-        // unwinding because the candidate's advances are held in `pending` and
-        // the shared state still describes the durable header.
+        // The reader-stall policy fires only on entries a live reader is
+        // genuinely holding — those at or above the oldest reader pin. Entries
+        // below it are being recycled and must not count, or an inherited-but-
+        // drainable backlog would spuriously abort a reader on reopen.
+        //
+        // The pin, and not the reclamation floor: the floor also folds in
+        // commit-history retention, and pages retention holds are not pages any
+        // reader abort can release. Counting them would abort readers for
+        // something no reader did, and would tie the cost of this count — which
+        // walks what it reports — to how deep retention runs.
+        //
+        // Evaluated before the chain write so a reject aborts cleanly: it
+        // returns without unwinding because the candidate's advances are held
+        // in `pending` and the shared state still describes the durable header.
         //
         // The threshold is defined over the whole chain, which a windowed
         // rewrite cannot produce on its own: `entries` covers only the scanned
-        // window. The retained tail is counted by streaming it — one page of
-        // entries resident at a time. That bounds MEMORY, not IO: the read cost
-        // stays proportional to the number of chain pages, and it is not
-        // pretended otherwise. Making it O(1) would need a durable aggregate in
-        // the header, which is a format change.
-        //
-        // The tail walk doubles as the tail's corruption check: the window walk
-        // at `begin` only authenticated the pages it scanned, and this runs
-        // before the header swap, so a torn or cyclic tail still fails the
-        // commit rather than being published.
+        // window. The tail supplies the rest from the summary each of its pages
+        // carries — the count stops at the first page whose suffix cannot reach
+        // the pin, since nothing below it can be held. With no live reader
+        // nothing can be, and that is the first page.
         let tail_stuck = freelist::count_at_or_above_floor(
             &self.db.pager,
             self.db.realm_id,
-            retained_tail,
-            self.reclaim_floor,
+            retained_tail.head,
+            self.reader_floor,
         )
         .await?;
         let window_stuck = entries
             .iter()
-            .filter(|(cid, _)| *cid >= self.reclaim_floor)
+            .filter(|(cid, _)| *cid >= self.reader_floor)
             .count() as u64;
         self.db
             .evaluate_stall_policy(tail_stuck.saturating_add(window_stuck))?;

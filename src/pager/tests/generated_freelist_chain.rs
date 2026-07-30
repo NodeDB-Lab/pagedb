@@ -20,7 +20,9 @@ use crate::RealmId;
 use crate::crypto::CipherId;
 use crate::crypto::kdf::derive_mk;
 use crate::pager::format::data_page::body_capacity;
-use crate::pager::freelist::{chain_capacity, count_chain, read_chain, rewrite_chain, write_chain};
+use crate::pager::freelist::{
+    ChainTail, chain_capacity, count_chain, read_chain, rewrite_chain, write_chain,
+};
 use crate::pager::{PageKind, Pager, PagerConfig};
 use crate::vfs::memory::MemVfs;
 use proptest::prelude::*;
@@ -255,8 +257,16 @@ fn written_freelist_chains_read_back_without_loss() {
 
             let outcome = block_on(async {
                 let pager = fresh_pager().await;
-                let (head, _next) =
-                    rewrite_chain(&pager, REALM, PAGE, entries, hosts, BUMP_BASE, 0).await?;
+                let (head, _next) = rewrite_chain(
+                    &pager,
+                    REALM,
+                    PAGE,
+                    entries,
+                    hosts,
+                    BUMP_BASE,
+                    ChainTail::EMPTY,
+                )
+                .await?;
                 read_chain(&pager, REALM, head).await
             });
             let (read_entries, chain_pages) =
@@ -301,7 +311,15 @@ fn hand_laid_chains_of_generated_shape_read_back_exactly() {
             prop_assume!(entries.len() <= chain_capacity(PAGE) * chain_pages.len());
             let outcome = block_on(async {
                 let pager = fresh_pager().await;
-                let head = write_chain(&pager, REALM, PAGE, &chain_pages, &entries, 0).await?;
+                let head = write_chain(
+                    &pager,
+                    REALM,
+                    PAGE,
+                    &chain_pages,
+                    &entries,
+                    ChainTail::EMPTY,
+                )
+                .await?;
                 read_chain(&pager, REALM, head).await
             });
             let (read_entries, _) =
