@@ -159,28 +159,34 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
                 }
             }
         }
-        db.free_page_consumed.lock().clear();
+        // Emptied here, at the boundary, and not again until commit: the trees
+        // decide reuse eligibility against this sink as they free, so it must
+        // only grow for as long as the session runs.
+        db.free_page_consumed.take();
 
-        let mut btree = BTree::open(
+        // One source for every tree in the session, so all three draw from the
+        // same cache and record into the same sink.
+        let source = crate::btree::PageSource::new(
+            reuse_threshold,
+            db.free_page_cache.clone(),
+            &db.free_page_consumed,
+        );
+        let btree = BTree::open_session(
             db.pager.clone(),
             db.realm_id,
             guard.root_page_id,
             guard.next_page_id,
             db.page_size,
+            source.clone(),
         );
-        btree.set_reuse_threshold(reuse_threshold);
-        btree.set_free_page_cache(db.free_page_cache.clone());
-        btree.set_free_page_consumed(db.free_page_consumed.clone());
-        let mut catalog_tree = BTree::open(
+        let catalog_tree = BTree::open_session(
             db.pager.clone(),
             db.realm_id,
             guard.catalog_root_page_id,
             guard.next_page_id,
             db.page_size,
+            source,
         );
-        catalog_tree.set_reuse_threshold(reuse_threshold);
-        catalog_tree.set_free_page_cache(db.free_page_cache.clone());
-        catalog_tree.set_free_page_consumed(db.free_page_consumed.clone());
         // Assign a txn_seq starting from 1: fetch_add returns the old value (0
         // for the first call), so we add 1 to produce 1-based ids.
         let txn_seq = db.txn_seq.fetch_add(1, Ordering::Relaxed) + 1;

@@ -12,4 +12,4 @@ pub(crate) mod tree;
 
 // `pub` here is crate-scoped in effect: the `btree` module itself is
 // `pub(crate)`, so this does not escape the crate.
-pub use tree::BTree;
+pub use tree::{BTree, ConsumedPages, PageSource};
