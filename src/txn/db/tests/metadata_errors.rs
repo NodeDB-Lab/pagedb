@@ -19,6 +19,23 @@ use crate::{Db, PagedbError, RealmId, Result, SegmentKind, SegmentPageKind};
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([1u8; 16]);
 
+/// Park a file in `seg/.tombstone/`, modelling a retirement interrupted between
+/// its rename and its removal.
+///
+/// Retiring a segment reclaims the file inside the commit that retires it, so an
+/// interrupted retirement is the only state in which the sweep has anything left
+/// to delete — and therefore the only setup under which its I/O errors can be
+/// exercised.
+async fn park_tombstone(vfs: &FailOnceVfs, name: &str) {
+    vfs.mkdir_all("seg/.tombstone").await.unwrap();
+    let mut file = vfs
+        .open(&format!("seg/.tombstone/{name}"), OpenMode::CreateNew)
+        .await
+        .unwrap();
+    file.write_at(0, b"parked").await.unwrap();
+    file.sync().await.unwrap();
+}
+
 /// MemVfs wrapper that injects one-shot metadata and main.db I/O failures.
 #[derive(Clone)]
 struct FailOnceVfs {
@@ -317,6 +334,9 @@ async fn gc_sync_dir_error_surfaces_then_retry_succeeds() {
         t.unlink_segment("dead").await.unwrap();
         t.commit().await.unwrap();
     }
+    // The unlink above already reclaimed the file; park one so the sweep has
+    // work and its directory sync can fail.
+    park_tombstone(&vfs, "aa00000000000000000000000000003f.1").await;
 
     // First gc_now hits the injected sync_dir failure and must SURFACE it.
     vfs.fail_sync_dir.store(true, Ordering::SeqCst);
@@ -868,24 +888,7 @@ async fn gc_now_surfaces_tombstone_list_dir_error_then_retry_succeeds() {
     let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, options)
         .await
         .unwrap();
-    let mut w = db
-        .create_segment(REALM, SegmentKind::Unspecified)
-        .await
-        .unwrap();
-    w.append_page(SegmentPageKind::Data, b"gc-list")
-        .await
-        .unwrap();
-    let m = w.seal().await.unwrap();
-    {
-        let mut t = db.begin_write().await.unwrap();
-        t.link_segment("gc-list", &m).await.unwrap();
-        t.commit().await.unwrap();
-    }
-    {
-        let mut t = db.begin_write().await.unwrap();
-        t.unlink_segment("gc-list").await.unwrap();
-        t.commit().await.unwrap();
-    }
+    park_tombstone(&vfs, "aa00000000000000000000000000000f.1").await;
 
     vfs.fail_tombstone_list_dir.store(true, Ordering::SeqCst);
     let err = db
@@ -954,6 +957,11 @@ async fn stats_surfaces_free_list_read_error_then_retry_succeeds() {
     let db = Db::open_existing_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
         .await
         .unwrap();
+    // Open validates the free-list chain, which leaves it in the page cache. A
+    // read fault only reaches the VFS on a cold read, so drop the cached pages —
+    // otherwise `stats` answers from memory and the injected failure is never
+    // reached, which would test nothing.
+    db.pager.reset_main_pages();
     vfs.fail_main_db_read_at.store(true, Ordering::SeqCst);
     let err = db
         .stats()
@@ -1075,24 +1083,7 @@ async fn gc_now_surfaces_tombstone_len_error_then_retry_succeeds() {
     let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, options)
         .await
         .unwrap();
-    let mut w = db
-        .create_segment(REALM, SegmentKind::Unspecified)
-        .await
-        .unwrap();
-    w.append_page(SegmentPageKind::Data, b"gc-len")
-        .await
-        .unwrap();
-    let m = w.seal().await.unwrap();
-    {
-        let mut t = db.begin_write().await.unwrap();
-        t.link_segment("gc-len", &m).await.unwrap();
-        t.commit().await.unwrap();
-    }
-    {
-        let mut t = db.begin_write().await.unwrap();
-        t.unlink_segment("gc-len").await.unwrap();
-        t.commit().await.unwrap();
-    }
+    park_tombstone(&vfs, "aa00000000000000000000000000001f.1").await;
 
     vfs.fail_tombstone_len.store(true, Ordering::SeqCst);
     let err = db
@@ -1116,25 +1107,7 @@ async fn gc_now_surfaces_tombstone_remove_error_then_retry_succeeds() {
     let db = Db::open_internal_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, options)
         .await
         .unwrap();
-    let mut segment = db
-        .create_segment(REALM, SegmentKind::Unspecified)
-        .await
-        .unwrap();
-    segment
-        .append_page(SegmentPageKind::Data, b"gc-remove")
-        .await
-        .unwrap();
-    let meta = segment.seal().await.unwrap();
-    {
-        let mut txn = db.begin_write().await.unwrap();
-        txn.link_segment("gc-remove", &meta).await.unwrap();
-        txn.commit().await.unwrap();
-    }
-    {
-        let mut txn = db.begin_write().await.unwrap();
-        txn.unlink_segment("gc-remove").await.unwrap();
-        txn.commit().await.unwrap();
-    }
+    park_tombstone(&vfs, "aa00000000000000000000000000002f.1").await;
 
     vfs.fail_tombstone_remove.store(true, Ordering::SeqCst);
     let err = db

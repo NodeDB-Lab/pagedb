@@ -1,4 +1,5 @@
 use pagedb::vfs::memory::MemVfs;
+use pagedb::vfs::{OpenMode, Vfs};
 use pagedb::{Db, OpenOptions, PagedbError, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
@@ -84,10 +85,14 @@ async fn deferred_tombstone_pins_under_reader() {
     assert!(stats.reclaimed_segments >= 1);
 }
 
+/// Retiring a segment reclaims its file as part of the commit that retires it,
+/// so on-disk size is bounded without anyone scheduling GC. This is the property
+/// that keeps an embedder which never calls `gc_now` from filling its disk.
 #[tokio::test(flavor = "current_thread")]
-async fn gc_now_deletes_tombstones() {
+async fn unlink_reclaims_the_segment_file_at_commit() {
+    let vfs = MemVfs::new();
     let db = Db::open(
-        MemVfs::new(),
+        vfs.clone(),
         [9u8; 32],
         PAGE,
         RealmId::new([1; 16]),
@@ -107,14 +112,36 @@ async fn gc_now_deletes_tombstones() {
         t.link_segment("dead", &m).await.unwrap();
         t.commit().await.unwrap();
     }
+
+    let live = format!(
+        "seg/{}",
+        m.segment_id.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    );
+    assert!(
+        vfs.open(&live, OpenMode::Read).await.is_ok(),
+        "the linked segment must be on disk before the unlink"
+    );
+
     {
         let mut t = db.begin_write().await.unwrap();
         t.unlink_segment("dead").await.unwrap();
         t.commit().await.unwrap();
     }
-    let stats = db.gc_now().await.unwrap();
-    assert!(stats.reclaimed_segments >= 1);
-    // open_segment now returns NotFound.
+
+    assert!(
+        vfs.open(&live, OpenMode::Read).await.is_err(),
+        "the unlink commit must reclaim the segment file, not leave it for a sweep"
+    );
+    assert_eq!(
+        db.gc_now().await.unwrap().reclaimed_segments,
+        0,
+        "nothing should be left for GC to reclaim"
+    );
+
     let err = db.open_segment(realm, "dead").await.err().unwrap();
     assert!(matches!(err, PagedbError::NotFound));
 }

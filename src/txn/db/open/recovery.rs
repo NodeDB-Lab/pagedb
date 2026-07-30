@@ -40,6 +40,27 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         // store. Gated with the removals above because it needs write
         // authority.
         crate::recovery::scratch::delete_orphaned_scratch(&*db.vfs).await?;
+
+        // Same reasoning for retired segments. A tombstone is only reachable by
+        // a reader that pinned it before the retirement, and no such reader can
+        // survive the process that opened it — so anything still parked here at
+        // open belongs to a handle that is gone. Without this, a crash between
+        // retiring a segment and reclaiming it leaked that file permanently, and
+        // stores carried the residue of every crash they had ever had.
+        match crate::recovery::gc::delete_tombstone_files(&*db.vfs).await {
+            Ok((0, _)) => {}
+            Ok((count, bytes)) => tracing::info!(
+                reclaimed_segments = count,
+                reclaimed_bytes = bytes,
+                "open: reclaimed tombstoned segments left by a previous run"
+            ),
+            // The store is usable without this; failing the open over unreclaimed
+            // garbage would turn a disk-space problem into an availability one.
+            Err(error) => tracing::warn!(
+                %error,
+                "open: could not reclaim tombstoned segments; they remain on disk"
+            ),
+        }
     }
 
     // An incremental apply assembles its target beside `main.db` and renames it

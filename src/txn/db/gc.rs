@@ -18,31 +18,43 @@ impl<V: Vfs + Clone> Db<V> {
         // physical tombstone deletion.
         let _writer = self.writer.lock().await;
         let _visibility = self.visibility_gate.write().await;
-        self.try_drain_pending_tombstones().await?;
-        let (count, bytes) = crate::recovery::gc::delete_tombstone_files(&*self.vfs).await?;
+        let (drained, drained_bytes) = self.try_drain_pending_tombstones().await?;
+        // Retirement reclaims each file as it happens, so the drain above is
+        // where almost everything is freed. The sweep still runs because a
+        // crash between the rename and the removal leaves a file parked here.
+        let (swept, swept_bytes) = crate::recovery::gc::delete_tombstone_files(&*self.vfs).await?;
         Ok(GcStats {
-            reclaimed_segments: count,
-            reclaimed_bytes: bytes,
+            reclaimed_segments: drained.saturating_add(swept),
+            reclaimed_bytes: drained_bytes.saturating_add(swept_bytes),
         })
     }
 
-    /// Re-evaluate each pending tombstone. If a segment is no longer pinned by
-    /// any tracked reader, rename it from the live path to the tombstone
-    /// directory now.
-    async fn try_drain_pending_tombstones(&self) -> Result<()> {
+    /// Re-evaluate every pending tombstone, reclaiming each segment that no
+    /// reader pins any more. Returns `(segments, bytes)` reclaimed.
+    ///
+    /// Entries still pinned are put back for a later attempt. Normal commits
+    /// drain this queue too, so reaching it here is the exception rather than
+    /// the mechanism.
+    async fn try_drain_pending_tombstones(&self) -> Result<(u64, u64)> {
         let pending = std::mem::take(&mut *self.pending_tombstones.lock());
+        let mut count: u64 = 0;
+        let mut bytes: u64 = 0;
         for entry in pending {
             if self.segment_id_is_reader_pinned(entry.segment_id).await? {
                 self.enqueue_pending_tombstone(entry);
                 continue;
             }
+            // Measured before reclaiming — afterwards the file is gone.
+            let len = self.live_segment_len(entry.segment_id).await?;
             let effects = [crate::txn::write::SegmentSideEffect::Tombstone {
                 segment_id: entry.segment_id,
                 tombstone_commit_id: None,
             }];
             self.reconcile_segment_effects(&effects, entry.commit_id)
                 .await?;
+            count += 1;
+            bytes = bytes.saturating_add(len);
         }
-        Ok(())
+        Ok((count, bytes))
     }
 }

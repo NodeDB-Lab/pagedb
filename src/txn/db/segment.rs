@@ -8,8 +8,8 @@ use crate::errors::{CorruptionDetail, PagedbError};
 use crate::segment::reader::SegmentReader;
 use crate::segment::writer::SegmentWriter;
 use crate::txn::write::SegmentSideEffect;
-use crate::vfs::Vfs;
 use crate::vfs::types::OpenMode;
+use crate::vfs::{Vfs, VfsFile};
 use crate::{RealmId, Result};
 
 use super::super::mode::DbMode;
@@ -208,6 +208,10 @@ impl<V: Vfs + Clone> Db<V> {
         self.vfs.sync_dir("seg/.staging").await?;
         self.vfs.sync_dir("seg/.tombstone").await?;
 
+        // Drain part of the deferred queue as a side effect of this commit, so a
+        // backlog cannot survive on the assumption that someone schedules GC.
+        self.drain_some_pending_tombstones().await?;
+
         let mut deferred = false;
         for effect in effects {
             let outcome = match effect {
@@ -255,6 +259,25 @@ impl<V: Vfs + Clone> Db<V> {
         self.vfs.rename(&staging, &live).await
     }
 
+    /// Retire a segment: delete it outright when no reader pins it, otherwise
+    /// defer.
+    ///
+    /// Reclaiming here — in the write path — rather than leaving the file for a
+    /// separately-scheduled sweep is what makes disk usage bounded by
+    /// construction. Every mature embedded engine works this way (`SQLite`
+    /// reuses freelist pages, redb processes its freed tree inside commit). A
+    /// retired file that only an explicitly-scheduled call reclaims grows
+    /// without bound for any embedder that never schedules it, and segments are
+    /// separate files, so the cost is disk exhaustion rather than a file that
+    /// merely fails to shrink.
+    ///
+    /// The rename into `seg/.tombstone/` is KEPT rather than replaced by a
+    /// direct unlink: it is the crash boundary the recovery protocol is built
+    /// on — a commit whose rename cannot run reports itself unpublished, and a
+    /// replay recognises an already-parked tombstone by its recorded commit id.
+    /// Reclamation is achieved by deleting the parked file immediately
+    /// afterwards, which costs one extra syscall and changes no crash semantics.
+    /// A crash between the two leaves a file that the next open sweeps.
     async fn tombstone_segment(
         &self,
         segment_id: [u8; 16],
@@ -273,6 +296,9 @@ impl<V: Vfs + Clone> Db<V> {
             commit_id
         );
         if self.path_exists(&tomb).await? {
+            // A retirement that was interrupted between the rename and the
+            // removal below.
+            self.vfs.remove(&tomb).await?;
             return Ok(SegmentReconciliation::Complete);
         }
         let live = crate::segment::writer::live_path(&segment_id);
@@ -280,7 +306,49 @@ impl<V: Vfs + Clone> Db<V> {
             return Ok(SegmentReconciliation::Complete);
         }
         self.vfs.rename(&live, &tomb).await?;
+        self.vfs.remove(&tomb).await?;
         Ok(SegmentReconciliation::Complete)
+    }
+
+    /// Re-evaluate a bounded slice of the deferred-tombstone queue.
+    ///
+    /// Runs on every commit that carries segment effects, so the queue drains as
+    /// a side effect of normal writes instead of waiting for an explicit GC —
+    /// the same property that makes redb's freed-tree handling self-limiting.
+    /// The slice is bounded so a long queue cannot turn one commit into an
+    /// unbounded amount of work.
+    ///
+    /// Entries still pinned by a reader are put back and retried on a later
+    /// commit.
+    async fn drain_some_pending_tombstones(&self) -> Result<()> {
+        const MAX_PER_COMMIT: usize = 32;
+
+        let batch: Vec<PendingTombstone> = {
+            let mut entries = self.pending_tombstones.lock();
+            let take = entries.len().min(MAX_PER_COMMIT);
+            entries.drain(..take).collect()
+        };
+        for entry in batch {
+            if self.segment_id_is_reader_pinned(entry.segment_id).await? {
+                self.enqueue_pending_tombstone(entry);
+                continue;
+            }
+            self.tombstone_segment(entry.segment_id, entry.commit_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Size of a segment's live file, or 0 if it is already gone.
+    ///
+    /// Measured before reclamation so callers can report bytes freed.
+    pub(super) async fn live_segment_len(&self, segment_id: [u8; 16]) -> Result<u64> {
+        let live = crate::segment::writer::live_path(&segment_id);
+        match self.vfs.open(&live, OpenMode::Read).await {
+            Ok(file) => file.len().await,
+            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) fn enqueue_pending_tombstone(&self, pending: PendingTombstone) {

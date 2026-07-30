@@ -3018,13 +3018,21 @@ async fn apply_incremental_tombstones_segment_removed_by_target_catalog() {
         !live_path.exists(),
         "removed segment must not remain at its live path after apply"
     );
+    // The retirement reclaims the file rather than parking it, so nothing is
+    // left behind for a later sweep to find.
     let tombstone_dir = dst_dir.join("seg").join(".tombstone");
     let tombstone_count = std::fs::read_dir(&tombstone_dir)
-        .unwrap()
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().is_file())
-        .count();
-    assert_eq!(tombstone_count, 1);
+        .map(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().is_file())
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        tombstone_count, 0,
+        "the removed segment must be reclaimed, not parked for a sweep"
+    );
 
     let rtxn = follower.begin_read().await.unwrap();
     assert!(
