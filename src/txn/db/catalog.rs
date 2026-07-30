@@ -232,13 +232,6 @@ impl<V: Vfs + Clone> Db<V> {
             readers.iter().map(|r| r.commit_id.0).min()
         };
 
-        let mut hist_tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.commit_history_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
         // The commit-history tree is not part of any reader's pinned snapshot
         // (readers track the data and catalog roots, never the history root), so
         // every page its copy-on-write/prune frees is immediately reusable
@@ -250,9 +243,18 @@ impl<V: Vfs + Clone> Db<V> {
         // pushes into it. Its own frees leave through `drain_freed` into the
         // commit's entry set instead, so no page reaches an allocator without
         // the window entry that names it having been located first.
-        hist_tree.set_reuse_threshold(0);
-        hist_tree.set_free_page_cache(self.free_page_cache.clone());
-        hist_tree.set_free_page_consumed(self.free_page_consumed.clone());
+        let mut hist_tree = BTree::open_session(
+            self.pager.clone(),
+            self.realm_id,
+            state.commit_history_root_page_id,
+            state.next_page_id,
+            self.page_size,
+            crate::btree::PageSource::new(
+                0,
+                self.free_page_cache.clone(),
+                &self.free_page_consumed,
+            ),
+        );
 
         // Insert the new entry.
         let key = new_commit_id.to_be_bytes().to_vec();

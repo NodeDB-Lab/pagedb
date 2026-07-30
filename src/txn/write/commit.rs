@@ -144,9 +144,9 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             .collect();
         // Pages the allocator reused from the cache this txn — they were free
         // before, now hold live committed data, so they leave the free-list.
-        let consumed: HashSet<u64> = std::mem::take(&mut *self.db.free_page_consumed.lock())
-            .into_iter()
-            .collect();
+        // Emptied here rather than mid-session: the trees have all drained, so
+        // nothing can still be banking pages against it.
+        let consumed = self.db.free_page_consumed.take();
 
         // The scanned window after this commit: its entries minus the ones
         // reused, kept with their original freeing-commit tag. Every id in

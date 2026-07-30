@@ -130,7 +130,7 @@ impl<V: Vfs + Clone> Db<V> {
             })),
             poisoned_commit: parking_lot::Mutex::new(None),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            free_page_consumed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            free_page_consumed: crate::btree::ConsumedPages::new(),
             #[cfg(test)]
             visibility_test_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]

@@ -100,10 +100,13 @@ impl<V: Vfs> BTree<V> {
 
     /// Drain and return all `page_ids` that were freed during this tree's
     /// mutation session, plus any leaf pages scheduled for freeing at the
-    /// upcoming `flush`. After this call, both `self.freed` and
-    /// `self.scheduled_frees` are empty.
+    /// upcoming `flush`. After this call, `self.freed`, `self.freed_reusable`
+    /// and `self.scheduled_frees` are all empty — a page eligible for
+    /// in-session reuse that no allocation claimed is still a page this session
+    /// freed, and the deferred-free queue must hear about it.
     pub fn drain_freed(&mut self) -> Vec<u64> {
         let mut out = std::mem::take(&mut self.freed);
+        out.append(&mut self.freed_reusable);
         out.append(&mut self.scheduled_frees);
         out
     }

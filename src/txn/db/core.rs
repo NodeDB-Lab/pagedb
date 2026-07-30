@@ -231,10 +231,15 @@ pub struct Db<V: Vfs + Clone> {
     /// history) draw from the same pool. Cleared by `compact_now`'s full repack,
     /// which relocates pages and invalidates every cached id.
     pub(crate) free_page_cache: Arc<parking_lot::Mutex<Vec<u64>>>,
-    /// Per-txn sink (cleared at `begin_write`) recording page ids the allocator
+    /// Per-txn sink (emptied at `begin_write`) recording page ids the allocator
     /// drew from `free_page_cache`. The commit path removes them from the
     /// durable free-list — they now hold live committed data.
-    pub(crate) free_page_consumed: Arc<parking_lot::Mutex<Vec<u64>>>,
+    ///
+    /// The trees see it through a handle that cannot empty it: a page banked
+    /// for in-session reuse on the strength of a record here must not have that
+    /// record withdrawn under it, so emptying belongs to the transaction
+    /// boundaries alone.
+    pub(crate) free_page_consumed: Arc<crate::btree::ConsumedPages>,
     #[cfg(test)]
     pub(crate) visibility_test_hook: parking_lot::Mutex<Option<Arc<VisibilityTestHook>>>,
     #[cfg(test)]
