@@ -13,6 +13,30 @@
 //! calls [`faultbox::init`], so a library emitting these costs nothing on its
 //! own.
 
+/// What a page's own cleartext envelope says about itself, read without
+/// decrypting anything.
+///
+/// A page that fails AEAD verification cannot be decoded, but its envelope is
+/// authenticated-as-associated-data rather than encrypted, so these fields are
+/// still readable — and they are what separates the possible causes. A kind
+/// byte naming a different structure than the reader expected points at a
+/// misrouted or reused page; a cipher or epoch the store no longer writes
+/// points at a stale page resurrected under a new key schedule; agreement on
+/// all of them narrows it to the page's own bytes, which is a torn write or
+/// media error.
+#[derive(Debug, Clone, Copy)]
+pub struct PageEnvelope {
+    /// The kind byte the page carries on disk.
+    pub on_disk_kind: u8,
+    /// The kind the read authenticated under. A disagreement with
+    /// `on_disk_kind` is itself the finding.
+    pub expected_kind: u8,
+    /// Cipher recorded in the page header.
+    pub cipher_id: u8,
+    /// Master-key epoch recorded in the page header.
+    pub mk_epoch: u64,
+}
+
 #[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
 mod imp {
     use std::cell::Cell;
@@ -116,6 +140,7 @@ mod imp {
         binding: String,
         realm_hex: String,
         main_db_path: String,
+        envelope: super::PageEnvelope,
     }
 
     impl faultbox::DomainContext for PageReadVerifyFailure {
@@ -137,7 +162,24 @@ mod imp {
                 // `pagedb-fsck` is the host application's job — only it knows
                 // the real on-disk directory behind the VFS.
                 "main_db_path": self.main_db_path,
+                // Read from the page's own envelope, which authentication does
+                // not have to succeed for. A kind byte that disagrees with the
+                // expected one is a misroute or a reused page; agreement points
+                // at the bytes themselves.
+                "on_disk_kind": self.envelope.on_disk_kind,
+                "expected_kind": self.envelope.expected_kind,
+                "kind_disagrees": self.envelope.on_disk_kind != self.envelope.expected_kind,
+                "cipher_id": self.envelope.cipher_id,
+                "mk_epoch": self.envelope.mk_epoch,
                 "fsck_hint": format!("pagedb-fsck <store-dir> --deep --realm {}", self.realm_hex),
+                // What the store's own structures say about this page. A page
+                // that is reachable from a live root *and* named by the free
+                // list was handed out twice; nothing else in this report can
+                // establish that.
+                "provenance_hint": format!(
+                    "Db::page_provenance({}) on a handle open at this store",
+                    self.page_id
+                ),
             })
         }
     }
@@ -157,6 +199,7 @@ mod imp {
         file: &str,
         binding: &str,
         realm: &RealmId,
+        envelope: super::PageEnvelope,
     ) -> RichlyReported {
         let ctx = PageReadVerifyFailure {
             page_id,
@@ -164,6 +207,7 @@ mod imp {
             binding: binding.to_owned(),
             realm_hex: crate::hex::to_hex_lower(&realm.0),
             main_db_path: main_db_path.to_owned(),
+            envelope,
         };
         let _ = faultbox::Capture::new(
             faultbox::EventKind::Corruption,
@@ -392,6 +436,7 @@ mod imp {
         _file: &str,
         _binding: &str,
         _realm: &RealmId,
+        _envelope: super::PageEnvelope,
     ) -> RichlyReported {
         RichlyReported
     }

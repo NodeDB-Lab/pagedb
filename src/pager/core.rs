@@ -1037,6 +1037,11 @@ impl<V: Vfs> Pager<V> {
             .checked_add(1)
             .ok_or_else(|| PagedbError::arithmetic_overflow("observer retry attempts"))?;
         let mut last_err: Option<PagedbError> = None;
+        // What the last attempt's page said about itself, kept for the
+        // corruption report: the envelope is authenticated rather than
+        // encrypted, so it is readable even though the page as a whole is not,
+        // and it is what separates a misroute from a torn write.
+        let mut last_envelope: Option<crate::diag::PageEnvelope> = None;
         for attempt in 0..max_attempts {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1072,10 +1077,17 @@ impl<V: Vfs> Pager<V> {
             // under it, so a leaf and an internal node are each read correctly
             // in one pass; a byte that is neither node kind means the pointer
             // led somewhere structurally wrong and is surfaced immediately.
+            let on_disk_kind_byte = extract_page_kind(&buf).map_or(0xFF, PageKind::as_byte);
             let auth_kind = match binding.resolve_on_disk(&buf) {
                 Ok(k) => k,
                 Err(e) => return Err(e),
             };
+            last_envelope = Some(crate::diag::PageEnvelope {
+                on_disk_kind: on_disk_kind_byte,
+                expected_kind: auth_kind.as_byte(),
+                cipher_id: on_disk_cipher_id.as_byte(),
+                mk_epoch: on_disk_epoch,
+            });
             let aad = Aad::from_fields(AadFields {
                 cipher_id: on_disk_cipher_id.as_byte(),
                 page_kind: auth_kind.as_byte(),
@@ -1153,6 +1165,12 @@ impl<V: Vfs> Pager<V> {
                 &crate::diag::dbg_str(&file),
                 &crate::diag::dbg_str(&binding),
                 &realm_id,
+                last_envelope.unwrap_or(crate::diag::PageEnvelope {
+                    on_disk_kind: 0xFF,
+                    expected_kind: 0xFF,
+                    cipher_id: 0xFF,
+                    mk_epoch: u64::MAX,
+                }),
             );
             // Report the page that failed, not just that something did: the
             // pager is the only layer that knows which file and page id the

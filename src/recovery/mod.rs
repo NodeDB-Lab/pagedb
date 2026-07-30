@@ -4,6 +4,8 @@
 pub(crate) mod deep_walk;
 pub(crate) mod gc;
 pub(crate) mod journal;
+pub(crate) mod provenance;
+pub(crate) mod quarantine;
 pub(crate) mod reconcile;
 pub(crate) mod scratch;
 #[cfg(test)]

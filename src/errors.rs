@@ -29,7 +29,17 @@ pub enum PagedbError {
     #[error("required persisted key is unavailable: mk_epoch={mk_epoch} cipher_id={cipher_id}")]
     MissingPersistedKey { mk_epoch: u64, cipher_id: u8 },
 
-    #[error("corruption: {0:?}")]
+    // The directive is part of the message, not documentation elsewhere. An
+    // application meeting this has to decide, usually under pressure, whether
+    // to come back up by discarding the store — and a store discarded is the
+    // only evidence of why it failed. `quarantine_store` renames instead of
+    // deleting, so recovering is still possible without destroying the answer.
+    #[error(
+        "corruption: {0:?} — preserve this store: it is the only evidence of the fault. \
+         Move it aside with `pagedb::quarantine_store` rather than deleting it, and \
+         `Db::page_provenance` on a page that failed to authenticate reports whether the \
+         store handed one page to two owners"
+    )]
     Corruption(CorruptionDetail),
 
     /// A realm exceeded one of the caps recorded in its

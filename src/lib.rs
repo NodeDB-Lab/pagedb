@@ -42,6 +42,8 @@ pub use crypto::{CipherId, SecretKey};
 pub use errors::{CorruptionDetail, Evictable, PagedbError, QuotaKind};
 pub use observability::DbStats;
 pub use options::{OpenOptions, RetainPolicy};
+pub use recovery::provenance::{PageProvenance, PageStanding};
+pub use recovery::quarantine::{QuarantineReport, quarantine_store};
 pub use recovery::{DeepWalkReport, DriftIssue, PageIssue, SegmentIssue, run_deep_walk};
 pub use segment::{
     ExtentRef, GcStats, MmapView, PageId, SegmentPageKind, SegmentReader, SegmentWriter,
