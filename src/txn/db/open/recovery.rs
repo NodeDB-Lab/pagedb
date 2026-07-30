@@ -3,6 +3,7 @@
 use crate::Result;
 use crate::crypto::SecretKey;
 use crate::errors::PagedbError;
+use crate::pager::freelist;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::Vfs;
 
@@ -126,4 +127,78 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     }
 
     Ok(())
+}
+
+impl<V: Vfs + Clone> Db<V> {
+    /// Detach the free-list chain when it cannot be read, so a store with a
+    /// damaged chain still opens.
+    ///
+    /// A free list records reclaimable space, not data: every page it names is
+    /// already unreachable from every root. Losing it therefore costs only the
+    /// ability to reuse that space — those pages become leaked, and a full
+    /// compaction reclaims them by rebuilding the file. Nothing reachable
+    /// through the roots is affected.
+    ///
+    /// Treating an unreadable chain as fatal traded that bounded, recoverable
+    /// cost for an unbounded one: the store would not open at all, so one
+    /// damaged page in a store of hundreds of thousands put every record in it
+    /// out of reach.
+    ///
+    /// The chain is dropped in memory only. Every commit writes the free-list
+    /// root into the header, so the next one persists the detachment; a crash
+    /// before then leaves the same unreadable chain to be dropped again on the
+    /// following open, which is why repeating this is safe.
+    ///
+    /// Rebuilding the free set instead — walking the roots and treating every
+    /// unreachable page as free — is deliberately NOT done here. It would
+    /// recover the space, but a reachability computation that errs in the unsafe
+    /// direction hands a live page to a second owner, which is silent data
+    /// corruption rather than a leak. Compaction already reclaims that space
+    /// through a path whose correctness does not rest on the inference.
+    ///
+    /// This lives beside its caller rather than with the free-list rebuild used
+    /// by incremental apply: that path is native-only, this one runs on every
+    /// target a store can be opened from. A browser-hosted store damages its
+    /// chain the same way a native one does, and skipping the detach there
+    /// would leave it unopenable for the same reason this recovery exists.
+    pub(crate) async fn drop_unreadable_free_list(&self) {
+        let head = {
+            let state = self.writer.lock().await;
+            state.free_list_root_page_id
+        };
+        if head == 0 {
+            return;
+        }
+
+        let mut walk = freelist::ChainWalk::new(head);
+        let error = loop {
+            match walk.advance(&self.pager, self.realm_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                // Corruption only. A transient I/O failure says nothing about
+                // the chain's content, and detaching on one would leak every
+                // page it names because a disk hiccuped during startup.
+                Err(error @ PagedbError::Corruption(_)) => break error,
+                Err(error) => {
+                    tracing::warn!(
+                        free_list_root = head,
+                        %error,
+                        "free-list chain could not be read at open; leaving it attached, \
+                         since this reports an I/O failure rather than damaged content"
+                    );
+                    return;
+                }
+            }
+        };
+
+        tracing::error!(
+            free_list_root = head,
+            %error,
+            "free-list chain is unreadable; detaching it so the store opens. The pages it \
+             named are unreachable from every root, so no data is lost — the space they \
+             occupy is leaked until a full compaction rebuilds the file."
+        );
+        let mut state = self.writer.lock().await;
+        state.free_list_root_page_id = 0;
+    }
 }
