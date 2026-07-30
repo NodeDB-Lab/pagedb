@@ -234,7 +234,7 @@ pub struct Db<V: Vfs + Clone> {
     /// Per-txn sink (cleared at `begin_write`) recording page ids the allocator
     /// drew from `free_page_cache`. The commit path removes them from the
     /// durable free-list — they now hold live committed data.
-    pub(crate) free_page_consumed: Arc<parking_lot::Mutex<Vec<u64>>>,
+    pub(crate) free_page_consumed: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<u64>>>,
     #[cfg(test)]
     pub(crate) visibility_test_hook: parking_lot::Mutex<Option<Arc<VisibilityTestHook>>>,
     #[cfg(test)]
