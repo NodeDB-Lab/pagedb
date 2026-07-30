@@ -1,30 +1,21 @@
-//! Catalog-backed operations: realm-quota persistence and commit-history
-//! maintenance.
+//! The commit-history index: appending an entry per commit, and pruning it back
+//! to the configured retention.
+//!
+//! Both the append and the prune run on every commit, so neither may cost what
+//! the index already holds. Retention is tracked across commits and the prune
+//! streams the prefix it deletes; nothing here materialises the tree.
 
-use std::sync::atomic::Ordering;
-
+use crate::Result;
 use crate::btree::BTree;
-use crate::catalog::codec::{Catalog, RealmQuotas};
 use crate::errors::PagedbError;
-use crate::pager::anchor::HeaderCursor;
-use crate::pager::header::commit_header;
 use crate::vfs::Vfs;
-use crate::{RealmId, Result};
 
-use super::core::{
-    CommitHistoryMeta, Db, HeaderFieldsParams, decode_commit_meta, encode_commit_meta,
-    encode_root_ref,
-};
-use super::pending::PendingWriterState;
+use crate::txn::db::core::{CommitHistoryMeta, Db, decode_commit_meta, encode_commit_meta};
+use crate::txn::db::pending::PendingWriterState;
 
-/// Named-counter rows read per batch while validating them at open. Rows are a
-/// fixed-width authenticated value, so this is a few KiB resident regardless of
-/// how many counters the embedder has named.
-const COUNTER_ROW_BATCH: usize = 512;
-
-/// Commit-history rows read per batch while pruning by age. A key is 8 bytes
-/// and a row 40, so this is a few tens of KiB resident regardless of how deep
-/// retention has run.
+/// Commit-history rows read per batch while pruning. A key is 8 bytes and a row
+/// 40, so this is a few tens of KiB resident regardless of how deep retention
+/// has run.
 const HISTORY_PRUNE_BATCH: usize = 512;
 
 impl<V: Vfs + Clone> Db<V> {
@@ -62,147 +53,6 @@ impl<V: Vfs + Clone> Db<V> {
         let mut b = [0u8; 8];
         b.copy_from_slice(&key[..8]);
         Ok(Some(u64::from_be_bytes(b)))
-    }
-
-    /// Authenticate and decode every persisted named-counter row during open.
-    ///
-    /// Named counters are already atomic with catalog-root publication, so
-    /// recovery validates their encoding but never rewrites their values.
-    ///
-    /// Rows are streamed in bounded batches: how many counters an embedder has
-    /// named is its business, and open must not size an allocation by it.
-    pub(super) async fn validate_counter_rows(
-        &self,
-        catalog_root_page_id: u64,
-        next_page_id: u64,
-    ) -> Result<()> {
-        if catalog_root_page_id == 0 {
-            return Ok(());
-        }
-
-        let prefix = [crate::catalog::codec::CatalogRowKind::Counter as u8];
-        let tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            catalog_root_page_id,
-            next_page_id,
-            self.page_size,
-        );
-        let mut cursor: Vec<u8> = prefix.to_vec();
-        loop {
-            let batch = tree
-                .collect_prefix_batch_from(&prefix, &cursor, COUNTER_ROW_BATCH)
-                .await?;
-            let Some((last_key, _)) = batch.last() else {
-                return Ok(());
-            };
-            cursor.clear();
-            cursor.extend_from_slice(last_key);
-            // The exact successor of `last_key` in the key ordering: resume
-            // strictly past the row just validated without re-reading it.
-            cursor.push(0);
-            let exhausted = batch.len() < COUNTER_ROW_BATCH;
-
-            for (_key, value) in &batch {
-                Catalog::decode_counter(value)?;
-            }
-            if exhausted {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Write per-realm quota caps into the catalog B+ tree and persist the
-    /// updated catalog root to the A/B header.
-    pub async fn set_realm_quotas(&self, realm: RealmId, quotas: RealmQuotas) -> Result<()> {
-        self.ensure_usable()?;
-        let mut state = self.writer.lock().await;
-        self.ensure_usable()?;
-        let key = Catalog::quota_key(realm);
-        let value = Catalog::encode_realm_quotas(&quotas);
-
-        let mut cat_tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        cat_tree.put(&key, &value).await?;
-        cat_tree.flush().await?;
-
-        let new_catalog_root = cat_tree.root_page_id();
-        let new_next = cat_tree.next_page_id();
-        let new_catalog_txn_id = state
-            .latest_commit_id
-            .checked_add(1)
-            .ok_or_else(|| PagedbError::arithmetic_overflow("catalog transaction id"))?;
-
-        let header_cursor = self.pager.header_cursor()?;
-        let new_seq = header_cursor.next_seq()?;
-        let counter_anchor = self.pager.pending_anchor();
-        let catalog_root_bytes = encode_root_ref(new_catalog_root, new_catalog_txn_id);
-
-        let fields = self.header_fields(HeaderFieldsParams {
-            mk_epoch: self.mk_epoch.load(Ordering::SeqCst),
-            seq: new_seq,
-            active_root_page_id: state.root_page_id,
-            active_root_txn_id: state.latest_commit_id,
-            counter_anchor,
-            commit_id: state.latest_commit_id,
-            catalog_root: catalog_root_bytes,
-            commit_history_root_page_id: state.commit_history_root_page_id,
-            commit_history_root_version: state.commit_history_root_version,
-            free_list_root_page_id: state.free_list_root_page_id,
-            next_page_id: new_next,
-        })?;
-        let hk_clone = { self.hk.read().clone() };
-        let new_slot = commit_header(
-            &*self.vfs,
-            &self.main_db_path,
-            &hk_clone,
-            &fields,
-            header_cursor.slot,
-            self.page_size,
-        )
-        .await?;
-        self.pager.note_header_written(HeaderCursor {
-            slot: new_slot,
-            seq: new_seq,
-        });
-
-        state.catalog_root_page_id = new_catalog_root;
-        state.catalog_root_txn_id = new_catalog_txn_id;
-        state.next_page_id = new_next;
-        let _ = self
-            .finish_durable_commit(
-                &state,
-                crate::CommitId(state.latest_commit_id),
-                counter_anchor,
-                &[],
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    /// Read per-realm quota caps from the catalog B+ tree. Returns
-    /// `RealmQuotas::default()` if no entry has been written for this realm.
-    pub async fn realm_quotas(&self, realm: RealmId) -> Result<RealmQuotas> {
-        self.ensure_usable()?;
-        let snapshot = *self.snapshot.read();
-        let key = Catalog::quota_key(realm);
-        let cat_tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            snapshot.catalog_root_page_id,
-            snapshot.next_page_id,
-            self.page_size,
-        );
-        match cat_tree.get(&key).await? {
-            Some(bytes) => Catalog::decode_realm_quotas(&bytes),
-            None => Ok(RealmQuotas::default()),
-        }
     }
 
     /// Insert the new commit-history entry and prune per the retention policy.
@@ -273,61 +123,29 @@ impl<V: Vfs + Clone> Db<V> {
                 }
             }
             crate::options::RetainPolicy::Count(n) => {
-                let count = *n as usize;
-                // Fast path: if the cached count is known and the post-insert
-                // count is at or below the retain limit, we can skip the
-                // full-tree scan entirely.
-                let projected = state
-                    .commit_history_count
-                    .map(|c| if was_new { c.saturating_add(1) } else { c });
-                if let Some(p) = projected {
-                    if p <= u64::from(*n) {
-                        state.commit_history_count = Some(p);
-                        // Materialize and return below.
-                    } else {
-                        // Over-limit: do the scan + prune.
-                        let all = hist_tree.collect_all().await?;
-                        let mut current = all.len() as u64;
-                        if all.len() > count {
-                            let to_delete = all.len() - count;
-                            for (k, _) in all.iter().take(to_delete) {
-                                let mut b = [0u8; 8];
-                                b.copy_from_slice(&k[..8]);
-                                let cid = u64::from_be_bytes(b);
-                                if let Some(min) = min_pinned {
-                                    if cid >= min {
-                                        continue;
-                                    }
-                                }
-                                if hist_tree.delete(k).await? {
-                                    current = current.saturating_sub(1);
-                                }
-                            }
-                        }
-                        state.commit_history_count = Some(current);
-                    }
+                // The retained count is tracked across commits, so the usual
+                // commit knows whether it is over the limit without reading the
+                // tree at all. It is unknown only on the first commit after
+                // opening an existing store, and is recovered there by counting
+                // in bounded batches — never by materialising the tree, which
+                // would size an allocation by how deep retention has run and
+                // put that on every commit once the limit is passed.
+                let known = match state.commit_history_count {
+                    Some(cached) => cached,
+                    None => count_history_rows(&hist_tree).await?,
+                };
+                let total = if was_new {
+                    known.saturating_add(1)
                 } else {
-                    // No cached count — do the scan to populate it.
-                    let all = hist_tree.collect_all().await?;
-                    let mut current = all.len() as u64;
-                    if all.len() > count {
-                        let to_delete = all.len() - count;
-                        for (k, _) in all.iter().take(to_delete) {
-                            let mut b = [0u8; 8];
-                            b.copy_from_slice(&k[..8]);
-                            let cid = u64::from_be_bytes(b);
-                            if let Some(min) = min_pinned {
-                                if cid >= min {
-                                    continue;
-                                }
-                            }
-                            if hist_tree.delete(k).await? {
-                                current = current.saturating_sub(1);
-                            }
-                        }
-                    }
-                    state.commit_history_count = Some(current);
-                }
+                    known
+                };
+                let excess = total.saturating_sub(u64::from(*n));
+                let deleted = if excess == 0 {
+                    0
+                } else {
+                    prune_oldest_history_rows(&mut hist_tree, excess, min_pinned).await?
+                };
+                state.commit_history_count = Some(total.saturating_sub(deleted));
             }
             crate::options::RetainPolicy::Age(duration) => {
                 let now_secs = std::time::SystemTime::now()
@@ -419,50 +237,201 @@ impl<V: Vfs + Clone> Db<V> {
     }
 }
 
+/// Count the rows the commit-history index holds, streaming them in bounded
+/// batches.
+///
+/// Reached only when the tracked count is unknown — the first commit after
+/// opening an existing store. Retention can be arbitrarily deep, so the count
+/// is accumulated rather than the rows collected: the answer is a number, and
+/// holding the tree to produce it would size an allocation by the embedder's
+/// retention setting.
+async fn count_history_rows<V: Vfs + Clone>(tree: &BTree<V>) -> Result<u64> {
+    let mut total: u64 = 0;
+    let mut cursor: Vec<u8> = Vec::new();
+    loop {
+        let batch = tree
+            .collect_batch_from(&cursor, HISTORY_PRUNE_BATCH)
+            .await?;
+        let Some((last_key, _)) = batch.last() else {
+            return Ok(total);
+        };
+        total = total.saturating_add(batch.len() as u64);
+        if batch.len() < HISTORY_PRUNE_BATCH {
+            return Ok(total);
+        }
+        cursor.clear();
+        cursor.extend_from_slice(last_key);
+        // The exact successor of `last_key` in the key ordering: resume
+        // strictly past the row just counted.
+        cursor.push(0);
+    }
+}
+
+/// Delete up to `excess` of the oldest rows, stopping at the first row a live
+/// reader still pins. Returns how many were deleted.
+///
+/// History keys are the commit id big-endian, so key order is commit order and
+/// the prunable rows are always a prefix of the oldest ones. The prefix is
+/// streamed in fixed-size batches: in the steady state `excess` is 1, and the
+/// cost of a commit is the row it removes rather than the depth of the
+/// retention behind it.
+///
+/// The first pinned row ends the walk rather than being skipped: every row
+/// after it is a later commit, so it is pinned too.
+async fn prune_oldest_history_rows<V: Vfs + Clone>(
+    tree: &mut BTree<V>,
+    excess: u64,
+    min_pinned: Option<u64>,
+) -> Result<u64> {
+    let mut deleted: u64 = 0;
+    let mut cursor: Vec<u8> = Vec::new();
+    while deleted < excess {
+        // Ask for what is left to delete, not for a fixed batch. The steady
+        // state removes a single row, and reading a full batch to find it would
+        // charge every commit the batch size instead of the work. The cap is
+        // what bounds residency when a real backlog has to drain.
+        let want = usize::try_from(excess - deleted)
+            .unwrap_or(HISTORY_PRUNE_BATCH)
+            .min(HISTORY_PRUNE_BATCH);
+        let batch = tree.collect_batch_from(&cursor, want).await?;
+        let Some((last_key, _)) = batch.last() else {
+            break;
+        };
+        cursor.clear();
+        cursor.extend_from_slice(last_key);
+        cursor.push(0);
+        let exhausted = batch.len() < want;
+
+        for (key, _) in &batch {
+            if deleted >= excess {
+                return Ok(deleted);
+            }
+            if key.len() != 8 {
+                return Err(PagedbError::catalog_row_invalid("commit_history.key"));
+            }
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&key[..8]);
+            if min_pinned.is_some_and(|min| u64::from_be_bytes(raw) >= min) {
+                return Ok(deleted);
+            }
+            if tree.delete(key).await? {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::btree::BTree;
+    use crate::options::RetainPolicy;
     use crate::vfs::memory::MemVfs;
-    use crate::{Db, PagedbError, RealmId};
-
-    use super::*;
+    use crate::{Db, OpenOptions, PagedbError, RealmId};
 
     const PAGE: usize = 4096;
     const REALM: RealmId = RealmId::new([0xA7; 16]);
 
+    /// A commit must not cost what retention holds.
+    ///
+    /// Retention holds the reclamation floor down, so a deep history keeps a
+    /// large set of free-list entries un-recyclable. Nothing on the commit path
+    /// may walk that set: what the commit does is bounded by what it changed,
+    /// and the depth of retention is a property of the store, not of the write.
+    ///
+    /// Both depths are past the point where the bounded free-list window is
+    /// full, so the window's own fixed cost is the same on each side and the
+    /// only thing varying is how much retention holds. Comparing a depth below
+    /// saturation against one above it would measure the window filling up,
+    /// which is a constant, and read as a scaling term that is not there.
     #[tokio::test(flavor = "current_thread")]
-    async fn counter_recovery_surfaces_malformed_counter_row() {
-        let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
+    async fn commit_cost_does_not_scale_with_retention_depth() {
+        use std::sync::atomic::Ordering;
+
+        async fn steady_state_commit_cost(retain: u32) -> u64 {
+            let db = Db::open_internal_with_options(
+                MemVfs::new(),
+                [7u8; 32],
+                PAGE,
+                REALM,
+                OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(retain)),
+            )
             .await
             .unwrap();
-        {
-            let mut txn = db.begin_write().await.unwrap();
-            let mut counter = txn.counter("bad-counter").unwrap();
-            counter.set(5).await.unwrap();
-            drop(counter);
-            txn.commit().await.unwrap();
+            for _ in 0..(u64::from(retain) + 8) {
+                db.begin_write().await.unwrap().commit().await.unwrap();
+            }
+            let lookups = || {
+                db.pager.inner.buffer_pool_hits.load(Ordering::Relaxed)
+                    + db.pager.inner.buffer_pool_misses.load(Ordering::Relaxed)
+            };
+            let before = lookups();
+            db.begin_write().await.unwrap().commit().await.unwrap();
+            lookups() - before
         }
 
-        let (catalog_root, next_page_id) = {
-            let state = db.writer.lock().await;
-            (state.catalog_root_page_id, state.next_page_id)
-        };
-        let mut tree = BTree::open(
-            db.pager.clone(),
-            db.realm_id,
-            catalog_root,
-            next_page_id,
-            db.page_size,
+        let shallow = steady_state_commit_cost(1024).await;
+        let deep = steady_state_commit_cost(2048).await;
+
+        assert!(
+            deep < shallow * 2,
+            "a commit cost {deep} page lookups at a 2048-row retention against {shallow} at \
+             1024 — twice the rows: the commit path is walking what retention holds"
         );
-        tree.put(&Catalog::counter_key(&[0xFF]).unwrap(), b"bad")
+    }
+
+    /// Once retention is at its limit every commit is a prune, and the prune
+    /// must cost the row it removes rather than the depth of the index behind
+    /// it.
+    ///
+    /// Isolated by holding the index size fixed and varying only whether
+    /// pruning happens: an unbounded policy builds the same tree and never
+    /// prunes, so the difference between the two is the prune and nothing else.
+    /// Comparing across retention settings instead would fold in the cost of a
+    /// taller tree, which is legitimate and would mask what is being measured.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pruning_history_costs_the_row_it_removes_not_the_depth_retained() {
+        use std::sync::atomic::Ordering;
+
+        const ROWS: u64 = 2048;
+
+        async fn steady_state_commit_cost(policy: RetainPolicy) -> u64 {
+            let db = Db::open_internal_with_options(
+                MemVfs::new(),
+                [7u8; 32],
+                PAGE,
+                REALM,
+                OpenOptions::default().with_commit_history_retain(policy),
+            )
             .await
             .unwrap();
-        tree.flush().await.unwrap();
 
-        let err = db
-            .validate_counter_rows(tree.root_page_id(), tree.next_page_id())
-            .await
-            .expect_err("malformed counter row must surface during recovery validation");
-        assert!(matches!(err, PagedbError::Corruption(_)));
+            for _ in 0..(ROWS + 8) {
+                db.begin_write().await.unwrap().commit().await.unwrap();
+            }
+
+            let lookups = || {
+                db.pager.inner.buffer_pool_hits.load(Ordering::Relaxed)
+                    + db.pager.inner.buffer_pool_misses.load(Ordering::Relaxed)
+            };
+            let before = lookups();
+            db.begin_write().await.unwrap().commit().await.unwrap();
+            lookups() - before
+        }
+
+        let pruning =
+            steady_state_commit_cost(RetainPolicy::Count(u32::try_from(ROWS).expect("fits"))).await;
+        let not_pruning = steady_state_commit_cost(RetainPolicy::Unbounded).await;
+
+        assert!(
+            pruning <= not_pruning + 16,
+            "a commit that prunes one row from a {ROWS}-row index cost {pruning} page lookups \
+             against {not_pruning} for the same index with no pruning: the prune is reading \
+             back what retention holds"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
