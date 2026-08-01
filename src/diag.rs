@@ -24,6 +24,17 @@
 /// points at a stale page resurrected under a new key schedule; agreement on
 /// all of them narrows it to the page's own bytes, which is a torn write or
 /// media error.
+///
+/// Only the `diagnostics` implementation below reads these fields. Call sites
+/// fill them in unconditionally — that is the point of the shim, so reporting a
+/// corruption never needs a `cfg` at the site that found it — so in a build
+/// without that implementation they are written and never read. Gating the
+/// struct itself would push the `cfg` back out to the call sites this module
+/// exists to keep clean.
+#[cfg_attr(
+    not(all(feature = "diagnostics", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, Copy)]
 pub struct PageEnvelope {
     /// The kind byte the page carries on disk.
