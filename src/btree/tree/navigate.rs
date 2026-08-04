@@ -207,6 +207,40 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
+    /// Return the exclusive separator bound of the leaf at `path`.
+    ///
+    /// The nearest ancestor with a child to the right owns the separator that
+    /// bounds this leaf's subtree. This avoids reading the next leaf merely to
+    /// decide whether another sorted key can reuse the current path.
+    pub(super) async fn exclusive_upper_bound_for_path(
+        &self,
+        path: &[u64],
+    ) -> Result<Option<Vec<u8>>> {
+        if path.len() < 2 {
+            return Ok(None);
+        }
+        let mut child = *path.last().expect("non-empty path");
+        for &internal_page in path[..path.len() - 1].iter().rev() {
+            let (guard, _kind) = self.read_node_guard(internal_page).await?;
+            let internal = Internal::decode(guard.body_ref())?;
+            drop(guard);
+            if internal.leftmost_child == child {
+                if let Some(entry) = internal.entries.first() {
+                    return Ok(Some(entry.key.clone()));
+                }
+            } else if let Some(index) = internal
+                .entries
+                .iter()
+                .position(|entry| entry.right_child == child)
+                && let Some(next) = internal.entries.get(index + 1)
+            {
+                return Ok(Some(next.key.clone()));
+            }
+            child = internal_page;
+        }
+        Ok(None)
+    }
+
     /// Given a `path` ending at a leaf, return the path to the next leaf to
     /// the right (in key order), or `None` if `path` is the rightmost leaf.
     ///
