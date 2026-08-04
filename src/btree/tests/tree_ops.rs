@@ -142,6 +142,42 @@ async fn put_batch_inserts_all() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn put_batch_interleaves_with_existing_leaves_and_overwrites() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    const RECORDS: u32 = 20_000;
+    const DUPLICATE: u32 = 12_345;
+    let old = vec![1u8; 48];
+    let new = vec![2u8; 48];
+    let duplicate_final = vec![3u8; 48];
+    for i in (0..RECORDS).step_by(2) {
+        let key = format!("k{i:06}");
+        tree.put(key.as_bytes(), &old).await.unwrap();
+    }
+    let mut batch: Vec<(Bytes, Bytes)> = Vec::with_capacity(RECORDS as usize + 1);
+    for i in 0..RECORDS {
+        let key = Bytes::from(format!("k{i:06}").into_bytes());
+        batch.push((key.clone(), Bytes::from(new.clone())));
+        if i == DUPLICATE {
+            batch.push((key, Bytes::from(duplicate_final.clone())));
+        }
+    }
+
+    tree.put_batch(batch).await.unwrap();
+
+    for i in 0..RECORDS {
+        let key = format!("k{i:06}");
+        let got = tree.get(key.as_bytes()).await.unwrap();
+        let expected = if i == DUPLICATE {
+            duplicate_final.as_slice()
+        } else {
+            new.as_slice()
+        };
+        assert_eq!(got.as_deref(), Some(expected), "key {key}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn delete_batch_removes_all() {
     let pager = fresh_pager().await;
     let mut tree = fresh_tree(pager);

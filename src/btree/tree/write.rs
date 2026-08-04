@@ -375,14 +375,43 @@ impl<V: Vfs> BTree<V> {
         Ok(true)
     }
 
-    /// Batch insert of sorted `(key, value)` pairs. Sorted input is required;
-    /// individual puts are issued per record.
+    /// Batch insert of sorted `(key, value)` pairs.
     ///
-    /// Per-leaf batching (amortising `CoW`) is a deferred performance
-    /// optimisation; this implementation is correct for all inputs.
+    /// Reuses the target leaf path and its exclusive upper bound while
+    /// consecutive keys remain in the same leaf. A split invalidates the
+    /// cached path; the next key descends through the updated spine.
     pub async fn put_batch(&mut self, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
-        for (k, v) in pairs {
-            self.put(&k, &v).await?;
+        self.invalidate_append_state();
+        let mut cached: Option<(Vec<u64>, Option<Vec<u8>>)> = None;
+
+        for (key, value) in pairs {
+            self.validate_insert_record_fits(&key, &value)?;
+            if self.root_page_id == 0 {
+                self.put(&key, &value).await?;
+                continue;
+            }
+
+            let (path, upper_bound) = match cached.take() {
+                Some((path, upper_bound))
+                    if upper_bound
+                        .as_ref()
+                        .is_none_or(|upper| key.as_ref() < upper.as_slice()) =>
+                {
+                    (path, upper_bound)
+                }
+                _ => {
+                    let path = self.path_to_leaf_for_key(&key).await?;
+                    let upper_bound = self.exclusive_upper_bound_for_path(&path).await?;
+                    (path, upper_bound)
+                }
+            };
+
+            let leaf_value = self.leaf_value_for(&value).await?;
+            let path_for_reuse = path.clone();
+            let split = self.put_at_path(path, &key, leaf_value).await?;
+            if !split {
+                cached = Some((path_for_reuse, upper_bound));
+            }
         }
         Ok(())
     }
