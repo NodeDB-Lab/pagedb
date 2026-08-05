@@ -56,7 +56,7 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
         source_next,
         db.page_size,
     );
-    let mut loader = dest.bulk_loader()?;
+    let mut loader = dest.bulk_loader_to(scratch)?;
     let mut cursor: Vec<u8> = Vec::new();
     loop {
         db.pager.flush_main_to(db.realm_id, scratch).await?;

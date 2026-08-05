@@ -67,10 +67,11 @@ pub struct BulkLoader<'a, V: Vfs> {
     /// Page id of the first leaf written; the root when it is also the only one.
     first_leaf_page_id: u64,
     levels: Vec<LevelAccum>,
+    alternate_flush_path: Option<String>,
 }
 
 impl<'a, V: Vfs> BulkLoader<'a, V> {
-    pub(crate) fn new(tree: &'a mut BTree<V>) -> Self {
+    pub(crate) fn new(tree: &'a mut BTree<V>, alternate_flush_path: Option<String>) -> Self {
         let body_cap = node::body_capacity(tree.page_size);
         let inline_threshold = overflow::inline_value_threshold(tree.page_size);
         Self {
@@ -85,6 +86,7 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
             leaf_count: 0,
             first_leaf_page_id: 0,
             levels: Vec::new(),
+            alternate_flush_path,
         }
     }
 
@@ -114,11 +116,19 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
             let realm_id = self.tree.realm_id;
             let page_size = self.tree.page_size;
             let tree = &mut *self.tree;
-            let root_page_id =
-                overflow::write_chain(&pager, realm_id, &value, page_size, &mut || {
-                    tree.allocate_page()
-                })
-                .await?;
+            let flush_target = match self.alternate_flush_path.as_deref() {
+                Some(path) => overflow::OverflowFlushTarget::Alternate(path),
+                None => overflow::OverflowFlushTarget::Main,
+            };
+            let root_page_id = overflow::write_chain(
+                &pager,
+                realm_id,
+                &value,
+                page_size,
+                &mut || tree.allocate_page(),
+                flush_target,
+            )
+            .await?;
             LeafValue::Overflow {
                 total_len,
                 root_page_id,
@@ -126,6 +136,7 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
         } else {
             LeafValue::Inline(value)
         };
+        self.flush_if_dirty_budget().await?;
 
         let cost = leaf_record_cost(key.len(), &stored)?;
         let projected = self
@@ -177,6 +188,7 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
             };
             let page_id = self.tree.allocate_page();
             self.tree.write_internal(page_id, &node).await?;
+            self.flush_if_dirty_budget().await?;
             self.push_child(level + 1, (page_id, separator)).await?;
             level += 1;
         }
@@ -219,6 +231,7 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
             records,
         };
         self.tree.write_leaf(page_id, &leaf).await?;
+        self.flush_if_dirty_budget().await?;
         self.left_sibling = page_id;
         self.leaf_used = node::HEADER_LEN;
         if self.leaf_count == 0 {
@@ -255,9 +268,25 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
             };
             let page_id = self.tree.allocate_page();
             self.tree.write_internal(page_id, &node).await?;
+            self.flush_if_dirty_budget().await?;
             child = (page_id, separator);
             level += 1;
         }
+    }
+
+    async fn flush_if_dirty_budget(&self) -> Result<()> {
+        if self.tree.pager.main_dirty_at_budget() {
+            match self.alternate_flush_path.as_deref() {
+                Some(path) => {
+                    self.tree
+                        .pager
+                        .flush_main_to(self.tree.realm_id, path)
+                        .await?
+                }
+                None => self.tree.pager.flush_main(self.tree.realm_id).await?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -275,7 +304,16 @@ impl<V: Vfs> BTree<V> {
                 "bulk_load: tree must be empty",
             )));
         }
-        Ok(BulkLoader::new(self))
+        Ok(BulkLoader::new(self, None))
+    }
+
+    pub(crate) fn bulk_loader_to(&mut self, path: &str) -> Result<BulkLoader<'_, V>> {
+        if self.root_page_id != 0 {
+            return Err(PagedbError::Io(std::io::Error::other(
+                "bulk_load: tree must be empty",
+            )));
+        }
+        Ok(BulkLoader::new(self, Some(path.to_string())))
     }
 
     /// Bulk-load sorted `(key, value)` pairs into a freshly-created tree
