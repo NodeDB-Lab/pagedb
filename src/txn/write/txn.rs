@@ -280,6 +280,28 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         self.btree.put_batch(sorted).await
     }
 
+    /// Build an empty data tree bottom-up from a sorted, unique record stream.
+    ///
+    /// The stream is consumed incrementally; records are not retained as a
+    /// graph-sized collection. Keys must be strictly increasing, and this
+    /// transaction's data tree must be empty. The transaction is consumed so
+    /// any stream or loader error necessarily aborts it; on success the caller
+    /// receives it back and may commit the new root normally.
+    pub async fn bulk_load_sorted_unique<I>(mut self, records: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = Result<(Vec<u8>, Bytes)>>,
+    {
+        {
+            let mut loader = self.btree.bulk_loader()?;
+            for record in records {
+                let (key, value) = record?;
+                loader.push(key, value).await?;
+            }
+            loader.finish().await?;
+        }
+        Ok(self)
+    }
+
     pub async fn delete_batch(&mut self, sorted: Vec<Vec<u8>>) -> Result<()> {
         self.btree.delete_batch(sorted).await
     }

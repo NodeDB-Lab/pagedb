@@ -162,45 +162,38 @@ pub async fn read_root_page<V: Vfs>(
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum OverflowFlushTarget<'a> {
+    Disabled,
+    Main,
+    Alternate(&'a str),
+}
+
 /// Write a value's overflow chain via the Pager. The root page is written as
 /// `PageKind::OverflowRoot` with `refcount = 1`; chain pages use
 /// `PageKind::Overflow`. Returns the root page's `page_id`.
-pub async fn write_chain<V: Vfs>(
+pub(super) async fn write_chain<V: Vfs>(
     pager: &Pager<V>,
     realm_id: RealmId,
     value: &[u8],
     page_size: usize,
     allocate_page: &mut (dyn FnMut() -> u64 + Send),
+    flush_target: OverflowFlushTarget<'_>,
 ) -> Result<u64> {
     let root_cap = overflow_root_capacity(page_size);
     let chain_cap = overflow_page_capacity(page_size);
 
-    // Collect chunk boundaries. The first chunk goes into the root page
-    // (smaller capacity); subsequent chunks go into chain pages.
-    let mut offsets: Vec<usize> = Vec::new();
-    let mut o = 0usize;
+    // Allocate one page ahead so the current page can name its successor,
+    // while retaining no graph-sized page-id or boundary vectors.
+    let root_page_id = allocate_page();
+    let mut page_id = root_page_id;
+    let mut start = 0usize;
+    let mut is_root = true;
     loop {
-        offsets.push(o);
-        let cap = if offsets.len() == 1 {
-            root_cap
-        } else {
-            chain_cap
-        };
-        o += cap;
-        if o >= value.len() {
-            break;
-        }
-    }
-    // Always have at least one page (root), even for zero-byte values.
-
-    let page_ids: Vec<u64> = offsets.iter().map(|_| allocate_page()).collect();
-
-    for (i, &start) in offsets.iter().enumerate() {
-        let is_root = i == 0;
         let cap = if is_root { root_cap } else { chain_cap };
-        let end = (start + cap).min(value.len());
-        let next = if i + 1 < page_ids.len() {
-            page_ids[i + 1]
+        let end = start.saturating_add(cap).min(value.len());
+        let next = if end < value.len() {
+            allocate_page()
         } else {
             0
         };
@@ -209,16 +202,29 @@ pub async fn write_chain<V: Vfs>(
         if is_root {
             encode_overflow_root(&mut body, 1, next, chunk)?;
             pager
-                .write_main_page(page_ids[i], realm_id, PageKind::OverflowRoot, &body)
+                .write_main_page(page_id, realm_id, PageKind::OverflowRoot, &body)
                 .await?;
         } else {
             encode_overflow(&mut body, next, chunk)?;
             pager
-                .write_main_page(page_ids[i], realm_id, PageKind::Overflow, &body)
+                .write_main_page(page_id, realm_id, PageKind::Overflow, &body)
                 .await?;
         }
+        if pager.main_dirty_at_budget() {
+            match flush_target {
+                OverflowFlushTarget::Disabled => {}
+                OverflowFlushTarget::Main => pager.flush_main(realm_id).await?,
+                OverflowFlushTarget::Alternate(path) => pager.flush_main_to(realm_id, path).await?,
+            }
+        }
+        if next == 0 {
+            break;
+        }
+        page_id = next;
+        start = end;
+        is_root = false;
     }
-    Ok(page_ids[0])
+    Ok(root_page_id)
 }
 
 /// The result of a `release` call.

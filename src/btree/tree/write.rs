@@ -95,9 +95,14 @@ impl<V: Vfs> BTree<V> {
             let realm = self.realm_id;
             let page_size = self.page_size;
             let pager = Arc::clone(&self.pager);
-            let root_page_id = overflow::write_chain(&pager, realm, value, page_size, &mut || {
-                self.allocate_page()
-            })
+            let root_page_id = overflow::write_chain(
+                &pager,
+                realm,
+                value,
+                page_size,
+                &mut || self.allocate_page(),
+                overflow::OverflowFlushTarget::Disabled,
+            )
             .await?;
             Ok(LeafValue::Overflow {
                 total_len: value.len() as u64,

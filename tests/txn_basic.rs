@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use pagedb::vfs::memory::MemVfs;
 use pagedb::{CommitId, Db, OpenOptions, PagedbError, ReaderStallPolicy, RealmId};
 
@@ -33,6 +34,50 @@ async fn write_commit_then_read() {
     }
     let r = db.begin_read().await.unwrap();
     assert_eq!(r.get(b"k").await.unwrap().as_deref(), Some(b"v".as_ref()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_load_sorted_unique_commits_and_reads() {
+    let db = open_db().await;
+    let records = (0..10_000).map(|i| {
+        Ok((
+            format!("k-{i:05}").into_bytes(),
+            Bytes::from(format!("v-{i:05}")),
+        ))
+    });
+    let writer = db.begin_write().await.unwrap();
+    let writer = writer.bulk_load_sorted_unique(records).await.unwrap();
+    writer.commit().await.unwrap();
+
+    let reader = db.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"k-09999").await.unwrap().as_deref(),
+        Some(b"v-09999".as_ref())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_load_stream_error_aborts_the_consumed_transaction() {
+    let db = open_db().await;
+    let records = (0..10_000)
+        .map(|i| Ok((format!("k-{i:05}").into_bytes(), Bytes::from_static(b"v"))))
+        .chain(std::iter::once(Err(PagedbError::Io(
+            std::io::Error::other("injected stream failure"),
+        ))));
+    let writer = db.begin_write().await.unwrap();
+    let error = match writer.bulk_load_sorted_unique(records).await {
+        Ok(_) => panic!("stream failure must abort the bulk transaction"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("injected stream failure"));
+
+    let reader = db.begin_read().await.unwrap();
+    assert!(reader.get(b"k-00000").await.unwrap().is_none());
+    drop(reader);
+
+    let mut writer = db.begin_write().await.unwrap();
+    writer.put(b"after", b"ok").await.unwrap();
+    writer.commit().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
