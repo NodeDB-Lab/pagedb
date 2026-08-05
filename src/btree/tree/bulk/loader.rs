@@ -5,8 +5,6 @@
 //! accumulates that scales with the number of records, so a caller that reads
 //! its source in bounded batches never materialises the source at all.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 
 use crate::Result;
@@ -19,6 +17,8 @@ use crate::btree::overflow;
 use crate::btree::tree::core::BTree;
 
 use super::levels::{Child, LevelAccum};
+
+mod batch;
 
 /// Bytes one record adds to a leaf body: the slot-directory entry, the
 /// key-suffix length field, the key itself, and the encoded value.
@@ -92,73 +92,21 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
 
     /// Append one record. Keys must arrive strictly increasing.
     ///
-    /// Rejects a non-increasing key with `BulkLoadNotMonotonic` and a record too
-    /// large for a leaf or a separator with `PayloadTooLarge`. Both checks run
-    /// before this record allocates a page or touches the cache, so a rejected
-    /// record leaves the tree exactly as it found it.
-    /// `value` is taken as [`Bytes`] so a repack, which reads each record out
-    /// of one page and stages it into another, moves it by refcount instead of
-    /// copying it at the boundary.
+    /// This is the one-record form of [`Self::push_batch`], preserving the
+    /// existing streaming API and its ordering/error semantics.
     pub async fn push(&mut self, key: Vec<u8>, value: Bytes) -> Result<()> {
-        if let Some(last) = &self.last_key {
-            if key <= *last {
-                return Err(PagedbError::BulkLoadNotMonotonic);
-            }
-        }
-        self.tree.validate_insert_record_fits(&key, &value)?;
+        self.push_batch(vec![(key, value)]).await
+    }
 
-        // Spill past the inline threshold exactly as the `put` path does, so a
-        // dense repack reproduces the original storage shape. Inlining an
-        // oversized value would exceed leaf capacity and fail the encode.
-        let stored = if value.len() > self.inline_threshold {
-            let total_len = value.len() as u64;
-            let pager = Arc::clone(&self.tree.pager);
-            let realm_id = self.tree.realm_id;
-            let page_size = self.tree.page_size;
-            let tree = &mut *self.tree;
-            let flush_target = match self.alternate_flush_path.as_deref() {
-                Some(path) => overflow::OverflowFlushTarget::Alternate(path),
-                None => overflow::OverflowFlushTarget::Main,
-            };
-            let root_page_id = overflow::write_chain(
-                &pager,
-                realm_id,
-                &value,
-                page_size,
-                &mut || tree.allocate_page(),
-                flush_target,
-            )
-            .await?;
-            LeafValue::Overflow {
-                total_len,
-                root_page_id,
-            }
-        } else {
-            LeafValue::Inline(value)
-        };
-        self.flush_if_dirty_budget().await?;
-
-        let cost = leaf_record_cost(key.len(), &stored)?;
-        let projected = self
-            .leaf_used
-            .checked_add(cost)
-            .ok_or(PagedbError::PayloadTooLarge)?;
-        if projected > self.body_cap && !self.leaf_records.is_empty() {
-            self.close_leaf(true).await?;
-        }
-        self.leaf_used = self
-            .leaf_used
-            .checked_add(cost)
-            .ok_or(PagedbError::PayloadTooLarge)?;
-        match &mut self.last_key {
-            Some(buffered) => {
-                buffered.clear();
-                buffered.extend_from_slice(&key);
-            }
-            None => self.last_key = Some(key.clone()),
-        }
-        self.leaf_records.push((key, stored));
-        Ok(())
+    /// Append a bounded ordered batch.
+    ///
+    /// The complete batch is checked for strict ordering and exact leaf and
+    /// separator fit before it can allocate a page, write overflow storage, or
+    /// alter the in-progress leaf. Inline records then flow through a tight
+    /// synchronous loop; async dirty-budget checks happen only at the batch
+    /// boundary or when page emission itself requires an await.
+    pub async fn push_batch(&mut self, batch: Vec<(Vec<u8>, Bytes)>) -> Result<()> {
+        batch::push_batch(self, batch).await
     }
 
     /// Write the last leaf, close every internal level, and publish the root on
