@@ -5,8 +5,12 @@ use pagedb::{CommitId, Db, OpenOptions, PagedbError, ReaderStallPolicy, RealmId}
 const PAGE: usize = 4096;
 
 async fn open_db() -> Db<MemVfs> {
+    open_db_on(MemVfs::new()).await
+}
+
+async fn open_db_on(vfs: MemVfs) -> Db<MemVfs> {
     Db::open(
-        MemVfs::new(),
+        vfs,
         [9u8; 32],
         PAGE,
         RealmId::new([1; 16]),
@@ -53,6 +57,75 @@ async fn bulk_load_sorted_unique_commits_and_reads() {
     assert_eq!(
         reader.get(b"k-09999").await.unwrap().as_deref(),
         Some(b"v-09999".as_ref())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_load_multi_level_inline_and_overflow_records_survive_reopen() {
+    let vfs = MemVfs::new();
+    let db = open_db_on(vfs.clone()).await;
+    let inline = Bytes::from(vec![0x2Bu8; 900]);
+    let overflow = Bytes::from(vec![0xB4u8; PAGE]);
+    // 5,000 sub-threshold records span enough leaves to require two internal levels.
+    let records = (0..5_000).map(|i| {
+        let value = if i % 17 == 0 {
+            overflow.clone()
+        } else {
+            inline.clone()
+        };
+        Ok((format!("k-{i:05}").into_bytes(), value))
+    });
+    let writer = db.begin_write().await.unwrap();
+    writer
+        .bulk_load_sorted_unique(records)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+    drop(db);
+
+    let reopened = open_db_on(vfs).await;
+    let reader = reopened.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"k-00000").await.unwrap().as_deref(),
+        Some(overflow.as_ref())
+    );
+    assert_eq!(
+        reader.get(b"k-00001").await.unwrap().as_deref(),
+        Some(inline.as_ref())
+    );
+    assert_eq!(
+        reader.get(b"k-04999").await.unwrap().as_deref(),
+        Some(inline.as_ref())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_load_keeps_an_oversized_byte_batch_record_intact() {
+    let db = open_db().await;
+    let huge = Bytes::from(vec![0xD3u8; 32 * 1024 * 1024 + 1]);
+    let records = vec![
+        Ok((b"a".to_vec(), huge.clone())),
+        Ok((b"b".to_vec(), Bytes::from_static(b"tail"))),
+    ];
+    let writer = db.begin_write().await.unwrap();
+    writer
+        .bulk_load_sorted_unique(records)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+
+    let reader = db.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"a").await.unwrap().as_deref(),
+        Some(huge.as_ref())
+    );
+    assert_eq!(
+        reader.get(b"b").await.unwrap().as_deref(),
+        Some(b"tail".as_ref())
     );
 }
 
