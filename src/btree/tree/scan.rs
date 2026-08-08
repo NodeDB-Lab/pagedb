@@ -28,6 +28,13 @@ fn scan_guard() -> SeenPageIds {
     SeenPageIds::new("btree_scan")
 }
 
+/// Entries a bounded scan reserves up front, however large its `limit`.
+///
+/// `limit` is caller-supplied and `usize::MAX` is a normal way to say "no cap",
+/// so reserving it directly aborts the process on a capacity overflow rather
+/// than scanning. The result grows past this on its own.
+const SCAN_PREALLOC_CAP: usize = 1024;
+
 impl<V: Vfs> BTree<V> {
     /// Forward range scan: `start` inclusive, `end` exclusive.
     ///
@@ -122,7 +129,7 @@ impl<V: Vfs> BTree<V> {
         }
         let mut path = self.path_to_leaf_for_key(start).await?;
         let mut seen_leaves = scan_guard();
-        let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit);
+        let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit.min(SCAN_PREALLOC_CAP));
         loop {
             let leaf_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_id)?;
@@ -192,7 +199,7 @@ impl<V: Vfs> BTree<V> {
         // their sibling links remain zero until flush.
         let mut path = self.path_to_leaf_for_key(start).await?;
         let mut seen_leaves = SeenPageIds::new("leaf_siblings");
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(limit);
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(limit.min(SCAN_PREALLOC_CAP));
         loop {
             let leaf_page_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_page_id)?;
@@ -276,7 +283,7 @@ impl<V: Vfs> BTree<V> {
             None => self.path_to_rightmost_leaf().await?,
         };
         let mut seen_leaves = scan_guard();
-        let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit);
+        let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(limit.min(SCAN_PREALLOC_CAP));
         loop {
             let leaf_id = *path.last().expect("non-empty path");
             seen_leaves.insert(leaf_id)?;
