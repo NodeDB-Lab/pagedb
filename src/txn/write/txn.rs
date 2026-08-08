@@ -278,8 +278,13 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
 
     /// Takes the same row shape the scans return, so read output feeds
     /// straight back in without a conversion.
-    pub async fn put_batch(&mut self, sorted: Vec<(Bytes, Bytes)>) -> Result<()> {
-        self.btree.put_batch(sorted).await
+    ///
+    /// Ascending key order is a performance property, not a precondition: it
+    /// lets consecutive keys in one leaf share a single descent. Any other
+    /// order costs a descent per key and is otherwise equivalent to calling
+    /// [`put`](Self::put) for each pair.
+    pub async fn put_batch(&mut self, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
+        self.btree.put_batch(pairs).await
     }
 
     pub async fn delete_batch(&mut self, sorted: Vec<Vec<u8>>) -> Result<()> {

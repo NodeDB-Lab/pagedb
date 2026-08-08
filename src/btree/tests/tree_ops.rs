@@ -177,6 +177,79 @@ async fn put_batch_interleaves_with_existing_leaves_and_overwrites() {
     }
 }
 
+/// Build a multi-level tree, then rewrite every record with a batch supplied in
+/// the given order. Returns the ordered scan so the caller can assert the tree
+/// a descent actually reaches, not just what `get` happens to answer.
+async fn put_batch_rewrite_in_order(
+    order: impl Iterator<Item = u32>,
+    records: u32,
+    updated: &[u8],
+) -> Vec<Vec<u8>> {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    let seed = vec![1u8; 64];
+    for i in 0..records {
+        tree.put(format!("k{i:06}").as_bytes(), &seed)
+            .await
+            .unwrap();
+    }
+
+    let batch: Vec<(Bytes, Bytes)> = order
+        .map(|i| {
+            (
+                Bytes::from(format!("k{i:06}").into_bytes()),
+                Bytes::from(updated.to_vec()),
+            )
+        })
+        .collect();
+    tree.put_batch(batch).await.unwrap();
+
+    for i in 0..records {
+        let key = format!("k{i:06}");
+        assert_eq!(
+            tree.get(key.as_bytes()).await.unwrap().as_deref(),
+            Some(updated),
+            "key {key}"
+        );
+    }
+    tree.scan_prefix(b"k")
+        .await
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.to_vec())
+        .collect()
+}
+
+/// A batch whose keys do not arrive in ascending order has to land in exactly
+/// the tree a sequence of `put` calls would build.
+///
+/// `put_batch` caches the leaf path across records and reuses it while the next
+/// key provably belongs to that leaf. The gate is both separator bounds: a key
+/// below the cached leaf's lower bound must miss it and re-descend. Gating on
+/// the upper bound alone lets a descending key be written into a leaf that no
+/// descent for that key ever reaches — `get` then answers with the stale record
+/// from the leaf that does own the key, and the ordered scan sees the misplaced
+/// one as a duplicate. Both halves are asserted here because either alone can
+/// be satisfied while the tree is wrong.
+#[tokio::test(flavor = "current_thread")]
+async fn put_batch_out_of_order_keys_land_in_the_right_leaves() {
+    const RECORDS: u32 = 4_000;
+    let updated = vec![2u8; 64];
+    let expected: Vec<Vec<u8>> = (0..RECORDS)
+        .map(|i| format!("k{i:06}").into_bytes())
+        .collect();
+
+    // Descending: every key after the first falls below the cached lower bound.
+    let scanned = put_batch_rewrite_in_order((0..RECORDS).rev(), RECORDS, &updated).await;
+    assert_eq!(scanned, expected, "descending batch");
+
+    // Ascending runs broken by backward jumps, so the gate is alternately hit
+    // and missed within a single batch.
+    let interleaved = (0..RECORDS / 2).flat_map(|i| [RECORDS / 2 + i, RECORDS / 2 - 1 - i]);
+    let scanned = put_batch_rewrite_in_order(interleaved, RECORDS, &updated).await;
+    assert_eq!(scanned, expected, "interleaved batch");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn delete_batch_removes_all() {
     let pager = fresh_pager().await;

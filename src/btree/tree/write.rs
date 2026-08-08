@@ -13,6 +13,7 @@ use crate::btree::overflow;
 use crate::btree::split::split_leaf;
 
 use super::core::{BTree, SeenPageIds};
+use super::navigate::LeafBounds;
 
 impl<V: Vfs> BTree<V> {
     fn invalidate_append_state(&mut self) {
@@ -380,14 +381,19 @@ impl<V: Vfs> BTree<V> {
         Ok(true)
     }
 
-    /// Batch insert of sorted `(key, value)` pairs.
+    /// Batch insert of `(key, value)` pairs.
     ///
-    /// Reuses the target leaf path and its exclusive upper bound while
-    /// consecutive keys remain in the same leaf. A split invalidates the
-    /// cached path; the next key descends through the updated spine.
+    /// Sorted input is what this is built for: consecutive keys landing in the
+    /// same leaf reuse its path instead of re-descending the spine. Reuse is
+    /// gated on both of the leaf's separator bounds, so the fast path is taken
+    /// exactly when the key provably belongs to the cached leaf and to no
+    /// other. Input arriving in any other order — descending, interleaved,
+    /// repeated — simply misses that gate and re-descends, so the result is
+    /// correct for every input, as it is for `put`. A split invalidates the
+    /// cached path outright; the next key descends through the updated spine.
     pub async fn put_batch(&mut self, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
         self.invalidate_append_state();
-        let mut cached: Option<(Vec<u64>, Option<Vec<u8>>)> = None;
+        let mut cached: Option<(Vec<u64>, LeafBounds)> = None;
 
         for (key, value) in pairs {
             self.validate_insert_record_fits(&key, &value)?;
@@ -396,26 +402,20 @@ impl<V: Vfs> BTree<V> {
                 continue;
             }
 
-            let (path, upper_bound) = match cached.take() {
-                Some((path, upper_bound))
-                    if upper_bound
-                        .as_ref()
-                        .is_none_or(|upper| key.as_ref() < upper.as_slice()) =>
-                {
-                    (path, upper_bound)
-                }
-                _ => {
-                    let path = self.path_to_leaf_for_key(&key).await?;
-                    let upper_bound = self.exclusive_upper_bound_for_path(&path).await?;
-                    (path, upper_bound)
-                }
+            let reusable = cached.take().filter(|(_, bounds)| bounds.contains(&key));
+            let (path, bounds) = if let Some(reusable) = reusable {
+                reusable
+            } else {
+                let path = self.path_to_leaf_for_key(&key).await?;
+                let bounds = self.separator_bounds_for_path(&path).await?;
+                (path, bounds)
             };
 
             let leaf_value = self.leaf_value_for(&value).await?;
             let path_for_reuse = path.clone();
             let split = self.put_at_path(path, &key, leaf_value).await?;
             if !split {
-                cached = Some((path_for_reuse, upper_bound));
+                cached = Some((path_for_reuse, bounds));
             }
         }
         Ok(())

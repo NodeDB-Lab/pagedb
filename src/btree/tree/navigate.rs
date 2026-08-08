@@ -9,6 +9,31 @@ use crate::btree::split::split_internal;
 
 use super::core::{BTree, SeenPageIds};
 
+/// The half-open key range a descent routes to one leaf: `lower <= key < upper`.
+/// `None` on a side means the leaf is unbounded there — it holds the smallest
+/// or largest keys in the tree.
+///
+/// Produced by [`BTree::separator_bounds_for_path`]. Its purpose is
+/// [`contains`](Self::contains): a cached leaf path may be reused for a key
+/// only while the key is inside the bounds, because that is precisely the
+/// condition under which a fresh descent would arrive at the same leaf.
+pub(super) struct LeafBounds {
+    lower: Option<Vec<u8>>,
+    upper: Option<Vec<u8>>,
+}
+
+impl LeafBounds {
+    pub(super) fn contains(&self, key: &[u8]) -> bool {
+        self.lower
+            .as_ref()
+            .is_none_or(|lower| key >= lower.as_slice())
+            && self
+                .upper
+                .as_ref()
+                .is_none_or(|upper| key < upper.as_slice())
+    }
+}
+
 impl<V: Vfs> BTree<V> {
     /// Given an internal node and a child `page_id`, return the `page_id` of the
     /// NEXT child (to the right), or `None` if `child` is the rightmost. Used by
@@ -207,17 +232,25 @@ impl<V: Vfs> BTree<V> {
         }
     }
 
-    /// Return the exclusive separator bound of the leaf at `path`.
+    /// Return the separator bounds of the leaf at `path`.
     ///
-    /// The nearest ancestor with a child to the right owns the separator that
-    /// bounds this leaf's subtree. This avoids reading the next leaf merely to
-    /// decide whether another sorted key can reuse the current path.
-    pub(super) async fn exclusive_upper_bound_for_path(
-        &self,
-        path: &[u64],
-    ) -> Result<Option<Vec<u8>>> {
+    /// These are exactly the keys a descent would route to this leaf: the
+    /// nearest ancestor with a child to the left owns the lower bound, the
+    /// nearest with a child to the right owns the upper one, and `None` on
+    /// either side means the leaf is unbounded there. A key inside both bounds
+    /// belongs to this leaf and to no other, which is what lets a caller reuse
+    /// a path instead of re-descending — without reading a neighbouring leaf,
+    /// and without assuming anything about the order its keys arrive in.
+    ///
+    /// The two bounds generally live at different levels, so the walk continues
+    /// until it has both or reaches the root. The lowest ancestor to supply a
+    /// bound gives the tightest one and wins; a bound from higher up still
+    /// holds, because a leaf's key range is contained in every ancestor's.
+    pub(super) async fn separator_bounds_for_path(&self, path: &[u64]) -> Result<LeafBounds> {
+        let mut lower: Option<Vec<u8>> = None;
+        let mut upper: Option<Vec<u8>> = None;
         if path.len() < 2 {
-            return Ok(None);
+            return Ok(LeafBounds { lower, upper });
         }
         let mut child = *path.last().expect("non-empty path");
         for &internal_page in path[..path.len() - 1].iter().rev() {
@@ -225,20 +258,33 @@ impl<V: Vfs> BTree<V> {
             let internal = Internal::decode(guard.body_ref())?;
             drop(guard);
             if internal.leftmost_child == child {
-                if let Some(entry) = internal.entries.first() {
-                    return Ok(Some(entry.key.clone()));
+                // Nothing to the left here, so any lower bound belongs to an
+                // ancestor; the first separator bounds this subtree above.
+                if upper.is_none()
+                    && let Some(entry) = internal.entries.first()
+                {
+                    upper = Some(entry.key.clone());
                 }
             } else if let Some(index) = internal
                 .entries
                 .iter()
                 .position(|entry| entry.right_child == child)
-                && let Some(next) = internal.entries.get(index + 1)
             {
-                return Ok(Some(next.key.clone()));
+                if lower.is_none() {
+                    lower = Some(internal.entries[index].key.clone());
+                }
+                if upper.is_none()
+                    && let Some(next) = internal.entries.get(index + 1)
+                {
+                    upper = Some(next.key.clone());
+                }
+            }
+            if lower.is_some() && upper.is_some() {
+                break;
             }
             child = internal_page;
         }
-        Ok(None)
+        Ok(LeafBounds { lower, upper })
     }
 
     /// Given a `path` ending at a leaf, return the path to the next leaf to
