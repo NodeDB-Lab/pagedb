@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, CatalogRowKind, SegmentMeta};
 use crate::errors::PagedbError;
@@ -73,20 +75,26 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
         cursor.push(0);
         let exhausted = batch.len() < REPACK_RECORD_BATCH;
 
-        for (key, value) in batch {
-            if !keep(&key) {
-                continue;
-            }
-            // The value carries through by refcount; only the key, which the
-            // staged record owns, is copied.
-            loader.push(key.to_vec(), value).await?;
-            // A compacted page is written once and never read back, so flushing
-            // it out mid-batch costs nothing and keeps the pool from growing
-            // with the tree instead of with the budget.
-            if db.pager.main_dirty_at_budget() {
-                db.pager.flush_main_to(db.realm_id, scratch).await?;
-                db.pager.reset_main_pages();
-            }
+        // The value carries through by refcount; only the key, which the staged
+        // record owns, is copied. The batch the source already handed over is
+        // admitted in one call, so the loader sees the same bounded run of
+        // records this loop holds rather than one Vec per record.
+        let kept: Vec<(Vec<u8>, Bytes)> = batch
+            .into_iter()
+            .filter(|(key, _)| keep(key))
+            .map(|(key, value)| (key.to_vec(), value))
+            .collect();
+        if !kept.is_empty() {
+            loader.push_batch(kept).await?;
+        }
+        // A compacted page is written once and never read back, so flushing it
+        // out between batches costs nothing and keeps the pool from growing
+        // with the tree instead of with the budget. The reset is what makes the
+        // next source read come from the untouched main.db rather than a
+        // resident compacted page at the same page id.
+        if db.pager.main_dirty_at_budget() {
+            db.pager.flush_main_to(db.realm_id, scratch).await?;
+            db.pager.reset_main_pages();
         }
 
         if exhausted {

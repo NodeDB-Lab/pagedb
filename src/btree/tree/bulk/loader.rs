@@ -92,10 +92,12 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
 
     /// Append one record. Keys must arrive strictly increasing.
     ///
-    /// This is the one-record form of [`Self::push_batch`], preserving the
-    /// existing streaming API and its ordering/error semantics.
+    /// This is the one-record form of [`Self::push_batch`], with the same
+    /// ordering and error semantics, and it admits and appends the record
+    /// directly — a caller streaming record by record allocates nothing per
+    /// record beyond the record itself.
     pub async fn push(&mut self, key: Vec<u8>, value: Bytes) -> Result<()> {
-        self.push_batch(vec![(key, value)]).await
+        batch::push_one(self, key, value).await
     }
 
     /// Append a bounded ordered batch.
@@ -229,7 +231,7 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
                     self.tree
                         .pager
                         .flush_main_to(self.tree.realm_id, path)
-                        .await?
+                        .await?;
                 }
                 None => self.tree.pager.flush_main(self.tree.realm_id).await?,
             }

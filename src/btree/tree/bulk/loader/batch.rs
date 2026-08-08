@@ -21,59 +21,97 @@ pub(super) async fn push_batch<V: crate::vfs::Vfs>(
     batch: Vec<(Vec<u8>, Bytes)>,
 ) -> Result<()> {
     prevalidate(loader, &batch)?;
-    let Some((last_key, _)) = batch.last() else {
-        return Ok(());
-    };
-    // The leaf owns every input key, so retain only the final batch boundary
-    // for the next batch's monotonicity check rather than cloning each record.
-    let batch_boundary = last_key.clone();
-
     for (key, value) in batch {
-        let stored = if value.len() > loader.inline_threshold {
-            let total_len = value.len() as u64;
-            let pager = Arc::clone(&loader.tree.pager);
-            let realm_id = loader.tree.realm_id;
-            let page_size = loader.tree.page_size;
-            let tree = &mut *loader.tree;
-            let flush_target = match loader.alternate_flush_path.as_deref() {
-                Some(path) => overflow::OverflowFlushTarget::Alternate(path),
-                None => overflow::OverflowFlushTarget::Main,
-            };
-            let root_page_id = overflow::write_chain(
-                &pager,
-                realm_id,
-                &value,
-                page_size,
-                &mut || tree.allocate_page(),
-                flush_target,
-            )
-            .await?;
-            LeafValue::Overflow {
-                total_len,
-                root_page_id,
-            }
-        } else {
-            LeafValue::Inline(value)
-        };
-
-        let cost = leaf_record_cost(key.len(), &stored)?;
-        let projected = projected_encoded_size(loader, &key, cost)?;
-        if projected > loader.body_cap && !loader.leaf_records.is_empty() {
-            loader.close_leaf(true).await?;
-        }
-        // `leaf_used` tracks the uncompressed representation. The fit check
-        // subtracts the exact shared-prefix saving using the first and newest
-        // sorted keys, which bracket every key already in this leaf.
-        loader.leaf_used = loader
-            .leaf_used
-            .checked_add(cost)
-            .ok_or(PagedbError::PayloadTooLarge)?;
-        loader.leaf_records.push((key, stored));
+        append_record(loader, key, value).await?;
     }
-
-    loader.last_key = Some(batch_boundary);
     // A batch boundary is the only dirty-budget check for inline records.
     loader.flush_if_dirty_budget().await
+}
+
+/// Append one record, admitting it on its own.
+///
+/// This is the whole of [`BulkLoader::push`], not a one-element `push_batch`:
+/// routing a single record through the batch form would allocate a `Vec` per
+/// record, and a dense repack pushes one record at a time for the entire
+/// contents of the store.
+pub(super) async fn push_one<V: crate::vfs::Vfs>(
+    loader: &mut BulkLoader<'_, V>,
+    key: Vec<u8>,
+    value: Bytes,
+) -> Result<()> {
+    if loader
+        .last_key
+        .as_deref()
+        .is_some_and(|last| key.as_slice() <= last)
+    {
+        return Err(PagedbError::BulkLoadNotMonotonic);
+    }
+    loader.tree.validate_insert_record_fits(&key, &value)?;
+    append_record(loader, key, value).await?;
+    loader.flush_if_dirty_budget().await
+}
+
+/// Resolve one already-admitted record's value, close the leaf under
+/// construction if it no longer fits, and stage the record into the next one.
+///
+/// Admission is the caller's job precisely so it can cover a whole batch before
+/// any of this runs — see the module comment.
+async fn append_record<V: crate::vfs::Vfs>(
+    loader: &mut BulkLoader<'_, V>,
+    key: Vec<u8>,
+    value: Bytes,
+) -> Result<()> {
+    let stored = if value.len() > loader.inline_threshold {
+        let total_len = value.len() as u64;
+        let pager = Arc::clone(&loader.tree.pager);
+        let realm_id = loader.tree.realm_id;
+        let page_size = loader.tree.page_size;
+        let tree = &mut *loader.tree;
+        let flush_target = match loader.alternate_flush_path.as_deref() {
+            Some(path) => overflow::OverflowFlushTarget::Alternate(path),
+            None => overflow::OverflowFlushTarget::Main,
+        };
+        let root_page_id = overflow::write_chain(
+            &pager,
+            realm_id,
+            &value,
+            page_size,
+            &mut || tree.allocate_page(),
+            flush_target,
+        )
+        .await?;
+        LeafValue::Overflow {
+            total_len,
+            root_page_id,
+        }
+    } else {
+        LeafValue::Inline(value)
+    };
+
+    let cost = leaf_record_cost(key.len(), &stored)?;
+    let projected = projected_encoded_size(loader, &key, cost)?;
+    if projected > loader.body_cap && !loader.leaf_records.is_empty() {
+        loader.close_leaf(true).await?;
+    }
+    // `leaf_used` tracks the uncompressed representation. The fit check
+    // subtracts the exact shared-prefix saving using the first and newest
+    // sorted keys, which bracket every key already in this leaf.
+    loader.leaf_used = loader
+        .leaf_used
+        .checked_add(cost)
+        .ok_or(PagedbError::PayloadTooLarge)?;
+    // The leaf takes ownership of the key, so the boundary carried for the next
+    // monotonicity check is rewritten into the buffer already held rather than
+    // reallocated — this runs once per record for the length of a repack.
+    match &mut loader.last_key {
+        Some(buffered) => {
+            buffered.clear();
+            buffered.extend_from_slice(&key);
+        }
+        None => loader.last_key = Some(key.clone()),
+    }
+    loader.leaf_records.push((key, stored));
+    Ok(())
 }
 
 fn projected_encoded_size<V: crate::vfs::Vfs>(

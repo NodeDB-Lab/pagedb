@@ -30,7 +30,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
                     .ok_or(PagedbError::PayloadTooLarge)?;
                 let exceeds_bytes = batch_bytes
                     .checked_add(record_bytes)
-                    .map_or(true, |total| total > BULK_LOAD_BATCH_MAX_BYTES);
+                    .is_none_or(|total| total > BULK_LOAD_BATCH_MAX_BYTES);
                 if !batch.is_empty()
                     && (batch.len() == BULK_LOAD_BATCH_MAX_RECORDS || exceeds_bytes)
                 {
