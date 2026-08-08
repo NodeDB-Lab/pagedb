@@ -30,8 +30,9 @@ pub enum PageStanding {
     /// handed to two owners; an authentication failure here is a symptom, and
     /// the reuse is the fault.
     LiveAndFree,
-    /// Reachable from a live root and not free. The structures agree that this
-    /// page is in use, so a failure to authenticate it is about its bytes.
+    /// Reachable from a live root, and the free list was read and does not
+    /// name it. The structures agree that this page is in use, so a failure to
+    /// authenticate it is about its bytes.
     Live,
     /// Named by the free list and reachable from nothing. Consistent: a free
     /// page holds whatever it last held, and nothing should be reading it.
@@ -49,6 +50,22 @@ pub enum PageStanding {
     /// one. What it does establish is the half that matters most: no live root
     /// refers to this page, so nothing is reading it as data.
     FreeListUnreadable,
+    /// Reachable from a live root, and the free list could not be read.
+    ///
+    /// Deliberately NOT [`Self::Live`]: the evidence that would have separated
+    /// a healthy live page from one the allocator also handed out is the
+    /// structure that failed. Reporting this as a single owner is the one
+    /// wrong answer the probe can give, because it sends the operator looking
+    /// at the page's bytes for a fault that is in the store's structures.
+    LiveFreeUnknown,
+    /// A root walk could not be completed and did not reach this page, so
+    /// "no root refers to it" is unproven.
+    ///
+    /// The usual cause is the very failure being diagnosed: the page that will
+    /// not authenticate sits in a tree the walk has to descend through. Nothing
+    /// about the page's ownership follows from a walk that stopped early, so
+    /// this reports the gap rather than a verdict resting on it.
+    RootsUnreadable,
 }
 
 /// What the store says about one page.
@@ -67,6 +84,14 @@ pub struct PageProvenance {
     /// `false` means the chain would not read, so `freed_by_commit` is `None`
     /// for lack of evidence rather than because the page is not free.
     pub free_list_readable: bool,
+    /// Roots whose walk could not be completed, by name.
+    ///
+    /// A root listed here neither reached the page nor finished proving it
+    /// could not, so an empty `reachable_from` alongside a non-empty list here
+    /// is silence, not a negative. The common cause is the failure being
+    /// diagnosed: a walk cannot descend past the page that will not
+    /// authenticate.
+    pub unwalkable_roots: Vec<&'static str>,
 }
 
 impl PageProvenance {
@@ -74,6 +99,19 @@ impl PageProvenance {
     #[must_use]
     pub fn is_double_owned(&self) -> bool {
         self.standing == PageStanding::LiveAndFree
+    }
+
+    /// Whether both halves of the question were actually answered.
+    ///
+    /// `false` means at least one structure could not be read, so the standing
+    /// records what is missing instead of a verdict — and in particular that
+    /// double ownership was neither established nor ruled out. Callers that
+    /// act on [`Self::is_double_owned`] returning `false` must consult this
+    /// first; treating missing evidence as a clean bill of health is how a
+    /// structural fault gets filed as a bad sector.
+    #[must_use]
+    pub fn is_conclusive(&self) -> bool {
+        self.free_list_readable && self.unwalkable_roots.is_empty()
     }
 }
 
@@ -83,24 +121,56 @@ impl<V: Vfs + Clone> Db<V> {
     /// Answer this after any page fails to authenticate, before concluding
     /// anything about the cause: [`PageStanding::LiveAndFree`] means a page was
     /// reused while still referenced and the store has a structural fault that
-    /// will recur, while every other standing points at the page's own bytes.
+    /// will recur, while a conclusive standing that is not `LiveAndFree` points
+    /// at the page's own bytes.
+    ///
+    /// Check [`PageProvenance::is_conclusive`] before drawing the second
+    /// conclusion. The structures this reads are the ones a corruption tends to
+    /// damage, and a standing computed from half the evidence records which
+    /// half is missing rather than asserting the other half's absence.
     ///
     /// Deliberately expensive — it walks each live root — because it runs once,
     /// on a failure that has already stopped the work it interrupted, and the
     /// alternative is not knowing.
+    ///
+    /// Never blocks on the writer. A write transaction holds the writer state
+    /// for its whole life and a corruption is most often raised from inside
+    /// one, so waiting for that guard would deadlock the caller against the
+    /// transaction it is still holding — the probe would hang exactly where its
+    /// own documentation says to call it. When the writer is busy this answers
+    /// against the last published snapshot instead, which is the state a reader
+    /// that met the failure was looking at anyway.
     pub async fn page_provenance(&self, page_id: u64) -> Result<PageProvenance> {
-        let (data_root, catalog_root, history_root, next_page_id, free_list_root) = {
-            let state = self.writer.lock().await;
-            (
-                state.root_page_id,
-                state.catalog_root_page_id,
-                state.commit_history_root_page_id,
-                state.next_page_id,
-                state.free_list_root_page_id,
-            )
-        };
+        let (data_root, catalog_root, history_root, next_page_id, free_list_root) =
+            if let Ok(state) = self.writer.try_lock() {
+                (
+                    state.root_page_id,
+                    state.catalog_root_page_id,
+                    state.commit_history_root_page_id,
+                    state.next_page_id,
+                    state.free_list_root_page_id,
+                )
+            } else {
+                let snapshot = self.snapshot.read();
+                (
+                    snapshot.root_page_id,
+                    snapshot.catalog_root_page_id,
+                    snapshot.commit_history_root_page_id,
+                    snapshot.next_page_id,
+                    snapshot.free_list_root_page_id,
+                )
+            };
 
+        // Each root walk is best-effort for the same reason the free-list walk
+        // below is: the page being asked about is usually the one that will not
+        // read, and it usually sits in one of these trees. Letting the error
+        // escape would make the probe fail precisely on the input it exists to
+        // answer. A walk that stops early still proves reachability if it got
+        // as far as the page — `collect_all_page_ids` records each id before
+        // descending through it — and what it cannot prove is recorded as a gap
+        // rather than reported as a negative.
         let mut reachable_from = Vec::new();
+        let mut unwalkable_roots = Vec::new();
         for (name, root) in [
             ("data", data_root),
             ("catalog", catalog_root),
@@ -110,7 +180,7 @@ impl<V: Vfs + Clone> Db<V> {
                 continue;
             }
             let mut pages = BTreeSet::new();
-            BTree::open(
+            let walked = BTree::open(
                 self.pager.clone(),
                 self.realm_id,
                 root,
@@ -118,9 +188,11 @@ impl<V: Vfs + Clone> Db<V> {
                 self.page_size,
             )
             .collect_all_page_ids(&mut pages)
-            .await?;
+            .await;
             if pages.contains(&page_id) {
                 reachable_from.push(name);
+            } else if walked.is_err() {
+                unwalkable_roots.push(name);
             }
         }
 
@@ -135,16 +207,33 @@ impl<V: Vfs + Clone> Db<V> {
         let free_list_readable = free_list.is_ok();
         let freed_by_commit = free_list.unwrap_or(None);
 
-        let standing = match (reachable_from.is_empty(), freed_by_commit.is_some()) {
-            (false, true) => PageStanding::LiveAndFree,
-            (false, false) => PageStanding::Live,
-            (true, true) => PageStanding::Free,
-            // Without a readable free list, "no root reaches it" cannot be
-            // sharpened into orphaned-versus-free: the structure that would
-            // distinguish them is the damaged one.
-            (true, false) if !free_list_readable => PageStanding::FreeListUnreadable,
-            (true, false) if page_id >= next_page_id => PageStanding::BeyondCursor,
-            (true, false) => PageStanding::Orphaned,
+        // Ordered by how much each fact is worth, and never stated beyond the
+        // evidence that supports it. Reachability comes first because a live
+        // owner is the fact that changes what the operator does; the cursor
+        // next, because it rests on neither walk; and every remaining answer is
+        // downgraded to the gap in the evidence when a structure would not
+        // read, rather than being asserted from its absence.
+        let standing = if reachable_from.is_empty() {
+            if page_id >= next_page_id {
+                PageStanding::BeyondCursor
+            } else if !unwalkable_roots.is_empty() {
+                PageStanding::RootsUnreadable
+            } else if freed_by_commit.is_some() {
+                PageStanding::Free
+            } else if free_list_readable {
+                PageStanding::Orphaned
+            } else {
+                // Without a readable free list, "no root reaches it" cannot be
+                // sharpened into orphaned-versus-free: the structure that would
+                // distinguish them is the damaged one.
+                PageStanding::FreeListUnreadable
+            }
+        } else if !free_list_readable {
+            PageStanding::LiveFreeUnknown
+        } else if freed_by_commit.is_some() {
+            PageStanding::LiveAndFree
+        } else {
+            PageStanding::Live
         };
 
         Ok(PageProvenance {
@@ -154,6 +243,7 @@ impl<V: Vfs + Clone> Db<V> {
             reachable_from,
             next_page_id,
             free_list_readable,
+            unwalkable_roots,
         })
     }
 }
@@ -300,5 +390,111 @@ mod tests {
 
         let provenance = db.page_provenance(next_page_id + 10).await.unwrap();
         assert_eq!(provenance.standing, PageStanding::BeyondCursor);
+        assert!(provenance.is_conclusive());
+    }
+
+    /// Point the free-list root at a chain page whose declared entry count
+    /// cannot fit, which is what a torn write leaves behind: the page still
+    /// authenticates as `Free`, so only the chain header's own check rejects
+    /// it.
+    async fn break_the_free_list(db: &Db<MemVfs>) {
+        use crate::pager::format::data_page::body_capacity;
+        use crate::pager::format::page_kind::PageKind;
+        use crate::pager::freelist::layout::{ChainPageHeader, encode_chain_header};
+
+        let root = {
+            let mut state = db.writer.lock().await;
+            let root = state.next_page_id;
+            state.next_page_id += 1;
+            state.free_list_root_page_id = root;
+            root
+        };
+        let body_len = body_capacity(PAGE);
+        let mut body = vec![0u8; body_len];
+        encode_chain_header(
+            &mut body,
+            ChainPageHeader {
+                next: 0,
+                count: 0,
+                suffix_entries: 0,
+                suffix_max_cid: 0,
+                suffix_min_cid: u64::MAX,
+            },
+        )
+        .unwrap();
+        let impossible = u32::try_from(body_len).unwrap();
+        body[8..12].copy_from_slice(&impossible.to_le_bytes());
+        db.pager
+            .write_main_page(root, REALM, PageKind::Free, &body)
+            .await
+            .unwrap();
+    }
+
+    /// The one wrong answer this probe can give. With the free list unreadable,
+    /// a page a root reaches has NOT been shown to have a single owner — the
+    /// structure that would have shown it is the broken one — and reporting it
+    /// as `Live` sends the operator hunting a bad sector for what may be a page
+    /// handed out twice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_live_page_with_an_unreadable_free_list_is_not_reported_as_single_owner() {
+        let db = seeded().await;
+        break_the_free_list(&db).await;
+        let root = db.writer.lock().await.root_page_id;
+
+        let provenance = db.page_provenance(root).await.unwrap();
+
+        assert_eq!(provenance.standing, PageStanding::LiveFreeUnknown);
+        assert_ne!(
+            provenance.standing,
+            PageStanding::Live,
+            "a missing free list cannot be read as evidence of a single owner"
+        );
+        assert!(!provenance.free_list_readable);
+        assert!(
+            !provenance.is_conclusive(),
+            "half the evidence is missing, and the caller has to be able to tell"
+        );
+        assert!(provenance.reachable_from.contains(&"data"));
+    }
+
+    /// A root walk that cannot finish proves nothing about pages it never
+    /// reached, so an empty `reachable_from` must not be read as "no root
+    /// refers to it".
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_root_walk_that_stops_early_is_a_gap_not_a_negative() {
+        let db = seeded().await;
+        // Aim the data root at the store's first page, which is a header page
+        // rather than a tree node: the walk fails on its first read.
+        let (unreachable_page, next_page_id) = {
+            let mut state = db.writer.lock().await;
+            state.root_page_id = 1;
+            (state.next_page_id - 1, state.next_page_id)
+        };
+        assert!(unreachable_page < next_page_id);
+
+        let provenance = db.page_provenance(unreachable_page).await.unwrap();
+
+        assert_eq!(provenance.standing, PageStanding::RootsUnreadable);
+        assert!(provenance.unwalkable_roots.contains(&"data"));
+        assert!(!provenance.is_conclusive());
+    }
+
+    /// The probe is documented as the thing to reach for when a page fails to
+    /// authenticate, and that failure is usually raised inside a transaction
+    /// the caller is still holding. Blocking on the writer state would deadlock
+    /// the caller against itself, so this must answer regardless.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_probe_answers_while_a_write_transaction_is_open() {
+        let db = seeded().await;
+        let root = db.writer.lock().await.root_page_id;
+        let _txn = db.begin_write().await.unwrap();
+
+        let provenance =
+            tokio::time::timeout(std::time::Duration::from_secs(5), db.page_provenance(root))
+                .await
+                .expect("the probe must not block on the transaction its caller is holding")
+                .unwrap();
+
+        assert_eq!(provenance.page_id, root);
     }
 }

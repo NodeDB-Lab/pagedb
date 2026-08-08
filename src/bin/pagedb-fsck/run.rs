@@ -67,16 +67,34 @@ async fn report_provenance<V: pagedb::vfs::Vfs + Clone>(
              this answer is missing rather than negative"
         );
     }
+    if !p.unwalkable_roots.is_empty() {
+        println!(
+            "  note            : these roots could not be walked to the end, so they \
+             neither reached this page nor ruled it out: {:?}",
+            p.unwalkable_roots
+        );
+    }
+    // The verdict has three outcomes, not two. "Not double-owned" and "not
+    // shown to be double-owned" differ by exactly the evidence a corruption
+    // destroys first, and collapsing them would answer "damage to its own
+    // bytes" in the case where the structural fault is most likely.
     if p.is_double_owned() {
         println!(
             "  VERDICT: this page is live AND free — the store handed one id to two \
              owners. That is a structural fault which will recur, not damage to this \
              page's bytes."
         );
-    } else {
+    } else if p.is_conclusive() {
         println!(
             "  VERDICT: single owner. Nothing here explains the page's content, so the \
              damage is to its own bytes."
+        );
+    } else {
+        println!(
+            "  VERDICT: INCONCLUSIVE. A structure this answer depends on could not be \
+             read, so double ownership was neither established nor ruled out — do not \
+             read this as damage confined to the page's own bytes. Preserve the store \
+             (`pagedb::quarantine_store`) before doing anything that rewrites it."
         );
     }
     Ok(())
