@@ -320,6 +320,12 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Entries still pinned by a reader are put back and retried on a later
     /// commit.
+    ///
+    /// An entry is put back on failure too. The queue is the only record that a
+    /// retired file still needs reclaiming, so an entry dropped here is a file
+    /// nothing will ever delete — the unbounded growth this drain exists to
+    /// prevent, reintroduced by the error path. A transient I/O failure on one
+    /// entry must cost a retry, not the record.
     async fn drain_some_pending_tombstones(&self) -> Result<()> {
         const MAX_PER_COMMIT: usize = 32;
 
@@ -328,25 +334,42 @@ impl<V: Vfs + Clone> Db<V> {
             let take = entries.len().min(MAX_PER_COMMIT);
             entries.drain(..take).collect()
         };
-        for entry in batch {
-            if self.segment_id_is_reader_pinned(entry.segment_id).await? {
+        let mut batch = batch.into_iter();
+        while let Some(entry) = batch.next() {
+            let outcome = match self.segment_id_is_reader_pinned(entry.segment_id).await {
+                Ok(true) => {
+                    self.enqueue_pending_tombstone(entry);
+                    continue;
+                }
+                Ok(false) => {
+                    self.tombstone_segment(entry.segment_id, entry.commit_id)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = outcome {
                 self.enqueue_pending_tombstone(entry);
-                continue;
+                for remaining in batch {
+                    self.enqueue_pending_tombstone(remaining);
+                }
+                return Err(error);
             }
-            self.tombstone_segment(entry.segment_id, entry.commit_id)
-                .await?;
         }
         Ok(())
     }
 
-    /// Size of a segment's live file, or 0 if it is already gone.
+    /// Size of a segment's live file, or `None` if it is already gone.
     ///
-    /// Measured before reclamation so callers can report bytes freed.
-    pub(super) async fn live_segment_len(&self, segment_id: [u8; 16]) -> Result<u64> {
+    /// Measured before reclamation so callers can report bytes freed. Absence
+    /// is `None` rather than zero because the two mean different things to a
+    /// caller counting reclaimed segments: a file a commit-time retirement
+    /// already deleted was not reclaimed by this call, and reporting it as a
+    /// zero-byte reclamation inflates the count with work nobody did.
+    pub(super) async fn live_segment_len(&self, segment_id: [u8; 16]) -> Result<Option<u64>> {
         let live = crate::segment::writer::live_path(&segment_id);
         match self.vfs.open(&live, OpenMode::Read).await {
-            Ok(file) => file.len().await,
-            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Ok(file) => file.len().await.map(Some),
+            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
