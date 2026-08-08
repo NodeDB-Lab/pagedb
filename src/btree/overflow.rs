@@ -337,6 +337,77 @@ pub async fn read_chain<V: Vfs>(
     Ok(out)
 }
 
+/// Read `len` bytes of a chain starting at byte `offset`, without assembling
+/// the whole value.
+///
+/// Resident cost is the slice, not `total_len` — the point of the call. The
+/// chain is still walked from the root, because pages are linked and not
+/// indexed, so skipping to a far offset reads the pages it passes but keeps
+/// none of them. A range past the end is clamped, so an empty result means
+/// `offset` is at or past `total_len`.
+pub async fn read_chain_range<V: Vfs>(
+    pager: &Pager<V>,
+    realm_id: RealmId,
+    root_page_id: u64,
+    total_len: u64,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    let total_len = usize::try_from(total_len)
+        .ok()
+        .filter(|len| isize::try_from(*len).is_ok())
+        .ok_or_else(|| PagedbError::overflow_body_malformed("chain.total_length"))?;
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total_len);
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|len| start.checked_add(len))
+        .unwrap_or(total_len)
+        .min(total_len);
+    if start >= end {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(end - start);
+    // Bytes of the chain already walked past, so a page's slice can be placed
+    // without knowing its index.
+    let mut consumed = 0usize;
+    let info = read_root_page(pager, realm_id, root_page_id).await?;
+    let mut chunk: Vec<u8> = info.root_data;
+    let mut next = info.next;
+    let mut seen = BTreeSet::from([root_page_id]);
+    loop {
+        let chunk_end = consumed.saturating_add(chunk.len());
+        if chunk_end > start {
+            let from = start.saturating_sub(consumed);
+            let to = (end - consumed).min(chunk.len());
+            out.extend_from_slice(&chunk[from..to]);
+            if consumed + to >= end {
+                return Ok(out);
+            }
+        }
+        consumed = chunk_end;
+        if next == 0 {
+            break;
+        }
+        if !seen.insert(next) {
+            return Err(PagedbError::overflow_chain_cycle(root_page_id, next));
+        }
+        let guard = pager
+            .read_main_page(next, realm_id, PageKind::Overflow)
+            .await?;
+        let body = guard.body();
+        let (n, data) = decode_overflow(&body)?;
+        chunk = data.to_vec();
+        next = n;
+    }
+    if out.len() != end - start {
+        return Err(PagedbError::overflow_body_malformed(
+            "chain.assembled_length",
+        ));
+    }
+    Ok(out)
+}
+
 /// Collect every `page_id` in an overflow chain. Does not modify any pages.
 /// Used when refcount tracking is handled externally.
 pub async fn collect_chain<V: Vfs>(

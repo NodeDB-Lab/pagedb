@@ -378,3 +378,111 @@ async fn random_100k_ops_match_ground_truth() {
         }
     }
 }
+
+/// Reverse paging must walk the same records forward paging does, in the
+/// opposite order, across leaf and internal-node boundaries. `prev_leaf_before`
+/// is a fresh mirror of `next_leaf_after`, so the risk is that it skips or
+/// repeats a leaf at a boundary rather than that it fails outright.
+#[tokio::test(flavor = "current_thread")]
+async fn scan_rev_from_pages_the_whole_tree_in_descending_order() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    const RECORDS: u32 = 5_000;
+    for i in 0..RECORDS {
+        tree.put(format!("k{i:06}").as_bytes(), &[7u8; 48])
+            .await
+            .unwrap();
+    }
+
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut before: Option<Vec<u8>> = None;
+    loop {
+        let batch = tree
+            .collect_rev_batch_before(before.as_deref(), 97)
+            .await
+            .unwrap();
+        let Some((last, _)) = batch.last() else { break };
+        before = Some(last.to_vec());
+        seen.extend(batch.iter().map(|(key, _)| key.to_vec()));
+    }
+
+    let mut expected: Vec<Vec<u8>> = (0..RECORDS)
+        .map(|i| format!("k{i:06}").into_bytes())
+        .collect();
+    expected.reverse();
+    assert_eq!(seen, expected);
+    assert_eq!(
+        tree.last_key().await.unwrap(),
+        Some(format!("k{:06}", RECORDS - 1).into_bytes())
+    );
+    assert_eq!(tree.first_key().await.unwrap(), Some(b"k000000".to_vec()));
+}
+
+/// A ranged read must return exactly what a full read would have at that
+/// offset, for both storage shapes — inline and a multi-page overflow chain,
+/// where the window has to be stitched across page boundaries.
+#[tokio::test(flavor = "current_thread")]
+async fn get_range_matches_the_full_value_for_inline_and_overflow() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    let inline: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+    let spilled: Vec<u8> = (0..(PAGE * 5) as u32).map(|i| (i % 251) as u8).collect();
+    tree.put(b"inline", &inline).await.unwrap();
+    tree.put(b"spilled", &spilled).await.unwrap();
+
+    for (key, whole) in [
+        (b"inline".as_slice(), &inline),
+        (b"spilled".as_slice(), &spilled),
+    ] {
+        for (offset, len) in [
+            (0usize, 1usize),
+            (0, whole.len()),
+            (1, whole.len() - 1),
+            (whole.len() / 2, 300),
+            (whole.len() - 1, 1),
+            // Spanning a chain-page boundary, and clamped past the end.
+            (PAGE - 10, 40),
+            (whole.len(), 10),
+            (0, whole.len() + 100),
+        ] {
+            let got = tree
+                .get_range(key, offset as u64, len as u64)
+                .await
+                .unwrap()
+                .expect("key present");
+            let end = (offset + len).min(whole.len());
+            let want = if offset >= whole.len() {
+                &[][..]
+            } else {
+                &whole[offset..end]
+            };
+            assert_eq!(got.as_ref(), want, "key {key:?} offset {offset} len {len}");
+        }
+    }
+    assert!(tree.get_range(b"absent", 0, 1).await.unwrap().is_none());
+}
+
+/// A range delete spanning many chunks must remove exactly the range and
+/// nothing either side of it, and report the count it actually deleted.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_range_chunks_without_skipping_or_repeating() {
+    let pager = fresh_pager().await;
+    let mut tree = fresh_tree(pager);
+    const RECORDS: u32 = 12_000;
+    for i in 0..RECORDS {
+        tree.put(format!("k{i:06}").as_bytes(), &[3u8; 32])
+            .await
+            .unwrap();
+    }
+
+    let removed = tree.delete_range(b"k000500", b"k009500").await.unwrap();
+    assert_eq!(removed, 9_000);
+
+    for i in 0..RECORDS {
+        let key = format!("k{i:06}");
+        let present = tree.get(key.as_bytes()).await.unwrap().is_some();
+        let want = !(500..9_500).contains(&i);
+        assert_eq!(present, want, "key {key}");
+    }
+    assert_eq!(tree.delete_range(b"k000500", b"k009500").await.unwrap(), 0);
+}

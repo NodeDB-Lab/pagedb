@@ -119,9 +119,8 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
     /// Materialising: every record in `[start, end)` is decoded into the
     /// returned `Vec` before the caller sees any of it, so both time and peak
     /// memory scale with the range, not with what the caller ends up reading.
-    /// To take the first few rows at or after a key, use
-    /// [`scan_from`](Self::scan_from) — bounding by count there is what keeps a
-    /// short read short.
+    /// Bound by count instead with [`scan_from`](Self::scan_from) forward or
+    /// [`scan_rev_from`](Self::scan_rev_from) backward.
     pub async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         self.check_abort()?;
         self.tree().collect_range(start, end).await
@@ -172,6 +171,43 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
     pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         self.check_abort()?;
         self.tree().scan_rev(start, end).await
+    }
+
+    /// Reverse scan of at most `limit` records with keys strictly below
+    /// `before`, descending. `before: None` starts at the largest key.
+    ///
+    /// The bounded counterpart to [`scan_rev`](Self::scan_rev), and the way to
+    /// read the newest N records without materialising the range behind them.
+    /// Resume by passing the last key returned; the bound is exclusive because
+    /// a key has no representable predecessor to resume at.
+    pub async fn scan_rev_from(
+        &self,
+        before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.check_abort()?;
+        self.tree().collect_rev_batch_before(before, limit).await
+    }
+
+    /// Smallest key in the tree, or `None` if empty. O(tree height).
+    pub async fn first_key(&self) -> Result<Option<Vec<u8>>> {
+        self.check_abort()?;
+        self.tree().first_key().await
+    }
+
+    /// Largest key in the tree, or `None` if empty. O(tree height).
+    pub async fn last_key(&self) -> Result<Option<Vec<u8>>> {
+        self.check_abort()?;
+        self.tree().last_key().await
+    }
+
+    /// Read `len` bytes of `key`'s value from byte `offset`. `None` if absent.
+    ///
+    /// Reads a window of a large value without materialising it, so a blob can
+    /// be consumed in pieces. A range past the end is clamped.
+    pub async fn get_range(&self, key: &[u8], offset: u64, len: u64) -> Result<Option<Bytes>> {
+        self.check_abort()?;
+        self.tree().get_range(key, offset, len).await
     }
 
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {

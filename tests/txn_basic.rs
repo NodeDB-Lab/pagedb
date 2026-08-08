@@ -407,3 +407,94 @@ async fn scan_prefix_from_stops_at_prefix_boundary() {
     assert_eq!(rows.len(), 5);
     assert!(rows.iter().all(|(k, _)| k.starts_with(b"a:")));
 }
+
+/// A scan on a write transaction must observe that transaction's own
+/// uncommitted writes. This is what lets read-modify-write over a range be one
+/// transaction; if scans read through to the published snapshot instead, every
+/// such pattern silently operates on stale data.
+#[tokio::test(flavor = "current_thread")]
+async fn write_txn_scans_observe_uncommitted_writes() {
+    let db = open_db().await;
+    let mut w = db.begin_write().await.unwrap();
+    for i in 0..2_000u32 {
+        w.put(format!("k{i:05}").as_bytes(), b"v1").await.unwrap();
+    }
+    w.commit().await.unwrap();
+
+    // Opened before the writer: a reader cannot *begin* while a write txn is
+    // live, because `WriteTxn` holds the visibility gate for its whole life.
+    let r = db.begin_read().await.unwrap();
+
+    let mut w = db.begin_write().await.unwrap();
+    w.put(b"k00500", b"v2").await.unwrap();
+    w.delete(b"k00501").await.unwrap();
+    w.put(b"k99999", b"new").await.unwrap();
+
+    let rows = w.scan(b"k00499", b"k00502").await.unwrap();
+    let seen: Vec<(&[u8], &[u8])> = rows.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect();
+    assert_eq!(
+        seen,
+        vec![
+            (b"k00499".as_ref(), b"v1".as_ref()),
+            (b"k00500".as_ref(), b"v2".as_ref()),
+        ],
+        "scan must see the overwrite and the delete"
+    );
+
+    // The newest key is uncommitted; reverse paging must still find it.
+    let newest = w.scan_rev_from(None, 1).await.unwrap();
+    assert_eq!(newest[0].0.as_ref(), b"k99999");
+    assert_eq!(
+        w.last_key().await.unwrap().as_deref(),
+        Some(b"k99999".as_ref())
+    );
+
+    let prefixed = w.scan_prefix_from(b"k005", b"k005", 3).await.unwrap();
+    assert_eq!(prefixed.len(), 3);
+    assert_eq!(prefixed[0].1.as_ref(), b"v2");
+
+    // The pre-existing reader is pinned to the published snapshot and must see
+    // none of it.
+    assert_eq!(
+        r.get(b"k00500").await.unwrap().as_deref(),
+        Some(b"v1".as_ref())
+    );
+    assert!(r.get(b"k99999").await.unwrap().is_none());
+    drop(r);
+
+    w.commit().await.unwrap();
+    let r = db.begin_read().await.unwrap();
+    assert_eq!(
+        r.get(b"k00500").await.unwrap().as_deref(),
+        Some(b"v2".as_ref())
+    );
+    assert!(r.get(b"k00501").await.unwrap().is_none());
+    assert_eq!(
+        r.scan_rev_from(None, 1).await.unwrap()[0].0.as_ref(),
+        b"k99999"
+    );
+}
+
+/// Reading a window of a large value must not depend on materialising it.
+#[tokio::test(flavor = "current_thread")]
+async fn get_range_reads_a_window_of_a_large_value() {
+    let db = open_db().await;
+    let blob: Vec<u8> = (0..(PAGE * 20) as u32).map(|i| (i % 253) as u8).collect();
+    let mut w = db.begin_write().await.unwrap();
+    w.put(b"blob", &blob).await.unwrap();
+    w.commit().await.unwrap();
+
+    let r = db.begin_read().await.unwrap();
+    let window = r.get_range(b"blob", 40_000, 1_000).await.unwrap().unwrap();
+    assert_eq!(window.as_ref(), &blob[40_000..41_000]);
+    let tail = r
+        .get_range(b"blob", blob.len() as u64 - 5, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.as_ref(), &blob[blob.len() - 5..]);
+    assert_eq!(
+        r.get(b"blob").await.unwrap().unwrap().as_ref(),
+        blob.as_slice()
+    );
+}

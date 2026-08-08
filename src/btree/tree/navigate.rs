@@ -329,6 +329,65 @@ impl<V: Vfs> BTree<V> {
         Ok(None)
     }
 
+    /// Given an internal node and a child `page_id`, return the `page_id` of
+    /// the PREVIOUS child (to the left), or `None` if `child` is the leftmost.
+    /// Mirror of [`Self::right_sibling_child`].
+    fn left_sibling_child(internal: &Internal, child: u64) -> Option<u64> {
+        if internal.leftmost_child == child {
+            return None;
+        }
+        for (i, e) in internal.entries.iter().enumerate() {
+            if e.right_child == child {
+                return Some(match i.checked_sub(1) {
+                    Some(prev) => internal.entries[prev].right_child,
+                    None => internal.leftmost_child,
+                });
+            }
+        }
+        None
+    }
+
+    /// Given a `path` ending at a leaf, return the path to the previous leaf to
+    /// the left, or `None` if `path` is the leftmost leaf. Mirror of
+    /// [`Self::next_leaf_after`]: finds the first ancestor where the subtree
+    /// isn't the leftmost child, then descends that sibling's rightmost branch.
+    pub(super) async fn prev_leaf_before(&self, path: &[u64]) -> Result<Option<Vec<u64>>> {
+        if path.len() < 2 {
+            return Ok(None);
+        }
+        let mut seen = SeenPageIds::from_existing("btree_descent", path)?;
+        let mut child = path[path.len() - 1];
+        for i in (0..path.len() - 1).rev() {
+            let (guard, _kind) = self.read_node_guard(path[i]).await?;
+            let internal = Internal::decode(guard.body_ref())?;
+            drop(guard);
+            if let Some(prev_child) = Self::left_sibling_child(&internal, child) {
+                let mut new_path: Vec<u64> = path[..=i].to_vec();
+                let mut cur = prev_child;
+                loop {
+                    seen.insert(cur)?;
+                    new_path.push(cur);
+                    // A fresh-from-split leaf has no pager presence yet.
+                    if self.fresh_leaves.contains_key(&cur) {
+                        return Ok(Some(new_path));
+                    }
+                    let (g, k) = self.read_node_guard(cur).await?;
+                    if k == NodeKind::Leaf {
+                        return Ok(Some(new_path));
+                    }
+                    let internal = Internal::decode(g.body_ref())?;
+                    drop(g);
+                    cur = match internal.entries.last() {
+                        Some(entry) => entry.right_child,
+                        None => internal.leftmost_child,
+                    };
+                }
+            }
+            child = path[i];
+        }
+        Ok(None)
+    }
+
     /// Descend from the root taking the rightmost child at every internal
     /// node. Returns the path (internal `page_ids` followed by the rightmost
     /// leaf `page_id`). Used by [`Self::put_append`] to seed the cached

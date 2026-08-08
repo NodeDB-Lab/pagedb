@@ -276,6 +276,71 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         self.btree.delete(key).await
     }
 
+    /// Read `len` bytes of `key`'s value from byte `offset`. `None` if absent.
+    ///
+    /// Reads a window of a large value without materialising it.
+    pub async fn get_range(&self, key: &[u8], offset: u64, len: u64) -> Result<Option<Bytes>> {
+        self.btree.get_range(key, offset, len).await
+    }
+
+    /// Forward range scan: `start` inclusive, `end` exclusive.
+    ///
+    /// Every scan on a write transaction observes that transaction's own
+    /// uncommitted writes, so read-modify-write over a range is a single
+    /// transaction rather than a read transaction paired with a write one.
+    /// Materialising — see [`scan_from`](Self::scan_from) to bound by count.
+    pub async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        self.btree.collect_range(start, end).await
+    }
+
+    /// Forward scan of at most `limit` records at or after `start`, ascending.
+    /// Resume at the last key returned plus `0x00`.
+    pub async fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
+        self.btree.collect_batch_from(start, limit).await
+    }
+
+    /// Records whose key starts with `prefix`, ascending.
+    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        self.btree.scan_prefix(prefix).await
+    }
+
+    /// At most `limit` records at or after `start` still carrying `prefix`.
+    pub async fn scan_prefix_from(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.btree
+            .collect_prefix_batch_from(prefix, start, limit)
+            .await
+    }
+
+    /// Reverse range scan: `start` inclusive, `end` exclusive, descending.
+    pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        self.btree.scan_rev(start, end).await
+    }
+
+    /// At most `limit` records with keys strictly below `before`, descending.
+    /// `before: None` starts at the largest key.
+    pub async fn scan_rev_from(
+        &self,
+        before: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.btree.collect_rev_batch_before(before, limit).await
+    }
+
+    /// Smallest key in the tree, or `None` if empty. O(tree height).
+    pub async fn first_key(&self) -> Result<Option<Vec<u8>>> {
+        self.btree.first_key().await
+    }
+
+    /// Largest key in the tree, or `None` if empty. O(tree height).
+    pub async fn last_key(&self) -> Result<Option<Vec<u8>>> {
+        self.btree.last_key().await
+    }
+
     /// Takes the same row shape the scans return, so read output feeds
     /// straight back in without a conversion.
     ///

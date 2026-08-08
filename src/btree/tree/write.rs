@@ -12,8 +12,12 @@ use crate::btree::leaf::{Leaf, LeafValue};
 use crate::btree::overflow;
 use crate::btree::split::split_leaf;
 
-use super::core::{BTree, SeenPageIds};
+use super::core::BTree;
 use super::navigate::LeafBounds;
+
+/// Keys a range delete collects before deleting them, bounding what it holds
+/// independently of how large the range is.
+const DELETE_RANGE_CHUNK: usize = 1024;
 
 impl<V: Vfs> BTree<V> {
     fn invalidate_append_state(&mut self) {
@@ -346,10 +350,16 @@ impl<V: Vfs> BTree<V> {
             return Ok(false);
         }
         let path = self.path_to_leaf_for_key(key).await?;
+        self.delete_at_path(&path, key).await
+    }
+
+    /// Delete `key` from the leaf `path` ends at. A delete never splits, so
+    /// `path` remains valid afterwards and a caller may reuse it.
+    async fn delete_at_path(&mut self, path: &[u64], key: &[u8]) -> Result<bool> {
         let leaf_page_id = *path.last().expect("non-empty path");
         let leaf_is_fresh = self.fresh_leaves.contains_key(&leaf_page_id);
         if !leaf_is_fresh {
-            self.ensure_leaf_dirty(leaf_page_id, &path).await?;
+            self.ensure_leaf_dirty(leaf_page_id, path).await?;
         }
         let removed = self
             .cached_leaf_mut(leaf_page_id, leaf_is_fresh)
@@ -421,13 +431,30 @@ impl<V: Vfs> BTree<V> {
         Ok(())
     }
 
-    /// Batch delete of sorted keys.
+    /// Batch delete of keys.
     ///
-    /// Per-leaf batching is a deferred performance optimisation; this
-    /// implementation is correct for all inputs.
+    /// Reuses the target leaf path across consecutive keys on the same terms as
+    /// [`Self::put_batch`] — gated on the leaf's separator bounds — so sorted
+    /// input descends once per leaf and any other order re-descends and is
+    /// still correct.
     pub async fn delete_batch(&mut self, keys: Vec<Vec<u8>>) -> Result<()> {
-        for k in keys {
-            self.delete(&k).await?;
+        self.invalidate_append_state();
+        if self.root_page_id == 0 {
+            return Ok(());
+        }
+        let mut cached: Option<(Vec<u64>, LeafBounds)> = None;
+
+        for key in keys {
+            let reusable = cached.take().filter(|(_, bounds)| bounds.contains(&key));
+            let (path, bounds) = if let Some(reusable) = reusable {
+                reusable
+            } else {
+                let path = self.path_to_leaf_for_key(&key).await?;
+                let bounds = self.separator_bounds_for_path(&path).await?;
+                (path, bounds)
+            };
+            self.delete_at_path(&path, &key).await?;
+            cached = Some((path, bounds));
         }
         Ok(())
     }
@@ -436,52 +463,33 @@ impl<V: Vfs> BTree<V> {
     /// deleted records. Empty leaves are left in place (rebalancing is
     /// deferred).
     ///
-    /// Implementation: collect the full set of matching keys via a forward
-    /// scan, then delete each one individually. This avoids the multi-path
-    /// `CoW` complexity of in-place range mutation.
+    /// Collects and deletes in bounded chunks rather than materialising every
+    /// matching key first: the range is unbounded in principle, so holding one
+    /// allocation per match made retention deletes scale with the data being
+    /// dropped. Each round resumes at the last key deleted plus `0x00`, its
+    /// exact successor, so nothing is skipped or revisited.
     pub async fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<u64> {
         if self.root_page_id == 0 {
             return Ok(0);
         }
-        // Parent paths are authoritative for fresh same-session split leaves;
-        // their sibling links remain zero until flush.
-        let mut path = self.path_to_leaf_for_key(start).await?;
-        let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
-        let mut seen_leaves = SeenPageIds::new("leaf_siblings");
-        'outer: loop {
-            let leaf_page_id = *path.last().expect("non-empty path");
-            seen_leaves.insert(leaf_page_id)?;
-            let leaf = self.read_leaf(leaf_page_id).await?;
-            for (k, _) in &leaf.records {
-                if k.as_slice() >= end {
-                    break 'outer;
-                }
-                if k.as_slice() >= start {
-                    keys_to_delete.push(k.clone());
-                }
-            }
-            let next_path = self.next_leaf_after(&path).await?;
-            match (leaf.right_sibling, next_path) {
-                (0, Some(parent_next)) => path = parent_next,
-                (0, None) => break,
-                (right_sibling, Some(parent_next))
-                    if parent_next.last().copied() == Some(right_sibling) =>
-                {
-                    path = parent_next;
-                }
-                (right_sibling, parent_next) => {
-                    return Err(PagedbError::leaf_sibling_mismatch(
-                        leaf_page_id,
-                        right_sibling,
-                        parent_next.and_then(|path| path.last().copied()),
-                    ));
-                }
+        let mut removed = 0u64;
+        let mut cursor: Vec<u8> = start.to_vec();
+        loop {
+            let keys = self
+                .collect_keys_batch_in_range(&cursor, end, DELETE_RANGE_CHUNK)
+                .await?;
+            let Some(last) = keys.last() else {
+                return Ok(removed);
+            };
+            let exhausted = keys.len() < DELETE_RANGE_CHUNK;
+            cursor.clear();
+            cursor.extend_from_slice(last);
+            cursor.push(0);
+            removed = removed.saturating_add(keys.len() as u64);
+            self.delete_batch(keys).await?;
+            if exhausted {
+                return Ok(removed);
             }
         }
-        let count = keys_to_delete.len() as u64;
-        for key in keys_to_delete {
-            self.delete(&key).await?;
-        }
-        Ok(count)
     }
 }

@@ -38,6 +38,52 @@ impl<V: Vfs> BTree<V> {
             .await
     }
 
+    /// Read `len` bytes of `key`'s value starting at byte `offset`. `None` if
+    /// the key is absent.
+    ///
+    /// Resident cost is the slice, not the value, so a large blob can be read a
+    /// window at a time instead of all at once. A range past the end is
+    /// clamped; an empty result means `offset` is at or past the value's end.
+    pub async fn get_range(&self, key: &[u8], offset: u64, len: u64) -> Result<Option<Bytes>> {
+        if self.root_page_id == 0 {
+            return Ok(None);
+        }
+        let path = self.path_to_leaf_for_key(key).await?;
+        let leaf_id = *path.last().expect("non-empty path");
+        let leaf = self.read_leaf(leaf_id).await?;
+        let Some((_, value)) = leaf.records.iter().find(|(k, _)| k.as_slice() == key) else {
+            return Ok(None);
+        };
+        match value {
+            LeafValue::Inline(bytes) => {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(bytes.len());
+                let end = usize::try_from(len)
+                    .ok()
+                    .and_then(|len| start.checked_add(len))
+                    .unwrap_or(bytes.len())
+                    .min(bytes.len());
+                Ok(Some(bytes.slice(start..end)))
+            }
+            LeafValue::Overflow {
+                total_len,
+                root_page_id,
+            } => {
+                let slice = overflow::read_chain_range(
+                    &self.pager,
+                    self.realm_id,
+                    *root_page_id,
+                    *total_len,
+                    offset,
+                    len,
+                )
+                .await?;
+                Ok(Some(Bytes::from(slice)))
+            }
+        }
+    }
+
     /// Resolve `key` against an in-memory `Leaf` (from `fresh_leaves` /
     /// `dirty_leaves`), following any overflow chain via the pager.
     async fn value_from_cached_leaf(
