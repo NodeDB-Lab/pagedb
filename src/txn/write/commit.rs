@@ -359,14 +359,13 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         // in page recycling, so this trail is what a corruption report needs.
         crate::diag::committed(new_commit_id, all_freed.len());
 
-        // `visibility_guard` was acquired before the reclamation-floor scan in
-        // `WriteTxn::begin` and is still held here — it is passed straight into
-        // the publication below, so the floor a reader could have observed
-        // cannot have moved between the scan and this commit becoming visible.
+        // Reader admission is closed here, for publication only. It stays open
+        // for the body of the transaction: every commit a reader can newly pin
+        // sits at or above the reclamation floor this txn scanned at begin, so
+        // admitting one cannot invalidate that scan. See `WriteTxn::begin`.
         if self
             .db
-            .finish_durable_commit_visible(
-                &self.visibility_guard,
+            .finish_durable_commit(
                 &self.guard,
                 CommitId(new_commit_id),
                 counter_anchor,

@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use tokio::sync::{MutexGuard, RwLockWriteGuard};
+use tokio::sync::MutexGuard;
 
 use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, RealmQuotas, SegmentMeta};
@@ -40,8 +40,6 @@ pub(crate) enum SegmentSideEffect {
 pub struct WriteTxn<'db, V: Vfs + Clone> {
     pub(super) db: &'db Db<V>,
     pub(super) guard: MutexGuard<'db, WriterState>,
-    /// Held from the reclamation-floor scan through commit publication.
-    pub(super) visibility_guard: RwLockWriteGuard<'db, ()>,
     pub(super) btree: BTree<V>,
     pub(super) catalog_tree: BTree<V>,
     pub(super) pending_segments: Vec<SegmentSideEffect>,
@@ -97,7 +95,19 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         db.ensure_usable()?;
         #[cfg(test)]
         db.notify_writer_waiting();
-        let visibility_guard = db.visibility_gate.write().await;
+        // The visibility gate is NOT held for the body of the transaction, only
+        // around publication in `commit`. Two things make that safe. Every
+        // destructive operation (gc, journal apply, snapshot restore) takes the
+        // writer mutex before the gate, and this txn holds that mutex
+        // throughout, so they are already excluded. And a reader admitted
+        // mid-transaction can only pin a commit at or above the floor scanned
+        // below — `begin_read` pins the published commit, and `begin_read_at`
+        // cannot reach past the retained history the floor already accounts
+        // for — so it cannot make a recycled page observable.
+        //
+        // Holding it for the whole transaction instead blocked every new reader
+        // for the duration of the write, which on a single-threaded runtime is
+        // a deadlock rather than a wait.
 
         // Pages freed *within this txn* must never be recycled within the same
         // txn if they existed before it began: a copy-on-write free means the
@@ -222,7 +232,6 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         Ok(Self {
             db,
             guard,
-            visibility_guard,
             btree,
             catalog_tree,
             pending_segments: Vec::new(),

@@ -498,3 +498,50 @@ async fn get_range_reads_a_window_of_a_large_value() {
         blob.as_slice()
     );
 }
+
+/// A reader must be able to *begin* while a write transaction is open, and see
+/// the published snapshot rather than the writer's uncommitted state.
+///
+/// The visibility gate is held only around publication. Holding it for the
+/// whole transaction blocked every new reader for the duration of the write —
+/// on this single-threaded runtime that is a deadlock, so this test hangs
+/// rather than fails if the gate ever widens again. Time travel is included
+/// because `begin_read_at` is the one admission that can pin an older commit,
+/// and so is the case the reclamation floor has to already account for.
+#[tokio::test(flavor = "current_thread")]
+async fn readers_can_begin_while_a_write_txn_is_open() {
+    let db = open_db().await;
+    let mut w = db.begin_write().await.unwrap();
+    w.put(b"k", b"v1").await.unwrap();
+    w.commit().await.unwrap();
+    let first = db.latest_commit();
+
+    let mut w = db.begin_write().await.unwrap();
+    w.put(b"k", b"v2").await.unwrap();
+    w.put(b"fresh", b"uncommitted").await.unwrap();
+
+    // Admitted mid-transaction, pinned to the published snapshot.
+    let r = db.begin_read().await.unwrap();
+    assert_eq!(r.get(b"k").await.unwrap().as_deref(), Some(b"v1".as_ref()));
+    assert!(r.get(b"fresh").await.unwrap().is_none());
+    drop(r);
+
+    // Time travel, also mid-transaction.
+    let historic = db.begin_read_at(first).await.unwrap();
+    assert_eq!(
+        historic.get(b"k").await.unwrap().as_deref(),
+        Some(b"v1".as_ref())
+    );
+    drop(historic);
+
+    // The writer still sees its own writes and can publish them.
+    assert_eq!(w.get(b"k").await.unwrap().as_deref(), Some(b"v2".as_ref()));
+    w.commit().await.unwrap();
+
+    let r = db.begin_read().await.unwrap();
+    assert_eq!(r.get(b"k").await.unwrap().as_deref(), Some(b"v2".as_ref()));
+    assert_eq!(
+        r.get(b"fresh").await.unwrap().as_deref(),
+        Some(b"uncommitted".as_ref())
+    );
+}
