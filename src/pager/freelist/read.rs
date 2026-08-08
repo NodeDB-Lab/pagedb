@@ -52,6 +52,10 @@ pub struct ChainTail {
 
 impl ChainTail {
     /// No retained remainder: the chain being written ends where it stops.
+    ///
+    /// Serves the native-only deferred-free reclaim path (`reclaim`); gate it
+    /// the same way.
+    #[cfg(any(test, not(target_arch = "wasm32")))]
     pub const EMPTY: Self = Self {
         head: 0,
         summary: ChainSummary {

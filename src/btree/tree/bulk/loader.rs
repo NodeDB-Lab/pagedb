@@ -1,9 +1,9 @@
 //! Push-style dense-tree builder.
 //!
-//! Records are handed in one at a time, in strictly increasing key order, and
-//! leaves plus internal nodes are emitted as the input flows past. Nothing
-//! accumulates that scales with the number of records, so a caller that reads
-//! its source in bounded batches never materialises the source at all.
+//! Records are handed in, singly or in bounded batches, in strictly increasing
+//! key order, and leaves plus internal nodes are emitted as the input flows
+//! past. Nothing accumulates that scales with the number of records, so a
+//! caller that reads its source in bounded batches never materialises it.
 
 use bytes::Bytes;
 
@@ -96,6 +96,11 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
     /// ordering and error semantics, and it admits and appends the record
     /// directly — a caller streaming record by record allocates nothing per
     /// record beyond the record itself.
+    ///
+    /// Carries the same reachability as [`BTree::bulk_load`], its only caller
+    /// outside tests: the repack hands over the bounded batch it already holds
+    /// and so goes through [`Self::push_batch`].
+    #[cfg(any(test, not(target_arch = "wasm32")))]
     pub async fn push(&mut self, key: Vec<u8>, value: Bytes) -> Result<()> {
         batch::push_one(self, key, value).await
     }

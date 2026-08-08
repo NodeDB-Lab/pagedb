@@ -32,8 +32,11 @@ pub(super) async fn push_batch<V: crate::vfs::Vfs>(
 ///
 /// This is the whole of [`BulkLoader::push`], not a one-element `push_batch`:
 /// routing a single record through the batch form would allocate a `Vec` per
-/// record, and a dense repack pushes one record at a time for the entire
-/// contents of the store.
+/// record, and a caller holding no more than a record at a time pays that for
+/// every record in its input.
+///
+/// Gated with [`BulkLoader::push`], which is its only caller.
+#[cfg(any(test, not(target_arch = "wasm32")))]
 pub(super) async fn push_one<V: crate::vfs::Vfs>(
     loader: &mut BulkLoader<'_, V>,
     key: Vec<u8>,
