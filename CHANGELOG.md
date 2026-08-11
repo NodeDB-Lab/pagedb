@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A rekey's source-epoch retirement is no longer lost when the last reader leaves mid-deferral.** `retire_rekey_source_when_safe` decided to defer under one lock and recorded the obligation under another. A reader dropping between the two ran its drain against a still-empty obligation list, so the record landed where nothing would visit it again and the superseded master key stayed leasable for the life of the handle — while `rekey_db` returned `Ok(())` with no error and no completion state to query. The deferral is now one step under one lock, and a drain that fails keeps every obligation queued instead of discarding the untried remainder.
+
 ## [0.1.0] - 2026-07-28
 
 The first release. Pre-releases were published as `0.1.0-beta.N`; the entries below describe `0.1.0` as a whole rather than deltas against a shipped version, since none exists yet.
