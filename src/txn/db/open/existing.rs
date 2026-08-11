@@ -325,6 +325,8 @@ impl<V: Vfs + Clone> Db<V> {
             #[cfg(test)]
             visibility_test_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            retirement_defer_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             rekey_test_fault: parking_lot::Mutex::new(None),
         };
 

@@ -944,6 +944,67 @@ mod tests {
         );
     }
 
+    /// The last reader may leave *during* the deferral, and the retirement must
+    /// still complete.
+    ///
+    /// Deferring is two facts that have to agree: a reader exists, and an
+    /// obligation is recorded where the drain will find it. Nothing pins the
+    /// first fact in place — the reader's `drop` is a plain unregister that can
+    /// land at any instant, including between the two. When it did, the drain
+    /// read an empty obligation list and the record arrived after the only
+    /// thing that ever reads it had gone: `rekey_db` returned `Ok(())` while the
+    /// superseded master key stayed leasable for the life of the handle, with no
+    /// error, no log line, and nothing to query. This drives the reader out at
+    /// exactly that instant and requires the epoch to retire anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_leaving_mid_deferral_still_retires_the_source_epoch() {
+        let db = Db::open_internal(MemVfs::new(), SOURCE_KEK, PAGE, REALM)
+            .await
+            .unwrap();
+        // Move the active epoch off 0 so retiring it is a real retirement
+        // rather than the active-epoch refusal.
+        let target_mk = derive_mk(&TARGET_KEK, &db.kek_salt, 1).unwrap();
+        db.pager.set_active_mk_epoch(target_mk, 1);
+
+        db.install_retirement_defer_hook(std::sync::Arc::new(|db: &Db<MemVfs>| {
+            for _ in 0..5_000 {
+                if db.tracked_readers.lock().is_empty() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("the reader never left; the window under test was not reached");
+        }));
+
+        let read = db.begin_read().await.unwrap();
+        assert!(
+            db.pager.mk_for(0, db.cipher_id).is_ok(),
+            "the source epoch must still be leasable while a reader holds it"
+        );
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| drop(read));
+            db.retire_rekey_source_when_safe(0, db.cipher_id)
+        })
+        .unwrap();
+
+        assert!(
+            db.tracked_readers.lock().is_empty(),
+            "the reader must be gone before the retirement is judged"
+        );
+        assert!(
+            db.pending_key_retirements.lock().is_empty(),
+            "an obligation no reader is waiting on must not survive the deferral"
+        );
+        assert!(
+            matches!(
+                db.pager.mk_for(0, db.cipher_id),
+                Err(PagedbError::MissingPersistedKey { mk_epoch: 0, .. })
+            ),
+            "a reader leaving mid-deferral must not leave the source epoch leasable"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn direct_segment_reader_keeps_source_lease_after_retirement() {
         let db = Db::open_internal(MemVfs::new(), SOURCE_KEK, PAGE, REALM)
