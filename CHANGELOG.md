@@ -2,12 +2,6 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-- **A rekey's source-epoch retirement is no longer lost when the last reader leaves mid-deferral.** `retire_rekey_source_when_safe` decided to defer under one lock and recorded the obligation under another. A reader dropping between the two ran its drain against a still-empty obligation list, so the record landed where nothing would visit it again and the superseded master key stayed leasable for the life of the handle — while `rekey_db` returned `Ok(())` with no error and no completion state to query. The deferral is now one step under one lock, and a drain that fails keeps every obligation queued instead of discarding the untried remainder.
-
 ## [0.1.0] - 2026-07-28
 
 The first release. Pre-releases were published as `0.1.0-beta.N`; the entries below describe `0.1.0` as a whole rather than deltas against a shipped version, since none exists yet.
@@ -22,7 +16,7 @@ The first release. Pre-releases were published as `0.1.0-beta.N`; the entries be
 - **Cross-platform VFS** — Linux (`io_uring`), Windows (IOCP), macOS/iOS (Grand Central Dispatch), Android, WASM/OPFS and WASI backends, plus a tokio thread-pool fallback and an in-memory backend, with format-bit identity across targets. On Linux the backend is chosen at run time: a kernel that refuses an `io_uring` ring falls back to the thread pool with a warning instead of failing the open. All native backends share one advisory-lock implementation, so processes on different backends still exclude each other on one store.
 - **Snapshots** — `snapshot_to`, `restore_from`, and incremental apply, each authenticated against the state its manifest describes. Destinations must be empty; malformed or incomplete artifacts fail closed.
 - **Recovery** — open-flow GC, apply-journal replay, deep-walk `fsck`, and the `pagedb-fsck` binary.
-- **Online rekey** — rekey under a new key with mixed-cipher and mixed-epoch page coexistence; no full-file migration.
+- **Online rekey** — rekey under a new key with mixed-cipher and mixed-epoch page coexistence; no full-file migration. A rotation whose source epoch is still pinned by a reader defers retiring it and completes the retirement once the reader set drains — including when the last reader leaves during the deferral itself, so the superseded master key never stays leasable behind an `Ok(())`. A retirement that cannot be taken yet stays queued for the next attempt without holding up the others.
 - **Handle modes** — `Standalone`, `Follower`, `ReadOnly`, and `Observer`.
 - **Open refusals name the parameter, not the store** — `KeyMismatch`, `PageSizeMismatch`, and `RealmMismatch`, each decided before anything is read or written, and none reported as corruption.
 - **Failures report themselves** — an unreadable free-list chain, main file, or segment catalog fails `stats()` instead of reporting zero; compaction never skips a catalog entry whose file it cannot open; segment open distinguishes a missing file from a permission or backend error; and only genuine contention is reported as contention. Persisted named-counter rows are validated at open, and commit-history keys are rejected unless exactly eight bytes.
