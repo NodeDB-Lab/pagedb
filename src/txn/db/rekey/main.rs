@@ -944,6 +944,167 @@ mod tests {
         );
     }
 
+    /// The last reader may leave *during* the deferral, and the retirement must
+    /// still complete.
+    ///
+    /// Deferring is two facts that have to agree: a reader exists, and an
+    /// obligation is recorded where the drain will find it. Nothing pins the
+    /// first fact in place — the reader's `drop` is a plain unregister that can
+    /// land at any instant, including between the two. When it did, the drain
+    /// read an empty obligation list and the record arrived after the only
+    /// thing that ever reads it had gone: `rekey_db` returned `Ok(())` while the
+    /// superseded master key stayed leasable for the life of the handle, with no
+    /// error, no log line, and nothing to query. This drives the reader out at
+    /// exactly that instant and requires the epoch to retire anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_leaving_mid_deferral_still_retires_the_source_epoch() {
+        let db = Db::open_internal(MemVfs::new(), SOURCE_KEK, PAGE, REALM)
+            .await
+            .unwrap();
+        // Move the active epoch off 0 so retiring it is a real retirement
+        // rather than the active-epoch refusal.
+        let target_mk = derive_mk(&TARGET_KEK, &db.kek_salt, 1).unwrap();
+        db.pager.set_active_mk_epoch(target_mk, 1);
+
+        // Left to race, the reader can be gone before the critical section is
+        // even entered, the deferral is never taken, and every assertion below
+        // passes against the unfixed code. So the hook drives the reader out
+        // itself, from the one instant the bug needed.
+        let departure = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let deferrals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_departure = departure.clone();
+        let hook_deferrals = deferrals.clone();
+        db.install_retirement_defer_hook(std::sync::Arc::new(move |db: &Db<MemVfs>| {
+            hook_deferrals.fetch_add(1, Ordering::Relaxed);
+            hook_departure.wait();
+            // `unregister_read` releases `tracked_readers` before it touches
+            // the retirement list held here, so this cannot deadlock.
+            for _ in 0..5_000 {
+                if db.tracked_readers.lock().is_empty() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("the reader never left; the window under test was not reached");
+        }));
+
+        let read = db.begin_read().await.unwrap();
+        assert!(
+            db.pager.mk_for(0, db.cipher_id).is_ok(),
+            "the source epoch must still be leasable while a reader holds it"
+        );
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                departure.wait();
+                drop(read);
+            });
+            db.retire_rekey_source_when_safe(0, db.cipher_id)
+        })
+        .unwrap();
+        db.clear_retirement_defer_hook();
+
+        assert_eq!(
+            deferrals.load(Ordering::Relaxed),
+            1,
+            "the retirement must have been deferred; otherwise the reader left \
+             before the window and the race was never staged"
+        );
+        assert!(
+            db.tracked_readers.lock().is_empty(),
+            "the reader must be gone before the retirement is judged"
+        );
+        assert!(
+            db.pending_key_retirements.lock().is_empty(),
+            "an obligation no reader is waiting on must not survive the deferral"
+        );
+        assert!(
+            matches!(
+                db.pager.mk_for(0, db.cipher_id),
+                Err(PagedbError::MissingPersistedKey { mk_epoch: 0, .. })
+            ),
+            "a reader leaving mid-deferral must not leave the source epoch leasable"
+        );
+    }
+
+    /// Queue two obligations, then make the first one refuse to retire.
+    /// Retirements are independent epochs, so the refusal must be kept and
+    /// stepped over, not treated as a wall.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_retirement_does_not_hold_up_the_obligations_behind_it() {
+        let db = Db::open_internal(MemVfs::new(), SOURCE_KEK, PAGE, REALM)
+            .await
+            .unwrap();
+        let target_mk = derive_mk(&TARGET_KEK, &db.kek_salt, 1).unwrap();
+        db.pager.set_active_mk_epoch(target_mk, 1);
+        let spare_mk = derive_mk(&TARGET_KEK, &db.kek_salt, 2).unwrap();
+        db.pager.install_mk_epoch(spare_mk, 2, db.cipher_id);
+
+        let read = db.begin_read().await.unwrap();
+        db.retire_rekey_source_when_safe(0, db.cipher_id).unwrap();
+        db.retire_rekey_source_when_safe(2, db.cipher_id).unwrap();
+
+        // Epoch 0 is the active one by the time the drain runs, which is the
+        // one condition `retire_mk_epoch` refuses.
+        let source_mk = derive_mk(&SOURCE_KEK, &db.kek_salt, 0).unwrap();
+        db.pager.set_active_mk_epoch(source_mk, 0);
+        drop(read);
+
+        assert!(
+            db.pager.mk_for(2, db.cipher_id).is_err(),
+            "an epoch queued behind a refusal must still be retired"
+        );
+        let queued: Vec<u64> = db
+            .pending_key_retirements
+            .lock()
+            .iter()
+            .map(|pending| pending.epoch)
+            .collect();
+        assert_eq!(
+            queued,
+            vec![0],
+            "the refused epoch — and only it — must stay queued for the next attempt"
+        );
+    }
+
+    /// A drain runs only when the last reader leaves, so an obligation it
+    /// failed to clear has no second drain coming while the reader set stays
+    /// empty. The next rotation is the only thing left that can retry it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rotation_with_no_readers_retires_the_backlog_it_inherits() {
+        let db = Db::open_internal(MemVfs::new(), SOURCE_KEK, PAGE, REALM)
+            .await
+            .unwrap();
+        let target_mk = derive_mk(&TARGET_KEK, &db.kek_salt, 1).unwrap();
+        db.pager.set_active_mk_epoch(target_mk, 1);
+
+        let read = db.begin_read().await.unwrap();
+        db.retire_rekey_source_when_safe(0, db.cipher_id).unwrap();
+        let source_mk = derive_mk(&SOURCE_KEK, &db.kek_salt, 0).unwrap();
+        db.pager.set_active_mk_epoch(source_mk, 0);
+        drop(read);
+        assert_eq!(
+            db.pending_key_retirements.lock().len(),
+            1,
+            "the refused epoch must have been kept"
+        );
+
+        let target_mk = derive_mk(&TARGET_KEK, &db.kek_salt, 1).unwrap();
+        db.pager.set_active_mk_epoch(target_mk, 1);
+        let spare_mk = derive_mk(&TARGET_KEK, &db.kek_salt, 2).unwrap();
+        db.pager.install_mk_epoch(spare_mk, 2, db.cipher_id);
+        db.retire_rekey_source_when_safe(2, db.cipher_id).unwrap();
+
+        assert!(
+            db.pending_key_retirements.lock().is_empty(),
+            "a rotation that finds no reader must clear the backlog, not just its own epoch"
+        );
+        assert!(
+            db.pager.mk_for(0, db.cipher_id).is_err(),
+            "the inherited obligation must actually have been retired"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn direct_segment_reader_keeps_source_lease_after_retirement() {
         let db = Db::open_internal(MemVfs::new(), SOURCE_KEK, PAGE, REALM)

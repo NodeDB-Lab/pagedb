@@ -244,7 +244,16 @@ pub struct Db<V: Vfs + Clone> {
     pub(crate) visibility_test_hook: parking_lot::Mutex<Option<Arc<VisibilityTestHook>>>,
     #[cfg(test)]
     pub(crate) rekey_test_fault: parking_lot::Mutex<Option<RekeyTestFault>>,
+    #[cfg(test)]
+    pub(crate) retirement_defer_hook: parking_lot::Mutex<Option<RetirementDeferHook<V>>>,
 }
+
+/// Runs inside `retire_rekey_source_when_safe`'s critical section, once it has
+/// decided to defer and before the obligation is recorded. That instant is the
+/// only place a test can stand to prove the two are indivisible, because the
+/// failure it guards against needs the last reader to leave precisely there.
+#[cfg(test)]
+pub(crate) type RetirementDeferHook<V> = Arc<dyn Fn(&Db<V>) + Send + Sync>;
 
 /// Reader-visible state, refreshed by the writer at commit time.
 #[derive(Debug, Clone, Copy)]
@@ -329,33 +338,75 @@ impl<V: Vfs + Clone> Db<V> {
     /// Retire an obsolete source epoch immediately when no reader can still
     /// resolve a pre-cutover snapshot; otherwise defer retirement until the
     /// tracked reader set drains.
+    ///
+    /// Deciding to defer and recording what was deferred happen under one
+    /// lock, held across both. They are one step, not two: the reader set is
+    /// only a reason to defer for as long as the obligation is not yet visible
+    /// to the drain, and the last reader can leave at any instant. Split them
+    /// and that reader's drain reads an obligation list that is still empty,
+    /// then this pushes into a list nothing will visit again — the rotation
+    /// reports success while the superseded key stays leasable for the life of
+    /// the handle. `drain_pending_key_retirements` takes the same two locks in
+    /// the same order.
+    ///
+    /// The immediate path records the obligation too, then retires the whole
+    /// list: it is the only place that sees an empty reader set together with
+    /// the backlog, and the drain that would otherwise retry a failed entry
+    /// only runs when the last reader leaves — which by then has happened.
     pub(crate) fn retire_rekey_source_when_safe(
         &self,
         epoch: u64,
         cipher_id: CipherId,
     ) -> Result<()> {
-        if self.tracked_readers.lock().is_empty() {
-            return self.pager.retire_mk_epoch(epoch, cipher_id);
+        let mut retirements = self.pending_key_retirements.lock();
+        let readers_present = !self.tracked_readers.lock().is_empty();
+        if readers_present {
+            #[cfg(test)]
+            self.await_retirement_defer_hook();
         }
         let pending = PendingKeyRetirement { epoch, cipher_id };
-        let mut retirements = self.pending_key_retirements.lock();
         if !retirements.contains(&pending) {
             retirements.push(pending);
         }
-        Ok(())
+        if readers_present {
+            return Ok(());
+        }
+        self.retire_recorded(&mut retirements)
     }
 
     /// Drain deferred source-epoch retirements once no tracked reader remains.
     pub(crate) fn drain_pending_key_retirements(&self) -> Result<()> {
+        let mut retirements = self.pending_key_retirements.lock();
         if !self.tracked_readers.lock().is_empty() {
             return Ok(());
         }
-        let pending = std::mem::take(&mut *self.pending_key_retirements.lock());
-        for retirement in pending {
-            self.pager
-                .retire_mk_epoch(retirement.epoch, retirement.cipher_id)?;
+        self.retire_recorded(&mut retirements)
+    }
+
+    /// Retire every recorded obligation, keeping the ones that fail.
+    ///
+    /// An entry leaves the list only once its retirement has succeeded, so a
+    /// failure keeps that obligation queued for the next attempt — and keeps
+    /// only that one: the rest are independent epochs, and stopping at the
+    /// first error would let one unretirable epoch stand in front of them
+    /// forever. The first error is reported once the whole pass is done.
+    fn retire_recorded(&self, retirements: &mut Vec<PendingKeyRetirement>) -> Result<()> {
+        let mut first_error = None;
+        retirements.retain(|pending| {
+            match self.pager.retire_mk_epoch(pending.epoch, pending.cipher_id) {
+                Ok(()) => false,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    true
+                }
+            }
+        });
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub(crate) fn ensure_usable(&self) -> Result<()> {
@@ -423,6 +474,27 @@ impl<V: Vfs + Clone> Db<V> {
     #[cfg(test)]
     pub(crate) fn install_visibility_test_hook(&self, hook: Arc<VisibilityTestHook>) {
         *self.visibility_test_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_retirement_defer_hook(&self, hook: RetirementDeferHook<V>) {
+        *self.retirement_defer_hook.lock() = Some(hook);
+    }
+
+    /// Detach the deferral hook, for the same reason as
+    /// [`Self::clear_visibility_test_hook`]: it is a rendezvous, and a later
+    /// deferral would park on a counterpart that is no longer coming.
+    #[cfg(test)]
+    pub(crate) fn clear_retirement_defer_hook(&self) {
+        *self.retirement_defer_hook.lock() = None;
+    }
+
+    #[cfg(test)]
+    fn await_retirement_defer_hook(&self) {
+        let hook = self.retirement_defer_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(self);
+        }
     }
 
     /// Detach the hook so the rest of a test runs on unrehearsed paths. Every
