@@ -3,7 +3,7 @@
 //! free-list persistence across reopen.
 
 use pagedb::vfs::memory::MemVfs;
-use pagedb::{Db, OpenOptions, RealmId, SegmentKind, SegmentPageKind};
+use pagedb::{CompactBudget, Db, OpenOptions, RealmId, SegmentKind, SegmentPageKind};
 
 const PAGE: usize = 4096;
 const REALM: RealmId = RealmId::new([0xAB; 16]);
@@ -515,6 +515,62 @@ async fn compact_respects_reader_pins() {
     }
 
     drop(reader);
+}
+
+/// A pass declined under a pinned reader must be distinguishable from a pass
+/// that found nothing to reclaim. Both return every count at zero, so the flag
+/// is what tells a caller to retry once the reader drops. The store here has
+/// garbage, so the same pass reclaims pages after the reader drops.
+#[tokio::test(flavor = "current_thread")]
+async fn compact_reports_a_pinned_reader_declining_the_pass() {
+    let db = fresh_db().await;
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in 0u32..100 {
+            let key = format!("decline-{i:04}");
+            w.put(key.as_bytes(), b"decline-test-value").await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+    {
+        let mut w = db.begin_write().await.unwrap();
+        for i in (0u32..100).step_by(2) {
+            let key = format!("decline-{i:04}");
+            w.delete(key.as_bytes()).await.unwrap();
+        }
+        w.commit().await.unwrap();
+    }
+
+    let reader = db.begin_read().await.unwrap();
+    let declined = db.compact_now().await.unwrap();
+    assert!(
+        declined.declined_readers_pinned,
+        "a pinned reader stops compaction, and the result must say so"
+    );
+    assert_eq!(declined.main_db_pages_reclaimed, 0);
+    assert_eq!(declined.bytes_truncated, 0);
+
+    let step = db.compact_step(CompactBudget::default()).await.unwrap();
+    assert!(
+        step.declined_readers_pinned,
+        "compact_step must carry the decline through to its progress report"
+    );
+    assert!(
+        !step.more_work,
+        "another call cannot help until readers drop"
+    );
+    assert_eq!(step.pages_relocated, 0);
+    drop(reader);
+
+    let ran = db.compact_now().await.unwrap();
+    assert!(
+        !ran.declined_readers_pinned,
+        "nothing pinned the range, so nothing declined"
+    );
+    assert!(
+        ran.main_db_pages_reclaimed > 0,
+        "the declined passes left garbage for this one to reclaim"
+    );
 }
 
 // ─── Test 5: compact_now is idempotent ───────────────────────────────────────
