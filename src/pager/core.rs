@@ -389,7 +389,7 @@ impl<V: Vfs> Pager<V> {
         &self.vfs
     }
 
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn open(vfs: V, mk: MasterKey, cfg: PagerConfig) -> Result<Self> {
         let inner = Arc::new(PagerInner {
             buffer_pool: parking_lot::Mutex::new(PageCache::with_capacity(cfg.buffer_pool_pages)),
@@ -542,7 +542,7 @@ impl<V: Vfs> Pager<V> {
     /// Write (insert into cache as dirty) a main.db page. The copy-on-write caller has
     /// already chosen `page_id`. `body_plain` is the plaintext payload
     /// (length must equal `page_size - 40`).
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn write_main_page(
         &self,
         page_id: u64,
@@ -567,7 +567,7 @@ impl<V: Vfs> Pager<V> {
     /// page 0 is the segment header, allocated separately by the segment
     /// writer in a later slice). Test-only; see [`Self::read_segment_page`].
     #[cfg(test)]
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn append_segment_page(
         &self,
         segment_id: [u8; 16],
@@ -610,7 +610,7 @@ impl<V: Vfs> Pager<V> {
     /// native-only (filesystem-backed VFS root); on wasm32 it never compiles
     /// in, leaving this unreachable there.
     #[cfg(not(target_arch = "wasm32"))]
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn stage_journal_page(
         &self,
         journal_id: [u8; 16],

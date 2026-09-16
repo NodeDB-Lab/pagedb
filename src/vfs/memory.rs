@@ -106,6 +106,9 @@ pub struct MemFile {
     writable: bool,
 }
 
+// These methods implement an async storage contract. Some finish immediately
+// in memory, but keeping the trait-shaped futures avoids a backend-specific API.
+#[allow(clippy::unused_async_trait_impl)]
 impl Vfs for MemVfs {
     type File = MemFile;
     type LockHandle = MemLockHandle;
@@ -221,6 +224,7 @@ impl Vfs for MemVfs {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl VfsFile for MemFile {
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let inode = self.inode.lock();
