@@ -459,6 +459,9 @@ mod shim {
 
     pub struct WasiFileShim;
 
+    // The non-WASI shim preserves the async VFS surface while refusing every
+    // operation immediately.
+    #[allow(clippy::unused_async_trait_impl)]
     impl VfsFile for WasiFileShim {
         async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize> {
             Err(PagedbError::Unsupported)
@@ -492,6 +495,7 @@ mod shim {
     /// Unreachable lock handle for the non-WASI shim.
     pub struct WasiLockHandleShim(());
 
+    #[allow(clippy::unused_async_trait_impl)]
     impl Vfs for WasiVfs {
         type File = WasiFileShim;
         type LockHandle = WasiLockHandleShim;

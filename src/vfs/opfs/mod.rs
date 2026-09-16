@@ -81,6 +81,9 @@ mod shim {
 
     pub struct OpfsFileShim;
 
+    // The native shim preserves the async VFS surface while refusing every
+    // operation immediately.
+    #[allow(clippy::unused_async_trait_impl)]
     impl VfsFile for OpfsFileShim {
         async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize> {
             Err(PagedbError::Unsupported)
@@ -114,6 +117,7 @@ mod shim {
     /// Unreachable lock handle for the native shim.
     pub struct OpfsLockHandleShim(());
 
+    #[allow(clippy::unused_async_trait_impl)]
     impl Vfs for OpfsVfs {
         type File = OpfsFileShim;
         type LockHandle = OpfsLockHandleShim;

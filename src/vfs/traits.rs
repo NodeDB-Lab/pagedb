@@ -596,6 +596,8 @@ mod tests {
         }
     }
 
+    // This synchronous test double implements the production async contract.
+    #[allow(clippy::unused_async_trait_impl)]
     impl VfsFile for ScriptedWriteFile {
         async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> crate::Result<usize> {
             unimplemented!("read_at is not used by write_all_at tests")
