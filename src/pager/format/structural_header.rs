@@ -26,6 +26,13 @@ pub const MAIN_FORMAT_VERSION: u16 = 1;
 /// versions, so they are bumped together or not at all.
 pub const SEGMENT_FORMAT_VERSION: u16 = 1;
 
+/// Main-header flag bits this build understands.
+///
+/// No flag currently changes `PageDB`'s behavior. A non-zero authenticated flag
+/// therefore describes a capability introduced by a newer build, and this
+/// build must refuse it instead of silently following its older path.
+pub const KNOWN_MAIN_HEADER_FLAGS: u32 = 0;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// All fields of a main.db A/B header. Matches the on-wire layout one-to-one.
@@ -89,7 +96,7 @@ fn validate_page_size_log2(log2: u8) -> Result<usize> {
     }
 }
 
-fn mac_hk(hk: &DerivedKey, bytes: &[u8]) -> Result<[u8; MAC_LEN]> {
+pub(crate) fn mac_hk(hk: &DerivedKey, bytes: &[u8]) -> Result<[u8; MAC_LEN]> {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(hk.as_bytes())
         .map_err(|_| PagedbError::Io(std::io::Error::other("hk key length")))?;
     mac.update(bytes);
@@ -246,6 +253,12 @@ pub fn decode_main_db_header(
     o += 1;
     let flags = u32_le(&bytes[o..o + 4]);
     o += 4;
+    // The MAC has verified by this point. Checking sooner would let an
+    // unauthenticated bit flip masquerade as a compatibility refusal.
+    let unknown_flags = flags & !KNOWN_MAIN_HEADER_FLAGS;
+    if unknown_flags != 0 {
+        return Err(PagedbError::HeaderCapabilityUnsupported { unknown_flags });
+    }
     let file_id = arr16(&bytes[o..o + 16]);
     o += 16;
     let kek_salt = arr16(&bytes[o..o + 16]);
@@ -522,6 +535,45 @@ mod tests {
         buf[300] = 0xAB;
         let err = decode_main_db_header(&buf, &hk, 4096).unwrap_err();
         assert!(matches!(err, PagedbError::Corruption(_)));
+    }
+
+    #[test]
+    fn main_unknown_authenticated_capability_is_refused() {
+        let hk = hk();
+        let mut fields = sample_main();
+        fields.flags = 1 << 7;
+        let buf = encode_main_db_header(&fields, &hk, 4096).unwrap();
+
+        match decode_main_db_header(&buf, &hk, 4096) {
+            Err(PagedbError::HeaderCapabilityUnsupported { unknown_flags }) => {
+                assert_eq!(unknown_flags, 1 << 7);
+            }
+            other => panic!("unknown capability must be refused precisely, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_unauthenticated_capability_bit_fails_the_mac_first() {
+        let hk = hk();
+        let buf = encode_main_db_header(&sample_main(), &hk, 4096).unwrap();
+
+        // The main-header flags occupy bytes 12..16.
+        let mut tampered = buf.clone();
+        tampered[12..16].copy_from_slice(&(1u32 << 7).to_le_bytes());
+        assert!(matches!(
+            decode_main_db_header(&tampered, &hk, 4096),
+            Err(PagedbError::Corruption(_))
+        ));
+
+        // Once the same bytes carry a valid MAC, the compatibility refusal is
+        // the correct diagnosis rather than corruption.
+        let end = tampered.len() - MAC_LEN;
+        let mac = mac_hk(&hk, &tampered[..end]).unwrap();
+        tampered[end..].copy_from_slice(&mac);
+        assert!(matches!(
+            decode_main_db_header(&tampered, &hk, 4096),
+            Err(PagedbError::HeaderCapabilityUnsupported { unknown_flags: 128 })
+        ));
     }
 
     #[test]

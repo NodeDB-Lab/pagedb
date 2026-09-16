@@ -176,6 +176,19 @@ pub enum PagedbError {
     )]
     FormatVersionUnsupported { stored: u16, supported: u16 },
 
+    /// The authenticated main header advertises a capability this build does
+    /// not implement.
+    ///
+    /// Distinct from corruption: the store is intact and was written by a
+    /// newer build. Opening it while ignoring the bit would silently select an
+    /// older behavior the writer explicitly moved away from. The store is not
+    /// modified.
+    #[error(
+        "store header advertises capabilities this build does not implement \
+         (unknown flag bits {unknown_flags:#010x}); the store was not modified"
+    )]
+    HeaderCapabilityUnsupported { unknown_flags: u32 },
+
     /// The caller opened the store with a different page size than it was
     /// created with.
     ///
