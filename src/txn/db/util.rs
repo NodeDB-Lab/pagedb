@@ -31,8 +31,8 @@ pub(super) fn get_vfs_root<V: Vfs + Clone>(vfs: &V) -> Result<std::path::PathBuf
 /// Read the `restore_mode` byte from the on-disk header of an existing
 /// `main.db` without fully opening the database.
 ///
-/// Tries both the A and B header slots. Returns the `restore_mode` byte from
-/// the first slot that verifies successfully under the given KEK.
+/// Authenticates both slots and rejects unsupported capabilities before
+/// returning the first understood slot's `restore_mode` under the given KEK.
 pub(super) async fn peek_restore_mode<V: Vfs + Clone>(
     vfs: &V,
     kek: &[u8; 32],
@@ -56,6 +56,7 @@ pub(super) async fn peek_restore_mode<V: Vfs + Clone>(
     super::open::header_probe::check_page_size(&buf_a, &buf_b, page_size)?;
     super::open::header_probe::check_format_version(&buf_a, &buf_b)?;
 
+    let mut restore_mode = None;
     for buf in [&buf_a, &buf_b] {
         if buf.len() < 56 {
             continue;
@@ -71,11 +72,19 @@ pub(super) async fn peek_restore_mode<V: Vfs + Clone>(
         let Ok(hk) = derive_hk(&mk) else {
             continue;
         };
-        if let Ok(fields) =
-            crate::pager::format::structural_header::decode_main_db_header(buf, &hk, page_size)
-        {
-            return Ok(fields.restore_mode);
+        match crate::pager::format::structural_header::decode_main_db_header(buf, &hk, page_size) {
+            Ok(fields) => {
+                // Keep the probe's existing first-understood-slot semantics,
+                // but inspect the other slot before returning: an authentic
+                // unknown capability must not disappear in this preflight.
+                restore_mode.get_or_insert(fields.restore_mode);
+            }
+            Err(error @ PagedbError::HeaderCapabilityUnsupported { .. }) => return Err(error),
+            Err(_) => {}
         }
+    }
+    if let Some(mode) = restore_mode {
+        return Ok(mode);
     }
     Err(super::open::header_probe::unverifiable_header_cause(
         &buf_a, &buf_b, page_size,

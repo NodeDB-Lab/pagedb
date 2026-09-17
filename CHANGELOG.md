@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Security
 
-- Opening a database now rejects authenticated main-header flag bits that this build does not implement, rather than silently accepting a store that may require a newer capability.
+- Opening a database now rejects main-header flag bits that this build does not implement when either slot authenticates, even if the alternate slot is understood. Unknown capabilities are not treated as torn writes; unauthenticated corruption still permits normal slot fallback.
 
 ## [0.1.0] - 2026-07-28
 

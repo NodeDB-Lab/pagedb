@@ -28,6 +28,10 @@ use super::recovery::recover_open_state;
 /// one `Option` cannot preserve both.
 type SlotDecode = (Option<(MainDbHeaderFields, bool)>, Option<PagedbError>);
 
+#[cfg(test)]
+#[path = "capability_tests.rs"]
+mod capability_tests;
+
 impl<V: Vfs + Clone> Db<V> {
     /// Like `open_existing` but with explicit memory budgets. Test-only, for
     /// the same reason.
@@ -176,6 +180,12 @@ impl<V: Vfs + Clone> Db<V> {
 
         let (a, a_capability) = try_decode(&buf_a);
         let (b, b_capability) = try_decode(&buf_b);
+        // An authenticated capability is not a torn write. Its meaning may
+        // affect the whole store, so even a newer understood alternate cannot
+        // establish that falling back is safe. Refuse before recovery or writes.
+        if let Some(error) = a_capability.or(b_capability) {
+            return Err(error);
+        }
         let (fields, active_slot, header_uses_primary) = match (a, b) {
             (Some(a), Some(b)) => {
                 if a.0.seq >= b.0.seq {
@@ -187,9 +197,6 @@ impl<V: Vfs + Clone> Db<V> {
             (Some(a), None) => (a.0, ActiveSlot::A, a.1),
             (None, Some(b)) => (b.0, ActiveSlot::B, b.1),
             (None, None) => {
-                if let Some(error) = a_capability.or(b_capability) {
-                    return Err(error);
-                }
                 // Neither slot verified. Whether that means "wrong key" or
                 // "damaged store" is not decidable from the MAC — but it is
                 // decidable from the framing around it, and the two demand
