@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Security
 
-- Key wrappers redact their `Debug` output, and their byte arrays are private so crate-internal diagnostics cannot accidentally format raw key material.
+- Key wrappers redact their `Debug` output; private tuple fields also prevent direct field formatting outside their module. Explicit internal byte access remains available for cryptographic operations and must not be logged.
 
 ## [0.1.0] - 2026-07-28
 

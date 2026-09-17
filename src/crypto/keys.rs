@@ -3,8 +3,10 @@
 //!
 //! # Formatting
 //!
-//! Every type here formats as a redacted placeholder and the byte array is
-//! private, so there is no safe-looking way to spell a key into a log line.
+//! Every wrapper formats as a redacted placeholder and its tuple field is
+//! private, preventing accidental wrapper or direct-field debug disclosure.
+//! Internal cryptographic code can still explicitly access the bytes through
+//! `as_bytes`; that material must not be logged.
 //!
 //! Both halves are load bearing. `Zeroizing<T>` derives `Debug` and forwards to
 //! the inner `T`, so a `pub(crate)` field was enough for
