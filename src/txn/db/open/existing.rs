@@ -23,6 +23,15 @@ use super::super::core::{Db, ReaderSnapshot, WriterState};
 use super::header_probe::{check_format_version, check_page_size, unverifiable_header_cause};
 use super::recovery::recover_open_state;
 
+/// One A/B slot's decoded fields and any authenticated capability refusal.
+/// A failed MAC and a verified header from a newer build are different answers;
+/// one `Option` cannot preserve both.
+type SlotDecode = (Option<(MainDbHeaderFields, bool)>, Option<PagedbError>);
+
+#[cfg(test)]
+#[path = "capability_tests.rs"]
+mod capability_tests;
+
 impl<V: Vfs + Clone> Db<V> {
     /// Like `open_existing` but with explicit memory budgets. Test-only, for
     /// the same reason.
@@ -135,9 +144,9 @@ impl<V: Vfs + Clone> Db<V> {
         check_page_size(&buf_a, &buf_b, page_size)?;
         check_format_version(&buf_a, &buf_b)?;
 
-        let try_decode = |buf: &[u8]| -> Option<(MainDbHeaderFields, bool)> {
+        let try_decode = |buf: &[u8]| -> SlotDecode {
             if buf.len() < 56 {
-                return None;
+                return (None, None);
             }
             let mut salt = [0u8; 16];
             salt.copy_from_slice(&buf[32..48]);
@@ -154,17 +163,29 @@ impl<V: Vfs + Clone> Db<V> {
                 let Ok(hk) = derive_hk(&mk) else {
                     continue;
                 };
-                if let Ok(fields) = crate::pager::format::structural_header::decode_main_db_header(
+                match crate::pager::format::structural_header::decode_main_db_header(
                     buf, &hk, page_size,
                 ) {
-                    return Some((fields, primary));
+                    Ok(fields) => return (Some((fields, primary)), None),
+                    // This key authenticated the slot, so trying a counterpart
+                    // cannot make its advertised capability disappear.
+                    Err(error @ PagedbError::HeaderCapabilityUnsupported { .. }) => {
+                        return (None, Some(error));
+                    }
+                    Err(_) => {}
                 }
             }
-            None
+            (None, None)
         };
 
-        let a = try_decode(&buf_a);
-        let b = try_decode(&buf_b);
+        let (a, a_capability) = try_decode(&buf_a);
+        let (b, b_capability) = try_decode(&buf_b);
+        // An authenticated capability is not a torn write. Its meaning may
+        // affect the whole store, so even a newer understood alternate cannot
+        // establish that falling back is safe. Refuse before recovery or writes.
+        if let Some(error) = a_capability.or(b_capability) {
+            return Err(error);
+        }
         let (fields, active_slot, header_uses_primary) = match (a, b) {
             (Some(a), Some(b)) => {
                 if a.0.seq >= b.0.seq {
@@ -332,5 +353,78 @@ impl<V: Vfs + Clone> Db<V> {
 
         recover_open_state(&db, &kek, counterpart_kek.as_ref(), &fields).await?;
         Ok(db)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pager::format::structural_header::{MAC_LEN, mac_hk};
+    use crate::vfs::VfsFile;
+    use crate::vfs::memory::MemVfs;
+    use crate::vfs::types::OpenMode;
+
+    const KEK: [u8; 32] = [0x3c; 32];
+    const REALM: RealmId = RealmId::new([0x3c; 16]);
+    const PAGE_SIZE: usize = 4096;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_capability_survives_ab_slot_selection() {
+        let vfs = MemVfs::new();
+        {
+            let db = Db::open_internal(vfs.clone(), KEK, PAGE_SIZE, REALM)
+                .await
+                .unwrap();
+            let mut write = db.begin_write().await.unwrap();
+            write.put(b"k", b"v").await.unwrap();
+            write.commit().await.unwrap();
+        }
+
+        // Turn every valid slot into an authentic header from a newer build.
+        // If this touched only one slot, open could correctly fall back to the
+        // older slot, which would not exercise the A/B error propagation.
+        let mut resealed = 0;
+        for slot in 0u64..2 {
+            let mut file = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+            let mut buf = vec![0u8; PAGE_SIZE];
+            let offset = slot * PAGE_SIZE as u64;
+            read_header_slot(&mut file, offset, &mut buf).await.unwrap();
+
+            let mut salt = [0u8; 16];
+            salt.copy_from_slice(&buf[32..48]);
+            let epoch = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+            let Ok(mk) = derive_mk(&KEK, &salt, epoch) else {
+                continue;
+            };
+            let hk = derive_hk(&mk).unwrap();
+            if crate::pager::format::structural_header::decode_main_db_header(&buf, &hk, PAGE_SIZE)
+                .is_err()
+            {
+                continue;
+            }
+
+            buf[12..16].copy_from_slice(&(1u32 << 7).to_le_bytes());
+            let end = PAGE_SIZE - MAC_LEN;
+            let mac = mac_hk(&hk, &buf[..end]).unwrap();
+            buf[end..].copy_from_slice(&mac);
+            let mut file = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+            file.write_at(offset, &buf).await.unwrap();
+            file.sync().await.unwrap();
+            resealed += 1;
+        }
+        assert_eq!(
+            resealed, 2,
+            "the fixture must carry two valid slots before both are upgraded"
+        );
+
+        match Db::open_existing(vfs, KEK, PAGE_SIZE, REALM).await {
+            Err(PagedbError::HeaderCapabilityUnsupported { unknown_flags }) => {
+                assert_eq!(unknown_flags, 1 << 7);
+            }
+            other => panic!(
+                "newer-store capability must survive A/B selection, got {:?}",
+                other.map(|_| "opened")
+            ),
+        }
     }
 }

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Opening a database now rejects main-header flag bits that this build does not implement when either slot authenticates, even if the alternate slot is understood. Unknown capabilities are not treated as torn writes; unauthenticated corruption still permits normal slot fallback.
+
 ## [0.1.0] - 2026-07-28
 
 The first release. Pre-releases were published as `0.1.0-beta.N`; the entries below describe `0.1.0` as a whole rather than deltas against a shipped version, since none exists yet.
