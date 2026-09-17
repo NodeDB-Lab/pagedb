@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Key wrappers redact their `Debug` output; private tuple fields also prevent direct field formatting outside their module. Explicit internal byte access remains available for cryptographic operations and must not be logged.
+
 ## [0.1.0] - 2026-07-28
 
 The first release. Pre-releases were published as `0.1.0-beta.N`; the entries below describe `0.1.0` as a whole rather than deltas against a shipped version, since none exists yet.
