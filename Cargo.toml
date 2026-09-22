@@ -1,5 +1,5 @@
 [workspace]
-members = ["benchmarks/engine-comparison"]
+members = ["benchmarks/engine-comparison", "wasm-smoke"]
 default-members = ["."]
 resolver = "3"
 
@@ -131,6 +131,9 @@ opfs = [
     "dep:send_wrapper",
     "dep:futures",
 ]
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = [

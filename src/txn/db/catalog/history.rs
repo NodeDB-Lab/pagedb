@@ -148,9 +148,7 @@ impl<V: Vfs + Clone> Db<V> {
                 state.commit_history_count = Some(total.saturating_sub(deleted));
             }
             crate::options::RetainPolicy::Age(duration) => {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
+                let now_secs = crate::clock::unix_seconds();
                 let threshold = now_secs.saturating_sub(duration.as_secs());
                 // History keys are the commit id big-endian, so lexicographic
                 // key order is commit order and the prunable rows are always a

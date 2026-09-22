@@ -21,6 +21,10 @@ No version has been released yet. Pre-releases are published as `0.1.0-beta.N`; 
 - **Open refusals name the parameter, not the store** — `KeyMismatch`, `PageSizeMismatch`, and `RealmMismatch`, each decided before anything is read or written, and none reported as corruption.
 - **Failures report themselves** — an unreadable free-list chain, main file, or segment catalog fails `stats()` instead of reporting zero; compaction never skips a catalog entry whose file it cannot open; segment open distinguishes a missing file from a permission or backend error; and only genuine contention is reported as contention. Persisted named-counter rows are validated at open, and commit-history keys are rejected unless exactly eight bytes.
 
+### Fixed
+
+- **Commits no longer need a wall clock.** `WriteTxn::commit` and the age-based retention threshold read `SystemTime::now()` directly, which panics on `wasm32-unknown-unknown` ("time not implemented on this platform") — the first write from an embedded build failed. Both go through `clock::unix_seconds()` now: `js_sys::Date::now()` on the OPFS build, std elsewhere, and `0` for a wasm build without the JS bindings instead of a panic. `wasm-smoke/` commits once per policy under node so the target stays covered.
+
 ### Security
 
 - Threat model documented in the README; disclosure policy in `SECURITY.md`.

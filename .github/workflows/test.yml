@@ -263,6 +263,39 @@ jobs:
         run: cargo check -p pagedb --target ${{ matrix.target }} --lib ${{ matrix.features }}
 
   # ─────────────────────────────────────────────────────────────────────────
+  # Runtime wasm coverage. The `wasm` job above only compiles: a wall-clock
+  # read inside the txn layer compiles fine on wasm32 and panics at the first
+  # commit ("time not implemented on this platform"), which is invisible to a
+  # check. This job runs the smoke crate under node.
+  wasm-tests:
+    name: WASM / node smoke (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust + target
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: wasm-smoke
+
+      # The runner must match the wasm-bindgen version the lockfile resolves,
+      # so read it from `cargo metadata` instead of pinning a number here.
+      - name: Install wasm-bindgen-test-runner
+        run: |
+          version=$(cargo metadata --format-version 1 --locked \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['version'] for p in d['packages'] if p['name']=='wasm-bindgen'))")
+          cargo install wasm-bindgen-cli --version "$version" --locked
+
+      - name: Run wasm smoke tests (node)
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test -p pagedb-wasm-smoke --target wasm32-unknown-unknown --test commit_smoke
+
+  # ─────────────────────────────────────────────────────────────────────────
   features:
     name: Feature matrix (${{ matrix.flags }})
     runs-on: ubuntu-latest
