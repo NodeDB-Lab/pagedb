@@ -620,15 +620,21 @@ mod tests {
             tree.free_page(id);
         }
 
+        // The loop is functional coverage on every target; the bound is a
+        // wall-clock regression guard, so it only runs where a clock exists.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let start = std::time::Instant::now();
         for _ in 0..N {
             tree.allocate_page();
         }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "{N} allocations against {N} held-back frees took {elapsed:?} — \
-             allocation is scanning the freed list again"
-        );
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "{N} allocations against {N} held-back frees took {elapsed:?} — \
+                 allocation is scanning the freed list again"
+            );
+        }
     }
 }

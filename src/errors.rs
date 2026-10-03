@@ -189,6 +189,15 @@ pub enum PagedbError {
     )]
     HeaderCapabilityUnsupported { unknown_flags: u32 },
 
+    /// A policy that prunes against `now` was requested on a build with no
+    /// clock, where a zero stand-in would silently prune nothing. Refused at
+    /// open, before the store is touched.
+    #[error(
+        "retain policy {policy} needs a wall clock and this target has none — \
+         use Unbounded or Count, or build with the `opfs` feature"
+    )]
+    RetainPolicyNeedsClock { policy: &'static str },
+
     /// The caller opened the store with a different page size than it was
     /// created with.
     ///

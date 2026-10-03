@@ -110,9 +110,9 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
 
         // Commit-history entry (also materialized here). Its frees are never
         // reader-pinned, so they fold into the free-list like any other.
-        let unix_seconds = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        // Ordering is by commit id, so a clockless build records 0; `Age` is
+        // refused at open there.
+        let unix_seconds = crate::clock::unix_seconds().unwrap_or(0);
         let history_meta = CommitHistoryMeta {
             active_root_page_id: new_root,
             catalog_root_page_id: new_catalog_root,

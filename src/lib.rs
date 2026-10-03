@@ -16,6 +16,7 @@
 // must not be able to reach around.
 pub(crate) mod btree;
 pub(crate) mod catalog;
+pub(crate) mod clock;
 pub(crate) mod compaction;
 pub(crate) mod crypto;
 pub(crate) mod diag;

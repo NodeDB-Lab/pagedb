@@ -1,0 +1,25 @@
+# wasm32 smoke tests for the OTHER wasm configuration: pagedb without `opfs`.
+#
+# Its sibling `wasm-smoke` depends on pagedb with `opfs`, which is the build
+# where a clock exists, so it can never compile this configuration. Nothing else
+# can either: `clock_available()` is decided by pagedb's own feature, and a
+# feature cannot be turned off from a test. A second crate is the only way to
+# build and run the no-clock configuration, and a crate of its own is needed for
+# the same reason as its sibling — pagedb's dev-dependencies (tokio
+# rt-multi-thread, tempfile) do not compile for wasm32, and Cargo builds every
+# dev-dependency for a crate's test targets.
+[package]
+name = "pagedb-wasm-smoke-no-clock"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Gated like the sibling crate so a native `cargo check --workspace` neither
+# builds pagedb twice nor needs the wasm toolchain.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen-test = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
+pagedb = { path = ".." }

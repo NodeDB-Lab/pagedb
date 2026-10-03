@@ -148,9 +148,10 @@ impl<V: Vfs + Clone> Db<V> {
                 state.commit_history_count = Some(total.saturating_sub(deleted));
             }
             crate::options::RetainPolicy::Age(duration) => {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
+                // `Age` is refused at open on a build without a clock, so
+                // the clock is present on every path that reaches this arm.
+                let now_secs = crate::clock::unix_seconds()
+                    .ok_or(PagedbError::RetainPolicyNeedsClock { policy: "Age" })?;
                 let threshold = now_secs.saturating_sub(duration.as_secs());
                 // History keys are the commit id big-endian, so lexicographic
                 // key order is commit order and the prunable rows are always a
@@ -455,5 +456,57 @@ mod tests {
                 .expect_err("malformed history key must surface");
             assert!(matches!(err, PagedbError::Corruption(_)));
         }
+    }
+
+    /// Age retention must actually prune, which it can only do when `now` is a
+    /// real time.
+    ///
+    /// This is the clocked half of the defect the wasm work fixed at the other
+    /// end. There the clock answered `0` for the whole build; the arithmetic is
+    /// the same one — `threshold = 0.saturating_sub(d)` is `0`, every recorded
+    /// timestamp compares as not older than it, the walk ends at the first row,
+    /// and `Age` silently behaves as `Unbounded`. So the assertion is that an
+    /// older entry really disappears: a `now` of zero cannot produce that, and
+    /// no error reports its absence.
+    ///
+    /// `Age(ZERO)` prunes every entry older than the current second, so the
+    /// wait only has to cross one second boundary, and no commit prunes the row
+    /// it just inserted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn age_retention_prunes_entries_older_than_its_threshold() {
+        use std::time::Duration;
+
+        let db = Db::open_internal_with_options(
+            MemVfs::new(),
+            [7u8; 32],
+            PAGE,
+            REALM,
+            OpenOptions::default().with_commit_history_retain(RetainPolicy::Age(Duration::ZERO)),
+        )
+        .await
+        .unwrap();
+
+        let oldest = db.begin_write().await.unwrap().commit().await.unwrap();
+        assert!(
+            db.begin_read_at(oldest).await.is_ok(),
+            "the only commit so far must be readable"
+        );
+
+        // Integer-second timestamps: 1.2 s crosses a boundary whichever
+        // fraction of a second the first commit landed on.
+        std::thread::sleep(Duration::from_millis(1200));
+        let newest = db.begin_write().await.unwrap().commit().await.unwrap();
+
+        assert!(
+            db.begin_read_at(newest).await.is_ok(),
+            "a commit must not prune the row it inserts"
+        );
+        let Err(pruned) = db.begin_read_at(oldest).await else {
+            panic!("an entry older than the age threshold must be pruned");
+        };
+        assert!(
+            matches!(pruned, PagedbError::CommitGone { .. }),
+            "a pruned commit is gone, not corruption and not a stall: {pruned:?}"
+        );
     }
 }

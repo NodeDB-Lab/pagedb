@@ -264,6 +264,14 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
         mode: DbMode,
     ) -> Result<Self> {
+        // Refuse a clock-dependent policy on a build with no clock, before
+        // anything is opened or touched; see
+        // `PagedbError::RetainPolicyNeedsClock`.
+        check_policy_needs_clock(
+            &options.commit_history_retain,
+            crate::clock::clock_available(),
+        )?;
+
         let capabilities = mode.open_capabilities();
         let bootstraps = capabilities.bootstraps() && counterpart_kek.is_none();
         let mut locks = Vec::new();
@@ -431,5 +439,80 @@ pub(super) fn map_lock_contention(
         on_contention()
     } else {
         error
+    }
+}
+
+/// Refuse a retention policy that cannot work without a wall clock.
+///
+/// `RetainPolicy::Age` decides what to prune by comparing each entry's recorded
+/// timestamp against `now - duration`. On a build with no clock there is no
+/// `now`: a stand-in zero makes every threshold zero, so no entry is ever older
+/// than it, the prune walk ends at its first row, and the policy behaves as
+/// `Unbounded` while still reporting itself as age-based — an unbounded history
+/// nobody asked for, and nothing in the API says so.
+///
+/// `Unbounded` prunes nothing by definition, `Count` prunes by ordinal, and
+/// `Disabled` keeps no history index at all, so none of the three consults time
+/// and none is refused. Taking `clock_available` as a parameter rather than
+/// reading it here is what makes both branches testable on a target that has a
+/// clock.
+pub(crate) fn check_policy_needs_clock(
+    policy: &crate::options::RetainPolicy,
+    clock_available: bool,
+) -> Result<()> {
+    if let crate::options::RetainPolicy::Age(_) = policy
+        && !clock_available
+    {
+        return Err(PagedbError::RetainPolicyNeedsClock { policy: "Age" });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod policy_clock_tests {
+    use super::check_policy_needs_clock;
+    use crate::options::RetainPolicy;
+    use crate::{PagedbError, Result};
+    use std::time::Duration;
+
+    /// The defect this guards: without a clock, age retention must be refused
+    /// rather than run against a zero threshold and silently prune nothing.
+    #[test]
+    fn age_is_refused_when_the_build_has_no_clock() {
+        let refused: Result<()> =
+            check_policy_needs_clock(&RetainPolicy::Age(Duration::from_secs(60)), false);
+        assert!(
+            matches!(
+                refused,
+                Err(PagedbError::RetainPolicyNeedsClock { policy: "Age" })
+            ),
+            "age retention must be refused by name when no clock exists"
+        );
+    }
+
+    /// With a clock it is served, so the refusal cannot be a blanket one.
+    #[test]
+    fn age_is_served_when_the_build_has_a_clock() {
+        assert!(
+            check_policy_needs_clock(&RetainPolicy::Age(Duration::from_secs(60)), true).is_ok()
+        );
+    }
+
+    /// `Unbounded` never prunes, `Count` prunes by ordinal, and `Disabled`
+    /// keeps no history index, so none reads the clock and none may be caught
+    /// by this check.
+    #[test]
+    fn clock_free_policies_are_never_refused() {
+        for policy in [
+            RetainPolicy::Unbounded,
+            RetainPolicy::Count(4),
+            RetainPolicy::Disabled,
+        ] {
+            assert!(
+                check_policy_needs_clock(&policy, false).is_ok(),
+                "consults no clock and must open without one"
+            );
+            assert!(check_policy_needs_clock(&policy, true).is_ok());
+        }
     }
 }
