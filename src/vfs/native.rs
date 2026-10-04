@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(vfs.list_dir("/seg").await.unwrap(), vec!["renamed"]);
         vfs.sync_dir("/seg").await.unwrap();
         vfs.remove("/seg/renamed").await.unwrap();
-        assert!(vfs.list_dir("/seg").await.unwrap().is_empty());
+        assert_eq!(vfs.list_dir("/seg").await.unwrap(), [] as [String; 0]);
 
         std::fs::remove_dir_all(&dir).ok();
     }

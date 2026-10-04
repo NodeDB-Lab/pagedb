@@ -1279,6 +1279,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pagedb-wasm-smoke"
+version = "0.0.0"
+dependencies = [
+ "pagedb",
+ "tokio",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

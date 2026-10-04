@@ -1028,7 +1028,8 @@ impl<V: Vfs> Pager<V> {
         let file_handle = self.open_file_handle(file).await?;
 
         // Observer-mode retry loop: on AEAD failure retry up to
-        // `observer_retry_count` times (10 ms backoff) to absorb torn reads
+        // `observer_retry_count` times (10 ms backoff, a yield where no time
+        // driver exists; see the per-target split below) to absorb torn reads
         // from a concurrent writer. In non-observer mode (retry_count == 0)
         // the loop body executes exactly once and any AEAD failure is a hard
         // corruption signal.
@@ -1044,7 +1045,17 @@ impl<V: Vfs> Pager<V> {
         let mut last_envelope: Option<crate::diag::PageEnvelope> = None;
         for attempt in 0..max_attempts {
             if attempt > 0 {
+                // Yield the executor on `wasm32-unknown-unknown` rather than
+                // sleeping: this loop runs on an embedder's single-threaded
+                // executor, which has no Tokio time driver, and
+                // `tokio::time::sleep` panics without one. That panic would
+                // replace the corruption this loop exists to report with a
+                // crash. Every other target sleeps, so a torn read still gets
+                // its backoff.
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                tokio::task::yield_now().await;
             }
             let mut buf = vec![0u8; page_size];
             {

@@ -327,7 +327,7 @@ mod tests {
         let provenance = db.page_provenance(page_id).await.unwrap();
         assert_eq!(provenance.standing, PageStanding::Free);
         assert_eq!(provenance.freed_by_commit, Some(commit_id));
-        assert!(provenance.reachable_from.is_empty());
+        assert_eq!(provenance.reachable_from, [] as [&str; 0]);
         assert!(!provenance.is_double_owned());
     }
 

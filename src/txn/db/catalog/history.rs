@@ -454,4 +454,53 @@ mod tests {
             assert!(matches!(err, PagedbError::Corruption(_)));
         }
     }
+
+    /// Age retention must prune, which it can only do against a real clock.
+    ///
+    /// The threshold is `now - duration`, so a clock that answers `0` makes
+    /// every threshold `0`: no recorded timestamp is older than it, the walk
+    /// ends at its first row, and `Age` behaves as `Unbounded` while still
+    /// reporting itself as age-based. Nothing in the API reports that absence,
+    /// the store simply keeps everything.
+    ///
+    /// `Age(ZERO)` prunes every entry older than the current second, so the wait
+    /// only has to cross one second boundary, and a commit never prunes the row
+    /// it just inserted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn age_retention_prunes_entries_older_than_its_threshold() {
+        use std::time::Duration;
+
+        let db = Db::open_internal_with_options(
+            MemVfs::new(),
+            [7u8; 32],
+            PAGE,
+            REALM,
+            OpenOptions::default().with_commit_history_retain(RetainPolicy::Age(Duration::ZERO)),
+        )
+        .await
+        .unwrap();
+
+        let oldest = db.begin_write().await.unwrap().commit().await.unwrap();
+        assert!(
+            db.begin_read_at(oldest).await.is_ok(),
+            "the only commit so far must be readable"
+        );
+
+        // Integer-second timestamps: 1.2 s crosses a boundary whichever
+        // fraction of a second the first commit landed on.
+        std::thread::sleep(Duration::from_millis(1200));
+        let newest = db.begin_write().await.unwrap().commit().await.unwrap();
+
+        assert!(
+            db.begin_read_at(newest).await.is_ok(),
+            "a commit must not prune the row it inserts"
+        );
+        let Err(pruned) = db.begin_read_at(oldest).await else {
+            panic!("an entry older than the age threshold must be pruned");
+        };
+        assert!(
+            matches!(pruned, PagedbError::CommitGone { .. }),
+            "a pruned commit is gone, not corruption and not a stall: {pruned:?}"
+        );
+    }
 }

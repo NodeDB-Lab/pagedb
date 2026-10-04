@@ -1,7 +1,7 @@
 //! A failed post-header segment reconciliation poisons only the active handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pagedb::vfs::memory::{MemFile, MemLockHandle, MemVfs};
 use pagedb::vfs::{OpenMode, Vfs};
@@ -16,7 +16,7 @@ struct RenameFaultVfs {
     inner: MemVfs,
     fail_renames: Arc<AtomicBool>,
     fail_sync_dirs: Arc<AtomicBool>,
-    failures_remaining: Arc<AtomicUsize>,
+    fail_rename_once: Arc<AtomicBool>,
 }
 
 impl RenameFaultVfs {
@@ -25,7 +25,7 @@ impl RenameFaultVfs {
             inner: MemVfs::new(),
             fail_renames: Arc::new(AtomicBool::new(false)),
             fail_sync_dirs: Arc::new(AtomicBool::new(false)),
-            failures_remaining: Arc::new(AtomicUsize::new(0)),
+            fail_rename_once: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -34,7 +34,7 @@ impl RenameFaultVfs {
     }
 
     fn fail_next_rename(&self) {
-        self.failures_remaining.store(1, Ordering::SeqCst);
+        self.fail_rename_once.store(true, Ordering::SeqCst);
     }
 
     fn fail_sync_dirs(&self, fail: bool) {
@@ -55,12 +55,7 @@ impl Vfs for RenameFaultVfs {
     }
 
     async fn rename(&self, from: &str, to: &str) -> pagedb::Result<()> {
-        let fail_once = self
-            .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok();
+        let fail_once = self.fail_rename_once.swap(false, Ordering::SeqCst);
         if self.fail_renames.load(Ordering::SeqCst) || fail_once {
             return Err(PagedbError::Io(std::io::Error::other(
                 "injected segment reconciliation failure",

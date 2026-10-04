@@ -1,5 +1,5 @@
 [workspace]
-members = ["benchmarks/engine-comparison"]
+members = ["benchmarks/engine-comparison", "wasm-smoke"]
 default-members = ["."]
 resolver = "3"
 

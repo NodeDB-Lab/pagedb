@@ -1,0 +1,19 @@
+# wasm32 smoke tests for pagedb.
+#
+# Separate crate on purpose: the pagedb dev-dependencies (tokio
+# rt-multi-thread, tempfile) do not compile for wasm32, and Cargo builds every
+# dev-dependency for a crate's test targets. This crate depends on pagedb with
+# the `opfs` feature only.
+[package]
+name = "pagedb-wasm-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen-test = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "time"] }
+pagedb = { path = "..", features = ["opfs"] }

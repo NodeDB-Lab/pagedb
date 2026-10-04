@@ -565,7 +565,7 @@ mod tests {
         let mut tree = fresh_tree(None).await;
         tree.free_page(9);
         assert_eq!(tree.allocate_page(), 9);
-        assert!(tree.drain_freed().is_empty());
+        assert_eq!(tree.drain_freed(), [] as [u64; 0]);
     }
 
     /// Eligibility is settled at the moment of the free and does not change
