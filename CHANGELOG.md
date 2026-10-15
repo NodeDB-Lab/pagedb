@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
-No version has been released yet. Pre-releases are published as `0.1.0-beta.N`; the entries below describe the upcoming `0.1.0` as a whole rather than deltas against a shipped version, since none exists.
+## [0.1.0] - 2026-10-15
+
+The first stable release. The entries describe `0.1.0` as a whole. The `0.1.0-beta.N` pre-releases have no entries of their own.
 
 ### Added
 
@@ -37,3 +39,6 @@ No version has been released yet. Pre-releases are published as `0.1.0-beta.N`; 
 - Single-writer per database; multi-writer cross-process is not supported.
 - Writes carry per-page AEAD and copy-on-write overhead; for throughput-bound plaintext KV workloads a generic store may be faster.
 - Applying an incremental snapshot stages a full copy of `main.db` alongside the original, so a follower needs room for two copies during an apply.
+
+[Unreleased]: https://github.com/NodeDB-Lab/pagedb/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/NodeDB-Lab/pagedb/releases/tag/v0.1.0
