@@ -82,9 +82,6 @@ jobs:
       - name: Install LLVM/Clang
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
 
-      - name: Set version from tag
-        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
-
       - name: Publish pagedb
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -105,9 +102,7 @@ jobs:
           fi
 
           echo "Publishing pagedb@$VERSION..."
-          # --allow-dirty: stamp_version.sh may have edited Cargo.toml for a
-          # prerelease tag; the verifying publish still runs.
-          cargo publish -p pagedb --allow-dirty
+          cargo publish -p pagedb
 
   # ── GitHub Release ───────────────────────────────────────────────────────────
   # Independent of publish-crate: a crates.io outage must not block cutting the

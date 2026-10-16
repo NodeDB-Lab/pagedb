@@ -83,10 +83,6 @@ jobs:
         with:
           prefix-key: fsck-${{ matrix.target }}
 
-      - name: Set version from tag
-        shell: bash
-        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
-
       - name: Build pagedb-fsck
         run: cargo build --release --bin pagedb-fsck --target ${{ matrix.target }}
 
