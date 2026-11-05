@@ -50,8 +50,10 @@ impl<V: Vfs + Clone> Db<V> {
             // Whatever this attempt produced went to the scratch or to the page
             // cache, never to `main.db`. Drop both so the base image is read
             // back from disk and no partially-built state survives the retry.
+            // A cache fault here stays latched for the next operation, and the
+            // caller receives the original error.
             self.pager.discard_dirty_main(self.realm_id);
-            self.pager.reset_main_pages();
+            let _ = self.pager.reset_main_pages();
             discard_staged_image(&*self.vfs, &staged_image).await;
         }
         outcome

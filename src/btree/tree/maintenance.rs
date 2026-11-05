@@ -638,7 +638,7 @@ mod tests {
             .await
             .unwrap();
         db.pager.flush_main(REALM).await.unwrap();
-        db.pager.reset_main_pages();
+        db.pager.reset_main_pages().unwrap();
 
         let tree = BTree::open(db.pager.clone(), REALM, forged, forged + 1, db.page_size);
         let error = tree.rekey_walk().await.unwrap_err();

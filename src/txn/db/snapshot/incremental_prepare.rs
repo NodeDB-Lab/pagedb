@@ -94,7 +94,7 @@ impl<V: Vfs + Clone> Db<V> {
         // Authenticate the target through a read-only view of the staged image.
         // Cached base pages are dropped first so the view's buffer pool and the
         // live one are not both resident at their full configured budget.
-        self.pager.reset_main_pages();
+        self.pager.reset_main_pages()?;
         let staged_view = Arc::new(self.pager.open_main_view(staged_image.to_owned()));
         let target_page_ids = collect_tree_page_ids(
             &staged_view,

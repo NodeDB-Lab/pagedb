@@ -62,7 +62,7 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
     let mut cursor: Vec<u8> = Vec::new();
     loop {
         db.pager.flush_main_to(db.realm_id, scratch).await?;
-        db.pager.reset_main_pages();
+        db.pager.reset_main_pages()?;
 
         let batch = source
             .collect_batch_from(&cursor, REPACK_RECORD_BATCH)
@@ -94,7 +94,7 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
         // resident compacted page at the same page id.
         if db.pager.main_dirty_at_budget() {
             db.pager.flush_main_to(db.realm_id, scratch).await?;
-            db.pager.reset_main_pages();
+            db.pager.reset_main_pages()?;
         }
 
         if exhausted {

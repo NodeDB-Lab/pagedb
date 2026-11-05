@@ -473,6 +473,22 @@ pub enum PagedbError {
         detail: &'static str,
     },
 
+    /// The in-memory page cache broke one of its own invariants. `operation` names
+    /// what was running, `detail` what it found, `slot` the slab slot when one is
+    /// known. The cache is memory only, so no fault is known in the store files and
+    /// quarantine does not apply. Every later operation on this cache reports
+    /// this error. Close the handle and reopen, which rebuilds the cache.
+    #[error(
+        "page cache state invalid during {operation}: {detail} (slot {slot:?}); no fault is \
+         known in the store files, do not quarantine; close this handle and reopen to rebuild \
+         the cache"
+    )]
+    PageCacheStateInvalid {
+        operation: &'static str,
+        detail: &'static str,
+        slot: Option<usize>,
+    },
+
     /// The requested operation is not implemented by the current backend or
     /// target — e.g. `mmap_view` on WASM (no native mmap) or an unknown
     /// on-wire cipher id. Nothing the caller does at runtime resolves it

@@ -237,6 +237,22 @@ impl PagedbError {
         Self::VfsContractViolated { operation, detail }
     }
 
+    /// Canonical constructor for a page cache that broke its own invariant.
+    /// It raises no corruption report, because no fault is known in the store.
+    #[cold]
+    #[must_use]
+    pub const fn page_cache_state_invalid(
+        operation: &'static str,
+        detail: &'static str,
+        slot: Option<usize>,
+    ) -> Self {
+        Self::PageCacheStateInvalid {
+            operation,
+            detail,
+            slot,
+        }
+    }
+
     /// Canonical constructor for a rekey admission that needs both KEKs.
     #[must_use]
     pub const fn rekey_resume_key_required(source_epoch: u64, target_epoch: u64) -> Self {

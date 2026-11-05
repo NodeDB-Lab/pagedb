@@ -353,8 +353,13 @@ impl<V: Vfs + Clone> Db<V> {
             return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
         }
         // The staged image is the live image now, so every main page cached
-        // from the base predates it.
-        self.pager.reset_main_pages();
+        // from the base predates it. A failed reset leaves those pages resident,
+        // so the handle poisons and reopen is the way out.
+        if self.pager.reset_main_pages().is_err() {
+            let commit = crate::CommitId(new_commit_id);
+            self.poison(commit);
+            return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
+        }
         if self.vfs.sync_dir(self.main_db_parent_dir()).await.is_err() {
             let commit = crate::CommitId(new_commit_id);
             self.poison(commit);

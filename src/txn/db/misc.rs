@@ -56,8 +56,8 @@ impl<V: Vfs + Clone> Db<V> {
     /// invites exactly that dependency. A test that needs a cold read from
     /// outside the crate reopens the handle instead.
     #[cfg(test)]
-    pub(crate) fn evict_main_pages(&self, realm: crate::RealmId) {
-        self.pager.evict_clean_main_pages(realm);
+    pub(crate) fn evict_main_pages(&self, realm: crate::RealmId) -> Result<()> {
+        self.pager.evict_clean_main_pages(realm)
     }
 
     /// Current size of `main.db` in bytes, read from the file rather than from
@@ -271,7 +271,7 @@ mod tests {
         }
         let before = db.stats().await.unwrap();
 
-        db.evict_main_pages(REALM);
+        db.evict_main_pages(REALM).unwrap();
 
         let reader = db.begin_read().await.unwrap();
         assert_eq!(

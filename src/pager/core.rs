@@ -668,7 +668,7 @@ impl<V: Vfs> Pager<V> {
     pub async fn remove_journal(&self, journal_id: [u8; 16]) -> Result<()> {
         let key = FileKey::ApplyJournal(journal_id);
         self.files.lock().await.remove(&key);
-        self.inner.cache_for_key(key).lock().clear_file(key);
+        self.inner.cache_for_key(key).lock().clear_file(key)?;
         self.journal_nonces.lock().remove(&journal_id);
         let path = format!("applyjournal/{}", crate::hex::to_hex_lower(&journal_id));
         self.vfs.remove(&path).await?;
@@ -678,9 +678,13 @@ impl<V: Vfs> Pager<V> {
     /// Drop an apply-journal sidecar's cached pages without removing the file,
     /// forcing subsequent reads to AEAD-decrypt from disk.
     #[cfg(test)]
-    pub(crate) fn drop_journal_cache(&self, journal_id: [u8; 16]) {
+    pub(crate) fn drop_journal_cache(&self, journal_id: [u8; 16]) -> Result<()> {
         let key = FileKey::ApplyJournal(journal_id);
-        self.inner.cache_for_key(key).lock().clear_file(key);
+        self.inner
+            .cache_for_key(key)
+            .lock()
+            .clear_file(key)
+            .map_err(PagedbError::from)
     }
 
     /// Flush all dirty main.db pages to the VFS in physical-id order.
@@ -714,8 +718,12 @@ impl<V: Vfs> Pager<V> {
     /// Used after compaction replaces main.db (the cached pages no longer match
     /// the on-disk file) and on a failed compaction (to discard the partially
     /// built, never-persisted compacted pages).
-    pub fn reset_main_pages(&self) {
-        self.inner.buffer_pool.lock().clear_file(FileKey::Main);
+    pub fn reset_main_pages(&self) -> Result<()> {
+        self.inner
+            .buffer_pool
+            .lock()
+            .clear_file(FileKey::Main)
+            .map_err(PagedbError::from)
     }
 
     /// Close the cached main.db file handle. The next access reopens the file.
@@ -900,7 +908,7 @@ impl<V: Vfs> Pager<V> {
         let file = FileKey::Main;
         let over_budget = {
             let mut cache = self.inner.cache_for_key(file).lock();
-            cache.mark_dirty((file, page_id));
+            cache.mark_dirty((file, page_id))?;
             cache.dirty_len() >= self.cfg.buffer_pool_pages.max(1)
         };
         drop(guard);
@@ -916,11 +924,17 @@ impl<V: Vfs> Pager<V> {
     /// buffer pool but will never be flushed (the next commit starts from the
     /// last durable root). A subsequent read that misses the cache will
     /// re-fetch the last persisted ciphertext from disk.
+    ///
+    /// Callers include a drop, so this returns nothing. A cache fault stops the
+    /// loop and stays latched. The latch then refuses every later flush, so the
+    /// pages still marked dirty never reach disk.
     pub fn discard_dirty_main(&self, _realm_id: crate::RealmId) {
         let mut cache = self.inner.buffer_pool.lock();
         let dirty_ids = cache.dirty_for_file(FileKey::Main);
         for pid in dirty_ids {
-            cache.clear_dirty((FileKey::Main, pid));
+            if cache.clear_dirty((FileKey::Main, pid)).is_err() {
+                return;
+            }
         }
     }
 
@@ -931,11 +945,12 @@ impl<V: Vfs> Pager<V> {
     /// accessor that is its sole caller: correctness never depends on whether a
     /// page is warm, so nothing in the shipped crate should be steering that.
     #[cfg(test)]
-    pub fn evict_clean_main_pages(&self, _realm_id: crate::RealmId) {
+    pub fn evict_clean_main_pages(&self, _realm_id: crate::RealmId) -> Result<()> {
         self.inner
             .buffer_pool
             .lock()
-            .clear_clean_file(FileKey::Main);
+            .clear_clean_file(FileKey::Main)
+            .map_err(PagedbError::from)
     }
 
     fn write_page(
@@ -958,8 +973,8 @@ impl<V: Vfs> Pager<V> {
         let page = Arc::new(Page::new_with_meta(buf, page_kind.as_byte(), realm_id.0));
         let cache_lock = self.inner.cache_for_key(file);
         let mut cache = cache_lock.lock();
-        let _ = cache.insert((file, page_id), page);
-        cache.mark_dirty((file, page_id));
+        cache.insert((file, page_id), page)?;
+        cache.mark_dirty((file, page_id))?;
         // Suppress unused warnings; these are used at flush time.
         let _ = realm_id;
         let _ = segment_id;
@@ -987,7 +1002,7 @@ impl<V: Vfs> Pager<V> {
         // Cache fast-path: verify realm matches to prevent cross-realm hits.
         {
             let mut cache = self.inner.cache_for_key(file).lock();
-            if let Some((page, slot)) = cache.get_and_pin((file, page_id)) {
+            if let Some((page, slot)) = cache.get_and_pin((file, page_id))? {
                 if page.realm_id_bytes != Some(realm_id.0) {
                     cache.unpin_at(slot, (file, page_id));
                     return Err(PagedbError::ChecksumFailure);
@@ -1128,8 +1143,7 @@ impl<V: Vfs> Pager<V> {
                 Ok(_page_kind) => {
                     let page = Arc::new(Page::new_with_meta(buf, auth_kind.as_byte(), realm_id.0));
                     let mut cache = self.inner.cache_for_key(file).lock();
-                    let (_evicted, slot) = cache.insert_and_index((file, page_id), page.clone());
-                    cache.pin_at(slot);
+                    let slot = cache.insert_and_pin((file, page_id), page.clone())?;
                     return Ok((
                         PageGuard {
                             page,
@@ -1216,7 +1230,12 @@ impl<V: Vfs> Pager<V> {
         if self.read_only.load(AtomOrd::SeqCst) {
             return Err(PagedbError::ReadOnly);
         }
-        let dirty_ids = self.inner.cache_for_key(file).lock().dirty_for_file(file);
+        let dirty_ids = {
+            let cache = self.inner.cache_for_key(file).lock();
+            // An empty dirty set must not hide a latched fault as a clean flush.
+            cache.check_usable()?;
+            cache.dirty_for_file(file)
+        };
         if dirty_ids.is_empty() {
             return Ok(());
         }
@@ -1237,7 +1256,7 @@ impl<V: Vfs> Pager<V> {
                 .inner
                 .cache_for_key(file)
                 .lock()
-                .get((file, *pid))
+                .get_dirty((file, *pid))?
                 .ok_or_else(|| {
                     PagedbError::Io(std::io::Error::other("dirty page missing from cache"))
                 })?;
@@ -1366,9 +1385,9 @@ impl<V: Vfs> Pager<V> {
         // A replaced page keeps its flag and flushes on the next cycle.
         let mut cache = self.inner.cache_for_key(file).lock();
         for (pid, snapshot) in gathered {
-            match cache.get((file, pid)) {
+            match cache.get((file, pid))? {
                 Some(current) if Arc::ptr_eq(&current, &snapshot) => {
-                    cache.clear_dirty((file, pid));
+                    cache.clear_dirty((file, pid))?;
                 }
                 _ => {
                     tracing::debug!(
@@ -1532,7 +1551,12 @@ mod tests {
             .await
             .unwrap();
         pager.flush_main(realm).await.unwrap();
-        pager.inner.buffer_pool.lock().clear_file(FileKey::Main);
+        pager
+            .inner
+            .buffer_pool
+            .lock()
+            .clear_file(FileKey::Main)
+            .unwrap();
         let misses_before = pager.inner.buffer_pool_misses.load(AtomOrd::Relaxed);
 
         let (guard, kind) = pager.read_main_node(8, realm).await.unwrap();
@@ -1637,12 +1661,14 @@ mod tests {
             assert_eq!(
                 cache
                     .get((FileKey::Main, 1))
+                    .unwrap()
                     .map(|page| page.realm_id_bytes),
                 Some(Some(zero_realm.0))
             );
             assert_eq!(
                 cache
                     .get((FileKey::Main, 2))
+                    .unwrap()
                     .map(|page| page.realm_id_bytes),
                 Some(Some(nonzero_realm.0))
             );
@@ -1729,5 +1755,122 @@ mod tests {
         }
         let dirty = pager.inner.buffer_pool.lock().dirty_for_file(FileKey::Main);
         assert_eq!(dirty.len(), 4);
+    }
+
+    /// Write and flush page 1, then read it back to learn its slab slot.
+    async fn flushed_page_slot(pager: &Pager<MemVfs>, realm: RealmId) -> usize {
+        let body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
+        pager
+            .write_main_page(1, realm, PageKind::BTreeLeaf, &body)
+            .await
+            .unwrap();
+        pager.flush_main(realm).await.unwrap();
+        let guard = pager
+            .read_main_page(1, realm, PageKind::BTreeLeaf)
+            .await
+            .unwrap();
+        guard.slot
+    }
+
+    fn assert_dead_slot_fault(err: &PagedbError, expected_operation: &str, expected_slot: usize) {
+        assert!(
+            matches!(
+                err,
+                PagedbError::PageCacheStateInvalid {
+                    operation,
+                    detail: "slot holds no entry",
+                    slot: Some(slot),
+                } if *operation == expected_operation && *slot == expected_slot
+            ),
+            "expected a dead-slot fault from {expected_operation}, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guard_drop_on_a_dead_slot_fails_the_next_read() {
+        let pager = mk_pager().await;
+        let realm = RealmId([7; 16]);
+        let slot = flushed_page_slot(&pager, realm).await;
+
+        let guard = pager
+            .read_main_page(1, realm, PageKind::BTreeLeaf)
+            .await
+            .unwrap();
+        pager.inner.buffer_pool.lock().clear_slot(slot);
+        drop(guard);
+
+        let err = pager
+            .read_main_page(2, realm, PageKind::BTreeLeaf)
+            .await
+            .err()
+            .unwrap();
+        assert_dead_slot_fault(&err, "unpin_at", slot);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_on_a_dead_slot_fails_the_next_flush() {
+        let pager = mk_pager().await;
+        let realm = RealmId([7; 16]);
+        let slot = flushed_page_slot(&pager, realm).await;
+        let body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
+        pager
+            .write_main_page(1, realm, PageKind::BTreeLeaf, &body)
+            .await
+            .unwrap();
+
+        pager.inner.buffer_pool.lock().clear_slot(slot);
+        pager.discard_dirty_main(realm);
+
+        let err = pager.flush_main(realm).await.unwrap_err();
+        assert_dead_slot_fault(&err, "clear_dirty", slot);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn latched_fault_fails_a_flush_with_nothing_dirty() {
+        let pager = mk_pager().await;
+        let realm = RealmId([7; 16]);
+        let slot = flushed_page_slot(&pager, realm).await;
+        assert_eq!(
+            pager.inner.buffer_pool.lock().dirty_for_file(FileKey::Main),
+            Vec::<u64>::new()
+        );
+
+        let guard = pager
+            .read_main_page(1, realm, PageKind::BTreeLeaf)
+            .await
+            .unwrap();
+        pager.inner.buffer_pool.lock().clear_slot(slot);
+        drop(guard);
+
+        let err = pager.flush_main(realm).await.unwrap_err();
+        assert_dead_slot_fault(&err, "unpin_at", slot);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dirty_page_missing_at_flush_is_a_typed_fault() {
+        let pager = mk_pager().await;
+        let realm = RealmId([7; 16]);
+        let body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
+        pager
+            .write_main_page(1, realm, PageKind::BTreeLeaf, &body)
+            .await
+            .unwrap();
+        {
+            let mut cache = pager.inner.buffer_pool.lock();
+            cache.forget_key((FileKey::Main, 1));
+        }
+
+        let err = pager.flush_main(realm).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PagedbError::PageCacheStateInvalid {
+                    operation: "get_dirty",
+                    detail: "dirty page not resident",
+                    slot: None,
+                }
+            ),
+            "got: {err:?}"
+        );
     }
 }

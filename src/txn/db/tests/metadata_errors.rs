@@ -961,7 +961,7 @@ async fn stats_surfaces_free_list_read_error_then_retry_succeeds() {
     // read fault only reaches the VFS on a cold read, so drop the cached pages —
     // otherwise `stats` answers from memory and the injected failure is never
     // reached, which would test nothing.
-    db.pager.reset_main_pages();
+    db.pager.reset_main_pages().unwrap();
     vfs.fail_main_db_read_at.store(true, Ordering::SeqCst);
     let err = db
         .stats()

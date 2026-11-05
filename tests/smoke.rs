@@ -57,6 +57,7 @@ fn every_variant_displays() {
             "read_at",
             "reported more bytes than the caller requested",
         ),
+        PagedbError::page_cache_state_invalid("unpin_at", "release without a pin", Some(3)),
         PagedbError::footer_framing_invalid("magic"),
         PagedbError::node_body_malformed("slot_directory"),
         PagedbError::node_kind_mismatch(Some(7), "leaf", "internal"),

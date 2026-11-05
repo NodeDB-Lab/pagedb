@@ -408,7 +408,7 @@ async fn rekey_preserves_preexisting_main_reader_snapshot_after_cache_evict() {
     }
 
     db.rekey_db(KEK0, 1).await.unwrap();
-    db.evict_main_pages(REALM);
+    db.evict_main_pages(REALM).unwrap();
 
     assert_eq!(
         reader.get(b"versioned").await.unwrap().as_deref(),

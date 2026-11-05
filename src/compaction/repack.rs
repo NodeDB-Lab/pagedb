@@ -70,8 +70,9 @@ pub(super) async fn atomic_dense_repack<V: Vfs + Clone>(
         Err(e) => {
             // Nothing was written to main.db; drop the never-persisted compacted
             // pages from the cache so the old tree is read back from disk, and
-            // remove the partial scratch.
-            db.pager.reset_main_pages();
+            // remove the partial scratch. A cache fault here stays latched for
+            // the next operation, and the caller receives the original error.
+            let _ = db.pager.reset_main_pages();
             db.vfs.remove(&scratch).await.ok();
             Err(e)
         }
@@ -242,7 +243,13 @@ async fn commit_swap<V: Vfs + Clone>(
     state.commit_history_root_page_id = 0;
     state.commit_history_root_version = 0;
     state.free_list_root_page_id = 0;
-    db.pager.reset_main_pages();
+    // The rename is durable, so a failed reset leaves old-image pages resident.
+    // Reads must never see them, so the handle poisons and reopen is the way out.
+    if db.pager.reset_main_pages().is_err() {
+        let commit = crate::CommitId(new_commit_id);
+        db.poison(commit);
+        return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
+    }
 
     if db.vfs.sync_dir(db.main_db_parent_dir()).await.is_err() {
         let commit = crate::CommitId(new_commit_id);

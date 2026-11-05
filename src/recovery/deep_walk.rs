@@ -954,7 +954,7 @@ mod tests {
             .await
             .unwrap();
         db.pager.flush_main(REALM).await.unwrap();
-        db.pager.reset_main_pages();
+        db.pager.reset_main_pages().unwrap();
     }
 
     fn issue_matching(report: &DeepWalkReport, page_id: u64, needle: &str) -> bool {
