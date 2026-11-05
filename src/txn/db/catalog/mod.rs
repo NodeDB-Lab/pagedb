@@ -3,4 +3,5 @@
 
 pub(crate) mod counters;
 pub(crate) mod history;
+pub(crate) mod history_policy;
 pub(crate) mod quotas;

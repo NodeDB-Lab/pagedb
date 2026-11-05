@@ -79,9 +79,7 @@ impl<V: Vfs> BTree<V> {
     /// silently drop records at the top of the keyspace (`[0xFF; N]` and any
     /// key extending it). Callers that need the whole tree must use this.
     ///
-    /// Serves the native-only incremental-snapshot apply path (`history_carry`);
-    /// gate it the same way.
-    #[cfg(any(test, not(target_arch = "wasm32")))]
+    /// `history_carry` calls this on every target, because rekey prunes rows too.
     pub async fn collect_all(&self) -> Result<Vec<(Bytes, Bytes)>> {
         if self.root_page_id == 0 {
             return Ok(Vec::new());

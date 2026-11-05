@@ -343,6 +343,11 @@ impl<V: Vfs + Clone> Db<V> {
                 ),
                 free_list_entries: None,
                 commit_history_root_page_id: fields.commit_history_root_page_id,
+                history_rows_abandoned:
+                    super::super::catalog::history_policy::history_rows_abandoned(
+                        fields.commit_retain_policy_tag,
+                        fields.commit_history_root_page_id,
+                    ),
             })),
             poisoned_commit: parking_lot::Mutex::new(None),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),

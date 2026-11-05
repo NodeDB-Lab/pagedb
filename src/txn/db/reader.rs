@@ -13,6 +13,7 @@ use super::super::policy::ReaderStallPolicy;
 use super::super::read::ReadTxn;
 use super::super::write::WriteTxn;
 use super::DbModeCapabilities;
+use super::catalog::history_policy::history_rows_abandoned;
 use super::core::{Db, ReaderSnapshot, TrackedReader, WriterState, decode_commit_meta};
 
 impl<V: Vfs + Clone> Db<V> {
@@ -75,6 +76,10 @@ impl<V: Vfs + Clone> Db<V> {
             free_list_root_page_id: state.free_list_root_page_id,
             free_list_entries: state.free_list_entries,
             commit_history_root_page_id: state.commit_history_root_page_id,
+            history_rows_abandoned: history_rows_abandoned(
+                state.commit_retain_policy_tag,
+                state.commit_history_root_page_id,
+            ),
         };
     }
 
@@ -153,12 +158,10 @@ impl<V: Vfs + Clone> Db<V> {
             let readers = self.tracked_readers.lock();
             readers.iter().map(|reader| reader.commit_id.0).min()
         };
-        let history_floor = self
-            .oldest_retained_history_commit(state.commit_history_root_page_id, state.next_page_id)
-            .await?;
+        let history_bound = self.history_reclamation_bound(state).await?;
         Ok(min_reader
             .unwrap_or(u64::MAX)
-            .min(history_floor.map_or(u64::MAX, |commit| commit.saturating_add(1))))
+            .min(history_bound.unwrap_or(u64::MAX)))
     }
 
     /// Unregister a reader by its unique `entry_id`. Called from `ReadTxn::drop`.
@@ -283,6 +286,11 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Look up `commit` in the commit-history B+ tree and, if found, return a
     /// `ReadTxn` pinned to that historical snapshot.
+    ///
+    /// Under [`RetainPolicy::Disabled`](crate::options::RetainPolicy::Disabled)
+    /// this serves the latest commit only. Rows a store's header proves went
+    /// unmaintained are gone under every policy. Each other commit then returns
+    /// [`PagedbError::CommitGone`] with the latest commit as `oldest_available`.
     pub async fn begin_read_at(&self, commit: CommitId) -> Result<ReadTxn<'_, V>> {
         self.ensure_usable()?;
         let _admission = self.visibility_gate.read().await;
@@ -300,7 +308,13 @@ impl<V: Vfs + Clone> Db<V> {
                 false,
             ));
         }
-        let history_root = snap.commit_history_root_page_id;
+        // These rows stay on disk for a handle that cannot remove them, so the
+        // root alone does not say whether they can be served.
+        let history_root = if self.history_disabled() || snap.history_rows_abandoned {
+            0
+        } else {
+            snap.commit_history_root_page_id
+        };
         let history_next = snap.next_page_id;
         let latest_commit_id = snap.commit_id;
 

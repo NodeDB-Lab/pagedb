@@ -7,9 +7,6 @@ mod core;
 mod free_fold;
 mod gc;
 mod guards;
-// Serves the native-only incremental-snapshot apply path, like `reclaim` below;
-// gate it the same way.
-#[cfg(not(target_arch = "wasm32"))]
 mod history_carry;
 // Serves the native-only incremental-snapshot apply path: its sole caller is
 // `snapshot` (wasm-gated below) and it imports `SnapshotManifest` from the
@@ -34,6 +31,7 @@ mod snapshot;
 mod tests;
 mod util;
 
+pub(crate) use catalog::history_policy::RETAIN_POLICY_TAG_DISABLED;
 pub use core::Db;
 #[cfg(test)]
 pub(crate) use core::VisibilityTestHook;

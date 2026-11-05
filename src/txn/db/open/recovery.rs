@@ -2,11 +2,11 @@
 
 use crate::Result;
 use crate::crypto::SecretKey;
-use crate::errors::PagedbError;
 use crate::pager::freelist;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::{Vfs, remove_if_present};
 
+use super::super::catalog::history_policy::proves_unreadable_pages;
 use super::super::core::Db;
 
 pub(super) async fn recover_open_state<V: Vfs + Clone>(
@@ -204,10 +204,10 @@ impl<V: Vfs + Clone> Db<V> {
             match walk.advance(&self.pager, self.realm_id).await {
                 Ok(Some(_)) => {}
                 Ok(None) => return,
-                // Corruption only. A transient I/O failure says nothing about
-                // the chain's content, and detaching on one would leak every
+                // Proof about the chain's bytes only. A transient I/O failure says
+                // nothing about its content, and detaching on one leaks every
                 // page it names because a disk hiccuped during startup.
-                Err(error @ PagedbError::Corruption(_)) => break error,
+                Err(error) if proves_unreadable_pages(&error) => break error,
                 Err(error) => {
                     tracing::warn!(
                         free_list_root = head,

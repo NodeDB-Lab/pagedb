@@ -314,12 +314,10 @@ impl<V: Vfs> Pager<V> {
         );
         // `last_err` is not always an authentication failure: the loop above
         // also lands here after exhausting retries on a header-decode
-        // rejection (`extract_page_header_ids` / on-disk cipher id), which is
-        // a plain `PagedbError`, not proof the page failed to authenticate.
-        // Only `ChecksumFailure` — the AEAD/MAC tag actually failing to
-        // verify — is the corruption signal this report exists for; anything
-        // else (and any plain I/O error, which already returns earlier via
-        // `?` and never reaches this tail at all) must not raise one.
+        // rejection (`extract_page_header_ids` / on-disk cipher id). Only
+        // `ChecksumFailure` — the AEAD/MAC tag actually failing to verify — is
+        // the corruption signal this report exists for; a plain I/O error
+        // already returns earlier via `?` and never reaches this tail at all.
         if matches!(last_err, Some(PagedbError::ChecksumFailure)) {
             // Black box: capture a structured corruption report (and, once per
             // process, a snapshot of the store for offline `pagedb-fsck`) so this
@@ -351,6 +349,19 @@ impl<V: Vfs> Pager<V> {
                     // An apply-journal sidecar is not a segment, so its id does
                     // not go in a field named `segment_id`; `file` is already
                     // in the diagnostic report above.
+                    segment_id: None,
+                    page_id,
+                    evictable: None,
+                },
+            ));
+        }
+        // Every VFS error returned above, so this `Unsupported` comes from the
+        // page's own cipher byte. Report it as damage to that page. A VFS raises
+        // `Unsupported` too, and a caller cannot tell the two apart by variant.
+        if matches!(last_err, Some(PagedbError::Unsupported)) {
+            return Err(PagedbError::corruption(
+                CorruptionDetail::PageUnverifiable {
+                    realm_id,
                     segment_id: None,
                     page_id,
                     evictable: None,

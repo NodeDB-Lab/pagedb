@@ -129,6 +129,7 @@ impl<V: Vfs + Clone> Db<V> {
                 free_list_root_page_id: 0,
                 free_list_entries: Some(0),
                 commit_history_root_page_id: 0,
+                history_rows_abandoned: false,
             })),
             poisoned_commit: parking_lot::Mutex::new(None),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),

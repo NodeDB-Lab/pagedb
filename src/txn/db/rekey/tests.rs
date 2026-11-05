@@ -12,6 +12,9 @@ use crate::{
     Db, Evictable, OpenOptions, PagedbError, RealmId, RealmQuotas, SegmentKind, SegmentPageKind,
 };
 
+#[path = "history_preflight_tests.rs"]
+mod history_preflight_tests;
+
 const PAGE: usize = 4096;
 const KEK0: [u8; 32] = [0xAA; 32];
 const REALM: RealmId = RealmId::new([0x01; 16]);
@@ -720,26 +723,32 @@ async fn rekey_succeeds_when_a_crash_tore_a_free_page() {
     );
 }
 
-/// A retained root can still reach this free page, so a tear is real corruption.
+/// A registered reader can still reach this free page, so a tear is real corruption.
 /// The rekey refuses, and the torn bytes stay on disk as evidence.
+/// With the reader gone, a reopen finishes the rekey.
 #[tokio::test(flavor = "current_thread")]
-async fn rekey_refuses_a_torn_free_page_a_retained_root_can_reach() {
+async fn rekey_refuses_a_torn_free_page_a_registered_reader_can_reach() {
     use crate::vfs::{OpenMode, Vfs, VfsFile};
 
     let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded);
     let (vfs, db, free_pages) = store_with_a_free_page(options.clone()).await;
-    drop(db);
+    let first = crate::CommitId(db.latest_commit().0 - 1);
+    let reader = db.begin_read_at(first).await.unwrap();
+    let torn_page = reader.root_page_id();
+    assert!(
+        free_pages.contains(&torn_page),
+        "setup error: page {torn_page} is not among the free pages {free_pages:?}"
+    );
 
-    let torn_offset = free_pages[0] * PAGE as u64 + (PAGE / 2) as u64;
+    let torn_offset = torn_page * PAGE as u64 + (PAGE / 2) as u64;
     let mut file = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
     file.write_at(torn_offset, &[0xEE; PAGE / 2]).await.unwrap();
     file.sync().await.unwrap();
     drop(file);
+    db.evict_main_pages().unwrap();
 
-    let db = Db::open_existing_with_options(vfs.clone(), KEK0, PAGE, REALM, options)
-        .await
-        .unwrap();
     assert!(db.rekey_db(KEK0, 1).await.is_err());
+    drop(reader);
     drop(db);
 
     let file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
@@ -750,6 +759,16 @@ async fn rekey_refuses_a_torn_free_page_a_retained_root_can_reach() {
         tail,
         vec![0xEE; PAGE / 2],
         "the torn bytes stay as evidence"
+    );
+    drop(file);
+
+    let reopened = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options)
+        .await
+        .expect("no reader survives a reopen, so the resume finishes");
+    let reader = reopened.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"kept").await.unwrap().as_deref(),
+        Some(b"second".as_slice())
     );
 }
 
@@ -881,6 +900,34 @@ struct RetainedRowScenario {
     commits: u64,
     /// Retention from the reopen onward, including across the rekey.
     after: RetainPolicy,
+    /// Rewrite the rekey's tags to the latest commit and reopen before the draw.
+    /// An earlier release left that tag on disk.
+    old_release_tags: bool,
+}
+
+/// Rewrite the free chain in place, so `from` entries read `to`. The chain keeps
+/// its pages and its head, so the durable header still names it.
+async fn retag_free_chain(db: &Db<MemVfs>, from: u64, to: u64) {
+    let head = db.writer.lock().await.free_list_root_page_id;
+    let (entries, chain_pages) = crate::pager::freelist::read_chain(&db.pager, REALM, head)
+        .await
+        .unwrap();
+    let retagged: Vec<(u64, u64)> = entries
+        .into_iter()
+        .map(|(tag, page_id)| (if tag == from { to } else { tag }, page_id))
+        .collect();
+    let rewritten_head = crate::pager::freelist::write::write_chain(
+        &db.pager,
+        REALM,
+        PAGE,
+        &chain_pages,
+        &retagged,
+        crate::pager::freelist::ChainTail::EMPTY,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rewritten_head, head, "setup error: the chain head moved");
+    db.pager.flush_main(REALM).await.unwrap();
 }
 
 async fn catalog_rows_of(
@@ -943,6 +990,7 @@ async fn run_retained_row_scenario(scenario: RetainedRowScenario) {
         before,
         commits,
         after,
+        old_release_tags,
     } = scenario;
     let vfs = MemVfs::new();
     let db = Db::open_internal_with_options(
@@ -1023,6 +1071,17 @@ async fn run_retained_row_scenario(scenario: RetainedRowScenario) {
         "{label}: the rekey tagged no page the row names with {rekey_tag}, \
          row pages {row_catalog_pages:?}, free entries {entries:?}"
     );
+    let (db, row_tag) = if old_release_tags {
+        retag_free_chain(&db, rekey_tag, retained.0).await;
+        drop(db);
+        let reopened =
+            Db::open_existing_with_options(vfs.clone(), KEK0, PAGE, REALM, options.clone())
+                .await
+                .unwrap();
+        (reopened, retained.0)
+    } else {
+        (db, rekey_tag)
+    };
     let cursor_before_draw = db.writer.lock().await.next_page_id;
 
     let drawing_commit = {
@@ -1049,10 +1108,16 @@ async fn run_retained_row_scenario(scenario: RetainedRowScenario) {
     assert!(
         tagged_row_pages
             .iter()
-            .all(|&page_id| entries.contains(&(rekey_tag, page_id))),
+            .all(|&page_id| entries.contains(&(row_tag, page_id))),
         "{label}: the commit drew a page of {tagged_row_pages:?}, free entries {entries:?}"
     );
 
+    if old_release_tags {
+        assert!(
+            db.begin_read_at(retained).await.is_ok(),
+            "{label}: Count(2) keeps the row at {retained:?} through one draw"
+        );
+    }
     assert_retained_row_reads_back(&db, label, retained, &row_catalog_rows, &versioned).await;
     drop(db);
 
@@ -1076,21 +1141,106 @@ async fn historical_read_after_a_rekey_survives_later_commits() {
             before: RetainPolicy::Count(1),
             commits: 1,
             after: RetainPolicy::Count(1),
+            old_release_tags: false,
         },
         RetainedRowScenario {
             label: "Count(2), one commit below retention",
             before: RetainPolicy::Count(2),
             commits: 1,
             after: RetainPolicy::Count(2),
+            old_release_tags: false,
         },
         RetainedRowScenario {
             label: "Count(1) widened to Count(2) at a reopen",
             before: RetainPolicy::Count(1),
             commits: 3,
             after: RetainPolicy::Count(2),
+            old_release_tags: false,
+        },
+        RetainedRowScenario {
+            label: "Count(1) widened to Count(2), tags from an earlier release",
+            before: RetainPolicy::Count(1),
+            commits: 3,
+            after: RetainPolicy::Count(2),
+            old_release_tags: true,
         },
     ];
     for scenario in scenarios {
         run_retained_row_scenario(scenario).await;
     }
+}
+
+/// Pages each entry in the free chain names, split by whether `begin_write` put
+/// them in the allocator cache.
+async fn pages_tagged_with_oldest_row(db: &Db<MemVfs>) -> (Vec<u64>, Vec<u64>) {
+    let oldest = {
+        let state = db.writer.lock().await;
+        db.oldest_retained_history_commit(state.commit_history_root_page_id, state.next_page_id)
+            .await
+            .unwrap()
+            .expect("setup error: the store holds no row")
+    };
+    let tagged: Vec<u64> = free_entries_of(db)
+        .await
+        .into_iter()
+        .filter(|&(tag, _)| tag == oldest)
+        .map(|(_, page_id)| page_id)
+        .collect();
+    assert!(
+        !tagged.is_empty(),
+        "setup error: no free entry carries the tag {oldest}"
+    );
+    let txn = db.begin_write().await.unwrap();
+    let cache = db.free_page_cache.lock().clone();
+    txn.abort().await;
+    (tagged, cache)
+}
+
+async fn store_past_its_retention(retain: u32, commits: u32) -> (MemVfs, Db<MemVfs>) {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal_with_options(
+        vfs.clone(),
+        KEK0,
+        PAGE,
+        REALM,
+        OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(retain)),
+    )
+    .await
+    .unwrap();
+    for index in 0..commits {
+        let mut tx = db.begin_write().await.unwrap();
+        tx.put(b"versioned", &index.to_le_bytes()).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    (vfs, db)
+}
+
+/// An ordinary commit's tag means only older rows reach the page. A store with
+/// no rekey behind it reuses a page tagged with the oldest row, as it always did.
+#[tokio::test(flavor = "current_thread")]
+async fn a_never_rekeyed_store_reuses_a_page_tagged_with_the_oldest_row() {
+    let (_vfs, db) = store_past_its_retention(2, 6).await;
+    assert_eq!(db.mk_epoch.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let (tagged, cache) = pages_tagged_with_oldest_row(&db).await;
+
+    assert!(
+        tagged.iter().all(|page_id| cache.contains(page_id)),
+        "pages {tagged:?} must be reusable, the allocator holds {cache:?}"
+    );
+}
+
+/// A rekeyed store can hold a page its oldest row still reaches under that
+/// row's own tag, so that tag stays out of the allocator.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rekeyed_store_holds_back_a_page_tagged_with_the_oldest_row() {
+    let (_vfs, db) = store_past_its_retention(2, 6).await;
+    db.rekey_db(KEK0, 1).await.unwrap();
+
+    let (tagged, cache) = pages_tagged_with_oldest_row(&db).await;
+
+    assert!(
+        tagged.iter().all(|page_id| !cache.contains(page_id)),
+        "pages {tagged:?} must stay out of the allocator, which holds {cache:?}"
+    );
 }

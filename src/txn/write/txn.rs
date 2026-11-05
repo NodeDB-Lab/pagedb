@@ -150,12 +150,10 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         // The reader pin is kept separately. Recycling has to respect both
         // bounds, but the reader-stall policy is about readers alone — see
         // [`WriteTxn::reader_floor`].
-        let history_floor = db
-            .oldest_retained_history_commit(guard.commit_history_root_page_id, guard.next_page_id)
-            .await?;
+        let history_bound = db.history_reclamation_bound(&guard).await?;
         let floor = min_reader
             .unwrap_or(u64::MAX)
-            .min(history_floor.map_or(u64::MAX, |h| h.saturating_add(1)));
+            .min(history_bound.unwrap_or(u64::MAX));
 
         // Rebuild the shared allocator cache from the durable free list.
         //

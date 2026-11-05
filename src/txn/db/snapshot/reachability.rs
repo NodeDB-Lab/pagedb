@@ -2,6 +2,7 @@
 
 //! Published and reader-visible page sets.
 
+use super::super::catalog::history_policy::{ALL_HISTORY_ROWS, proves_unreadable_pages};
 use super::super::core::{Db, ReaderSnapshot, WriterState, decode_commit_meta};
 use crate::pager::Pager;
 use crate::vfs::Vfs;
@@ -109,6 +110,23 @@ impl<V: Vfs + Clone> Db<V> {
         Ok(())
     }
 
+    /// The newest row an apply must prune, or `None` when every row stays.
+    ///
+    /// Rows this handle must not keep leave whatever the delta names, so nothing
+    /// walks them.
+    pub(super) async fn history_rows_apply_prunes(
+        &self,
+        state: &WriterState,
+        visited: BTreeSet<u64>,
+        delta_page_ids: &BTreeSet<u64>,
+    ) -> crate::Result<Option<u64>> {
+        if self.history_rows_gone(state) {
+            return Ok(Some(ALL_HISTORY_ROWS));
+        }
+        self.newest_history_row_reaching_delta(state, visited, delta_page_ids)
+            .await
+    }
+
     /// The newest retained commit whose pages a delta overwrites, or `None` when
     /// every row stays intact.
     ///
@@ -125,7 +143,7 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// A row that cannot be walked counts as an overlap, because nothing proves
     /// it disjoint. Reads the live Pager, which serves the unchanged base image.
-    pub(super) async fn newest_history_row_reaching_delta(
+    async fn newest_history_row_reaching_delta(
         &self,
         state: &WriterState,
         mut visited: BTreeSet<u64>,
@@ -176,14 +194,9 @@ impl<V: Vfs + Clone> Db<V> {
         visited: &mut BTreeSet<u64>,
         delta_page_ids: &BTreeSet<u64>,
     ) -> crate::Result<bool> {
-        use crate::errors::PagedbError;
         match self.collect_history_row_pages(row, visited).await {
             Ok(reached) => Ok(!reached.is_disjoint(delta_page_ids)),
-            Err(
-                error @ (PagedbError::ChecksumFailure
-                | PagedbError::IllegalPageKind
-                | PagedbError::Corruption(_)),
-            ) => {
+            Err(error) if proves_unreadable_pages(&error) => {
                 tracing::debug!(
                     name = "apply.history_row_unwalkable",
                     commit,

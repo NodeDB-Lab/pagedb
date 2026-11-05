@@ -20,21 +20,17 @@ const HISTORY_PRUNE_BATCH: usize = 512;
 
 impl<V: Vfs + Clone> Db<V> {
     /// The oldest commit id still retained in the commit-history index, or
-    /// `None` when history is disabled or the index is empty. Pages reachable
-    /// from this commit's root (or any newer one) must not be recycled, so it
-    /// is one of the two floors gating free-page reclamation (the other is the
-    /// oldest live reader pin). Reads only the leftmost spine of the history
-    /// tree — O(height), not O(retained count).
+    /// `None` when the index is empty. Pages reachable from this commit's root
+    /// (or any newer one) must not be recycled, so it is one of the two floors
+    /// gating free-page reclamation (the other is the oldest live reader pin).
+    /// Reads only the leftmost spine of the history tree — O(height), not
+    /// O(retained count).
     pub(crate) async fn oldest_retained_history_commit(
         &self,
         commit_history_root_page_id: u64,
         next_page_id: u64,
     ) -> Result<Option<u64>> {
-        if matches!(
-            self.options.commit_history_retain,
-            crate::options::RetainPolicy::Disabled
-        ) || commit_history_root_page_id == 0
-        {
+        if commit_history_root_page_id == 0 {
             return Ok(None);
         }
         let hist = BTree::open(

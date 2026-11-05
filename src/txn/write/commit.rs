@@ -49,7 +49,9 @@ use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 use std::collections::HashSet;
 
-use super::super::db::{CommitHistoryMeta, PendingWriterState, encode_free_list_root};
+use super::super::db::{
+    CommitHistoryMeta, PendingWriterState, RETAIN_POLICY_TAG_DISABLED, encode_free_list_root,
+};
 use super::txn::WriteTxn;
 
 impl<V: Vfs + Clone> WriteTxn<'_, V> {
@@ -119,15 +121,18 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             next_page_id: pending.next_page_id,
             unix_seconds,
         };
+        // Rows this handle must not keep leave first. A policy that keeps history
+        // then starts a fresh tree holding this commit alone.
         let mut hist_freed: Vec<u64> = Vec::new();
-        if !matches!(
-            self.db.options.commit_history_retain,
-            crate::options::RetainPolicy::Disabled
-        ) {
-            hist_freed = self
-                .db
-                .write_commit_history_entry(&mut pending, new_commit_id, history_meta)
-                .await?;
+        if self.db.history_rows_gone(&self.guard) {
+            hist_freed = self.db.drop_commit_history(&mut pending).await?;
+        }
+        if !self.db.history_disabled() {
+            hist_freed.extend(
+                self.db
+                    .write_commit_history_entry(&mut pending, new_commit_id, history_meta)
+                    .await?,
+            );
         }
 
         // ── Account freed and reused pages ───────────────────────────────────
@@ -367,6 +372,10 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         self.guard.catalog_root_txn_id = new_commit_id;
         self.guard.free_list_root_page_id = new_free_list_root;
         self.guard.free_list_entries = Some(new_free_list_entries);
+        // A later header that is not a commit repeats these. A stale tag there
+        // either marks maintained rows as abandoned or hides abandoned ones.
+        self.guard.commit_retain_policy_tag = policy_tag;
+        self.guard.commit_retain_policy_value = policy_value;
         self.committed_or_aborted = true;
 
         // Black box: record the commit + how many pages it freed into the
@@ -531,7 +540,7 @@ fn encode_retain_policy(policy: &crate::options::RetainPolicy) -> (u8, u64) {
         crate::options::RetainPolicy::Count(n) => (0, u64::from(*n)),
         crate::options::RetainPolicy::Age(d) => (1, d.as_secs()),
         crate::options::RetainPolicy::Unbounded => (2, 0),
-        crate::options::RetainPolicy::Disabled => (3, 0),
+        crate::options::RetainPolicy::Disabled => (RETAIN_POLICY_TAG_DISABLED, 0),
     }
 }
 

@@ -29,16 +29,29 @@ pub enum RetainPolicy {
     /// Never prune; keep every commit entry.
     Unbounded,
     /// **Pagedb extension beyond the architecture spec** (which defines
-    /// only `Count` / `Age` / `Bytes` / `Unbounded`). Do not maintain the
-    /// commit-history index at all. `WriteTxn::commit` skips the
-    /// history-tree `CoW` + flush entirely (no per-commit insert, no
-    /// pruning). The header's `commit_history_root_page_id` stays at zero.
+    /// only `Count` / `Age` / `Bytes` / `Unbounded`). Keep no commit-history
+    /// rows. `WriteTxn::commit` writes no row and prunes nothing.
     ///
-    /// Selecting this disables every API that depends on commit history:
+    /// Selecting this on a store that holds rows removes them:
+    /// - The handle refuses them at once.
+    /// - The first `WriteTxn::commit`, `rekey_db`, or `apply_incremental` frees
+    ///   the history tree and writes root zero. No later policy gets them back.
+    /// - A read-only or observer handle changes nothing. Reopening under another
+    ///   policy before any such write still finds them.
+    /// - Until the removal is durable, the rows still hold back free-page reuse.
+    ///   A crash cannot leave them naming overwritten pages.
+    ///
+    /// These APIs serve the latest commit only, and return
+    /// [`PagedbError::CommitGone`](crate::PagedbError::CommitGone) for any other:
     /// - `Db::begin_read_at(commit_id)` — point-in-time reads
-    /// - `Db::restore_from(commit_id)` — snapshot-restore by id
-    /// - `apply_incremental` from a `base_commit` (Follower-mode replication)
-    /// - `snapshot_to(since=Some(base))` — incremental snapshot exports
+    /// - `Db::snapshot_incremental_to(base, ..)` — incremental snapshot exports
+    ///
+    /// `apply_incremental` still works, because its base is the follower's latest
+    /// commit. `snapshot_to` and `restore_from` copy the store as it stands.
+    ///
+    /// A header holding this policy's tag beside a non-zero history root proves
+    /// an earlier release left those rows unmaintained. They count as gone under
+    /// every policy, and a writable handle removes them at its first write.
     ///
     /// Use only when the embedder will never need any of those APIs (e.g.
     /// pure ephemeral KV workloads, benchmarks against engines that don't

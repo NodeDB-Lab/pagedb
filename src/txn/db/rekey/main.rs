@@ -10,7 +10,7 @@ use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, RekeyIntent, RekeyStage};
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::{CipherId, DerivedKey, MasterKey, SecretKey};
-use crate::errors::{CorruptionDetail, PagedbError};
+use crate::errors::PagedbError;
 use crate::pager::PageKind;
 use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
@@ -18,6 +18,7 @@ use crate::pager::page_space::{is_reserved, page_offset};
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::{OpenMode, Vfs, VfsFile, read_exact_at};
 
+use super::super::catalog::history_policy::proves_unreadable_pages;
 #[cfg(test)]
 use super::super::core::RekeyTestFault;
 use super::super::core::{
@@ -28,7 +29,7 @@ use super::intent::{intent_proof, validate_intent_for_current_cipher};
 /// Commit-history rows read per batch while rekeying the roots they name.
 /// Rows are 40 bytes, so this is a few KiB resident regardless of how deep
 /// retention runs.
-const HISTORY_ROOT_BATCH: usize = 512;
+pub(super) const HISTORY_ROOT_BATCH: usize = 512;
 
 /// One catalog rewrite a rekey stage is about to make durable.
 ///
@@ -64,24 +65,14 @@ async fn read_main_page_kind<F: VfsFile + ?Sized>(
     Ok(Some(kind))
 }
 
-/// Whether a read error proves a free page's bytes cannot authenticate. A tear
-/// can garble the kind, cipher, or epoch fields, and a page can end past the file.
-/// Any other I/O error or a cache fault says nothing about the bytes.
-fn free_page_is_unreadable(error: &PagedbError) -> bool {
-    match error {
-        PagedbError::ChecksumFailure
-        | PagedbError::IllegalPageKind
-        | PagedbError::Unsupported
-        | PagedbError::MissingPersistedKey { .. }
-        | PagedbError::Corruption(CorruptionDetail::PageUnverifiable { .. }) => true,
-        PagedbError::Io(io_error) => io_error.kind() == std::io::ErrorKind::UnexpectedEof,
-        _ => false,
-    }
-}
-
 impl<V: Vfs + Clone> Db<V> {
     /// Rekey the reachable main database and every catalog-linked immutable
     /// segment under `new_mk_epoch`.
+    ///
+    /// A read-only walk runs first, and an error there changes nothing. A live
+    /// page that fails authentication refuses the rekey. A retained commit whose
+    /// pages fail authentication leaves durably with every older commit, and
+    /// [`begin_read_at`](Self::begin_read_at) then reports them gone.
     pub async fn rekey_db(&self, kek: impl Into<SecretKey>, new_mk_epoch: u64) -> Result<()> {
         let kek = kek.into();
         self.ensure_usable()?;
@@ -140,12 +131,23 @@ impl<V: Vfs + Clone> Db<V> {
         };
         let mut state = self.writer.lock().await;
         self.ensure_usable()?;
-        // Armed from the first intent write through completion. That write moves
-        // the free-list root in `state` before its header lands. Every later stage
-        // leaves target-epoch pages and durable headers ahead of memory. A rekey
-        // advances no commit, so the poison names the latest one. A reopen resumes
-        // from whatever intent stage is durable.
+        // Read-only, so an error here leaves the store and the handle as they were.
+        let pruned_through = self.history_rows_rekey_prunes(&state).await?;
+        // Armed from the first header write through completion. A prune or an
+        // intent moves the free-list root in `state` before its header lands. Every
+        // later stage leaves target-epoch pages and durable headers ahead of memory.
+        // A rekey advances no commit, so the poison names the latest one. A reopen
+        // resumes from whatever intent stage is durable.
         let publish = self.arm_durable_publish(crate::CommitId(state.latest_commit_id));
+        if let Some(pruned_through) = pruned_through {
+            self.prune_history_rows_locked(
+                &mut state,
+                pruned_through,
+                source_epoch,
+                &source_header_key,
+            )
+            .await?;
+        }
         self.write_rekey_intent_locked(&mut state, &intent, source_epoch, &source_header_key)
             .await?;
         #[cfg(test)]
@@ -163,6 +165,7 @@ impl<V: Vfs + Clone> Db<V> {
             .load_rekey_intent(&state)
             .await?
             .ok_or_else(|| PagedbError::rekey_state_invalid("rekey.intent_missing"))?;
+        self.settle_history_for_resume(&mut state, &intent).await?;
         self.resume_rekey_locked(&mut state, intent).await
     }
 
@@ -316,6 +319,11 @@ impl<V: Vfs + Clone> Db<V> {
     /// snapshot, whose pages are not free-listed. A later historical reader pins
     /// a retained row, whose pages are in `rewritten`.
     ///
+    /// A page outside `rewritten` is out of every retained row's reach, whatever
+    /// its tag says. Only a registered reader can still read it. A page that
+    /// fails to authenticate therefore gets a blank page unless a reader's pin
+    /// covers its tag.
+    ///
     /// Resident cost is one id per chain page and one page of entries.
     async fn rewrite_free_list_discarding_dead_pages(
         &self,
@@ -336,6 +344,7 @@ impl<V: Vfs + Clone> Db<V> {
         }
 
         let floor = self.reclamation_floor(state).await?;
+        let reader_pin = self.oldest_reader_pin();
         let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
         let mut walk = crate::pager::freelist::ChainWalk::new(root_page_id);
         while let Some(chain_page_id) = walk.advance(&self.pager, self.realm_id).await? {
@@ -354,8 +363,12 @@ impl<V: Vfs + Clone> Db<V> {
                         .write_blank_free_page(page_id, self.realm_id)
                         .await?;
                 } else {
-                    self.reseal_free_page_keeping_content(&mut file, page_id, false)
-                        .await?;
+                    self.reseal_free_page_keeping_content(
+                        &mut file,
+                        page_id,
+                        freed_at < reader_pin,
+                    )
+                    .await?;
                 }
             }
         }
@@ -368,8 +381,9 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// This pass runs after the target header, once the catalog pages that the
     /// intent writes superseded are on the list. It has no record of what retained
-    /// roots reach, so it never blanks a readable page. It blanks an unreadable
-    /// page only when the page's entry is older than every retained root's reach.
+    /// roots reach, so it never blanks a readable page. Every retained row
+    /// authenticated before this pass, so an unreadable page is not one a row
+    /// reaches. This pass blanks it unless a registered reader's pin covers its tag.
     ///
     /// The walk is streamed one chain page at a time. Touching every named page
     /// is inherently proportional to the free list's size in IO, but holding
@@ -387,7 +401,7 @@ impl<V: Vfs + Clone> Db<V> {
             return Ok(());
         }
 
-        let floor = self.reclamation_floor(state).await?;
+        let reader_pin = self.oldest_reader_pin();
         let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
         let mut walk = crate::pager::freelist::ChainWalk::new(root_page_id);
         while let Some(chain_page_id) = walk.advance(&self.pager, self.realm_id).await? {
@@ -402,16 +416,26 @@ impl<V: Vfs + Clone> Db<V> {
                         page_id,
                     ));
                 }
-                self.reseal_free_page_keeping_content(&mut file, page_id, freed_at < floor)
+                self.reseal_free_page_keeping_content(&mut file, page_id, freed_at < reader_pin)
                     .await?;
             }
         }
         Ok(())
     }
 
+    /// The oldest registered reader's commit, or `u64::MAX` with no reader.
+    fn oldest_reader_pin(&self) -> u64 {
+        self.tracked_readers
+            .lock()
+            .iter()
+            .map(|reader| reader.commit_id.0)
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     /// Re-seal a named free page with its content when it authenticates. A hole
     /// stays a hole. A page that fails to authenticate is replaced with a blank
-    /// page only when `unreachable` says no retained root or reader can name it.
+    /// page only when `unreachable` says no reader can name it.
     /// Otherwise the error returns. That error is real corruption, and the page
     /// bytes are the evidence.
     async fn reseal_free_page_keeping_content(
@@ -448,7 +472,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// Replace a free page whose read reported `error` with a blank page.
     /// Return `error` instead when it says nothing about the page's bytes.
     async fn blank_unreadable_free_page(&self, page_id: u64, error: PagedbError) -> Result<()> {
-        if !free_page_is_unreadable(&error) {
+        if !proves_unreadable_pages(&error) {
             return Err(error);
         }
         tracing::warn!(

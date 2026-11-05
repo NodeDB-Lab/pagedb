@@ -25,6 +25,8 @@
 //! a row and every older row leave the carried tree. Then `begin_read_at`
 //! reports them gone and admits no reader over newer bytes. A cut always loads
 //! the surviving rows onto fresh ids, the same way a relocation does.
+//!
+//! A rekey prunes rows through the same path, with no delta and no staged image.
 
 use std::collections::BTreeSet;
 
@@ -34,6 +36,7 @@ use crate::Result;
 use crate::btree::BTree;
 use crate::vfs::Vfs;
 
+use super::catalog::history_policy::ALL_HISTORY_ROWS;
 use super::core::{Db, WriterState};
 
 /// Where the commit-history tree lives once the apply's target image is built.
@@ -50,7 +53,8 @@ pub(super) struct CarriedHistory {
 
 /// What one apply asks of the commit-history carry.
 pub(super) struct HistoryCarry<'a> {
-    pub staged_image: &'a str,
+    /// Where a load past the dirty budget flushes. `None` means the live file.
+    pub staged_image: Option<&'a str>,
     pub delta_page_ids: &'a BTreeSet<u64>,
     pub target_page_ids: &'a BTreeSet<u64>,
     pub history_version: u64,
@@ -92,6 +96,18 @@ impl<V: Vfs + Clone> Db<V> {
         if state.commit_history_root_page_id == 0 {
             return Ok(unmoved);
         }
+        if pruned_through == Some(ALL_HISTORY_ROWS) {
+            let occupied = self
+                .droppable_history_pages(state.commit_history_root_page_id, state.next_page_id)
+                .await?;
+            return Ok(CarriedHistory {
+                root_page_id: 0,
+                root_version: 0,
+                entry_count: Some(0),
+                next_page_id: alloc_cursor,
+                released_page_ids: occupied.difference(target_page_ids).copied().collect(),
+            });
+        }
 
         let base_tree = BTree::open(
             self.pager.clone(),
@@ -125,7 +141,10 @@ impl<V: Vfs + Clone> Db<V> {
             alloc_cursor,
             self.page_size,
         );
-        let mut loader = relocated.bulk_loader_to(staged_image)?;
+        let mut loader = match staged_image {
+            Some(path) => relocated.bulk_loader_to(path)?,
+            None => relocated.bulk_loader()?,
+        };
         for (key, value) in rows {
             loader.push(key, value).await?;
         }

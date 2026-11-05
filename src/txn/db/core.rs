@@ -121,7 +121,9 @@ pub(crate) struct WriterState {
     pub pending_apply_journal_id: [u8; 16],
     /// Header mode preserved by every recovery header rewrite.
     pub restore_mode: u8,
-    /// Header commit-history retention fields preserved by recovery rewrites.
+    /// The retention fields of the last header this store wrote. Every header
+    /// that is not a commit repeats them. Tag 3 beside a non-zero history root
+    /// marks abandoned rows, so a commit must update these with its own header.
     pub commit_retain_policy_tag: u8,
     pub commit_retain_policy_value: u64,
 }
@@ -291,6 +293,9 @@ pub(crate) struct ReaderSnapshot {
     /// reader admission resolves from this immutable root without taking the
     /// writer lock.
     pub commit_history_root_page_id: u64,
+    /// The header pair behind this snapshot proves the rows went unmaintained.
+    /// Historical reader admission serves none of them.
+    pub history_rows_abandoned: bool,
 }
 
 /// Encode a 16-byte catalog/free-list root reference: `page_id` (LE u64) in the

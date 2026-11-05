@@ -53,6 +53,26 @@ impl<V: Vfs> BTree<V> {
         &self,
         visited: &mut BTreeMap<u64, PageKind>,
     ) -> Result<u64> {
+        self.walk_unique(visited, true).await
+    }
+
+    /// Run the walk [`Self::rekey_walk_unique`] runs and change nothing.
+    ///
+    /// Each failure matches the one the rewriting walk reports over the same map.
+    /// A page reached under two roles fails here too. A caller can therefore find
+    /// such a page before it commits to rewriting.
+    pub(crate) async fn verify_walk_unique(
+        &self,
+        visited: &mut BTreeMap<u64, PageKind>,
+    ) -> Result<()> {
+        self.walk_unique(visited, false).await.map(drop)
+    }
+
+    async fn walk_unique(
+        &self,
+        visited: &mut BTreeMap<u64, PageKind>,
+        reseal: bool,
+    ) -> Result<u64> {
         if self.root_page_id == 0 {
             return Ok(0);
         }
@@ -108,7 +128,7 @@ impl<V: Vfs> BTree<V> {
 
                     for overflow_root in overflow_roots {
                         count += self
-                            .rekey_overflow_unique(page_id, overflow_root, visited)
+                            .walk_overflow_unique(page_id, overflow_root, visited, reseal)
                             .await?;
                     }
                 }
@@ -128,16 +148,19 @@ impl<V: Vfs> BTree<V> {
                 }
             }
 
-            self.pager
-                .rewrite_page_under_current_epoch(page_id, self.realm_id, page_kind)
-                .await?;
+            if reseal {
+                self.pager
+                    .rewrite_page_under_current_epoch(page_id, self.realm_id, page_kind)
+                    .await?;
+            }
             count += 1;
         }
         Ok(count)
     }
 
-    /// Rewrite the overflow chain rooted at `root` — referenced by leaf
-    /// `leaf_page_id` — returning the number of pages this call rewrote.
+    /// Walk the overflow chain rooted at `root` — referenced by leaf
+    /// `leaf_page_id` — returning the number of pages this call covered. With
+    /// `reseal` set, it rewrites each page.
     ///
     /// Overflow roots are reference-counted, so a chain reached a second time
     /// through a different leaf (in this tree or in another snapshot's tree)
@@ -145,11 +168,12 @@ impl<V: Vfs> BTree<V> {
     /// twice therefore cannot be a legitimate share: either the chain loops, or
     /// two distinct roots claim one page. Both mean the chain has no honest
     /// terminator, which is why neither is treated as a stopping condition.
-    async fn rekey_overflow_unique(
+    async fn walk_overflow_unique(
         &self,
         leaf_page_id: u64,
         root: u64,
         visited: &mut BTreeMap<u64, PageKind>,
+        reseal: bool,
     ) -> Result<u64> {
         // Unlike an internal child slot or a chain terminator, zero is not a
         // valid overflow root: an `Overflow` leaf value always owns at least
@@ -172,9 +196,11 @@ impl<V: Vfs> BTree<V> {
         visited.insert(root, PageKind::OverflowRoot);
 
         let root_info = overflow::read_root_page(&self.pager, self.realm_id, root).await?;
-        self.pager
-            .rewrite_page_under_current_epoch(root, self.realm_id, PageKind::OverflowRoot)
-            .await?;
+        if reseal {
+            self.pager
+                .rewrite_page_under_current_epoch(root, self.realm_id, PageKind::OverflowRoot)
+                .await?;
+        }
         let mut count = 1;
         let mut next = root_info.next;
         while next != 0 {
@@ -198,9 +224,11 @@ impl<V: Vfs> BTree<V> {
                 .await?;
             let (following, _) = overflow::decode_overflow(guard.body_ref())?;
             drop(guard);
-            self.pager
-                .rewrite_page_under_current_epoch(next, self.realm_id, PageKind::Overflow)
-                .await?;
+            if reseal {
+                self.pager
+                    .rewrite_page_under_current_epoch(next, self.realm_id, PageKind::Overflow)
+                    .await?;
+            }
             count += 1;
             next = following;
         }
@@ -608,6 +636,48 @@ mod tests {
             ),
             "expected an alias naming the page and both roles, got {error:?}"
         );
+    }
+
+    /// The read-only walk reports the alias the rewriting walk reports. A plain
+    /// page set skips this page, so a caller finds it only after it rewrites.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_read_only_walk_reports_an_alias_and_dirties_no_page() {
+        use crate::pager::core::FileKey;
+
+        let db = populated_db().await;
+        let tree = data_tree(&db).await;
+        db.pager.flush_main(REALM).await.unwrap();
+
+        let mut shared = BTreeMap::new();
+        tree.verify_walk_unique(&mut shared).await.unwrap();
+        let (&overflow_root, _) = shared
+            .iter()
+            .find(|(_, kind)| **kind == PageKind::OverflowRoot)
+            .expect("the fixture stores one overflow value");
+        let aliased = BTree::open(
+            db.pager.clone(),
+            REALM,
+            overflow_root,
+            overflow_root + 1,
+            db.page_size,
+        );
+        let error = aliased.verify_walk_unique(&mut shared).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                PagedbError::Corruption(CorruptionDetail::PageKindAliased { page_id, .. })
+                    if page_id == overflow_root
+            ),
+            "expected an alias naming the page, got {error:?}"
+        );
+        let dirty = db
+            .pager
+            .inner
+            .buffer_pool
+            .lock()
+            .dirty_for_file(FileKey::Main);
+        assert!(dirty.is_empty(), "the walk dirtied {dirty:?}");
     }
 
     /// Rekey re-seals each page under the kind it walked it as. Taking that

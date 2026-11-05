@@ -97,10 +97,8 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
     /// directly — a caller streaming record by record allocates nothing per
     /// record beyond the record itself.
     ///
-    /// The incremental-apply history carry is its only caller outside tests,
-    /// and that path is native-only. The repack hands over the bounded batch it
-    /// already holds and so goes through [`Self::push_batch`].
-    #[cfg(any(test, not(target_arch = "wasm32")))]
+    /// The history carry is its only caller outside tests. The repack hands over
+    /// the bounded batch it already holds and so goes through [`Self::push_batch`].
     pub async fn push(&mut self, key: Vec<u8>, value: Bytes) -> Result<()> {
         batch::push_one(self, key, value).await
     }

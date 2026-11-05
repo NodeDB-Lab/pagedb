@@ -2,6 +2,7 @@
 
 //! Publish a staged incremental target under writer and visibility ownership.
 
+use super::super::catalog::history_policy::RETAIN_POLICY_TAG_DISABLED;
 use super::super::core::{Db, WriterState};
 use super::super::history_carry::{CarriedHistory, HistoryCarry};
 use super::super::reclaim::StagedFreeList;
@@ -84,15 +85,16 @@ impl<V: Vfs + Clone> Db<V> {
         // The cut reaches disk only in the staged image, so a failed apply keeps
         // every row.
         let pruned_through = self
-            .newest_history_row_reaching_delta(&state, base_reader_visible, &delta_page_ids)
+            .history_rows_apply_prunes(&state, base_reader_visible, &delta_page_ids)
             .await?;
 
         let alloc_cursor = manifest.next_page_id_at_target.max(state.next_page_id);
         let (carried, staged_free_list) = self
             .stage_incremental_metadata(
                 &state,
+                staged_image,
                 HistoryCarry {
-                    staged_image,
+                    staged_image: Some(staged_image),
                     delta_page_ids: &delta_page_ids,
                     target_page_ids: &target_page_ids,
                     history_version: new_commit_id,
@@ -193,10 +195,10 @@ impl<V: Vfs + Clone> Db<V> {
     async fn stage_incremental_metadata(
         &self,
         state: &WriterState,
+        staged_image: &str,
         carry: HistoryCarry<'_>,
         mut reclaimed_page_ids: std::collections::BTreeSet<u64>,
     ) -> crate::Result<(CarriedHistory, StagedFreeList)> {
-        let staged_image = carry.staged_image;
         let target_page_ids = carry.target_page_ids;
         let new_commit_id = carry.history_version;
         let carried = self.carry_commit_history(state, carry).await?;
@@ -304,6 +306,17 @@ impl<V: Vfs + Clone> Db<V> {
         catalog_root_bytes[..8].copy_from_slice(&new_catalog_root_page_id.to_le_bytes());
         catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());
 
+        // A follower writes no rows of its own, so its other policies keep the
+        // tag the store carries. A `Disabled` follower publishes what it did.
+        let (commit_retain_policy_tag, commit_retain_policy_value) = if self.history_disabled() {
+            (RETAIN_POLICY_TAG_DISABLED, 0)
+        } else {
+            (
+                state.commit_retain_policy_tag,
+                state.commit_retain_policy_value,
+            )
+        };
+
         let fields_with_journal = MainDbHeaderFields {
             format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
             cipher_id: self.cipher_id.as_byte(),
@@ -327,8 +340,8 @@ impl<V: Vfs + Clone> Db<V> {
             commit_history_root_version: carried.root_version,
             restore_mode: state.restore_mode,
             next_page_id: new_next_page_id,
-            commit_retain_policy_tag: state.commit_retain_policy_tag,
-            commit_retain_policy_value: state.commit_retain_policy_value,
+            commit_retain_policy_tag,
+            commit_retain_policy_value,
             realm_id: self.realm_id,
         };
 
@@ -380,6 +393,8 @@ impl<V: Vfs + Clone> Db<V> {
         state.commit_history_root_page_id = carried.root_page_id;
         state.commit_history_root_version = carried.root_version;
         state.commit_history_count = carried.entry_count;
+        state.commit_retain_policy_tag = staged_header.fields.commit_retain_policy_tag;
+        state.commit_retain_policy_value = staged_header.fields.commit_retain_policy_value;
         // The header is the source of truth for a pending apply. Mirror it in
         // live writer state immediately so every subsequent operation sees the
         // same retry obligation.
