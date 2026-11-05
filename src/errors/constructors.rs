@@ -237,6 +237,13 @@ impl PagedbError {
         Self::VfsContractViolated { operation, detail }
     }
 
+    /// Canonical constructor for page-cache bookkeeping that disagrees with
+    /// itself.
+    #[must_use]
+    pub const fn page_cache_inconsistent(operation: &'static str) -> Self {
+        Self::PageCacheInconsistent { operation }
+    }
+
     /// Canonical constructor for a rekey admission that needs both KEKs.
     #[must_use]
     pub const fn rekey_resume_key_required(source_epoch: u64, target_epoch: u64) -> Self {

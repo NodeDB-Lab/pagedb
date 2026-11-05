@@ -473,6 +473,15 @@ pub enum PagedbError {
         detail: &'static str,
     },
 
+    /// The in-memory page cache found an index entry whose slot is empty
+    /// while it tried to `operation`, and stopped instead of guessing.
+    ///
+    /// Not corruption: nothing on disk is known to be wrong. The cache's own
+    /// bookkeeping disagreed with itself, so the handle's cached state cannot
+    /// be trusted. Drop the handle and reopen the store.
+    #[error("page cache bookkeeping is inconsistent: cannot {operation}")]
+    PageCacheInconsistent { operation: &'static str },
+
     /// The requested operation is not implemented by the current backend or
     /// target — e.g. `mmap_view` on WASM (no native mmap) or an unknown
     /// on-wire cipher id. Nothing the caller does at runtime resolves it

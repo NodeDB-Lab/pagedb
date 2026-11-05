@@ -882,7 +882,7 @@ impl<V: Vfs> Pager<V> {
     ///
     /// The dirty set is kept inside the configured buffer-pool budget. A rekey
     /// re-seals every page a root can reach, and dirty entries are never
-    /// evicted (the cache's eviction scan skips them), so without an intermediate
+    /// evicted (they are off the cache's eviction list), so without an intermediate
     /// flush the walk would pin the whole decrypted database in memory no
     /// matter what budget the caller asked for. Flushing mid-walk is safe and
     /// idempotent: the active epoch is already the target, so a page re-read
@@ -900,7 +900,7 @@ impl<V: Vfs> Pager<V> {
         let file = FileKey::Main;
         let over_budget = {
             let mut cache = self.inner.cache_for_key(file).lock();
-            cache.mark_dirty((file, page_id));
+            cache.mark_dirty((file, page_id))?;
             cache.dirty_len() >= self.cfg.buffer_pool_pages.max(1)
         };
         drop(guard);
@@ -920,7 +920,12 @@ impl<V: Vfs> Pager<V> {
         let mut cache = self.inner.buffer_pool.lock();
         let dirty_ids = cache.dirty_for_file(FileKey::Main);
         for pid in dirty_ids {
-            cache.clear_dirty((FileKey::Main, pid));
+            // An abort cannot fail, so a cache error is logged, that page
+            // stays in the dirty set, and the remaining pages are still
+            // discarded.
+            if let Err(error) = cache.clear_dirty((FileKey::Main, pid)) {
+                tracing::error!(page_id = pid, error = %error, "discard dirty page");
+            }
         }
     }
 
@@ -958,8 +963,8 @@ impl<V: Vfs> Pager<V> {
         let page = Arc::new(Page::new_with_meta(buf, page_kind.as_byte(), realm_id.0));
         let cache_lock = self.inner.cache_for_key(file);
         let mut cache = cache_lock.lock();
-        let _ = cache.insert((file, page_id), page);
-        cache.mark_dirty((file, page_id));
+        let _ = cache.insert((file, page_id), page)?;
+        cache.mark_dirty((file, page_id))?;
         // Suppress unused warnings; these are used at flush time.
         let _ = realm_id;
         let _ = segment_id;
@@ -1128,7 +1133,7 @@ impl<V: Vfs> Pager<V> {
                 Ok(_page_kind) => {
                     let page = Arc::new(Page::new_with_meta(buf, auth_kind.as_byte(), realm_id.0));
                     let mut cache = self.inner.cache_for_key(file).lock();
-                    let (_evicted, slot) = cache.insert_and_index((file, page_id), page.clone());
+                    let (_evicted, slot) = cache.insert_and_index((file, page_id), page.clone())?;
                     cache.pin_at(slot);
                     return Ok((
                         PageGuard {
@@ -1368,7 +1373,7 @@ impl<V: Vfs> Pager<V> {
         for (pid, snapshot) in gathered {
             match cache.get((file, pid)) {
                 Some(current) if Arc::ptr_eq(&current, &snapshot) => {
-                    cache.clear_dirty((file, pid));
+                    cache.clear_dirty((file, pid))?;
                 }
                 _ => {
                     tracing::debug!(

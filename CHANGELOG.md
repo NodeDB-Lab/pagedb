@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format is based on 
 
 - **Reader observability** — `DbStats` gains `oldest_reader_commit_id`, `oldest_reader_age_ms` (both `None` when no reader is registered) and `tracked_readers_non_abortable` (`u32`), so a long-lived read transaction that holds back free-page reuse is visible from `Db::stats()`.
 - **Compaction decline flag** — `CompactStats` and `CompactProgress` gain `declined_readers_pinned` (`bool`). `compact_now` and `compact_step` set it when a registered reader pins the page range and the pass does not run, so a caller can tell that result apart from a pass that found nothing to reclaim. Every count is zero in both cases, and `CompactProgress::more_work` stays `false`.
+- **`PagedbError::PageCacheInconsistent`** — returned when the in-memory page cache finds an index entry whose slot is empty, in place of a panic. It is not corruption: nothing on disk is known to be wrong. Drop the handle and reopen the store.
+
+### Changed
+
+- **Page cache eviction with a large dirty set** — dirty pages leave the SIEVE eviction list until they are clean again. A write transaction whose dirty pages outgrow `buffer_pool_pages`, such as one writing many overflow values into a tree larger than the pool, no longer pays a walk over every dirty page for each eviction. Its inserts now cost time linear in the pages it writes, not quadratic.
 
 ## [0.1.0] - 2026-10-15
 

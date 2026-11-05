@@ -4,7 +4,8 @@
 //! SIEVE (Zhang et al., NSDI 2024) replaces classic LRU. The hit path is a
 //! single bit set — no list-shuffle, no `O(N)` order maintenance. Eviction
 //! walks a "hand" through a FIFO of insertions, clearing `visited` bits and
-//! evicting the first unvisited (and unpinned, undirty) entry.
+//! evicting the first unvisited, unpinned entry. Dirty entries are off the
+//! FIFO until they are clean again.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -12,6 +13,8 @@ use std::sync::atomic::AtomicBool;
 
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
+
+use crate::{PagedbError, Result};
 
 /// File-identity discriminator for the cache key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -93,12 +96,21 @@ struct Node {
     /// not pay a second hash to pin, nor a third to unpin on drop.
     pins: u32,
     visited: bool,
+    /// Whether the node is on the SIEVE list. A dirty node is off it: dirty
+    /// pages are never evicted, so the hand has no reason to visit them.
+    linked: bool,
     prev: Option<usize>,
     next: Option<usize>,
 }
 
-/// Bounded page cache with SIEVE eviction. Pinned and dirty entries are
-/// skipped by the eviction hand.
+/// Bounded page cache with SIEVE eviction. Dirty entries leave the SIEVE
+/// list until they are clean again, and pinned entries are skipped by the
+/// eviction hand.
+///
+/// A large write transaction leaves most of the cache dirty. Keeping dirty
+/// entries off the list lets an eviction reach the few clean pages without
+/// walking past every dirty one, so a transaction's inserts stay linear in
+/// the pages it writes.
 pub struct PageCache {
     capacity: usize,
     /// Keys are `(FileKey, u64)` page identities, never attacker-chosen in a
@@ -213,8 +225,12 @@ impl PageCache {
 
     /// Insert `(key, page)`. Evicts one unpinned, undirty, unvisited entry
     /// (per SIEVE) if at capacity. Returns the evicted key if any.
-    pub fn insert(&mut self, key: (FileKey, u64), page: Arc<Page>) -> Option<(FileKey, u64)> {
-        self.insert_and_index(key, page).0
+    pub fn insert(
+        &mut self,
+        key: (FileKey, u64),
+        page: Arc<Page>,
+    ) -> Result<Option<(FileKey, u64)>> {
+        Ok(self.insert_and_index(key, page)?.0)
     }
 
     /// [`insert`](Self::insert), additionally returning the slab index of the
@@ -223,12 +239,12 @@ impl PageCache {
         &mut self,
         key: (FileKey, u64),
         page: Arc<Page>,
-    ) -> (Option<(FileKey, u64)>, usize) {
+    ) -> Result<(Option<(FileKey, u64)>, usize)> {
         // Update in place if key already present (preserve list position).
         if let Some(&idx) = self.map.get(&key) {
             let node = self.slab[idx].as_mut().expect("indexed node alive");
             node.page = page;
-            return (None, idx);
+            return Ok((None, idx));
         }
         let evicted = if self.map.len() >= self.capacity {
             self.evict_one()
@@ -240,24 +256,60 @@ impl PageCache {
             page,
             pins: 0,
             visited: false,
-            prev: self.head,
+            linked: false,
+            prev: None,
             next: None,
         });
-        // Splice in as new head.
-        if let Some(old_head) = self.head {
+        self.map.insert(key, idx);
+        // Fresh entries are unpinned; a caller that pins or dirties this one
+        // adjusts the count through those paths. A key already marked dirty
+        // stays off the list until it is clean.
+        if !self.dirty.contains(&key) {
+            self.link_as_head(idx)?;
+            self.evictable += 1;
+        }
+        Ok((evicted, idx))
+    }
+
+    /// Splice the unlinked node at `idx` in as the newest entry.
+    fn link_as_head(&mut self, idx: usize) -> Result<()> {
+        let old_head = self.head;
+        {
+            let node = self.slab[idx]
+                .as_mut()
+                .ok_or(PagedbError::page_cache_inconsistent("link an entry"))?;
+            debug_assert!(!node.linked, "node linked twice");
+            node.linked = true;
+            node.prev = old_head;
+            node.next = None;
+        }
+        if let Some(old_head) = old_head {
             self.slab[old_head].as_mut().expect("old head alive").next = Some(idx);
         } else {
             // Empty list; this node is also the new tail.
             self.tail = Some(idx);
         }
         self.head = Some(idx);
-        self.map.insert(key, idx);
-        // Fresh entries are clean and unpinned; a caller that pins or dirties
-        // this one adjusts the count through those paths.
-        if !self.dirty.contains(&key) {
-            self.evictable += 1;
+        Ok(())
+    }
+
+    /// Take the node at `idx` off the list, moving the hand off it first.
+    fn unlink_from_list(&mut self, idx: usize) -> Result<()> {
+        let (prev, next) = {
+            let node = self.slab[idx]
+                .as_mut()
+                .ok_or(PagedbError::page_cache_inconsistent("unlink an entry"))?;
+            if !node.linked {
+                return Ok(());
+            }
+            node.linked = false;
+            (node.prev.take(), node.next.take())
+        };
+        if self.hand == Some(idx) {
+            self.hand = next;
         }
-        (evicted, idx)
+        self.unlink_node(idx, prev, next);
+        Ok(())
     }
 
     fn evict_one(&mut self) -> Option<(FileKey, u64)> {
@@ -272,6 +324,12 @@ impl PageCache {
                 .filter(|&&idx| self.is_evictable(idx))
                 .count(),
             "evictable count drifted from the live entries"
+        );
+        debug_assert!(
+            self.map.iter().all(|(key, &idx)| self.slab[idx]
+                .as_ref()
+                .is_some_and(|node| node.linked != self.dirty.contains(key))),
+            "an entry's list membership disagrees with its dirty state"
         );
         // Nothing clean and unpinned exists, so no sweep can succeed. Bailing
         // here is what keeps a write transaction linear in the pages it dirties.
@@ -292,9 +350,11 @@ impl PageCache {
                 let node = self.slab[idx].as_ref().expect("hand on live node");
                 (node.key, node.next, node.visited, node.prev, node.pins)
             };
-            let pinned = pins > 0;
-            let is_dirty = self.dirty.contains(&key);
-            if pinned || is_dirty {
+            debug_assert!(
+                !self.dirty.contains(&key),
+                "a dirty page is on the SIEVE list"
+            );
+            if pins > 0 {
                 // Skip without touching the visited bit.
                 cur = next_idx;
                 continue;
@@ -347,22 +407,38 @@ impl PageCache {
         }
     }
 
-    pub fn mark_dirty(&mut self, key: (FileKey, u64)) {
+    /// Mark `key` dirty, taking a cached entry off the SIEVE list. The list
+    /// is updated first, so an error leaves the dirty set and the evictable
+    /// count as they were.
+    pub fn mark_dirty(&mut self, key: (FileKey, u64)) -> Result<()> {
         let idx = self.map.get(&key).copied();
         let was_evictable = idx.is_some_and(|i| self.is_evictable(i));
+        if let Some(idx) = idx {
+            self.unlink_from_list(idx)?;
+        }
         self.dirty.insert(key);
         if was_evictable {
             self.evictable -= 1;
         }
+        Ok(())
     }
 
-    pub fn clear_dirty(&mut self, key: (FileKey, u64)) {
+    /// Mark `key` clean, putting a cached entry back on the SIEVE list as the
+    /// newest entry. The list is updated first, so an error leaves the dirty
+    /// set and the evictable count as they were.
+    pub fn clear_dirty(&mut self, key: (FileKey, u64)) -> Result<()> {
+        if !self.dirty.contains(&key) {
+            return Ok(());
+        }
+        let idx = self.map.get(&key).copied();
+        if let Some(idx) = idx {
+            self.link_as_head(idx)?;
+        }
         self.dirty.remove(&key);
-        if let Some(idx) = self.map.get(&key).copied()
-            && self.is_evictable(idx)
-        {
+        if idx.is_some_and(|i| self.is_evictable(i)) {
             self.evictable += 1;
         }
+        Ok(())
     }
 
     /// How many entries are currently dirty, across every file.
@@ -427,15 +503,15 @@ impl PageCache {
             if let Some(&idx) = self.map.get(&key) {
                 let was_evictable = self.is_evictable(idx);
                 self.map.remove(&key);
-                let (prev, next) = {
-                    let node = self.slab[idx].as_ref().expect("indexed node alive");
-                    (node.prev, node.next)
-                };
-                if self.hand == Some(idx) {
-                    self.hand = next;
+                // The entry is dropped either way, so a list error is logged
+                // and the clear goes on. A slot that failed is already empty
+                // and is not freed again, so it cannot be handed out twice.
+                match self.unlink_from_list(idx) {
+                    Ok(()) => self.free_node(idx),
+                    Err(error) => {
+                        tracing::error!(page_id = key.1, error = %error, "page cache clear");
+                    }
                 }
-                self.unlink_node(idx, prev, next);
-                self.free_node(idx);
                 if was_evictable {
                     self.evictable -= 1;
                 }
@@ -458,7 +534,7 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let mut c = PageCache::with_capacity(4);
-        c.insert((FileKey::Main, 1), page(0));
+        c.insert((FileKey::Main, 1), page(0)).unwrap();
         assert_eq!(
             c.get((FileKey::Main, 1))
                 .map(|cached| cached.realm_id_bytes),
@@ -469,10 +545,10 @@ mod tests {
     #[test]
     fn evicts_oldest_unvisited_on_overflow() {
         let mut c = PageCache::with_capacity(2);
-        c.insert((FileKey::Main, 1), page(1));
-        c.insert((FileKey::Main, 2), page(2));
+        c.insert((FileKey::Main, 1), page(1)).unwrap();
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
         // No gets — both unvisited. Hand starts at tail = key 1. Evicts it.
-        let evicted = c.insert((FileKey::Main, 3), page(3));
+        let evicted = c.insert((FileKey::Main, 3), page(3)).unwrap();
         assert_eq!(evicted, Some((FileKey::Main, 1)));
         assert!(c.get((FileKey::Main, 1)).is_none());
         assert!(c.get((FileKey::Main, 2)).is_some());
@@ -483,11 +559,11 @@ mod tests {
     fn visited_entries_survive_one_pass() {
         // SIEVE: hit sets visited; first hand pass clears it; second pass evicts.
         let mut c = PageCache::with_capacity(2);
-        c.insert((FileKey::Main, 1), page(1));
-        c.insert((FileKey::Main, 2), page(2));
+        c.insert((FileKey::Main, 1), page(1)).unwrap();
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
         let _ = c.get((FileKey::Main, 1)); // mark 1 as visited
         // Hand starts at tail = 1, sees visited, clears, moves to 2 (unvisited): evicts 2.
-        let evicted = c.insert((FileKey::Main, 3), page(3));
+        let evicted = c.insert((FileKey::Main, 3), page(3)).unwrap();
         assert_eq!(evicted, Some((FileKey::Main, 2)));
         assert!(
             c.get((FileKey::Main, 1)).is_some(),
@@ -498,10 +574,10 @@ mod tests {
     #[test]
     fn pinned_pages_survive_eviction() {
         let mut c = PageCache::with_capacity(2);
-        let (_, pinned) = c.insert_and_index((FileKey::Main, 1), page(1));
+        let (_, pinned) = c.insert_and_index((FileKey::Main, 1), page(1)).unwrap();
         c.pin_at(pinned);
-        c.insert((FileKey::Main, 2), page(2));
-        let evicted = c.insert((FileKey::Main, 3), page(3));
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
+        let evicted = c.insert((FileKey::Main, 3), page(3)).unwrap();
         assert_eq!(evicted, Some((FileKey::Main, 2)));
         assert!(
             c.get((FileKey::Main, 1)).is_some(),
@@ -513,31 +589,31 @@ mod tests {
     fn releasing_the_last_pin_makes_an_entry_evictable_again() {
         let mut c = PageCache::with_capacity(2);
         let key = (FileKey::Main, 1);
-        let (_, idx) = c.insert_and_index(key, page(1));
+        let (_, idx) = c.insert_and_index(key, page(1)).unwrap();
         c.pin_at(idx);
-        c.insert((FileKey::Main, 2), page(2));
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
         assert_eq!(
-            c.insert((FileKey::Main, 3), page(3)),
+            c.insert((FileKey::Main, 3), page(3)).unwrap(),
             Some((FileKey::Main, 2))
         );
 
         c.unpin_at(idx, key);
         // Unpinned and never re-read, so it is now the eviction hand's victim.
-        assert_eq!(c.insert((FileKey::Main, 4), page(4)), Some(key));
+        assert_eq!(c.insert((FileKey::Main, 4), page(4)).unwrap(), Some(key));
     }
 
     #[test]
     fn nested_pins_each_need_releasing() {
         let mut c = PageCache::with_capacity(2);
         let key = (FileKey::Main, 1);
-        let (_, idx) = c.insert_and_index(key, page(1));
+        let (_, idx) = c.insert_and_index(key, page(1)).unwrap();
         c.pin_at(idx);
         c.pin_at(idx);
 
         c.unpin_at(idx, key);
-        c.insert((FileKey::Main, 2), page(2));
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
         assert_eq!(
-            c.insert((FileKey::Main, 3), page(3)),
+            c.insert((FileKey::Main, 3), page(3)).unwrap(),
             Some((FileKey::Main, 2)),
             "one outstanding pin still protects the entry"
         );
@@ -549,17 +625,20 @@ mod tests {
     fn unpinning_a_recycled_slot_leaves_the_new_occupant_pinned() {
         let mut c = PageCache::with_capacity(1);
         let old_key = (FileKey::Main, 1);
-        let (_, idx) = c.insert_and_index(old_key, page(1));
-        assert_eq!(c.insert((FileKey::Main, 2), page(2)), Some(old_key));
+        let (_, idx) = c.insert_and_index(old_key, page(1)).unwrap();
+        assert_eq!(
+            c.insert((FileKey::Main, 2), page(2)).unwrap(),
+            Some(old_key)
+        );
 
         // The slot now belongs to page 2. Pin it, then replay the stale
         // release for page 1 against the same index.
         let new_key = (FileKey::Main, 2);
-        let (_, new_idx) = c.insert_and_index(new_key, page(2));
+        let (_, new_idx) = c.insert_and_index(new_key, page(2)).unwrap();
         c.pin_at(new_idx);
         c.unpin_at(idx, old_key);
 
-        c.insert((FileKey::Main, 3), page(3));
+        c.insert((FileKey::Main, 3), page(3)).unwrap();
         assert!(
             c.get(new_key).is_some(),
             "the stale release must not have unpinned the new occupant"
@@ -573,17 +652,17 @@ mod tests {
         let mut c = PageCache::with_capacity(4);
         for id in 1u8..=6 {
             let key = (FileKey::Main, u64::from(id));
-            c.insert(key, page(id));
-            c.mark_dirty(key);
+            c.insert(key, page(id)).unwrap();
+            c.mark_dirty(key).unwrap();
         }
         assert_eq!(c.evictable, 0);
         assert_eq!(c.len(), 6, "dirty entries grow the cache past capacity");
 
         // Cleaning one makes it — and only it — a candidate again.
-        c.clear_dirty((FileKey::Main, 3));
+        c.clear_dirty((FileKey::Main, 3)).unwrap();
         assert_eq!(c.evictable, 1);
         assert_eq!(
-            c.insert((FileKey::Main, 7), page(7)),
+            c.insert((FileKey::Main, 7), page(7)).unwrap(),
             Some((FileKey::Main, 3))
         );
         // Page 3 left, but page 7 arrived clean and is a candidate in its turn.
@@ -594,26 +673,26 @@ mod tests {
     fn evictable_count_tracks_pin_and_dirty_transitions() {
         let mut c = PageCache::with_capacity(8);
         let key = (FileKey::Main, 1);
-        let (_, idx) = c.insert_and_index(key, page(1));
+        let (_, idx) = c.insert_and_index(key, page(1)).unwrap();
         assert_eq!(c.evictable, 1, "a fresh clean entry is a candidate");
 
         c.pin_at(idx);
         assert_eq!(c.evictable, 0, "pinned");
-        c.mark_dirty(key);
+        c.mark_dirty(key).unwrap();
         assert_eq!(c.evictable, 0, "pinned and dirty");
         c.unpin_at(idx, key);
         assert_eq!(c.evictable, 0, "still dirty");
-        c.clear_dirty(key);
+        c.clear_dirty(key).unwrap();
         assert_eq!(c.evictable, 1, "clean and unpinned again");
     }
 
     #[test]
     fn dirty_pages_not_evicted() {
         let mut c = PageCache::with_capacity(2);
-        c.insert((FileKey::Main, 1), page(1));
-        c.mark_dirty((FileKey::Main, 1));
-        c.insert((FileKey::Main, 2), page(2));
-        let evicted = c.insert((FileKey::Main, 3), page(3));
+        c.insert((FileKey::Main, 1), page(1)).unwrap();
+        c.mark_dirty((FileKey::Main, 1)).unwrap();
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
+        let evicted = c.insert((FileKey::Main, 3), page(3)).unwrap();
         assert_eq!(evicted, Some((FileKey::Main, 2)));
         assert!(c.get((FileKey::Main, 1)).is_some());
     }
@@ -621,9 +700,9 @@ mod tests {
     #[test]
     fn clear_clean_file_preserves_dirty_entries() {
         let mut c = PageCache::with_capacity(4);
-        c.insert((FileKey::Main, 1), page(1));
-        c.insert((FileKey::Main, 2), page(2));
-        c.mark_dirty((FileKey::Main, 2));
+        c.insert((FileKey::Main, 1), page(1)).unwrap();
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
+        c.mark_dirty((FileKey::Main, 2)).unwrap();
 
         c.clear_clean_file(FileKey::Main);
 
@@ -636,8 +715,8 @@ mod tests {
     fn dirty_iter_is_sorted_ascending() {
         let mut c = PageCache::with_capacity(16);
         for p in [50, 25, 100, 75] {
-            c.insert((FileKey::Main, p), page(0));
-            c.mark_dirty((FileKey::Main, p));
+            c.insert((FileKey::Main, p), page(0)).unwrap();
+            c.mark_dirty((FileKey::Main, p)).unwrap();
         }
         assert_eq!(c.dirty_for_file(FileKey::Main), vec![25, 50, 75, 100]);
     }
@@ -645,8 +724,8 @@ mod tests {
     #[test]
     fn file_classes_dont_collide() {
         let mut c = PageCache::with_capacity(4);
-        c.insert((FileKey::Main, 1), page(1));
-        c.insert((FileKey::Segment([0; 16]), 1), page(2));
+        c.insert((FileKey::Main, 1), page(1)).unwrap();
+        c.insert((FileKey::Segment([0; 16]), 1), page(2)).unwrap();
         assert!(c.get((FileKey::Main, 1)).is_some());
         assert!(c.get((FileKey::Segment([0; 16]), 1)).is_some());
     }
@@ -655,9 +734,9 @@ mod tests {
     fn reuse_slab_slots() {
         // Insert N+1 over capacity N to force one eviction; slab should reuse the slot.
         let mut c = PageCache::with_capacity(2);
-        c.insert((FileKey::Main, 1), page(1));
-        c.insert((FileKey::Main, 2), page(2));
-        c.insert((FileKey::Main, 3), page(3));
+        c.insert((FileKey::Main, 1), page(1)).unwrap();
+        c.insert((FileKey::Main, 2), page(2)).unwrap();
+        c.insert((FileKey::Main, 3), page(3)).unwrap();
         assert_eq!(c.slab.len(), 2, "slab reuses freed slot");
     }
 
@@ -667,13 +746,13 @@ mod tests {
 
         for id in 1u8..=4 {
             let key = (FileKey::Main, u64::from(id));
-            let (_, idx) = c.insert_and_index(key, page(id));
+            let (_, idx) = c.insert_and_index(key, page(id)).unwrap();
             c.pin_at(idx);
         }
-        c.insert((FileKey::Main, 5), page(5));
+        c.insert((FileKey::Main, 5), page(5)).unwrap();
         assert_eq!(c.len(), 5, "pinned pages may force temporary growth");
 
-        let evicted = c.insert((FileKey::Main, 6), page(6));
+        let evicted = c.insert((FileKey::Main, 6), page(6)).unwrap();
         assert_eq!(
             evicted,
             Some((FileKey::Main, 5)),
@@ -682,5 +761,112 @@ mod tests {
         assert_eq!(c.len(), 5);
         assert!(c.get((FileKey::Main, 5)).is_none());
         assert!(c.get((FileKey::Main, 6)).is_some());
+    }
+
+    /// Dirty entries leave the SIEVE list, so eviction takes the clean ones
+    /// without visiting them, and an entry made clean is evictable again.
+    #[test]
+    fn dirty_entries_stay_off_the_eviction_list_until_clean() {
+        let mut c = PageCache::with_capacity(3);
+        for p in 1..=3u8 {
+            c.insert((FileKey::Main, u64::from(p)), page(p)).unwrap();
+        }
+        c.mark_dirty((FileKey::Main, 1)).unwrap();
+        c.mark_dirty((FileKey::Main, 2)).unwrap();
+        // Page 3 is the only clean entry, so it goes, not a dirty one.
+        assert_eq!(
+            c.insert((FileKey::Main, 4), page(4)).unwrap(),
+            Some((FileKey::Main, 3))
+        );
+
+        // Cleaned, page 1 rejoins as the newest entry: page 4 is older.
+        c.clear_dirty((FileKey::Main, 1)).unwrap();
+        assert_eq!(
+            c.insert((FileKey::Main, 5), page(5)).unwrap(),
+            Some((FileKey::Main, 4))
+        );
+        assert!(c.get((FileKey::Main, 2)).is_some(), "dirty page kept");
+
+        // A key marked dirty before it is cached is inserted off the list:
+        // the hand passes over it to the clean entries.
+        c.mark_dirty((FileKey::Main, 9)).unwrap();
+        assert_eq!(
+            c.insert((FileKey::Main, 9), page(9)).unwrap(),
+            Some((FileKey::Main, 1))
+        );
+        assert_eq!(
+            c.insert((FileKey::Main, 6), page(6)).unwrap(),
+            Some((FileKey::Main, 5))
+        );
+        assert!(c.get((FileKey::Main, 9)).is_some());
+        assert_eq!(c.dirty_len(), 2);
+    }
+
+    /// Dropping a file's entries takes dirty, unlinked ones too, and leaves
+    /// the list and the hand consistent for the next eviction. An entry of
+    /// another file survives on the list and is evicted in its turn.
+    #[test]
+    fn clearing_a_file_drops_unlinked_dirty_entries() {
+        let seg = FileKey::Segment([7u8; 16]);
+        let mut c = PageCache::with_capacity(3);
+        c.insert((FileKey::Main, 1), page(1)).unwrap();
+        c.insert((seg, 1), page(2)).unwrap();
+        c.insert((FileKey::Main, 2), page(3)).unwrap();
+        c.mark_dirty((FileKey::Main, 1)).unwrap();
+        c.clear_file(FileKey::Main);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.dirty_len(), 0);
+
+        // The segment entry is the oldest on the list, then 3, then 4.
+        c.insert((FileKey::Main, 3), page(4)).unwrap();
+        c.insert((FileKey::Main, 4), page(5)).unwrap();
+        assert_eq!(
+            c.insert((FileKey::Main, 5), page(6)).unwrap(),
+            Some((seg, 1))
+        );
+        assert_eq!(
+            c.insert((FileKey::Main, 6), page(7)).unwrap(),
+            Some((FileKey::Main, 3))
+        );
+    }
+
+    /// A live index entry whose slot is empty is reported as an error from
+    /// both list operations, not a panic.
+    #[test]
+    fn dead_slot_is_an_error() {
+        let mut c = PageCache::with_capacity(4);
+        let (_, linked) = c.insert_and_index((FileKey::Main, 1), page(1)).unwrap();
+        c.slab[linked] = None;
+        assert!(matches!(
+            c.mark_dirty((FileKey::Main, 1)),
+            Err(PagedbError::PageCacheInconsistent { .. })
+        ));
+        assert_eq!(c.dirty_len(), 0);
+        assert_eq!(c.evictable, 1);
+
+        let mut c = PageCache::with_capacity(4);
+        let (_, unlinked) = c.insert_and_index((FileKey::Main, 2), page(2)).unwrap();
+        c.mark_dirty((FileKey::Main, 2)).unwrap();
+        c.slab[unlinked] = None;
+        assert!(matches!(
+            c.clear_dirty((FileKey::Main, 2)),
+            Err(PagedbError::PageCacheInconsistent { .. })
+        ));
+        assert_eq!(c.dirty_len(), 1);
+        assert_eq!(c.evictable, 0);
+    }
+
+    /// Clearing a file past a freed slot that a live index entry still names
+    /// does not free the slot a second time, so two later inserts get two
+    /// different slots.
+    #[test]
+    fn clearing_past_a_freed_slot_does_not_free_it_twice() {
+        let mut c = PageCache::with_capacity(4);
+        let (_, idx) = c.insert_and_index((FileKey::Main, 1), page(1)).unwrap();
+        c.free_node(idx);
+        c.clear_file(FileKey::Main);
+        let (_, first) = c.insert_and_index((FileKey::Main, 2), page(2)).unwrap();
+        let (_, second) = c.insert_and_index((FileKey::Main, 3), page(3)).unwrap();
+        assert_ne!(first, second);
     }
 }
