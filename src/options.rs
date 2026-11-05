@@ -5,9 +5,10 @@
 //! (decrypted `mmap_view` scratch), and `reader_stall_threshold_pages`
 //! (deferred-free backlog). `buffer_pool_pages` and `segment_cache_pages` cap
 //! their caches by eviction rather than by refusal: a clean, unpinned page is
-//! evicted to stay within the count. Dirty pages are exempt from eviction
-//! until they are flushed, so a single very large write transaction can hold
-//! more than `buffer_pool_pages` resident between flushes.
+//! evicted to stay within the count. A cache exceeds its count only while every
+//! entry is dirty or pinned. A transaction's dirty pages and pinned pages can
+//! exceed the budget until they are flushed or released, and the cache then
+//! returns to the count.
 
 use std::time::Duration;
 

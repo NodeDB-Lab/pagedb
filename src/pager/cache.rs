@@ -6,6 +6,10 @@
 //! walks a "hand" through a FIFO of insertions, clearing `visited` bits and
 //! evicting the first unvisited (and unpinned, undirty) entry.
 //!
+//! When a cache mutex is released, the cache holds at most `capacity` entries,
+//! or every entry is dirty or pinned. Dirty pages and pinned pages exceed the
+//! budget only until they are flushed or released.
+//!
 //! A broken invariant becomes a [`CacheFault`]. The first fault latches, and
 //! every later fallible operation reports it. No state in this module panics.
 
@@ -24,6 +28,10 @@ const NO_VICTIM: &str = "evictable count is positive with no victim";
 const RELEASE_WITHOUT_PIN: &str = "release without a pin";
 const DIRTY_NOT_RESIDENT: &str = "dirty page not resident";
 const EVICTABLE_COUNT_DRIFTED: &str = "evictable count differs from the live entries";
+const OVER_BUDGET: &str = "entries exceed capacity while one is evictable";
+const LIST_LINK_BROKEN: &str = "list link disagrees with the slot it names";
+const MAP_SLOT_DISAGREES: &str = "map entry disagrees with the slot";
+const LIVE_SLOTS_DRIFTED: &str = "live slots differ from the map";
 
 /// A broken cache invariant. `operation` names what was running, `detail` what
 /// it found, and `slot` the slab slot when one is known.
@@ -139,6 +147,9 @@ struct Node {
 /// Bounded page cache with SIEVE eviction. Pinned and dirty entries are
 /// skipped by the eviction hand.
 pub struct PageCache {
+    /// The entry budget. At every mutex release, `map.len() <= capacity` or
+    /// `evictable == 0`. Transaction dirty pages and pinned pages exceed it
+    /// until they are flushed or released, and the pool then returns to it.
     capacity: usize,
     /// Keys are `(FileKey, u64)` page identities, never attacker-chosen in a
     /// way that could be ground into collisions, so the DoS-resistant `SipHash`
@@ -167,6 +178,9 @@ pub struct PageCache {
     /// The first broken invariant. Once set, every fallible method returns it
     /// and changes nothing.
     fault: Option<CacheFault>,
+    /// Loop iterations of the eviction hand, so a test can bound a batch trim.
+    #[cfg(test)]
+    walk_visits: usize,
 }
 
 impl PageCache {
@@ -184,6 +198,8 @@ impl PageCache {
             dirty: BTreeSet::new(),
             evictable: 0,
             fault: None,
+            #[cfg(test)]
+            walk_visits: 0,
         }
     }
 
@@ -288,7 +304,7 @@ impl PageCache {
         self.map.len()
     }
 
-    /// Lookup. Sets the `visited` bit on hit; does not touch the FIFO order.
+    /// Lookup. Sets the `visited` bit on hit. Leaves the FIFO order alone.
     pub fn get(&mut self, key: (FileKey, u64)) -> Result<Option<Arc<Page>>, CacheFault> {
         const OPERATION: &str = "get";
         self.guarded(|cache| {
@@ -301,29 +317,23 @@ impl PageCache {
         })
     }
 
-    /// [`get`](Self::get) for a key a flush read from the dirty set. `None` means
-    /// the key is no longer dirty and left the cache.
+    /// Lookup for a key a flush read from the dirty set. `None` means the key
+    /// is no longer dirty and left the cache.
     pub fn get_dirty(&mut self, key: (FileKey, u64)) -> Result<Option<Arc<Page>>, CacheFault> {
         const OPERATION: &str = "get_dirty";
-        self.guarded(|cache| {
-            let Some(&idx) = cache.map.get(&key) else {
-                // A key that is no longer dirty left through a legitimate clear.
-                // A key still marked dirty cannot leave, so that one is a fault.
-                if cache.dirty.contains(&key) {
-                    return Err(CacheFault::new(OPERATION, DIRTY_NOT_RESIDENT, None));
-                }
-                return Ok(None);
-            };
-            let node = Self::keyed_node_mut(&mut cache.slab, idx, key, OPERATION)?;
-            node.visited = true;
-            Ok(Some(node.page.clone()))
-        })
+        let page = self.get(key)?;
+        // A key that is no longer dirty left through a legitimate clear.
+        // A key still marked dirty cannot leave, so that one is a fault.
+        if page.is_none() && self.dirty.contains(&key) {
+            return Err(self.latch(CacheFault::new(OPERATION, DIRTY_NOT_RESIDENT, None)));
+        }
+        Ok(page)
     }
 
-    /// [`get`](Self::get) that also pins, returning the slab index to release
-    /// it with. One hash lookup serves the read, the `visited` bit, and the
-    /// pin — the read path's hottest operation, so the separate `pin` call it
-    /// replaces was a second hash of the same key.
+    /// Lookup that also pins, returning the slab index to release it with. One
+    /// hash lookup serves the read, the `visited` bit, and the pin — the read
+    /// path's hottest operation, so the separate `pin` call it replaces was a
+    /// second hash of the same key.
     pub fn get_and_pin(
         &mut self,
         key: (FileKey, u64),
@@ -361,6 +371,9 @@ impl PageCache {
     /// A stale slot, another key, or a release with no pin latches a fault. The
     /// caller is a guard drop or an error branch, so the next operation reports
     /// it.
+    ///
+    /// An over-budget pool has nothing evictable, so at most this entry becomes
+    /// a candidate. The trim below is therefore at most one eviction.
     pub fn unpin_at(&mut self, idx: usize, key: (FileKey, u64)) {
         const OPERATION: &str = "unpin_at";
         let _ = self.guarded(|cache| {
@@ -371,13 +384,17 @@ impl PageCache {
             node.pins -= 1;
             if Self::is_evictable(node, &cache.dirty) {
                 cache.evictable = cache.evictable.saturating_add(1);
+                if cache.map.len() > cache.capacity {
+                    cache.trim_to(cache.capacity)?;
+                }
             }
-            Ok(())
+            cache.check_within_budget(OPERATION)
         });
     }
 
-    /// Insert `(key, page)`. Attempts one eviction of an unpinned, undirty,
-    /// unvisited entry (per SIEVE) if at capacity.
+    /// Insert `(key, page)`, trimming the pool first if it is at capacity. A new
+    /// clean entry on a pool of dirty and pinned pages stays over budget until
+    /// the caller marks it dirty under the same lock.
     pub fn insert(&mut self, key: (FileKey, u64), page: Arc<Page>) -> Result<(), CacheFault> {
         const OPERATION: &str = "insert";
         self.guarded(|cache| {
@@ -417,8 +434,9 @@ impl PageCache {
         pins: u32,
         operation: &'static str,
     ) -> Result<usize, CacheFault> {
+        // The trim runs before the entry exists, so it is never its own victim.
         if self.map.len() >= self.capacity {
-            self.evict_one()?;
+            self.trim_to(self.capacity.saturating_sub(1))?;
         }
         let old_head = self.head;
         let idx = self.alloc_node(
@@ -446,21 +464,39 @@ impl PageCache {
         Ok(idx)
     }
 
-    /// Evict one candidate, reporting whether one left. `Ok(false)` means every
-    /// entry is pinned or dirty, and the caller lets the cache grow.
-    fn evict_one(&mut self) -> Result<bool, CacheFault> {
-        const OPERATION: &str = "evict_one";
+    /// Evict entries until at most `target` remain or none is evictable. This is
+    /// the only caller of [`evict_one`](Self::evict_one).
+    ///
+    /// Each eviction resumes from the hand. A batch therefore walks at most two
+    /// passes over the list plus its evictions.
+    fn trim_to(&mut self, target: usize) -> Result<(), CacheFault> {
+        const OPERATION: &str = "trim_to";
         // A drifted count either skips a possible eviction (unbounded growth)
         // or reintroduces the sweep it exists to avoid. The recount costs one
-        // map walk, so it runs in debug builds only.
+        // map walk, so it runs once per trim and in debug builds only.
         if cfg!(debug_assertions) {
             self.check_evictable_count(OPERATION)?;
         }
-        // Nothing clean and unpinned exists, so no sweep can succeed. Bailing
-        // here is what keeps a write transaction linear in the pages it dirties.
-        if self.evictable == 0 {
-            return Ok(false);
+        // With nothing clean and unpinned, no sweep can succeed. The zero check
+        // keeps a write transaction linear in the pages it dirties.
+        while self.map.len() > target && self.evictable > 0 {
+            self.evict_one()?;
         }
+        Ok(())
+    }
+
+    /// Report a pool over budget with a candidate left, in debug builds only.
+    fn check_within_budget(&self, operation: &'static str) -> Result<(), CacheFault> {
+        if cfg!(debug_assertions) && self.map.len() > self.capacity && self.evictable > 0 {
+            return Err(CacheFault::new(operation, OVER_BUDGET, None));
+        }
+        Ok(())
+    }
+
+    /// Evict one candidate. The caller has seen a positive `evictable` count, so
+    /// a walk that finds no victim is a fault.
+    fn evict_one(&mut self) -> Result<(), CacheFault> {
+        const OPERATION: &str = "evict_one";
         // Use the live list length rather than the configured capacity because
         // pinned or dirty pages can temporarily grow the cache past capacity.
         // Each wrap past head uses one loop iteration.
@@ -469,6 +505,10 @@ impl PageCache {
         let max_steps = self.map.len().saturating_add(1).saturating_mul(2);
         let mut cur = self.hand.or(self.tail);
         for _ in 0..max_steps {
+            #[cfg(test)]
+            {
+                self.walk_visits = self.walk_visits.saturating_add(1);
+            }
             let Some(idx) = cur else {
                 // Reached past head — wrap to tail.
                 cur = self.tail;
@@ -493,7 +533,7 @@ impl PageCache {
             self.map.remove(&key);
             self.free_node(idx, OPERATION)?;
             self.evictable = Self::one_less(self.evictable, OPERATION)?;
-            return Ok(true);
+            return Ok(());
         }
         Err(CacheFault::new(OPERATION, NO_VICTIM, None))
     }
@@ -579,7 +619,10 @@ impl PageCache {
 
     /// Clear a dirty marker. A key that is already clean is a no-op. A failed
     /// call leaves the marker set, so the page stays visible to the flush check.
-    pub fn clear_dirty(&mut self, key: (FileKey, u64)) -> Result<(), CacheFault> {
+    ///
+    /// This does not trim, because a trim per key is quadratic. Each batch caller
+    /// trims once at its end.
+    fn clear_dirty(&mut self, key: (FileKey, u64)) -> Result<(), CacheFault> {
         const OPERATION: &str = "clear_dirty";
         self.guarded(|cache| {
             if !cache.dirty.contains(&key) {
@@ -595,6 +638,166 @@ impl PageCache {
             }
             Ok(())
         })
+    }
+
+    /// Clear the dirty markers of pages that reached disk, then return the pool
+    /// to its budget.
+    ///
+    /// Only a page still holding the gathered `Arc<Page>` is cleared. A concurrent
+    /// writer replaces the `Arc` on every write. Clearing its flag loses content
+    /// that never reached disk, so the next cold read finds a stale page. A
+    /// replaced page keeps its flag and flushes on the next cycle.
+    pub fn finish_flush(
+        &mut self,
+        file: FileKey,
+        gathered: Vec<(u64, Arc<Page>)>,
+    ) -> Result<(), CacheFault> {
+        const OPERATION: &str = "finish_flush";
+        for (pid, snapshot) in gathered {
+            match self.get((file, pid))? {
+                Some(current) if Arc::ptr_eq(&current, &snapshot) => {
+                    self.clear_dirty((file, pid))?;
+                }
+                _ => {
+                    tracing::debug!(
+                        page_id = pid,
+                        "page re-dirtied during flush; keeping dirty for next cycle"
+                    );
+                }
+            }
+        }
+        self.guarded(|cache| cache.settle_batch(OPERATION))
+    }
+
+    /// Clear every dirty marker of `file` without flushing, then return the pool
+    /// to its budget. A fault stops the loop and stays latched, so the pages
+    /// still marked dirty never reach disk.
+    pub fn discard_dirty(&mut self, file: FileKey) {
+        const OPERATION: &str = "discard_dirty";
+        for pid in self.dirty_for_file(file) {
+            if self.clear_dirty((file, pid)).is_err() {
+                return;
+            }
+        }
+        let _ = self.guarded(|cache| cache.settle_batch(OPERATION));
+    }
+
+    /// The single trim that ends a batch, plus its index memory reclaim.
+    fn settle_batch(&mut self, operation: &'static str) -> Result<(), CacheFault> {
+        self.trim_to(self.capacity)?;
+        self.reclaim_index_memory()?;
+        self.check_within_budget(operation)
+    }
+
+    /// Return the map and slab memory of an overgrown pool once the pool shrinks.
+    /// The cost is linear in `slab.len()`.
+    fn reclaim_index_memory(&mut self) -> Result<(), CacheFault> {
+        const OPERATION: &str = "reclaim_index_memory";
+        let bound = self.capacity.saturating_mul(2);
+        if self.map.capacity() <= bound && self.slab.len() <= bound {
+            return Ok(());
+        }
+        self.map.shrink_to(self.capacity);
+        self.compact_high_slots(OPERATION)?;
+        let keep = self
+            .slab
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |top| top.saturating_add(1));
+        self.slab.truncate(keep);
+        self.slab.shrink_to(self.capacity);
+        // Listed highest first, so allocation pops the lowest free slot.
+        let free_slots = self
+            .slab
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(idx, slot)| slot.is_none().then_some(idx));
+        self.free.clear();
+        self.free.extend(free_slots);
+        self.free.shrink_to_fit();
+        if self.free.len().saturating_add(self.map.len()) != self.slab.len() {
+            return Err(CacheFault::new(OPERATION, LIVE_SLOTS_DRIFTED, None));
+        }
+        Ok(())
+    }
+
+    /// Move unpinned nodes from the top of the slab into its lowest free slots.
+    /// The walk stops at the highest pin. A `PageGuard` holds that slot, so the
+    /// slab cannot truncate below it, and a move below it frees nothing.
+    fn compact_high_slots(&mut self, operation: &'static str) -> Result<(), CacheFault> {
+        let mut low = 0_usize;
+        for high in (0..self.slab.len()).rev() {
+            let Some(node) = self.slab.get(high).and_then(Option::as_ref) else {
+                continue;
+            };
+            if node.pins > 0 {
+                break;
+            }
+            while low < high && matches!(self.slab.get(low), Some(Some(_))) {
+                low = low.saturating_add(1);
+            }
+            if low >= high {
+                break;
+            }
+            self.move_node(high, low, operation)?;
+        }
+        Ok(())
+    }
+
+    /// Move an unpinned node into the free slot `to`. This fixes the neighbours,
+    /// `head`, `tail`, `hand`, and the map entry. Dirty tracking is by key, so a
+    /// dirty node moves as well.
+    fn move_node(
+        &mut self,
+        from: usize,
+        to: usize,
+        operation: &'static str,
+    ) -> Result<(), CacheFault> {
+        let broken = CacheFault::new(operation, LIST_LINK_BROKEN, Some(from));
+        let node = Self::node(&self.slab, from, operation)?;
+        let (key, prev, next) = (node.key, node.prev, node.next);
+        if let Some(p) = prev {
+            let neighbour = Self::node_mut(&mut self.slab, p, operation)?;
+            if neighbour.next != Some(from) {
+                return Err(broken);
+            }
+            neighbour.next = Some(to);
+        } else if self.tail == Some(from) {
+            self.tail = Some(to);
+        } else {
+            return Err(broken);
+        }
+        if let Some(n) = next {
+            let neighbour = Self::node_mut(&mut self.slab, n, operation)?;
+            if neighbour.prev != Some(from) {
+                return Err(broken);
+            }
+            neighbour.prev = Some(to);
+        } else if self.head == Some(from) {
+            self.head = Some(to);
+        } else {
+            return Err(broken);
+        }
+        if self.hand == Some(from) {
+            self.hand = Some(to);
+        }
+        match self.map.get_mut(&key) {
+            Some(mapped) if *mapped == from => *mapped = to,
+            _ => {
+                return Err(CacheFault::new(operation, MAP_SLOT_DISAGREES, Some(from)));
+            }
+        }
+        let moved = self.slab.get_mut(from).and_then(Option::take);
+        let slot = self
+            .slab
+            .get_mut(to)
+            .ok_or_else(|| CacheFault::new(operation, SLOT_EMPTY, Some(to)))?;
+        if slot.is_some() {
+            return Err(CacheFault::new(operation, SLOT_HOLDS_OTHER_KEY, Some(to)));
+        }
+        *slot = moved;
+        Ok(())
     }
 
     /// How many entries are currently dirty, across every file.
@@ -916,6 +1119,8 @@ mod tests {
         assert_eq!(c.insert_and_pin(absent, page(3)), Err(first));
         assert_eq!(c.mark_dirty(absent), Err(first));
         assert_eq!(c.clear_dirty(healthy), Err(first));
+        assert_eq!(c.finish_flush(FileKey::Main, Vec::new()), Err(first));
+        c.discard_dirty(FileKey::Main);
         assert_eq!(c.clear_file(FileKey::Main), Err(first));
         assert_eq!(c.clear_clean_file(FileKey::Main), Err(first));
 
@@ -1199,5 +1404,317 @@ mod tests {
 
         c.clear_dirty(key).unwrap();
         assert_eq!(c.evictable, 1);
+    }
+
+    fn main_key(id: u64) -> (FileKey, u64) {
+        (FileKey::Main, id)
+    }
+
+    /// Add dirty main.db entries, one per id, in ascending list order.
+    fn add_dirty(c: &mut PageCache, ids: std::ops::RangeInclusive<u64>) {
+        for id in ids {
+            c.insert(main_key(id), page(u8::try_from(id % 251).unwrap()))
+                .unwrap();
+            c.mark_dirty(main_key(id)).unwrap();
+        }
+    }
+
+    /// Snapshot pages the way a flush gathers them.
+    fn gather(c: &mut PageCache, ids: impl Iterator<Item = u64>) -> Vec<(u64, Arc<Page>)> {
+        ids.map(|id| (id, c.get_dirty(main_key(id)).unwrap().unwrap()))
+            .collect()
+    }
+
+    /// Walk the list both ways against the map, the free list, and the counts.
+    fn assert_list_matches_map(c: &PageCache) {
+        let mut walked = 0_usize;
+        let mut prev = None;
+        let mut cur = c.tail;
+        while let Some(idx) = cur {
+            let node = PageCache::node(&c.slab, idx, "test").unwrap();
+            assert_eq!(
+                node.prev, prev,
+                "slot {idx} names the wrong older neighbour"
+            );
+            assert_eq!(c.map.get(&node.key), Some(&idx), "map disagrees at {idx}");
+            walked += 1;
+            assert!(walked <= c.map.len(), "the list holds a cycle");
+            prev = Some(idx);
+            cur = node.next;
+        }
+        assert_eq!(c.head, prev);
+        assert_eq!(walked, c.map.len());
+        if let Some(hand) = c.hand {
+            PageCache::node(&c.slab, hand, "test").unwrap();
+        }
+        c.check_evictable_count("test").unwrap();
+
+        let mut free = c.free.clone();
+        free.sort_unstable();
+        free.dedup();
+        assert_eq!(free.len(), c.free.len(), "a free slot is listed twice");
+        assert!(free.iter().all(|&idx| c.slab[idx].is_none()));
+        assert_eq!(free.len() + c.map.len(), c.slab.len());
+    }
+
+    #[test]
+    fn insert_evicts_until_below_capacity_after_overgrowth() {
+        let mut c = PageCache::with_capacity(4);
+        add_dirty(&mut c, 1..=10);
+        for id in 1..=10 {
+            c.clear_dirty(main_key(id)).unwrap();
+        }
+        assert_eq!(c.len(), 10, "clearing a marker does not trim");
+
+        c.insert(main_key(11), page(11)).unwrap();
+
+        assert_eq!(c.len(), 4);
+        assert!(
+            c.contains(main_key(11)),
+            "the new entry is never its own victim"
+        );
+        for id in 8..=10 {
+            assert!(c.contains(main_key(id)), "the oldest entries leave first");
+        }
+    }
+
+    #[test]
+    fn finish_flush_returns_pool_to_capacity() {
+        let mut c = PageCache::with_capacity(4);
+        add_dirty(&mut c, 1..=10);
+        let gathered = gather(&mut c, 1..=10);
+
+        c.finish_flush(FileKey::Main, gathered).unwrap();
+
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.dirty_len(), 0);
+        assert_eq!(c.evictable, 4);
+        assert_list_matches_map(&c);
+    }
+
+    #[test]
+    fn finish_flush_keeps_a_replaced_page_dirty() {
+        let mut c = PageCache::with_capacity(2);
+        add_dirty(&mut c, 1..=5);
+        let gathered = gather(&mut c, 1..=5);
+        c.insert(main_key(3), page(99)).unwrap();
+
+        c.finish_flush(FileKey::Main, gathered).unwrap();
+
+        assert_eq!(c.dirty_for_file(FileKey::Main), vec![3]);
+        assert_eq!(c.get(main_key(3)).unwrap().unwrap().bytes[0], 99);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.evictable, 1);
+    }
+
+    #[test]
+    fn discard_dirty_returns_pool_to_capacity() {
+        let mut c = PageCache::with_capacity(4);
+        let other_file = (FileKey::Segment([1; 16]), 1);
+        add_dirty(&mut c, 1..=10);
+        c.insert(other_file, page(1)).unwrap();
+        c.mark_dirty(other_file).unwrap();
+
+        c.discard_dirty(FileKey::Main);
+
+        assert_eq!(c.dirty_for_file(FileKey::Main), Vec::<u64>::new());
+        assert_eq!(c.dirty_len(), 1, "another file keeps its dirty page");
+        assert!(c.contains(other_file));
+        assert_eq!(c.len(), 4);
+        c.check_usable().unwrap();
+    }
+
+    #[test]
+    fn last_unpin_over_capacity_evicts_one_entry() {
+        let mut c = PageCache::with_capacity(2);
+        let mut slots = Vec::new();
+        for id in 1u8..=4 {
+            let key = main_key(u64::from(id));
+            slots.push((c.insert_and_pin(key, page(id)).unwrap(), key));
+        }
+        let (first_slot, first_key) = slots[0];
+        c.get_and_pin(first_key).unwrap().unwrap();
+        assert_eq!(c.len(), 4);
+
+        c.unpin_at(first_slot, first_key);
+        assert_eq!(c.len(), 4, "a release that leaves a pin evicts nothing");
+
+        c.unpin_at(first_slot, first_key);
+        assert_eq!(c.len(), 3);
+        assert!(!c.contains(first_key));
+
+        c.unpin_at(slots[1].0, slots[1].1);
+        assert_eq!(c.len(), 2);
+        c.unpin_at(slots[2].0, slots[2].1);
+        c.unpin_at(slots[3].0, slots[3].1);
+        assert_eq!(c.len(), 2, "a pool within budget keeps its entries");
+        c.check_usable().unwrap();
+    }
+
+    #[test]
+    fn trim_spares_pinned_and_dirty_entries() {
+        let mut c = PageCache::with_capacity(1);
+        let pinned = main_key(1);
+        let slot = c.insert_and_pin(pinned, page(1)).unwrap();
+        add_dirty(&mut c, 2..=3);
+        let gathered = gather(&mut c, 3..=3);
+
+        c.finish_flush(FileKey::Main, gathered).unwrap();
+
+        assert!(c.contains(pinned));
+        assert!(c.contains(main_key(2)));
+        assert!(!c.contains(main_key(3)));
+        assert_eq!(c.evictable, 0);
+        assert_eq!(c.len(), 2, "pins and dirty pages exceed the budget");
+
+        c.unpin_at(slot, pinned);
+        assert!(!c.contains(pinned));
+        assert_eq!(c.len(), 1);
+        c.check_usable().unwrap();
+    }
+
+    #[test]
+    fn batch_trim_walk_steps_are_linear_in_entries() {
+        for entries in [512_u64, 2048] {
+            let mut c = PageCache::with_capacity(4);
+            add_dirty(&mut c, 1..=entries);
+            for id in 1..=entries {
+                let _ = c.get(main_key(id)).unwrap();
+            }
+            let gathered = gather(&mut c, (1..=entries).filter(|id| id % 4 != 0));
+            c.walk_visits = 0;
+
+            c.finish_flush(FileKey::Main, gathered).unwrap();
+
+            let total = usize::try_from(entries).unwrap();
+            let evicted = total - c.len();
+            assert_eq!(evicted, total / 4 * 3);
+            let passes = (total + 1) * 2;
+            assert!(
+                c.walk_visits > total,
+                "every visited candidate takes a clearing visit, got {}",
+                c.walk_visits
+            );
+            assert!(
+                c.walk_visits <= passes + evicted,
+                "{} visits for {total} entries and {evicted} evictions",
+                c.walk_visits
+            );
+        }
+    }
+
+    #[test]
+    fn index_memory_returns_near_budget_after_overgrowth() {
+        const CAPACITY: usize = 16;
+        let mut c = PageCache::with_capacity(CAPACITY);
+        add_dirty(&mut c, 1..=1024);
+        assert!(c.map.capacity() > CAPACITY * 2);
+        assert_eq!(c.slab.len(), 1024);
+        let gathered = gather(&mut c, 1..=1024);
+
+        c.finish_flush(FileKey::Main, gathered).unwrap();
+
+        assert_eq!(c.len(), CAPACITY);
+        assert!(c.map.capacity() <= CAPACITY * 2);
+        assert_eq!(c.slab.len(), CAPACITY, "survivors fill the lowest slots");
+        assert!(c.slab.capacity() <= CAPACITY * 2);
+        assert_eq!(c.free.len(), 0);
+        assert_list_matches_map(&c);
+
+        c.insert(main_key(2000), page(1)).unwrap();
+        assert_eq!(c.len(), CAPACITY);
+        assert_list_matches_map(&c);
+    }
+
+    #[test]
+    fn moved_nodes_keep_the_list_and_map_consistent() {
+        let mut c = PageCache::with_capacity(4);
+        add_dirty(&mut c, 1..=64);
+        let (_, low_pin) = c.get_and_pin(main_key(21)).unwrap().unwrap();
+        let (_, high_pin) = c.get_and_pin(main_key(61)).unwrap().unwrap();
+        assert_eq!(
+            (low_pin, high_pin),
+            (20, 60),
+            "slots follow insertion order"
+        );
+        let gathered = gather(&mut c, 1..=64);
+
+        c.finish_flush(FileKey::Main, gathered).unwrap();
+
+        // Pins stay put, and the two survivors above the high pin move down.
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.map[&main_key(21)], low_pin);
+        assert_eq!(c.map[&main_key(61)], high_pin);
+        assert_eq!(c.map[&main_key(64)], 0);
+        assert_eq!(c.map[&main_key(63)], 1);
+        assert_eq!(c.hand, Some(1), "the hand follows the node it pointed at");
+        assert_eq!(c.tail, Some(low_pin));
+        assert_eq!(c.head, Some(0));
+        assert_eq!(c.slab.len(), high_pin + 1, "the high pin bounds truncation");
+        assert_list_matches_map(&c);
+        for id in [21_u64, 61, 63, 64] {
+            let byte = u8::try_from(id).unwrap();
+            assert_eq!(c.get(main_key(id)).unwrap().unwrap().bytes[0], byte);
+        }
+
+        // New entries take low slots and leave the pinned slots alone.
+        c.insert(main_key(65), page(65)).unwrap();
+        assert_list_matches_map(&c);
+
+        // Each guard slot still resolves to the entry it pinned.
+        c.unpin_at(high_pin, main_key(61));
+        c.unpin_at(low_pin, main_key(21));
+        c.check_usable().unwrap();
+        assert_eq!(c.evictable, 4);
+
+        // With the pins gone, the next batch empties the high slots.
+        c.discard_dirty(FileKey::Main);
+        c.check_usable().unwrap();
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.slab.len(), 4);
+        assert_list_matches_map(&c);
+    }
+
+    #[test]
+    fn a_dirty_node_keeps_its_marker_when_it_moves() {
+        let mut c = PageCache::with_capacity(2);
+        add_dirty(&mut c, 1..=8);
+        let gathered = gather(&mut c, 1..=7);
+
+        c.finish_flush(FileKey::Main, gathered).unwrap();
+
+        assert_eq!(c.dirty_for_file(FileKey::Main), vec![8]);
+        assert_eq!(
+            c.map[&main_key(8)],
+            0,
+            "the dirty survivor moves to a low slot"
+        );
+        assert_eq!(c.get_dirty(main_key(8)).unwrap().unwrap().bytes[0], 8);
+        assert_list_matches_map(&c);
+    }
+
+    #[test]
+    fn a_move_over_a_broken_link_or_map_entry_reports_a_fault() {
+        let free_slot = 3;
+        let fixture = || {
+            let mut c = PageCache::with_capacity(8);
+            add_dirty(&mut c, 1..=3);
+            c.slab.push(None);
+            c
+        };
+
+        let mut broken_link = fixture();
+        broken_link.slab[0].as_mut().unwrap().next = None;
+        assert_eq!(
+            broken_link.move_node(1, free_slot, "test"),
+            Err(CacheFault::new("test", LIST_LINK_BROKEN, Some(1)))
+        );
+
+        let mut broken_map = fixture();
+        broken_map.map.insert(main_key(2), 0);
+        assert_eq!(
+            broken_map.move_node(1, free_slot, "test"),
+            Err(CacheFault::new("test", MAP_SLOT_DISAGREES, Some(1)))
+        );
     }
 }

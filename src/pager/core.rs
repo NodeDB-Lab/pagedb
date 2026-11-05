@@ -919,23 +919,17 @@ impl<V: Vfs> Pager<V> {
     }
 
     /// Discard all dirty main.db pages from the cache without flushing them.
-    /// Used by `WriteTxn::abort` to undo in-flight `CoW` writes. Pages are
-    /// removed from the dirty set; their cached plaintext remains in the
-    /// buffer pool but will never be flushed (the next commit starts from the
-    /// last durable root). A subsequent read that misses the cache will
-    /// re-fetch the last persisted ciphertext from disk.
+    /// Used by `WriteTxn::abort` to undo in-flight `CoW` writes. Pages leave the
+    /// dirty set, and the pool then returns to its budget unless pins hold it
+    /// over. Discarded pages that stay resident are never flushed, because the
+    /// next commit starts from the last durable root. A subsequent read that
+    /// misses the cache re-fetches the last persisted ciphertext from disk.
     ///
     /// Callers include a drop, so this returns nothing. A cache fault stops the
     /// loop and stays latched. The latch then refuses every later flush, so the
     /// pages still marked dirty never reach disk.
     pub fn discard_dirty_main(&self, _realm_id: crate::RealmId) {
-        let mut cache = self.inner.buffer_pool.lock();
-        let dirty_ids = cache.dirty_for_file(FileKey::Main);
-        for pid in dirty_ids {
-            if cache.clear_dirty((FileKey::Main, pid)).is_err() {
-                return;
-            }
-        }
+        self.inner.buffer_pool.lock().discard_dirty(FileKey::Main);
     }
 
     /// Evict unpinned clean main.db pages so later reads fetch and authenticate
@@ -1377,26 +1371,12 @@ impl<V: Vfs> Pager<V> {
         }
         crate::diag::flushed(page_size_u64.saturating_mul(reqs.len() as u64));
 
-        // Clear dirty flags — but ONLY for pages still holding the exact
-        // `Arc<Page>` we gathered. A concurrent writer replaces the Arc on
-        // every write; unconditionally clearing here would wipe its dirty
-        // flag while its content never reached disk (lost update → stale
-        // page on next cold read → AEAD/kind mismatch).
-        // A replaced page keeps its flag and flushes on the next cycle.
-        let mut cache = self.inner.cache_for_key(file).lock();
-        for (pid, snapshot) in gathered {
-            match cache.get((file, pid))? {
-                Some(current) if Arc::ptr_eq(&current, &snapshot) => {
-                    cache.clear_dirty((file, pid))?;
-                }
-                _ => {
-                    tracing::debug!(
-                        page_id = pid,
-                        "page re-dirtied during flush; keeping dirty for next cycle"
-                    );
-                }
-            }
-        }
+        // Clear the flags of pages that still hold the gathered `Arc<Page>`, and
+        // return the pool to its budget now that those pages are evictable.
+        self.inner
+            .cache_for_key(file)
+            .lock()
+            .finish_flush(file, gathered)?;
         Ok(())
     }
 
@@ -1770,6 +1750,49 @@ mod tests {
             .await
             .unwrap();
         guard.slot
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guard_held_across_flush_returns_pool_to_budget_on_release() {
+        const BUDGET: usize = 4;
+        let pager = mk_pager().await;
+        let realm = RealmId([7; 16]);
+        let body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
+        for page_id in 1..=8u64 {
+            pager
+                .write_main_page(page_id, realm, PageKind::BTreeLeaf, &body)
+                .await
+                .unwrap();
+        }
+        let mut guards = Vec::new();
+        for page_id in 1..=6u64 {
+            guards.push(
+                pager
+                    .read_main_page(page_id, realm, PageKind::BTreeLeaf)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        pager.flush_main(realm).await.unwrap();
+
+        assert_eq!(
+            pager.inner.buffer_pool.lock().len(),
+            6,
+            "the flush evicts every unpinned page and spares the pinned ones"
+        );
+
+        // Each release past the budget evicts one entry.
+        drop(guards.pop());
+        assert_eq!(pager.inner.buffer_pool.lock().len(), 5);
+        drop(guards.pop());
+        assert_eq!(pager.inner.buffer_pool.lock().len(), BUDGET);
+        guards.clear();
+
+        let cache = pager.inner.buffer_pool.lock();
+        assert_eq!(cache.len(), BUDGET);
+        assert_eq!(cache.dirty_len(), 0);
+        cache.check_usable().unwrap();
     }
 
     fn assert_dead_slot_fault(err: &PagedbError, expected_operation: &str, expected_slot: usize) {
