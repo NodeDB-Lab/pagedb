@@ -292,16 +292,16 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// A free-list entry does not prove a page is dead. An entry at or above the
     /// reclamation floor names a page a live reader or retained root can reach.
-    /// Those pages keep their content. An entry below the floor holds no data, so
-    /// it gets a fresh blank page without a read. A torn page therefore costs
-    /// nothing, and old plaintext never reaches disk under the target key.
+    /// Those pages keep their content. An entry below the floor holds no data.
+    /// It gets a fresh blank page without a read. A torn page therefore costs
+    /// nothing. Old plaintext never reaches disk under the target key.
     ///
     /// `rewritten` holds every page the root walks re-sealed. A store written by
     /// an earlier release tags rekey-freed catalog pages with the latest commit.
-    /// A retained row can name those pages while the floor passes them, so
-    /// membership here overrides the floor.
-    /// Chain pages join `rewritten` first. A blank chain page ends the walk early,
-    /// which strands the rest of the chain under the source epoch.
+    /// A retained row can name those pages while the floor passes them. Membership
+    /// here therefore overrides the floor.
+    /// Chain pages join `rewritten` first. A blank chain page ends the walk early.
+    /// An early end strands the rest of the chain under the source epoch.
     ///
     /// The floor is read once. A reader admitted later pins the published
     /// snapshot, whose pages are not free-listed. A later historical reader pins
@@ -403,8 +403,8 @@ impl<V: Vfs + Clone> Db<V> {
     /// Re-seal a named free page with its content when it authenticates. A hole
     /// stays a hole. A page that fails to authenticate is replaced with a blank
     /// page only when `unreachable` says no retained root or reader can name it.
-    /// Otherwise the error returns, because that failure is real corruption and
-    /// its bytes are the evidence.
+    /// Otherwise the error returns. That error is real corruption, and the page
+    /// bytes are the evidence.
     async fn reseal_free_page_keeping_content(
         &self,
         file: &mut V::File,
@@ -436,8 +436,8 @@ impl<V: Vfs + Clone> Db<V> {
             .await
     }
 
-    /// Replace a free page whose read reported `error` with a blank page, or
-    /// return `error` when it says nothing about the page's bytes.
+    /// Replace a free page whose read reported `error` with a blank page.
+    /// Return `error` instead when it says nothing about the page's bytes.
     async fn blank_unreadable_free_page(&self, page_id: u64, error: PagedbError) -> Result<()> {
         if !free_page_is_unreadable(&error) {
             return Err(error);
@@ -723,11 +723,11 @@ impl<V: Vfs + Clone> Db<V> {
     /// list, returning the allocation cursor the header must record.
     ///
     /// Every ordinary commit routes its copy-on-write leftovers here. Without
-    /// it a rekey abandons pages at each intent transition: unreachable from
-    /// any root, absent from the free list, and — once the source epoch is
-    /// retired — sealed under a key that no longer exists. Entries carry the
-    /// commit id after the latest one, so the reclamation floor still withholds
-    /// any page a live reader or retained history root can still name.
+    /// it a rekey abandons pages at each intent transition. No root reaches
+    /// them and the free list lacks them. Once the source epoch is retired, a
+    /// key that no longer exists seals them. Entries carry the commit id after
+    /// the latest one. The reclamation floor therefore still withholds any page
+    /// a live reader or retained history root can name.
     async fn record_rekey_freed_pages(
         &self,
         state: &mut WriterState,

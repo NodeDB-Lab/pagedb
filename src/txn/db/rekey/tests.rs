@@ -613,8 +613,8 @@ async fn rekey_leaves_no_leaked_pages() {
     );
 }
 
-/// Commit the same key twice with no retained history, which leaves the first
-/// commit's leaf as a free page on disk. Returns the ids the free chain names.
+/// Commit the same key twice with no retained history. That leaves the first
+/// commit's leaf as a free page on disk. Return the ids the free chain names.
 async fn store_with_a_free_page(options: OpenOptions) -> (MemVfs, Db<MemVfs>, Vec<u64>) {
     let vfs = MemVfs::new();
     let db = Db::open_internal_with_options(vfs.clone(), KEK0, PAGE, REALM, options)
@@ -683,8 +683,8 @@ async fn rekey_after_abort_reseals_free_pages_from_disk() {
     );
 }
 
-/// A crash mid-flush can tear a page the durable chain still names as free,
-/// because a later commit drew it and never published. Free pages carry no data,
+/// A crash mid-flush can tear a page the durable chain still names as free.
+/// A later commit drew that page and never published. Free pages carry no data,
 /// so a torn one cannot stop a rekey.
 #[tokio::test(flavor = "current_thread")]
 async fn rekey_succeeds_when_a_crash_tore_a_free_page() {
@@ -754,7 +754,7 @@ async fn rekey_refuses_a_torn_free_page_a_retained_root_can_reach() {
 }
 
 /// A crash can tear a free page while a rekey is in flight. The resume runs at
-/// open from the durable intent, so a torn page must not stop the open at any
+/// open from the durable intent. A torn page must not stop the open at any
 /// boundary that still has a free-list pass ahead of it.
 #[tokio::test(flavor = "current_thread")]
 async fn rekey_resume_succeeds_past_a_torn_free_page() {

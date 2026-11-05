@@ -1,30 +1,29 @@
 //! Carrying the Follower's commit-history tree across an incremental apply.
 //!
-//! An apply installs the producer's roots wholesale, but the commit-history
-//! tree is not the producer's — a follower inherits it from the full snapshot it
-//! was restored from and then keeps it, because nothing in the delta protocol
-//! describes it. The producer cannot see it either, so its allocator will
-//! happily recycle the ids that host it into the target's own trees, and the
-//! delta then ships those ids by number.
+//! An apply installs the producer's roots wholesale. The commit-history tree is
+//! not the producer's. A follower inherits it from the full snapshot it was
+//! restored from and keeps it. Nothing in the delta protocol describes it.
+//! The producer cannot see it either. Its allocator recycles the ids that host
+//! the tree into the target's own trees, and the delta ships those ids by number.
 //!
-//! Overwriting them is safe now that the target image is staged and swapped
-//! atomically — but only for the *bytes*. The header this apply publishes still
-//! names the old history root, and if the target has taken that page, the root
-//! points at somebody else's node: `begin_read_at` fails, the reclamation floor
-//! cannot be derived, and a deep walk reports the tree unreadable.
+//! Overwriting those ids is safe for the bytes, because the target image is
+//! staged and swapped atomically. The header this apply publishes still names
+//! the old history root. If the target has taken that page, the root points at
+//! another node. Then `begin_read_at` fails and the reclamation floor cannot be
+//! derived. A deep walk reports the tree unreadable.
 //!
-//! So the tree is moved out of the way instead of being defended. When the
-//! incoming delta claims any page it occupies, its rows are read from the still
-//! intact base image and bulk-loaded onto fresh ids above the target's
-//! allocation cursor — ids no delta record can name, since every record is
-//! bounded by that cursor. The pages it vacates that the target does not claim
-//! are returned to this handle's free list by the caller. When the delta claims
-//! none of its pages, nothing moves: relocation costs pages, so it happens only
-//! when the alternative is a broken root.
+//! The tree moves out of the way instead. When the incoming delta claims any
+//! page the tree occupies, the apply reads its rows from the intact base image.
+//! It bulk-loads them onto fresh ids above the target's allocation cursor. No
+//! delta record can name those ids, because the cursor bounds every record. The
+//! pages it vacates that the target does not claim return to this handle's free
+//! list. The caller does that. When the delta claims none of its pages, nothing
+//! moves. Relocation costs pages, so it happens only when the alternative is a
+//! broken root.
 //!
 //! The rows themselves name data and catalog pages the delta can overwrite. Such
-//! a row and every older row leave the carried tree, so `begin_read_at` reports
-//! them gone instead of admitting a reader over newer bytes. A cut always loads
+//! a row and every older row leave the carried tree. Then `begin_read_at`
+//! reports them gone and admits no reader over newer bytes. A cut always loads
 //! the surviving rows onto fresh ids, the same way a relocation does.
 
 use std::collections::BTreeSet;

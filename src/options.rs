@@ -7,8 +7,8 @@
 //! their caches by eviction rather than by refusal: a clean, unpinned page is
 //! evicted to stay within the count. A cache exceeds its count only while every
 //! entry is dirty or pinned. A transaction's dirty pages and pinned pages can
-//! exceed the budget until they are flushed or released, and the cache then
-//! returns to the count.
+//! exceed the budget. The cache returns to the count once they are flushed or
+//! released.
 
 use std::time::Duration;
 

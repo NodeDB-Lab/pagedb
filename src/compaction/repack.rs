@@ -70,8 +70,9 @@ pub(super) async fn atomic_dense_repack<V: Vfs + Clone>(
         Err(e) => {
             // Nothing was written to main.db; drop the never-persisted compacted
             // pages from the cache so the old tree is read back from disk, and
-            // remove the partial scratch. A cache fault here stays latched for
-            // the next operation, and the caller receives the original error.
+            // remove the partial scratch.
+            // Deliberate discard: a cache fault stays latched and the next
+            // operation reports it. The caller receives the original error.
             let _ = db.pager.reset_main_pages();
             db.vfs.remove(&scratch).await.ok();
             Err(e)

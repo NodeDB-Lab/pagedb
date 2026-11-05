@@ -48,7 +48,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// The delta screen covers the published base only. A reader pinned further
     /// back can reach a page a later commit freed. The producer recycles that
     /// id. The new bytes authenticate under the same page id, so that reader
-    /// would receive them with no error.
+    /// receives them with no error.
     ///
     /// A reader at the base roots is skipped, because the screen already covers
     /// it. Readers sharing a pinned state share one walk. A reader whose pages

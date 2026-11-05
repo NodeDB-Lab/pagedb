@@ -81,7 +81,7 @@ pub struct PageProvenance {
     pub next_page_id: u64,
     /// Whether the free-list half of the answer could be computed at all.
     ///
-    /// `false` means the chain would not read, or the writer was busy and the
+    /// `false` means the chain does not read, or the writer was busy and the
     /// chain was not walked. `unwalkable_roots` names `"free-list"` in the second
     /// case. Either way `freed_by_commit` is `None` for lack of evidence rather
     /// than because the page is not free.

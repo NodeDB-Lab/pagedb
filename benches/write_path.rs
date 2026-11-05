@@ -214,12 +214,12 @@ fn scaling_uncommitted(b: &mut Bencher, rows: u32) {
 ///
 /// `put` writes an overflow chain straight into the page cache as dirty pages.
 /// It does not flush them before commit, so one transaction's dirty set outgrows
-/// the buffer pool. Each `put` also descends the existing tree, and a leaf that
+/// the buffer pool. Each `put` also descends the existing tree. A leaf that
 /// missed the cache comes back as a clean page that needs a slot. Each row adds
-/// a fixed number of pages, so the expected per-row cost is flat. A rising one
+/// a fixed number of pages, so the expected per-row cost is flat. A rising cost
 /// means evicting for those reads pays for the dirty pages already staged. The
-/// timed region ends with `abort`, which cleans every dirty page at a constant
-/// cost per page.
+/// timed region ends with `abort`. The `abort` cleans every dirty page at a
+/// constant cost per page.
 #[bench(group = "btree/write-path/scaling", args = [1000, 2000, 4000], samples = 3)]
 fn scaling_overflow_into_large_tree(b: &mut Bencher, rows: u32) {
     let small = value();

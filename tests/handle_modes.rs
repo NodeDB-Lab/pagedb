@@ -420,8 +420,8 @@ async fn lock_released_on_drop_lets_second_open_succeed() {
     .unwrap();
 }
 
-/// A follower has no user writes, and a quota row seals fresh pages under the
-/// identity it shares with its source. So a follower refuses the write.
+/// A follower has no user writes. A quota row seals fresh pages under the
+/// identity the follower shares with its source. The follower refuses the write.
 #[tokio::test(flavor = "current_thread")]
 async fn set_realm_quotas_on_a_follower_is_refused() {
     let vfs = MemVfs::new();
@@ -462,8 +462,8 @@ async fn set_realm_quotas_on_a_follower_is_refused() {
     );
 }
 
-/// Handles without write access refuse a quota write and a collection through
-/// the mode gate, before the operation reaches the store.
+/// Handles without write access refuse a quota write and a collection. The mode
+/// gate refuses them before the operation reaches the store.
 #[tokio::test(flavor = "current_thread")]
 async fn store_writes_on_read_only_and_observer_handles_are_refused() {
     let vfs = MemVfs::new();

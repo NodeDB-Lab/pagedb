@@ -413,9 +413,9 @@ pub enum PagedbError {
     #[error("readers pinning truncated range")]
     ReadersPinningTruncatedRange,
 
-    /// An incremental apply was refused before it changed the store: its delta
-    /// rewrites a page a registered reader can still reach, or that reader's
-    /// pages cannot be walked to prove otherwise. Distinct from
+    /// An incremental apply was refused before it changed the store. Either its
+    /// delta rewrites a page a registered reader can still reach, or that
+    /// reader's pages cannot be walked to prove otherwise. This differs from
     /// [`Self::ReadersPinningTruncatedRange`], which reports a target already
     /// durable and published. Here the handle stays at its base commit. Finish
     /// the reader pinned at `reader_commit`, then retry the same delta.

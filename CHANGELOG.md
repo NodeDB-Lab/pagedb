@@ -12,6 +12,10 @@ All notable changes to this project are documented here. The format is based on 
 ### Changed
 
 - **Mode gates on two store writes** — `set_realm_quotas` now returns `WrongMode` on `Follower`, `ReadOnly`, and `Observer` handles. `gc_now` now returns `WrongMode` on `ReadOnly` and `Observer` handles.
+- **MSRV is Rust 1.88** — earlier toolchains did not build, because the crate and `faultbox` use let-chains.
+- **Visibility gate on metadata walks** — `Db::stats`, `list_segments`, `open_segment`, and `realm_quotas` hold the visibility gate for their walk. They wait during a compaction or an apply, and a commit's publication waits for them. `run_deep_walk` holds the writer lock for its whole walk. `page_provenance` with a busy writer reports the free list as an unwalkable gap.
+- **Page cache invariant error** — new `PagedbError::PageCacheStateInvalid` replaces a panic when the page cache breaks an invariant. The cache latches the error, and every later operation on that cache reports it. Close and reopen the handle to clear it. No fault is known in the store files.
+- **Free pages after a rekey** — a free page below the reclamation floor reads as a zeroed `Free` page on disk after a rekey.
 
 ### Fixed
 
@@ -20,6 +24,13 @@ All notable changes to this project are documented here. The format is based on 
 - **Relocated commit history on a small buffer pool** — an apply that relocated a commit-history tree larger than the buffer pool flushed part of it to the live `main.db`. The published image then lacked those pages.
 - **Historical reads after a rekey** — `rekey_db` tagged the catalog pages it superseded with the latest commit, so a later commit could recycle them while that commit's retained row still named them. `begin_read_at` then failed with `ChecksumFailure`. New entries carry the next commit id. Entries already on a store's free list keep their old tag, so such a page stays exposed until that row is pruned. The on-disk format does not change.
 - **Historical reads on a follower** — `apply_incremental` carried commit-history rows whose pages its delta overwrote, so `begin_read_at` admitted a reader over bytes from a later commit. An apply now prunes the newest such row and every older row, durably, and `begin_read_at` reports `CommitGone` for them. Surviving rows read their own values. An apply on a follower with retained rows now reads each retained page the base does not reach once.
+- **Buffer pool budget** — `buffer_pool_pages` and `segment_cache_pages` are now honoured. The cache evicts back to its count after a flush, an abort, or a last unpin. Before, one large transaction kept the pool above budget for the life of the handle. Dirty and pinned pages can still exceed the budget until flushed or released. A large write now misses the cache more often, because the tree no longer stays cached past the budget.
+- **Quadratic eviction** — dirty pages leave the eviction list. A large transaction no longer walks them for each clean-page eviction.
+- **Lost writes from a racing read** — a read miss that completed after a write replaced the dirty page with older bytes, and a flush could persist them. The resident page now wins. The reads that register no reader cannot run during a swap.
+- **Stale file handle** — a read during a compaction or apply swap could keep the replaced file open. Later reads then used the old file.
+- **Rekey after an abort** — aborted pages stayed in the cache as clean pages. A rekey could hit one, fail with `ChecksumFailure`, and poison the handle. An abort now removes unpinned dirty pages.
+- **Rekey past a torn free page** — a free page that no retained root or reader can name no longer stops a rekey or its resume. A torn page a retained root can reach still fails, and its bytes stay on disk as evidence.
+- **`dirty_pages` in `DbStats`** — it counted only one segment id. It now counts every entry.
 
 ## [0.1.0] - 2026-10-15
 

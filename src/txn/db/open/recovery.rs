@@ -138,7 +138,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// reads the chain on a healthy store.
     ///
     /// This costs one page read. A read error leaves the count unknown and never
-    /// fails the open, because a free list records reclaimable space, not data.
+    /// fails the open. A free list records reclaimable space and holds no data.
     async fn publish_free_list_count(&self) {
         let mut state = self.writer.lock().await;
         let entries =

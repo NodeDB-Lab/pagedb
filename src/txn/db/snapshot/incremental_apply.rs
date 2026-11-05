@@ -21,14 +21,14 @@ impl<V: Vfs + Clone> Db<V> {
     /// An apply never overwrites a page a registered reader can reach, so a
     /// reader always sees its own snapshot.
     ///
-    /// A reader pinned at the base commit never conflicts, because a delta cannot
-    /// name a page the base reaches. A reader pinned further back can reach a page
-    /// a later commit freed and the producer recycled. An apply whose delta
+    /// A reader pinned at the base commit never conflicts. A delta cannot name a
+    /// page the base reaches. A reader pinned further back can reach a page a
+    /// later commit freed and the producer recycled. An apply whose delta
     /// rewrites such a page returns
     /// [`PagedbError::ApplyBlockedByPinnedReader`](crate::PagedbError::ApplyBlockedByPinnedReader).
     /// A reader whose pages cannot be walked counts as a conflict too.
     ///
-    /// The refusal changes nothing in `main.db`, and the handle stays at its base
+    /// The refusal changes nothing in `main.db`. The handle stays at its base
     /// commit. Finish that reader and call this again with the same delta. The
     /// reader stall policy does not change this outcome.
     ///
@@ -102,6 +102,8 @@ impl<V: Vfs + Clone> Db<V> {
     pub(super) async fn discard_failed_apply(&self, staged_image: &str) {
         let _writer = self.writer.lock().await;
         self.pager.discard_dirty_main();
+        // Deliberate discard: a cache fault stays latched and the next operation
+        // reports it. The caller returns the original error.
         let _ = self.pager.reset_main_pages();
         discard_staged_image(&*self.vfs, staged_image).await;
     }

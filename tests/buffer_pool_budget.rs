@@ -56,8 +56,8 @@ async fn idle_handle_after_large_commit_reports_resident_pages_within_budget() {
     assert!(stats.buffer_pool_pages <= BUDGET as u64);
 }
 
-/// Each value exceeds a quarter page, so `put` writes an overflow page through
-/// the pager at once, with no flush until commit. The pool therefore overgrows
+/// Each value exceeds a quarter page. `put` therefore writes an overflow page
+/// through the pager at once, with no flush until commit. The pool overgrows
 /// before the abort, and the test asserts that it does.
 #[tokio::test(flavor = "current_thread")]
 async fn aborted_large_transaction_returns_pool_to_budget() {

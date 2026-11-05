@@ -1,14 +1,14 @@
 //! Reads running beside a dense repack.
 //!
-//! A repack writes compacted pages under page ids the old image also uses. So an
-//! old page arriving late lands on a compacted page id.
+//! A repack writes compacted pages under page ids the old image also uses. An
+//! old page arriving late therefore lands on a compacted page id.
 //!
-//! `Db::stats` holds the visibility gate's read side and reads no free-list chain,
-//! so it waits for a repack. Each test asserts that wait. Each test then drives
-//! the same race through a direct pager read, which has no such hold.
+//! `Db::stats` holds the visibility gate's read side and reads no free-list chain.
+//! It therefore waits for a repack. Each test asserts that wait. Each test then
+//! drives the same race through a direct pager read, which has no such hold.
 //!
 //! The pager holds the main handle mutex across a read. A parked read therefore
-//! blocks the repack's next source read, so each test parks the repack on
+//! blocks the repack's next source read. Each test parks the repack on
 //! scratch-file work that takes no main handle.
 
 use std::time::Duration;
@@ -37,7 +37,7 @@ const HIGHEST_CHAIN_HEAD: u64 = 240;
 /// A value past the inline threshold that fits in one overflow page.
 const VALUE_LEN: usize = 3000;
 /// How long a `stats` call runs while a parked repack holds the gate. The repack
-/// stays parked until the test releases it, so `stats` cannot finish in any time.
+/// stays parked until the test releases it. `stats` cannot finish in any time.
 const STATS_PATIENCE: Duration = Duration::from_millis(50);
 
 fn row_key(row: u32) -> Vec<u8> {
@@ -66,7 +66,7 @@ struct Store {
 /// also writes, so the old chain page and a compacted page share one id.
 ///
 /// The commit path picks the head from already-free pages. Overwriting low rows
-/// fills the free list with low ids, and the loop stops once one hosts the chain.
+/// fills the free list with low ids. The loop stops once one hosts the chain.
 async fn store_with_chain_head_in_the_first_batch() -> Store {
     let vfs = GatedVfs::new();
     let mut generations = vec![0u8; ROWS as usize];

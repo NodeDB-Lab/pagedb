@@ -97,10 +97,10 @@ impl<V: Vfs + Clone> Db<V> {
             write_delta_into_image(&*self.vfs, staged_image, src_path, page_size, &plan).await?;
 
         // Authenticate the target through a read-only view of the staged image.
-        // Clean base pages are dropped first so the view's buffer pool and the
-        // live one are not both resident at their full configured budget. This
-        // runs without the writer lock, so a dirty page belongs to another
-        // writer and stays.
+        // Drop clean base pages first. The view's buffer pool and the live one
+        // then are not both resident at their full configured budget. This runs
+        // without the writer lock. A dirty page belongs to another writer and
+        // stays.
         self.pager.evict_clean_main_pages()?;
         let staged_view = Arc::new(self.pager.open_main_view(staged_image.to_owned()));
         let target_page_ids = collect_tree_page_ids(
