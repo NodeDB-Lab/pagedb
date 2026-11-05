@@ -18,12 +18,18 @@ use crate::vfs::Vfs;
 pub struct CounterRef<'a, V: Vfs + Clone> {
     pub(super) catalog_tree: &'a mut BTree<V>,
     pub(super) main_tree: &'a mut BTree<V>,
+    /// The transaction's mutation marker. A future dropped inside the catalog
+    /// write leaves it set. See [`WriteTxn`](super::txn::WriteTxn).
+    pub(super) mutation_pending: &'a mut bool,
     pub(super) key: Vec<u8>,
 }
 
 impl<V: Vfs + Clone> CounterRef<'_, V> {
     /// Return the current counter value, or `0` if no row exists yet.
     pub async fn get(&self) -> Result<u64> {
+        if *self.mutation_pending {
+            return Err(PagedbError::write_txn_interrupted());
+        }
         match self.catalog_tree.get(&self.key).await? {
             Some(v) => Catalog::decode_counter(&v),
             None => Ok(0),
@@ -37,11 +43,7 @@ impl<V: Vfs + Clone> CounterRef<'_, V> {
         if value < current {
             return Err(PagedbError::Aborted);
         }
-        Self::sync_to(self.main_tree, self.catalog_tree);
-        let bytes = Catalog::encode_counter(value);
-        self.catalog_tree.put(&self.key, &bytes).await?;
-        Self::sync_from(self.catalog_tree, self.main_tree);
-        Ok(())
+        self.write(value).await
     }
 
     /// Increment the counter by `delta` and return the new value. Returns
@@ -51,11 +53,21 @@ impl<V: Vfs + Clone> CounterRef<'_, V> {
         let next = current
             .checked_add(delta)
             .ok_or(PagedbError::NonceCounterExhausted)?;
-        Self::sync_to(self.main_tree, self.catalog_tree);
-        let bytes = Catalog::encode_counter(next);
-        self.catalog_tree.put(&self.key, &bytes).await?;
-        Self::sync_from(self.catalog_tree, self.main_tree);
+        self.write(next).await?;
         Ok(next)
+    }
+
+    /// Write the counter row. Only the catalog write can leave a tree partly
+    /// updated, so the marker covers that await alone. A dropped future or an
+    /// error from it leaves the marker set.
+    async fn write(&mut self, value: u64) -> Result<()> {
+        Self::sync_to(self.main_tree, self.catalog_tree);
+        let bytes = Catalog::encode_counter(value);
+        *self.mutation_pending = true;
+        self.catalog_tree.put(&self.key, &bytes).await?;
+        *self.mutation_pending = false;
+        Self::sync_from(self.catalog_tree, self.main_tree);
+        Ok(())
     }
 
     /// Advance the catalog allocator cursor to be at least as high as the

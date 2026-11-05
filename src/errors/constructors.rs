@@ -220,6 +220,28 @@ impl PagedbError {
         Self::DurablyCommittedButUnpublished { commit }
     }
 
+    /// Canonical constructor for a handle that got `source` from a header write
+    /// and cannot tell which header is durable.
+    #[must_use]
+    pub fn commit_outcome_unknown(commit: CommitId, source: PagedbError) -> Self {
+        Self::commit_outcome_unknown_shared(commit, std::sync::Arc::new(source))
+    }
+
+    /// [`Self::commit_outcome_unknown`] for a cause the handle's poison also holds.
+    #[must_use]
+    pub(crate) fn commit_outcome_unknown_shared(
+        commit: CommitId,
+        source: std::sync::Arc<PagedbError>,
+    ) -> Self {
+        Self::CommitOutcomeUnknown { commit, source }
+    }
+
+    /// Canonical constructor for a write transaction with a dropped mutation.
+    #[must_use]
+    pub const fn write_txn_interrupted() -> Self {
+        Self::WriteTxnInterrupted
+    }
+
     /// Canonical constructor for a rekey that cannot safely continue after
     /// activating target-key routing before recovery completes.
     #[must_use]

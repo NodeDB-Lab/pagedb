@@ -1,7 +1,11 @@
 //! Drop guards that keep a cancelled write-side future from leaving the handle
 //! or the page cache in a half-published state.
 
+use std::sync::Arc;
+
 use crate::CommitId;
+use crate::errors::PagedbError;
+use crate::pager::header::HeaderWriteError;
 use crate::vfs::Vfs;
 
 use super::core::Db;
@@ -28,6 +32,35 @@ impl<V: Vfs + Clone> DurablePublishGuard<'_, V> {
     /// Memory now matches the durable state, or the durable write did not happen.
     pub(crate) fn disarm(mut self) {
         self.armed = false;
+    }
+
+    /// Turn a failed header write into the error its caller returns.
+    ///
+    /// When no byte landed, the previous header stands. The guard disarms and the
+    /// cause returns as it is, so the handle stays usable.
+    ///
+    /// A failed write or sync can leave the new header durable while this handle
+    /// keeps the old state. The next commit then overwrites pages that header
+    /// names. So the handle poisons, and only a reopen can read which header won.
+    /// The returned error carries the cause and claims no durable commit.
+    pub(crate) fn header_write_failed(self, error: HeaderWriteError) -> PagedbError {
+        let commit = self.commit;
+        let source = match error {
+            HeaderWriteError::NotStarted(cause) => {
+                self.disarm();
+                return cause;
+            }
+            HeaderWriteError::OutcomeUnknown(cause) => Arc::new(cause),
+        };
+        tracing::error!(
+            commit = commit.0,
+            error = %source,
+            "header write failed, so the durable header is unknown; reopen required"
+        );
+        self.db
+            .poison_header_outcome_unknown(commit, Arc::clone(&source));
+        self.disarm();
+        PagedbError::commit_outcome_unknown_shared(commit, source)
     }
 }
 
@@ -69,8 +102,53 @@ impl<V: Vfs + Clone> Drop for UnpublishedPagesGuard<'_, V> {
     }
 }
 
+/// Drops one apply-journal sidecar's in-memory state when dropped armed.
+///
+/// Staged journal pages stay dirty until `flush_journal` returns. No later flush
+/// names this journal id, and dirty pages cannot be evicted. Without this guard
+/// they hold their cache budget until a reopen. The id is never reused, so its
+/// in-memory state has no later use.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use = "dropping an armed guard drops the staged journal pages"]
+pub(crate) struct UnflushedJournalGuard<'db, V: Vfs + Clone> {
+    db: &'db Db<V>,
+    journal_id: [u8; 16],
+    armed: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<V: Vfs + Clone> UnflushedJournalGuard<'_, V> {
+    /// The journal pages reached the sidecar file.
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<V: Vfs + Clone> Drop for UnflushedJournalGuard<'_, V> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.db.pager.discard_unflushed_journal(self.journal_id);
+        }
+    }
+}
+
 /// `Db` constructors for the guards above.
 impl<V: Vfs + Clone> Db<V> {
+    /// Arm a guard that drops this journal's staged pages unless it is disarmed.
+    /// Call this before the first `stage_journal_page` for `journal_id`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn discard_unflushed_journal_on_drop(
+        &self,
+        journal_id: [u8; 16],
+    ) -> UnflushedJournalGuard<'_, V> {
+        UnflushedJournalGuard {
+            db: self,
+            journal_id,
+            armed: true,
+        }
+    }
+
     /// Arm a guard that poisons this handle at `commit` unless it is disarmed.
     /// Call this before the rename or header write that makes state durable.
     pub(crate) fn arm_durable_publish(&self, commit: CommitId) -> DurablePublishGuard<'_, V> {
@@ -93,9 +171,12 @@ impl<V: Vfs + Clone> Db<V> {
 
 #[cfg(test)]
 mod guard_tests {
+    use std::sync::Arc;
+
     use crate::pager::PageKind;
     use crate::pager::core::FileKey;
     use crate::pager::format::data_page::body_capacity;
+    use crate::pager::header::HeaderWriteError;
     use crate::vfs::memory::MemVfs;
     use crate::{CommitId, Db, OpenOptions, PagedbError, RealmId};
 
@@ -152,6 +233,81 @@ mod guard_tests {
         let db = db().await;
         db.arm_durable_publish(CommitId::new(7)).disarm();
         db.ensure_usable().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_header_write_poisons_with_the_unknown_outcome_error() {
+        let db = db().await;
+        let commit = CommitId::new(7);
+        let returned = db
+            .arm_durable_publish(commit)
+            .header_write_failed(HeaderWriteError::OutcomeUnknown(PagedbError::NoSpace));
+        let assert_carries_the_cause = |error: PagedbError| {
+            assert!(error.to_string().contains("no space"), "display: {error}");
+            assert!(matches!(
+                error,
+                PagedbError::CommitOutcomeUnknown { commit: poisoned, source }
+                    if poisoned == commit && matches!(*source, PagedbError::NoSpace)
+            ));
+        };
+        assert_carries_the_cause(returned);
+        assert_carries_the_cause(db.ensure_usable().unwrap_err());
+    }
+
+    /// No byte landed, so the previous header is known to stand.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_header_write_that_never_started_returns_its_cause_without_poison() {
+        let db = db().await;
+        let returned = db
+            .arm_durable_publish(CommitId::new(7))
+            .header_write_failed(HeaderWriteError::NotStarted(PagedbError::NoSpace));
+        assert!(matches!(returned, PagedbError::NoSpace));
+        db.ensure_usable().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_first_poison_of_a_handle_stands() {
+        let db = db().await;
+        db.poison_header_outcome_unknown(CommitId::new(7), Arc::new(PagedbError::NoSpace));
+        db.poison(CommitId::new(8));
+        assert!(matches!(
+            db.ensure_usable(),
+            Err(PagedbError::CommitOutcomeUnknown { commit, .. }) if commit == CommitId::new(7)
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unflushed_journal_guard_drops_staged_pages_when_dropped_armed() {
+        let db = db().await;
+        let journal_id = [0x5A; 16];
+        let guard = db.discard_unflushed_journal_on_drop(journal_id);
+        db.pager
+            .stage_journal_page(journal_id, 0, REALM, &vec![0xAB; body_capacity(PAGE)])
+            .await
+            .unwrap();
+        assert_eq!(db.pager.inner.segment_cache.lock().dirty_len(), 1);
+        drop(guard);
+        assert_eq!(db.pager.inner.segment_cache.lock().dirty_len(), 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unflushed_journal_guard_keeps_flushed_pages_when_disarmed() {
+        let db = db().await;
+        let journal_id = [0x5B; 16];
+        let guard = db.discard_unflushed_journal_on_drop(journal_id);
+        db.pager
+            .stage_journal_page(journal_id, 0, REALM, &vec![0xAB; body_capacity(PAGE)])
+            .await
+            .unwrap();
+        db.pager.flush_journal(journal_id, REALM).await.unwrap();
+        guard.disarm();
+        let _page = db
+            .pager
+            .read_journal_page(journal_id, 0, REALM)
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

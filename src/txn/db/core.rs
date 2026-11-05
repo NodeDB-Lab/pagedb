@@ -226,10 +226,10 @@ pub struct Db<V: Vfs + Clone> {
     /// publication channel, so readers see either the prior complete commit or
     /// the next complete commit.
     pub(crate) snapshot: Arc<parking_lot::RwLock<ReaderSnapshot>>,
-    /// The durable commit that could not be reconciled into `snapshot`.
+    /// Why this handle stopped describing the durable store, if it did.
     /// Existing readers retain their pinned snapshots; all new state-dependent
     /// operations fail until the database is reopened.
-    pub(crate) poisoned_commit: parking_lot::Mutex<Option<CommitId>>,
+    pub(crate) poisoned_commit: parking_lot::Mutex<Option<HandlePoison>>,
     /// Cross-commit cache of page IDs known to be safely reusable. Populated
     /// after each commit with the pages it freed that no live reader and no
     /// retained commit-history root can still observe; the next writer txn's
@@ -262,6 +262,18 @@ pub struct Db<V: Vfs + Clone> {
 /// failure it guards against needs the last reader to leave precisely there.
 #[cfg(test)]
 pub(crate) type RetirementDeferHook<V> = Arc<dyn Fn(&Db<V>) + Send + Sync>;
+
+/// Why a handle refuses every new state-dependent operation.
+#[derive(Debug, Clone)]
+pub(crate) enum HandlePoison {
+    /// `commit` could not be reconciled into the published snapshot.
+    Unpublished(CommitId),
+    /// A header write for `commit` failed partway, so the durable header is unknown.
+    HeaderOutcomeUnknown {
+        commit: CommitId,
+        source: Arc<PagedbError>,
+    },
+}
 
 /// Reader-visible state, refreshed by the writer at commit time.
 #[derive(Debug, Clone, Copy)]
@@ -421,16 +433,31 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     pub(crate) fn ensure_usable(&self) -> Result<()> {
-        match *self.poisoned_commit.lock() {
-            Some(commit) => Err(PagedbError::durably_committed_but_unpublished(commit)),
+        match &*self.poisoned_commit.lock() {
+            Some(HandlePoison::Unpublished(commit)) => {
+                Err(PagedbError::durably_committed_but_unpublished(*commit))
+            }
+            Some(HandlePoison::HeaderOutcomeUnknown { commit, source }) => Err(
+                PagedbError::commit_outcome_unknown_shared(*commit, Arc::clone(source)),
+            ),
             None => Ok(()),
         }
     }
 
     pub(crate) fn poison(&self, commit: CommitId) {
+        self.poison_with(HandlePoison::Unpublished(commit));
+    }
+
+    /// Record a header write that returned an error. The durable header is unknown.
+    pub(crate) fn poison_header_outcome_unknown(&self, commit: CommitId, source: Arc<PagedbError>) {
+        self.poison_with(HandlePoison::HeaderOutcomeUnknown { commit, source });
+    }
+
+    /// The first poison stands, because it names the earliest unknown state.
+    fn poison_with(&self, poison: HandlePoison) {
         let mut poisoned = self.poisoned_commit.lock();
         if poisoned.is_none() {
-            *poisoned = Some(commit);
+            *poisoned = Some(poison);
         }
     }
 

@@ -131,6 +131,41 @@ async fn apply_dropped_after_its_rename_poisons_and_reopens_at_the_target() {
     assert!(segment.read_page(1).await.unwrap().starts_with(b"promoted"));
 }
 
+/// The flush opens the sidecar after the apply staged its pages. Those pages are
+/// dirty, and no later flush names this journal id.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_dropped_between_staging_and_flushing_its_journal_drops_the_journal_pages() {
+    let fixture = follower_with_delta().await;
+    let sidecar_open = fixture.vfs.park_next_open_under("/applyjournal/");
+
+    cancel_when(
+        Box::pin(fixture.follower.apply_incremental(fixture.delta_dir.path())),
+        sidecar_open.wait_until_parked(),
+    )
+    .await;
+
+    fixture.follower.ensure_usable().unwrap();
+    assert_eq!(fixture.follower.latest_commit(), fixture.base);
+    assert_eq!(
+        fixture
+            .follower
+            .pager
+            .inner
+            .segment_cache
+            .lock()
+            .dirty_len(),
+        0,
+        "staged journal pages stayed dirty"
+    );
+
+    fixture
+        .follower
+        .apply_incremental(fixture.delta_dir.path())
+        .await
+        .unwrap();
+    assert_eq!(fixture.follower.latest_commit(), fixture.target);
+}
+
 /// The journal directory sync runs before the rename. The apply has already
 /// staged its free list and history through the Pager. Those pages sit in the
 /// cache under ids the live image also uses.

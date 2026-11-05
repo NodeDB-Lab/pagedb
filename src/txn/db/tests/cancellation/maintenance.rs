@@ -3,6 +3,7 @@
 use crate::Db;
 use crate::catalog::codec::{RealmQuotas, SegmentKind};
 use crate::options::OpenOptions;
+use crate::recovery::deep_walk::run_deep_walk;
 use crate::segment::types::SegmentPageKind;
 use crate::segment::writer::live_path;
 use crate::vfs::gated::{GatedVfs, cancel_when};
@@ -30,6 +31,56 @@ async fn realm_quota_update_dropped_after_its_header_write_poisons_the_handle() 
         .await
         .unwrap();
     reopened.realm_quotas(REALM).await.unwrap();
+}
+
+/// The catalog rewrite supersedes pages. They must join the free list, or no root
+/// and no free-list entry names them.
+#[tokio::test(flavor = "current_thread")]
+async fn realm_quota_update_puts_the_superseded_catalog_pages_on_the_free_list() {
+    let vfs = GatedVfs::new();
+    let db = Db::open(vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
+    let mut txn = db.begin_write().await.unwrap();
+    txn.put(b"base", b"row").await.unwrap();
+    txn.commit().await.unwrap();
+    db.set_realm_quotas(REALM, RealmQuotas::default())
+        .await
+        .unwrap();
+    let entries_before = db.writer.lock().await.free_list_entries.unwrap_or(0);
+
+    db.set_realm_quotas(REALM, RealmQuotas::default())
+        .await
+        .unwrap();
+
+    let (entries_after, free_list_root) = {
+        let state = db.writer.lock().await;
+        (
+            state.free_list_entries.unwrap_or(0),
+            state.free_list_root_page_id,
+        )
+    };
+    assert!(
+        entries_after > entries_before,
+        "the free list went from {entries_before} to {entries_after} entries"
+    );
+    assert_eq!(
+        db.stats().await.unwrap().free_list_pending_entries,
+        entries_after,
+        "the published snapshot disagrees with the writer state"
+    );
+    drop(db);
+
+    let reopened = Db::open(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.writer.lock().await.free_list_root_page_id,
+        free_list_root,
+        "the durable header disagrees with the state it was written from"
+    );
+    let report = run_deep_walk(&reopened).await.unwrap();
+    assert!(report.is_clean(), "the reopened store: {report:?}");
 }
 
 /// The queue is the only record that a retired file still needs reclaiming. The

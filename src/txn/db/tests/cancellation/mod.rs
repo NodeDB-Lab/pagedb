@@ -6,6 +6,8 @@ mod apply;
 mod commit;
 mod compact;
 mod gating;
+mod header_errors;
 mod maintenance;
+mod mutation;
 mod rekey;
 mod support;

@@ -80,6 +80,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             self.db.write_lock_satisfied(),
             "page write without held writer lock"
         );
+        self.ensure_mutations_finished()?;
         let _span = tracing::debug_span!("txn.commit");
         // Note: span is not entered via `.entered()` to keep this async fn's
         // future `Send`. Use `tracing::instrument` or enter in sync sections only.
@@ -328,9 +329,10 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         };
 
         let hk_clone = { self.db.hk.read().clone() };
-        // A drop from here to publication poisons the handle. Bytes can land while
-        // the header future is pending. The next commit then overwrites pages a
-        // durable header names. Every earlier drop stays a plain abort.
+        // A drop or a header error from here to publication poisons the handle.
+        // Bytes can land while the header future is pending, or before a sync
+        // fails. The next commit then overwrites pages a durable header names.
+        // Every earlier drop stays a plain abort.
         let db = self.db;
         let publish = db.arm_durable_publish(CommitId(new_commit_id));
         let new_slot = match commit_header(
@@ -344,10 +346,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         .await
         {
             Ok(slot) => slot,
-            Err(error) => {
-                publish.disarm();
-                return Err(error);
-            }
+            Err(error) => return Err(publish.header_write_failed(error)),
         };
         self.db.pager.note_header_written(HeaderCursor {
             slot: new_slot,

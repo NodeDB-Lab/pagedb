@@ -342,7 +342,7 @@ impl<V: Vfs> BTree<V> {
         page_id >= source.reuse_threshold || source.consumed.contains(page_id)
     }
 
-    pub(super) fn validate_insert_record_fits(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub(crate) fn validate_insert_record_fits(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let value_encoded_size = stored_leaf_value_encoded_size(value.len(), self.page_size)?;
         if !Leaf::single_record_fits_encoded(key.len(), value_encoded_size, self.page_size)
             || !internal::separator_fits(key.len(), self.page_size)

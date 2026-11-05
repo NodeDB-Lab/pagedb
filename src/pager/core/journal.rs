@@ -50,6 +50,26 @@ impl<V: Vfs> Pager<V> {
         .await
     }
 
+    /// Drop a sidecar's cached pages, dirty ones included, and its nonce generator
+    /// and cached handle. The file stays on disk, and no header names it.
+    ///
+    /// A cancelled apply calls this from a drop, so it cannot wait for the handle
+    /// lock. A held lock leaves the cached handle for the next reopen. A cache
+    /// fault stays latched, and every later operation on the cache reports it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn discard_unflushed_journal(&self, journal_id: [u8; 16]) {
+        let key = FileKey::ApplyJournal(journal_id);
+        {
+            let mut cache = self.inner.cache_for_key(key).lock();
+            cache.discard_dirty(key);
+            let _ = cache.clear_file(key);
+        }
+        self.journal_nonces.lock().remove(&journal_id);
+        if let Ok(mut files) = self.files.try_lock() {
+            files.remove(&key);
+        }
+    }
+
     /// Read an apply-journal sidecar page, AEAD-verified under `realm_id`.
     pub async fn read_journal_page(
         &self,

@@ -158,7 +158,7 @@ pub(super) async fn segment_rows_from<V: Vfs + Clone>(
 /// both live, and the header must not disagree with them.
 ///
 /// A drop before the header write discards the staged catalog pages and changes
-/// nothing else. A drop from the header write on poisons the handle.
+/// nothing else. A drop or error from the header write on poisons the handle.
 pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     db: &Db<V>,
     state: &mut WriterState,
@@ -241,10 +241,7 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     .await
     {
         Ok(slot) => slot,
-        Err(error) => {
-            publish.disarm();
-            return Err(error);
-        }
+        Err(error) => return Err(publish.header_write_failed(error)),
     };
     unpublished.disarm();
     db.pager.note_header_written(HeaderCursor {

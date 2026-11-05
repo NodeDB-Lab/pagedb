@@ -102,6 +102,8 @@ fn every_variant_displays() {
             commit: CommitId::new(10),
             oldest_available: CommitId::new(20),
         },
+        PagedbError::commit_outcome_unknown(CommitId::new(10), PagedbError::NoSpace),
+        PagedbError::write_txn_interrupted(),
         PagedbError::NotFound,
         PagedbError::AlreadyLinked,
         PagedbError::NotLinked,

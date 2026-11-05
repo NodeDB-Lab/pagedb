@@ -266,6 +266,39 @@ pub enum PagedbError {
     #[error("commit {commit:?} is durable but unpublished; reopen required")]
     DurablyCommittedButUnpublished { commit: CommitId },
 
+    /// A header write for `commit` failed partway, so this handle cannot tell
+    /// which A/B header is durable. A failed sync can leave the new header on
+    /// disk, and a failed write can leave none of it. The handle is poisoned, and
+    /// every later state-dependent call on it returns this error. `source` is the
+    /// failure, such as [`Self::NoSpace`] or [`Self::Io`].
+    ///
+    /// An encode or open failure writes no byte, so it returns its own error and
+    /// does not poison. `source` is an `Arc` because the poison repeats it on later
+    /// calls, and this error type is not `Clone`.
+    ///
+    /// Distinct from [`Self::DurablyCommittedButUnpublished`], which says the
+    /// commit is durable. Reopen the store: the reopen reads the durable header,
+    /// and [`Db::latest_commit`](crate::Db::latest_commit) then reports the
+    /// outcome. A set of realm quotas names the latest commit and writes no new one.
+    #[error(
+        "the header write for commit {commit:?} failed and its outcome is unknown; \
+         reopen required: {source}"
+    )]
+    CommitOutcomeUnknown {
+        commit: CommitId,
+        #[source]
+        source: std::sync::Arc<PagedbError>,
+    },
+
+    /// A mutating [`WriteTxn`](crate::WriteTxn) call did not finish: its future was
+    /// dropped, or it returned an error other than input validation. The
+    /// transaction's trees can be partly updated. Every later read, mutation, and
+    /// `commit` on that transaction returns this error, and nothing it wrote is
+    /// published. The store and the handle are unaffected. Drop or `abort` the
+    /// transaction, then start a new one.
+    #[error("a mutation on this write transaction did not finish; abort it")]
+    WriteTxnInterrupted,
+
     /// A rekey resume began writing pages under the target epoch — an
     /// operation with no safe in-process rollback — and then failed before
     /// recovery could complete. The handle is poisoned at `commit` and

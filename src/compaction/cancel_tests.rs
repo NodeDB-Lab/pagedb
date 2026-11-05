@@ -196,6 +196,75 @@ async fn replace_segment_compact_dropped_after_its_header_write_poisons_the_hand
     );
 }
 
+/// The new catalog header reached the file and its sync reported failure. The
+/// handle cannot tell which header won, so only a reopen may continue.
+#[tokio::test(flavor = "current_thread")]
+async fn replace_segment_compact_with_a_failed_header_sync_poisons_the_handle() {
+    let fixture = store_with_linked_segment().await;
+    let db = &fixture.db;
+    let expected = CommitId::new(db.latest_commit().value() + 1);
+    let offset = db.pager.header_cursor().unwrap().slot.other().page_id() * PAGE as u64;
+    fixture
+        .vfs
+        .fail_sync_after_next_write_at(&db.main_db_path, offset);
+
+    let outcome = {
+        let mut state = db.writer.lock().await;
+        let visibility = db.visibility_gate.write().await;
+        Box::pin(replace_segment_compact(
+            db,
+            &mut state,
+            &visibility,
+            SEGMENT,
+            &fixture.old_meta.segment_id,
+            &fixture.new_meta,
+        ))
+        .await
+    };
+
+    assert!(matches!(
+        outcome,
+        Err(PagedbError::CommitOutcomeUnknown { commit, .. }) if commit == expected
+    ));
+    assert!(matches!(
+        db.begin_read().await,
+        Err(PagedbError::CommitOutcomeUnknown { commit, .. }) if commit == expected
+    ));
+}
+
+/// No header byte landed, so the old catalog stands and the handle stays usable.
+#[tokio::test(flavor = "current_thread")]
+async fn replace_segment_compact_with_a_failed_header_open_stays_a_plain_error() {
+    let fixture = store_with_linked_segment().await;
+    let db = &fixture.db;
+    fixture.vfs.fail_next_read_write_open(&db.main_db_path);
+
+    let outcome = {
+        let mut state = db.writer.lock().await;
+        let visibility = db.visibility_gate.write().await;
+        Box::pin(replace_segment_compact(
+            db,
+            &mut state,
+            &visibility,
+            SEGMENT,
+            &fixture.old_meta.segment_id,
+            &fixture.new_meta,
+        ))
+        .await
+    };
+
+    assert!(matches!(outcome, Err(PagedbError::Io(_))));
+    db.ensure_usable().unwrap();
+    let segment = db.open_segment(REALM, SEGMENT).await.unwrap();
+    assert!(
+        segment
+            .read_page(1)
+            .await
+            .unwrap()
+            .starts_with(b"old-bytes")
+    );
+}
+
 /// The catalog flush runs before any header. A drop there leaves the old catalog
 /// durable, so it must discard the staged pages and must not poison.
 #[tokio::test(flavor = "current_thread")]

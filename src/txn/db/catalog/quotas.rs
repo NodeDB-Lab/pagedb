@@ -33,7 +33,7 @@ impl<V: Vfs + Clone> Db<V> {
         let value = Catalog::encode_realm_quotas(&quotas);
 
         // A drop or error before the header write leaves nothing staged in the
-        // cache. A drop from the header write on poisons the handle.
+        // cache. A drop or error from the header write on poisons the handle.
         let unpublished = self.discard_unpublished_pages_on_drop();
         let mut cat_tree = BTree::open(
             self.pager.clone(),
@@ -46,7 +46,18 @@ impl<V: Vfs + Clone> Db<V> {
         cat_tree.flush().await?;
 
         let new_catalog_root = cat_tree.root_page_id();
-        let new_next = cat_tree.next_page_id();
+        // No root reaches the pages this rewrite superseded. Without the fold, no
+        // free-list entry names them either, and they stay lost for good.
+        let freed_pages = cat_tree.drain_freed();
+        let folded = self
+            .fold_freed_catalog_pages(
+                &state,
+                &freed_pages,
+                cat_tree.next_page_id().max(state.next_page_id),
+            )
+            .await?;
+        self.pager.flush_main(self.realm_id).await?;
+        let new_next = folded.next_page_id;
         let new_catalog_txn_id = state
             .latest_commit_id
             .checked_add(1)
@@ -69,7 +80,7 @@ impl<V: Vfs + Clone> Db<V> {
                 catalog_root: catalog_root_bytes,
                 commit_history_root_page_id: state.commit_history_root_page_id,
                 commit_history_root_version: state.commit_history_root_version,
-                free_list_root_page_id: state.free_list_root_page_id,
+                free_list_root_page_id: folded.root_page_id,
                 next_page_id: new_next,
             },
         )?;
@@ -86,10 +97,7 @@ impl<V: Vfs + Clone> Db<V> {
         .await
         {
             Ok(slot) => slot,
-            Err(error) => {
-                publish.disarm();
-                return Err(error);
-            }
+            Err(error) => return Err(publish.header_write_failed(error)),
         };
         unpublished.disarm();
         self.pager.note_header_written(HeaderCursor {
@@ -100,6 +108,8 @@ impl<V: Vfs + Clone> Db<V> {
         state.catalog_root_page_id = new_catalog_root;
         state.catalog_root_txn_id = new_catalog_txn_id;
         state.next_page_id = new_next;
+        state.free_list_root_page_id = folded.root_page_id;
+        state.free_list_entries = folded.entries;
         let _ = self
             .finish_durable_commit(
                 &state,

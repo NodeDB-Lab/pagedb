@@ -252,12 +252,14 @@ impl<V: Vfs + Clone> Db<V> {
             };
             let pages = encode_journal_pages(&record, page_size)?;
             self.vfs.mkdir_all("applyjournal").await?;
+            let unflushed = self.discard_unflushed_journal_on_drop(id);
             for (page_id, body) in pages.iter().enumerate() {
                 self.pager
                     .stage_journal_page(id, page_id as u64, self.realm_id, body)
                     .await?;
             }
             self.pager.flush_journal(id, self.realm_id).await?;
+            unflushed.disarm();
             self.vfs.sync_dir("applyjournal").await?;
             id
         };
