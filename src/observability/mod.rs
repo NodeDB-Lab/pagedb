@@ -24,6 +24,25 @@ pub struct DbStats {
     pub dirty_pages: u64,
     /// Number of read transactions currently registered with the `Db`.
     pub tracked_readers: u32,
+    /// Smallest snapshot commit id pinned by a registered read transaction,
+    /// or `None` when no reader is registered. Pages freed after this commit
+    /// cannot be reused while the reader stays open.
+    ///
+    /// Readers are not the only bound on reuse. Retained commit history
+    /// (`OpenOptions::commit_history_retain`) also holds back pages freed
+    /// after the oldest retained commit, so `None` does not mean nothing
+    /// blocks reuse.
+    pub oldest_reader_commit_id: Option<u64>,
+    /// Milliseconds since the longest-lived registered read transaction began,
+    /// or `None` when no reader is registered.
+    ///
+    /// The longest-lived reader is not always the one pinning
+    /// `oldest_reader_commit_id`: `begin_read_at` can open a new reader on an
+    /// older commit, and then the two fields describe different readers.
+    pub oldest_reader_age_ms: Option<u64>,
+    /// Number of registered read transactions exempt from reader-stall abort
+    /// (created by `begin_read_non_abortable`). A subset of `tracked_readers`.
+    pub tracked_readers_non_abortable: u32,
     /// Number of segment tombstones that are deferred pending reader drain.
     pub pending_tombstones: u32,
     /// Number of live segments recorded in the catalog.

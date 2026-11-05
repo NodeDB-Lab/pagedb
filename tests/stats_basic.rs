@@ -138,3 +138,74 @@ async fn stats_reports_mode() {
         s.mode
     );
 }
+
+#[tokio::test]
+async fn stats_reports_reader_census() {
+    let db = fresh_db().await;
+    write_n(&db, 1).await;
+
+    let idle = db.stats().await.unwrap();
+    assert_eq!(idle.oldest_reader_commit_id, None);
+    assert_eq!(idle.oldest_reader_age_ms, None);
+    assert_eq!(idle.tracked_readers_non_abortable, 0);
+
+    let reader = db.begin_read().await.unwrap();
+    let pinned = reader.commit_id().value();
+    write_n(&db, 3).await;
+    // Only the older reader can be 10 ms old when the first census runs, so
+    // the age assertion below fails if the census reports the newest reader.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let internal = db.begin_read_non_abortable().await.unwrap();
+    assert!(internal.commit_id().value() > pinned);
+    write_n(&db, 3).await;
+
+    let first = db.stats().await.unwrap();
+    assert_eq!(first.oldest_reader_commit_id, Some(pinned));
+    assert_eq!(first.tracked_readers_non_abortable, 1);
+    let first_age = first.oldest_reader_age_ms.expect("reader is pinned");
+    assert!(
+        first_age >= 10,
+        "age is the older reader's, at least the 10 ms sleep: {first_age}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    write_n(&db, 1).await;
+
+    let second = db.stats().await.unwrap();
+    assert_eq!(second.oldest_reader_commit_id, Some(pinned));
+    let second_age = second.oldest_reader_age_ms.expect("reader is pinned");
+    assert!(
+        second_age >= first_age + 10,
+        "age grew less than the 10 ms sleep: {first_age} -> {second_age}"
+    );
+
+    drop(reader);
+    drop(internal);
+    let drained = db.stats().await.unwrap();
+    assert_eq!(drained.oldest_reader_commit_id, None);
+    assert_eq!(drained.oldest_reader_age_ms, None);
+    assert_eq!(drained.tracked_readers_non_abortable, 0);
+}
+
+#[tokio::test]
+async fn stats_reader_census_fields_can_describe_different_readers() {
+    let db = fresh_db().await;
+    write_n(&db, 1).await;
+    let old_commit = db.begin_read().await.unwrap().commit_id();
+    write_n(&db, 3).await;
+
+    let longest_lived = db.begin_read().await.unwrap();
+    assert!(longest_lived.commit_id().value() > old_commit.value());
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // Opened later, but pinned to an older commit.
+    let _historical = db.begin_read_at(old_commit).await.unwrap();
+
+    let s = db.stats().await.unwrap();
+    assert_eq!(s.tracked_readers, 2);
+    assert_eq!(s.oldest_reader_commit_id, Some(old_commit.value()));
+    let age = s.oldest_reader_age_ms.expect("readers are registered");
+    assert!(
+        age >= 10,
+        "age is the longest-lived reader's, not the oldest-commit reader's: {age}"
+    );
+}

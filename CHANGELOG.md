@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+### Added
+
+- **Reader observability** — `DbStats` gains `oldest_reader_commit_id`, `oldest_reader_age_ms` (both `None` when no reader is registered) and `tracked_readers_non_abortable` (`u32`), so a long-lived read transaction that holds back free-page reuse is visible from `Db::stats()`.
+
 ## [0.1.0] - 2026-10-15
 
 The first stable release. The entries describe `0.1.0` as a whole. The `0.1.0-beta.N` pre-releases have no entries of their own.

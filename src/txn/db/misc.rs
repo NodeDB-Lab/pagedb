@@ -13,6 +13,14 @@ use std::sync::atomic::Ordering as AtOrd;
 use super::super::mode::DbMode;
 use super::core::Db;
 
+/// Point-in-time summary of the registered read transactions.
+struct ReaderCensus {
+    count: u32,
+    oldest_commit_id: Option<u64>,
+    oldest_age_ms: Option<u64>,
+    non_abortable: u32,
+}
+
 /// Segment catalog rows read per batch while aggregating `stats()`. Rows are a
 /// fixed-width authenticated value, so this is a few KiB resident regardless of
 /// how many segments a realm has linked.
@@ -91,6 +99,24 @@ impl<V: Vfs + Clone> Db<V> {
         crate::compaction::compact_step(self, budget).await
     }
 
+    /// Reader count, oldest pinned commit id, age of the oldest reader in
+    /// milliseconds, and the non-abortable count, read under one lock.
+    fn reader_census(&self) -> ReaderCensus {
+        let readers = self.tracked_readers.lock();
+        let oldest_age_ms = readers
+            .iter()
+            .map(|r| r.began_at)
+            .min()
+            .map(|began| u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX));
+        ReaderCensus {
+            count: u32::try_from(readers.len()).unwrap_or(u32::MAX),
+            oldest_commit_id: readers.iter().map(|r| r.commit_id.value()).min(),
+            oldest_age_ms,
+            non_abortable: u32::try_from(readers.iter().filter(|r| r.non_abortable).count())
+                .unwrap_or(u32::MAX),
+        }
+    }
+
     /// Collect a point-in-time snapshot of database runtime metrics.
     pub async fn stats(&self) -> Result<DbStats> {
         // Stats that describe reader-visible state must use the publication
@@ -135,7 +161,7 @@ impl<V: Vfs + Clone> Db<V> {
         };
 
         // Tracked readers.
-        let tracked_readers = u32::try_from(self.tracked_readers.lock().len()).unwrap_or(u32::MAX);
+        let census = self.reader_census();
 
         // Pending tombstones.
         let pending_tombstones =
@@ -197,7 +223,10 @@ impl<V: Vfs + Clone> Db<V> {
             buffer_pool_hits,
             buffer_pool_misses,
             dirty_pages,
-            tracked_readers,
+            tracked_readers: census.count,
+            oldest_reader_commit_id: census.oldest_commit_id,
+            oldest_reader_age_ms: census.oldest_age_ms,
+            tracked_readers_non_abortable: census.non_abortable,
             pending_tombstones,
             segments_live,
             segments_total_bytes,

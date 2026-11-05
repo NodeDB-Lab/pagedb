@@ -85,6 +85,8 @@ impl<V: Vfs + Clone> Db<V> {
         non_abortable: bool,
     ) -> ReadTxn<'_, V> {
         let entry_id = self.reader_seq.fetch_add(1, Ordering::Relaxed);
+        // Read the clock before taking the lock: on wasm32 it is a JS call.
+        let began_at = crate::clock::Instant::now();
         let mut readers = self.tracked_readers.lock();
         readers.push(TrackedReader {
             entry_id,
@@ -93,6 +95,7 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id,
             catalog_root_page_id,
             non_abortable,
+            began_at,
         });
         drop(readers);
         #[cfg(test)]

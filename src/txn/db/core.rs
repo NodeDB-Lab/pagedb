@@ -45,6 +45,8 @@ pub(crate) struct TrackedReader {
     pub next_page_id: u64,
     pub catalog_root_page_id: u64,
     pub non_abortable: bool,
+    /// When the reader registered; feeds the oldest-reader age in `DbStats`.
+    pub began_at: crate::clock::Instant,
 }
 
 /// Writer state, guarded by the writer mutex. Holds the current root and
