@@ -4,7 +4,8 @@
 //! SIEVE (Zhang et al., NSDI 2024) replaces classic LRU. The hit path is a
 //! single bit set — no list-shuffle, no `O(N)` order maintenance. Eviction
 //! walks a "hand" through a FIFO of insertions, clearing `visited` bits and
-//! evicting the first unvisited (and unpinned, undirty) entry.
+//! evicting the first unvisited, unpinned entry. An entry leaves the FIFO when
+//! marked dirty and rejoins as the newest entry when clean.
 //!
 //! When a cache mutex is released, the cache holds at most `capacity` entries,
 //! or every entry is dirty or pinned. Dirty pages and pinned pages exceed the
@@ -32,6 +33,8 @@ const OVER_BUDGET: &str = "entries exceed capacity while one is evictable";
 const LIST_LINK_BROKEN: &str = "list link disagrees with the slot it names";
 const MAP_SLOT_DISAGREES: &str = "map entry disagrees with the slot";
 const LIVE_SLOTS_DRIFTED: &str = "live slots differ from the map";
+const NODE_ALREADY_LINKED: &str = "node is already on the list";
+const LIST_MEMBERSHIP_DRIFTED: &str = "list membership disagrees with the dirty marker";
 
 /// A broken cache invariant. `operation` names what was running, `detail` what
 /// it found, and `slot` the slab slot when one is known.
@@ -130,8 +133,8 @@ impl Page {
     }
 }
 
-/// Node in the SIEVE FIFO. `prev` points toward the tail (older), `next`
-/// toward the head (newer). The hand walks tail→head via `next`.
+/// Slab node, on the SIEVE FIFO unless dirty. `prev` points toward the tail
+/// (older), `next` toward the head (newer). The hand walks tail→head via `next`.
 struct Node {
     key: (FileKey, u64),
     page: Arc<Page>,
@@ -140,12 +143,18 @@ struct Node {
     /// not pay a second hash to pin, nor a third to unpin on drop.
     pins: u32,
     visited: bool,
+    /// Whether this node is on the list. A clean node is on it, and a dirty one
+    /// is off it. An unlinked node has `prev` and `next` of `None`.
+    linked: bool,
     prev: Option<usize>,
     next: Option<usize>,
 }
 
-/// Bounded page cache with SIEVE eviction. Pinned and dirty entries are
-/// skipped by the eviction hand.
+/// Bounded page cache with SIEVE eviction. The eviction hand skips pinned
+/// entries. Dirty entries are off the list it walks.
+///
+/// A large write transaction leaves most of the cache dirty. Keeping dirty
+/// entries off the list spares each clean-page eviction a walk past all of them.
 pub struct PageCache {
     /// The entry budget. At every mutex release, `map.len() <= capacity` or
     /// `evictable == 0`. Transaction dirty pages and pinned pages exceed it
@@ -170,10 +179,7 @@ pub struct PageCache {
     ///
     /// A large write transaction dirties every page it touches, and dirty pages
     /// are never evicted, so the cache legitimately grows past capacity with
-    /// nothing evictable in it. Without this the hand re-swept the whole list on
-    /// every insert only to fail — and the list it swept was the overgrown one,
-    /// so a single transaction's page inserts cost time quadratic in the pages
-    /// it wrote.
+    /// nothing evictable in it. At zero, a trim ends without walking the list.
     evictable: usize,
     /// The first broken invariant. Once set, every fallible method returns it
     /// and changes nothing.
@@ -426,7 +432,8 @@ impl PageCache {
         })
     }
 
-    /// Splice a new entry in as head, holding `pins` pins from the start.
+    /// Splice a new entry in as head, holding `pins` pins from the start. A key
+    /// is resident when marked dirty, so a new entry always starts on the list.
     fn insert_new(
         &mut self,
         key: (FileKey, u64),
@@ -438,30 +445,60 @@ impl PageCache {
         if self.map.len() >= self.capacity {
             self.trim_to(self.capacity.saturating_sub(1))?;
         }
-        let old_head = self.head;
         let idx = self.alloc_node(
             Node {
                 key,
                 page,
                 pins,
                 visited: false,
-                prev: old_head,
+                linked: false,
+                prev: None,
                 next: None,
             },
             operation,
         )?;
-        if let Some(old_head) = old_head {
-            Self::node_mut(&mut self.slab, old_head, operation)?.next = Some(idx);
-        } else {
-            // Empty list; this node is also the new tail.
-            self.tail = Some(idx);
-        }
-        self.head = Some(idx);
+        self.link_as_head(idx, operation)?;
         self.map.insert(key, idx);
         if pins == 0 && !self.dirty.contains(&key) {
             self.evictable = self.evictable.saturating_add(1);
         }
         Ok(idx)
+    }
+
+    /// Splice the unlinked node at `idx` in as the newest entry. A node already
+    /// on the list reports a fault and changes nothing.
+    fn link_as_head(&mut self, idx: usize, operation: &'static str) -> Result<(), CacheFault> {
+        let old_head = self.head;
+        let node = Self::node_mut(&mut self.slab, idx, operation)?;
+        if node.linked {
+            return Err(CacheFault::new(operation, NODE_ALREADY_LINKED, Some(idx)));
+        }
+        node.linked = true;
+        node.prev = old_head;
+        node.next = None;
+        if let Some(old_head) = old_head {
+            Self::node_mut(&mut self.slab, old_head, operation)?.next = Some(idx);
+        } else {
+            // The list is empty, so this node is also the new tail.
+            self.tail = Some(idx);
+        }
+        self.head = Some(idx);
+        Ok(())
+    }
+
+    /// Take the node at `idx` off the list, moving the hand off it first. A node
+    /// already off the list is left alone.
+    fn unlink_from_list(&mut self, idx: usize, operation: &'static str) -> Result<(), CacheFault> {
+        let node = Self::node_mut(&mut self.slab, idx, operation)?;
+        if !node.linked {
+            return Ok(());
+        }
+        node.linked = false;
+        let (prev, next) = (node.prev.take(), node.next.take());
+        if self.hand == Some(idx) {
+            self.hand = next;
+        }
+        self.unlink_node(prev, next, operation)
     }
 
     /// Evict entries until at most `target` remain or none is evictable. This is
@@ -476,9 +513,10 @@ impl PageCache {
         // map walk, so it runs once per trim and in debug builds only.
         if cfg!(debug_assertions) {
             self.check_evictable_count(OPERATION)?;
+            self.check_list_membership(OPERATION)?;
         }
         // With nothing clean and unpinned, no sweep can succeed. The zero check
-        // keeps a write transaction linear in the pages it dirties.
+        // ends the trim without a walk.
         while self.map.len() > target && self.evictable > 0 {
             self.evict_one()?;
         }
@@ -497,12 +535,13 @@ impl PageCache {
     /// a walk that finds no victim is a fault.
     fn evict_one(&mut self) -> Result<(), CacheFault> {
         const OPERATION: &str = "evict_one";
-        // Use the live list length rather than the configured capacity because
-        // pinned or dirty pages can temporarily grow the cache past capacity.
+        // The bound uses the live list length, which holds every entry not dirty.
+        // Pinned pages can grow the list past the configured capacity.
         // Each wrap past head uses one loop iteration.
         // The worst case is one evictable visited entry directly behind the hand.
         // That entry needs two passes over the list plus two wraps.
-        let max_steps = self.map.len().saturating_add(1).saturating_mul(2);
+        let list_len = self.map.len().saturating_sub(self.dirty.len());
+        let max_steps = list_len.saturating_add(1).saturating_mul(2);
         let mut cur = self.hand.or(self.tail);
         for _ in 0..max_steps {
             #[cfg(test)]
@@ -516,8 +555,15 @@ impl PageCache {
             };
             let node = Self::node_mut(&mut self.slab, idx, OPERATION)?;
             let (key, prev_idx, next_idx) = (node.key, node.prev, node.next);
+            if cfg!(debug_assertions) && self.dirty.contains(&key) {
+                return Err(CacheFault::new(
+                    OPERATION,
+                    LIST_MEMBERSHIP_DRIFTED,
+                    Some(idx),
+                ));
+            }
             if !Self::is_evictable(node, &self.dirty) {
-                // Skip without touching the visited bit.
+                // Skip a pinned entry without touching the visited bit.
                 cur = next_idx;
                 continue;
             }
@@ -551,6 +597,21 @@ impl PageCache {
         } else {
             Err(CacheFault::new(operation, EVICTABLE_COUNT_DRIFTED, None))
         }
+    }
+
+    /// Compare each entry's list membership against its dirty marker.
+    fn check_list_membership(&self, operation: &'static str) -> Result<(), CacheFault> {
+        for (key, &idx) in &self.map {
+            let node = Self::node(&self.slab, idx, operation)?;
+            if node.linked == self.dirty.contains(key) {
+                return Err(CacheFault::new(
+                    operation,
+                    LIST_MEMBERSHIP_DRIFTED,
+                    Some(idx),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn alloc_node(&mut self, node: Node, operation: &'static str) -> Result<usize, CacheFault> {
@@ -600,8 +661,8 @@ impl PageCache {
         Ok(())
     }
 
-    /// Mark a resident entry dirty. A key with no entry has nothing to flush, so
-    /// it reports `dirty page not resident`.
+    /// Mark a resident entry dirty and take it off the eviction list. A key with
+    /// no entry has nothing to flush, so it reports `dirty page not resident`.
     pub fn mark_dirty(&mut self, key: (FileKey, u64)) -> Result<(), CacheFault> {
         const OPERATION: &str = "mark_dirty";
         self.guarded(|cache| {
@@ -613,12 +674,13 @@ impl PageCache {
                 cache.evictable = Self::one_less(cache.evictable, OPERATION)?;
             }
             cache.dirty.insert(key);
-            Ok(())
+            cache.unlink_from_list(idx, OPERATION)
         })
     }
 
-    /// Clear a dirty marker. A key that is already clean is a no-op. A failed
-    /// call leaves the marker set, so the page stays visible to the flush check.
+    /// Clear a dirty marker and link the entry as the newest. A key that is
+    /// already clean is a no-op. A failed call leaves the marker set, so the page
+    /// stays visible to the flush check.
     ///
     /// This does not trim, because a trim per key is quadratic. Each batch caller
     /// trims once at its end.
@@ -631,9 +693,10 @@ impl PageCache {
             let Some(&idx) = cache.map.get(&key) else {
                 return Err(CacheFault::new(OPERATION, DIRTY_NOT_RESIDENT, None));
             };
-            let node = Self::keyed_node(&cache.slab, idx, key, OPERATION)?;
+            let unpinned = Self::keyed_node(&cache.slab, idx, key, OPERATION)?.pins == 0;
+            cache.link_as_head(idx, OPERATION)?;
             cache.dirty.remove(&key);
-            if Self::is_evictable(node, &cache.dirty) {
+            if unpinned {
                 cache.evictable = cache.evictable.saturating_add(1);
             }
             Ok(())
@@ -745,18 +808,49 @@ impl PageCache {
         Ok(())
     }
 
-    /// Move an unpinned node into the free slot `to`. This fixes the neighbours,
-    /// `head`, `tail`, `hand`, and the map entry. Dirty tracking is by key, so a
-    /// dirty node moves as well.
+    /// Move an unpinned node into the free slot `to`. This fixes the map entry,
+    /// and for a node on the list also its list links. Dirty tracking is by key,
+    /// and a dirty node is off the list, so only its map entry changes.
     fn move_node(
         &mut self,
         from: usize,
         to: usize,
         operation: &'static str,
     ) -> Result<(), CacheFault> {
-        let broken = CacheFault::new(operation, LIST_LINK_BROKEN, Some(from));
         let node = Self::node(&self.slab, from, operation)?;
-        let (key, prev, next) = (node.key, node.prev, node.next);
+        let (key, linked, prev, next) = (node.key, node.linked, node.prev, node.next);
+        if linked {
+            self.retarget_list_links(from, to, prev, next, operation)?;
+        }
+        match self.map.get_mut(&key) {
+            Some(mapped) if *mapped == from => *mapped = to,
+            _ => {
+                return Err(CacheFault::new(operation, MAP_SLOT_DISAGREES, Some(from)));
+            }
+        }
+        let moved = self.slab.get_mut(from).and_then(Option::take);
+        let slot = self
+            .slab
+            .get_mut(to)
+            .ok_or_else(|| CacheFault::new(operation, SLOT_EMPTY, Some(to)))?;
+        if slot.is_some() {
+            return Err(CacheFault::new(operation, SLOT_HOLDS_OTHER_KEY, Some(to)));
+        }
+        *slot = moved;
+        Ok(())
+    }
+
+    /// Point the neighbours, `head`, `tail`, and `hand` of the linked node at
+    /// `from` to its new slot `to`.
+    fn retarget_list_links(
+        &mut self,
+        from: usize,
+        to: usize,
+        prev: Option<usize>,
+        next: Option<usize>,
+        operation: &'static str,
+    ) -> Result<(), CacheFault> {
+        let broken = CacheFault::new(operation, LIST_LINK_BROKEN, Some(from));
         if let Some(p) = prev {
             let neighbour = Self::node_mut(&mut self.slab, p, operation)?;
             if neighbour.next != Some(from) {
@@ -782,21 +876,6 @@ impl PageCache {
         if self.hand == Some(from) {
             self.hand = Some(to);
         }
-        match self.map.get_mut(&key) {
-            Some(mapped) if *mapped == from => *mapped = to,
-            _ => {
-                return Err(CacheFault::new(operation, MAP_SLOT_DISAGREES, Some(from)));
-            }
-        }
-        let moved = self.slab.get_mut(from).and_then(Option::take);
-        let slot = self
-            .slab
-            .get_mut(to)
-            .ok_or_else(|| CacheFault::new(operation, SLOT_EMPTY, Some(to)))?;
-        if slot.is_some() {
-            return Err(CacheFault::new(operation, SLOT_HOLDS_OTHER_KEY, Some(to)));
-        }
-        *slot = moved;
         Ok(())
     }
 
@@ -858,12 +937,8 @@ impl PageCache {
                     continue;
                 }
                 let was_evictable = Self::is_evictable(node, &cache.dirty);
-                let (prev, next) = (node.prev, node.next);
                 cache.map.remove(&key);
-                if cache.hand == Some(idx) {
-                    cache.hand = next;
-                }
-                cache.unlink_node(prev, next, OPERATION)?;
+                cache.unlink_from_list(idx, OPERATION)?;
                 cache.free_node(idx, OPERATION)?;
                 if was_evictable {
                     cache.evictable = Self::one_less(cache.evictable, OPERATION)?;
@@ -1383,8 +1458,9 @@ mod tests {
         assert_eq!(c.hand, c.map.get(&(FileKey::Main, 3)).copied());
 
         let _ = c.get(behind).unwrap();
+        // Pinned entries stay on the list, so the hand walks them on both passes.
         for id in 3..=5 {
-            c.mark_dirty((FileKey::Main, id)).unwrap();
+            c.get_and_pin((FileKey::Main, id)).unwrap().unwrap();
         }
         assert_eq!(c.evictable, 1, "only page 1 is a candidate");
 
@@ -1425,13 +1501,16 @@ mod tests {
             .collect()
     }
 
-    /// Walk the list both ways against the map, the free list, and the counts.
+    /// Walk the list both ways against the map, the free list, and the counts. A
+    /// dirty entry is absent from the walk and has no list links.
     fn assert_list_matches_map(c: &PageCache) {
         let mut walked = 0_usize;
         let mut prev = None;
         let mut cur = c.tail;
         while let Some(idx) = cur {
             let node = PageCache::node(&c.slab, idx, "test").unwrap();
+            assert!(node.linked, "slot {idx} is on the list but not linked");
+            assert!(!c.dirty.contains(&node.key), "slot {idx} is dirty");
             assert_eq!(
                 node.prev, prev,
                 "slot {idx} names the wrong older neighbour"
@@ -1443,11 +1522,17 @@ mod tests {
             cur = node.next;
         }
         assert_eq!(c.head, prev);
-        assert_eq!(walked, c.map.len());
+        assert_eq!(walked, c.map.len() - c.dirty.len());
         if let Some(hand) = c.hand {
-            PageCache::node(&c.slab, hand, "test").unwrap();
+            let node = PageCache::node(&c.slab, hand, "test").unwrap();
+            assert!(node.linked, "the hand rests on an entry off the list");
         }
         c.check_evictable_count("test").unwrap();
+        c.check_list_membership("test").unwrap();
+        for key in &c.dirty {
+            let node = PageCache::node(&c.slab, c.map[key], "test").unwrap();
+            assert_eq!((node.prev, node.next), (None, None), "{key:?} has links");
+        }
 
         let mut free = c.free.clone();
         free.sort_unstable();
@@ -1698,7 +1783,9 @@ mod tests {
         let free_slot = 3;
         let fixture = || {
             let mut c = PageCache::with_capacity(8);
-            add_dirty(&mut c, 1..=3);
+            for id in 1..=3 {
+                c.insert(main_key(id), page(1)).unwrap();
+            }
             c.slab.push(None);
             c
         };
@@ -1716,5 +1803,179 @@ mod tests {
             broken_map.move_node(1, free_slot, "test"),
             Err(CacheFault::new("test", MAP_SLOT_DISAGREES, Some(1)))
         );
+    }
+
+    /// Eviction takes the clean entries, and an entry made clean is evictable
+    /// again in its new list position.
+    #[test]
+    fn dirty_entries_stay_off_the_eviction_list_until_clean() {
+        let mut c = PageCache::with_capacity(3);
+        for id in 1..=3_u8 {
+            c.insert(main_key(u64::from(id)), page(id)).unwrap();
+        }
+        c.mark_dirty(main_key(1)).unwrap();
+        c.mark_dirty(main_key(2)).unwrap();
+        assert_list_matches_map(&c);
+
+        // Page 3 is the only clean entry, so it leaves and the dirty ones stay.
+        c.insert(main_key(4), page(4)).unwrap();
+        assert!(!c.contains(main_key(3)));
+        assert!(c.contains(main_key(1)) && c.contains(main_key(2)));
+
+        // Cleaned, page 1 rejoins as the newest entry, so page 4 is older.
+        c.clear_dirty(main_key(1)).unwrap();
+        c.insert(main_key(5), page(5)).unwrap();
+        assert!(!c.contains(main_key(4)));
+        assert!(c.contains(main_key(1)));
+        assert!(c.contains(main_key(2)), "the dirty page stays");
+        assert_eq!(c.dirty_for_file(FileKey::Main), vec![2]);
+        assert_list_matches_map(&c);
+    }
+
+    /// Dropping a file's entries takes the dirty, unlinked ones too. The list
+    /// stays consistent, and another file's entry is evicted in its turn.
+    #[test]
+    fn clearing_a_file_drops_unlinked_dirty_entries() {
+        let segment_key = (FileKey::Segment([7; 16]), 1);
+        let mut c = PageCache::with_capacity(3);
+        c.insert(main_key(1), page(1)).unwrap();
+        c.insert(segment_key, page(2)).unwrap();
+        c.insert(main_key(2), page(3)).unwrap();
+        c.mark_dirty(main_key(1)).unwrap();
+
+        c.clear_file(FileKey::Main).unwrap();
+
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.dirty_len(), 0);
+        assert_list_matches_map(&c);
+
+        // The segment entry is the oldest on the list, then page 3, then page 4.
+        c.insert(main_key(3), page(4)).unwrap();
+        c.insert(main_key(4), page(5)).unwrap();
+        c.insert(main_key(5), page(6)).unwrap();
+        assert!(!c.contains(segment_key));
+        c.insert(main_key(6), page(7)).unwrap();
+        assert!(!c.contains(main_key(3)));
+        assert!(c.contains(main_key(4)));
+        assert_list_matches_map(&c);
+    }
+
+    #[test]
+    fn the_hand_moves_off_an_entry_when_it_turns_dirty() {
+        let mut c = PageCache::with_capacity(4);
+        for id in 1..=4_u8 {
+            c.insert(main_key(u64::from(id)), page(id)).unwrap();
+        }
+        // Evicting page 1 leaves the hand on page 2.
+        c.insert(main_key(5), page(5)).unwrap();
+        assert_eq!(c.hand, c.map.get(&main_key(2)).copied());
+
+        c.mark_dirty(main_key(2)).unwrap();
+        assert_eq!(c.hand, c.map.get(&main_key(3)).copied());
+        assert_list_matches_map(&c);
+
+        // The next eviction starts from the entry the hand moved to.
+        c.insert(main_key(6), page(6)).unwrap();
+        assert!(!c.contains(main_key(3)));
+        assert!(c.contains(main_key(2)));
+        assert_eq!(c.hand, c.map.get(&main_key(4)).copied());
+
+        // Past the newest entry, the hand has nowhere left to rest.
+        for id in 4..=6 {
+            c.mark_dirty(main_key(id)).unwrap();
+        }
+        assert_eq!(c.hand, None);
+        assert_eq!((c.head, c.tail), (None, None));
+        assert_list_matches_map(&c);
+    }
+
+    #[test]
+    fn a_cleaned_entry_rejoins_as_the_newest_entry() {
+        let mut c = PageCache::with_capacity(3);
+        for id in 1..=3_u8 {
+            c.insert(main_key(u64::from(id)), page(id)).unwrap();
+        }
+        c.mark_dirty(main_key(1)).unwrap();
+
+        c.clear_dirty(main_key(1)).unwrap();
+
+        assert_eq!(c.head, c.map.get(&main_key(1)).copied());
+        assert_eq!(c.tail, c.map.get(&main_key(2)).copied());
+        assert_list_matches_map(&c);
+
+        // Eviction order follows the list, with page 1 last.
+        c.insert(main_key(4), page(4)).unwrap();
+        assert!(!c.contains(main_key(2)));
+        c.insert(main_key(5), page(5)).unwrap();
+        assert!(!c.contains(main_key(3)));
+        assert!(c.contains(main_key(1)));
+        c.insert(main_key(6), page(6)).unwrap();
+        assert!(!c.contains(main_key(1)));
+    }
+
+    #[test]
+    fn a_dirty_entry_on_the_list_reports_list_membership_drift() {
+        let mut c = PageCache::with_capacity(4);
+        let key = (FileKey::Main, 1);
+        c.insert(key, page(1)).unwrap();
+        c.dirty.insert(key);
+
+        let fault = c.check_list_membership("test").unwrap_err();
+        assert_eq!(fault.detail, LIST_MEMBERSHIP_DRIFTED);
+    }
+
+    #[test]
+    fn linking_a_linked_node_reports_a_fault() {
+        let mut c = PageCache::with_capacity(4);
+        let key = main_key(1);
+        c.insert(key, page(1)).unwrap();
+        let idx = c.map[&key];
+
+        assert_eq!(
+            c.link_as_head(idx, "test"),
+            Err(CacheFault::new("test", NODE_ALREADY_LINKED, Some(idx)))
+        );
+        assert_list_matches_map(&c);
+
+        // A dirty marker on a linked node reaches the same fault through a clear.
+        // The fault latches, and the marker stays set for the flush check.
+        c.dirty.insert(key);
+        let fault = CacheFault::new("clear_dirty", NODE_ALREADY_LINKED, Some(idx));
+        assert_eq!(c.clear_dirty(key), Err(fault));
+        assert_eq!(c.check_usable(), Err(fault));
+        assert!(c.dirty.contains(&key));
+    }
+
+    #[test]
+    fn moved_unlinked_node_stays_off_the_list() {
+        let mut c = PageCache::with_capacity(2);
+        add_dirty(&mut c, 1..=8);
+        let dirty_slot = c.map[&main_key(8)];
+        let gathered = gather(&mut c, 1..=7);
+
+        c.finish_flush(FileKey::Main, gathered).unwrap();
+
+        // Compaction moves the dirty node down, and it stays unlinked.
+        let moved_slot = c.map[&main_key(8)];
+        assert_ne!(moved_slot, dirty_slot);
+        let moved = PageCache::node(&c.slab, moved_slot, "test").unwrap();
+        assert!(!moved.linked);
+        let clean_slot = c.map[&main_key(7)];
+        assert_eq!(c.head, Some(clean_slot));
+        assert_eq!(c.tail, Some(clean_slot));
+        assert_eq!(c.hand, Some(clean_slot));
+        assert_list_matches_map(&c);
+
+        // Cleaned, it joins from the new slot as the newest entry.
+        c.clear_dirty(main_key(8)).unwrap();
+        assert_eq!(c.head, Some(moved_slot));
+        assert_eq!(c.tail, Some(clean_slot));
+        assert_eq!(c.evictable, 2);
+        assert_list_matches_map(&c);
+
+        c.insert(main_key(9), page(9)).unwrap();
+        assert!(!c.contains(main_key(7)));
+        assert!(c.contains(main_key(8)));
+        assert_list_matches_map(&c);
     }
 }

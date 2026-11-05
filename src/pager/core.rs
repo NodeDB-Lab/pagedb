@@ -889,10 +889,10 @@ impl<V: Vfs> Pager<V> {
     /// simply reads then marks dirty.
     ///
     /// The dirty set is kept inside the configured buffer-pool budget. A rekey
-    /// re-seals every page a root can reach, and dirty entries are never
-    /// evicted (the cache's eviction scan skips them), so without an intermediate
-    /// flush the walk would pin the whole decrypted database in memory no
-    /// matter what budget the caller asked for. Flushing mid-walk is safe and
+    /// re-seals every page a root can reach. Dirty entries are never evicted, and
+    /// they are off the cache's eviction list. Without an intermediate flush, the
+    /// walk pins the whole decrypted database in memory whatever the budget the
+    /// caller asked for. Flushing mid-walk is safe and
     /// idempotent: the active epoch is already the target, so a page re-read
     /// after being re-sealed opens under the same key, and a crash resumes
     /// from the durable rekey intent.

@@ -46,6 +46,11 @@ const PAGE: usize = 4096;
 const ROWS: usize = 10_000;
 const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
+/// A multi-page overflow chain per value at the 4 KiB [`PAGE`].
+const OVERFLOW_VALUE_SIZE: usize = 8 * 1024;
+/// Rows committed before [`scaling_overflow_into_large_tree`] measures: enough
+/// leaves that the tree does not fit the default 1024-page buffer pool.
+const LARGE_TREE_ROWS: usize = 50_000;
 
 thread_local! {
     static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
@@ -196,6 +201,52 @@ fn scaling_uncommitted(b: &mut Bencher, rows: u32) {
                     let mut w = db.begin_write().await.unwrap();
                     for i in 0..rows {
                         w.put(&scrambled_key(i), &v).await.unwrap();
+                    }
+                    w.abort().await;
+                })
+            })
+        },
+    );
+}
+
+/// Per-row cost against transaction size when every value overflows into a
+/// tree larger than the buffer pool.
+///
+/// `put` writes an overflow chain straight into the page cache as dirty pages.
+/// It does not flush them before commit, so one transaction's dirty set outgrows
+/// the buffer pool. Each `put` also descends the existing tree, and a leaf that
+/// missed the cache comes back as a clean page that needs a slot. Each row adds
+/// a fixed number of pages, so the expected per-row cost is flat. A rising one
+/// means evicting for those reads pays for the dirty pages already staged. The
+/// timed region ends with `abort`, which cleans every dirty page at a constant
+/// cost per page.
+#[bench(group = "btree/write-path/scaling", args = [1000, 2000, 4000], samples = 3)]
+fn scaling_overflow_into_large_tree(b: &mut Bencher, rows: u32) {
+    let small = value();
+    let big = vec![0xA5u8; OVERFLOW_VALUE_SIZE];
+    let rows = rows as usize;
+    b.iter_with_setup(
+        || {
+            with_rt(|rt| {
+                rt.block_on(async {
+                    let db = open_mem().await;
+                    let mut w = db.begin_write().await.unwrap();
+                    for i in 0..LARGE_TREE_ROWS {
+                        w.put(&scrambled_key(i), &small).await.unwrap();
+                    }
+                    w.commit().await.unwrap();
+                    db
+                })
+            })
+        },
+        |db| {
+            with_rt(|rt| {
+                rt.block_on(async {
+                    let mut w = db.begin_write().await.unwrap();
+                    for i in 0..rows {
+                        w.put(&scrambled_key(LARGE_TREE_ROWS + i), &big)
+                            .await
+                            .unwrap();
                     }
                     w.abort().await;
                 })
