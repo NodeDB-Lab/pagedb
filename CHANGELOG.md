@@ -18,6 +18,8 @@ All notable changes to this project are documented here. The format is based on 
 - **Pinned follower readers** — `apply_incremental` now returns `ApplyBlockedByPinnedReader`, before it changes `main.db`, when its delta rewrites a page a reader pinned before the base commit can reach. That reader previously read authenticated bytes from the later commit. Retry the same delta after the reader finishes.
 - **Commit-history retention after a reopen** — with `RetainPolicy::Count(n)`, the first commit after a reopen pruned one commit too many and kept `n - 1`.
 - **Relocated commit history on a small buffer pool** — an apply that relocated a commit-history tree larger than the buffer pool flushed part of it to the live `main.db`. The published image then lacked those pages.
+- **Historical reads after a rekey** — `rekey_db` tagged the catalog pages it superseded with the latest commit, so a later commit could recycle them while that commit's retained row still named them. `begin_read_at` then failed with `ChecksumFailure`. New entries carry the next commit id. Entries already on a store's free list keep their old tag, so such a page stays exposed until that row is pruned. The on-disk format does not change.
+- **Historical reads on a follower** — `apply_incremental` carried commit-history rows whose pages its delta overwrote, so `begin_read_at` admitted a reader over bytes from a later commit. An apply now prunes the newest such row and every older row, durably, and `begin_read_at` reports `CommitGone` for them. Surviving rows read their own values. An apply on a follower with retained rows now reads each retained page the base does not reach once.
 
 ## [0.1.0] - 2026-10-15
 

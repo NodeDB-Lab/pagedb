@@ -221,15 +221,31 @@ impl<V: Vfs> BTree<V> {
         &self,
         out: &mut std::collections::BTreeSet<u64>,
     ) -> Result<()> {
-        if self.root_page_id == 0 {
-            return Ok(());
-        }
         // Track traversal separately from `out`. `out` is the caller's
         // accumulator across every tree in the database and arrives pre-seeded
         // with the reserved pages, so doubling it as the visited set would let
         // whatever the caller happened to put in it silently truncate this
         // walk — the walk's own progress must not depend on that.
         let mut visited = std::collections::BTreeSet::new();
+        self.collect_unvisited_page_ids(&mut visited, out).await
+    }
+
+    /// Collect into `out` the pages this tree reaches that `visited` does not
+    /// hold, and add them to `visited`.
+    ///
+    /// A page in `visited` ends the walk below it. So `visited` must also hold
+    /// every page reachable from each page it holds. Several roots that share
+    /// one set read each shared page once.
+    ///
+    /// Authoritative on the same terms as [`Self::collect_all_page_ids`].
+    pub(crate) async fn collect_unvisited_page_ids(
+        &self,
+        visited: &mut std::collections::BTreeSet<u64>,
+        out: &mut std::collections::BTreeSet<u64>,
+    ) -> Result<()> {
+        if self.root_page_id == 0 {
+            return Ok(());
+        }
         let mut stack: Vec<(u64, u64)> = vec![(0, self.root_page_id)];
 
         while let Some((parent_page_id, page_id)) = stack.pop() {
@@ -259,7 +275,7 @@ impl<V: Vfs> BTree<V> {
                     drop(guard);
 
                     for overflow_root in overflow_roots {
-                        self.collect_overflow_chain(page_id, overflow_root, &mut visited, out)
+                        self.collect_overflow_chain(page_id, overflow_root, visited, out)
                             .await?;
                     }
                 }

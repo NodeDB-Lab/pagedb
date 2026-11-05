@@ -564,14 +564,7 @@ impl<V: Vfs> Pager<V> {
         if !page_kind.is_main_db() {
             return Err(PagedbError::IllegalPageKind);
         }
-        self.write_page(
-            FileKey::Main,
-            page_id,
-            realm_id,
-            page_kind,
-            body_plain,
-            MAIN_DB_SEGMENT_ID,
-        )
+        self.write_page(FileKey::Main, page_id, realm_id, page_kind, body_plain)
     }
 
     /// Append a fresh segment page; returns the assigned `page_id` (1-based;
@@ -601,7 +594,6 @@ impl<V: Vfs> Pager<V> {
             realm_id,
             page_kind,
             body_plain,
-            segment_id,
         )?;
         // Consume the counter slot after successful insert.
         {
@@ -635,7 +627,6 @@ impl<V: Vfs> Pager<V> {
             realm_id,
             PageKind::ApplyJournal,
             body_plain,
-            journal_id,
         )
     }
 
@@ -718,9 +709,11 @@ impl<V: Vfs> Pager<V> {
     /// Whether the dirty main.db page set has reached the configured
     /// buffer-pool budget.
     ///
-    /// Dirty pages are never evicted, so a producer that seals pages in a long
-    /// loop is the one thing that can push the pool past its budget. Such a
-    /// producer polls this and flushes when it answers `true`.
+    /// Dirty pages are never evicted, so the dirty set can push the pool past
+    /// its budget. Pinned pages also stay resident over the budget.
+    /// A transaction that dirties pages between flushes grows the set too.
+    /// A producer that seals pages in a long loop polls this and flushes
+    /// when it answers `true`.
     pub fn main_dirty_at_budget(&self) -> bool {
         self.inner.buffer_pool.lock().dirty_len() >= self.cfg.buffer_pool_pages.max(1)
     }
@@ -968,14 +961,14 @@ impl<V: Vfs> Pager<V> {
     /// Callers include a drop, so this returns nothing. A cache fault stops the
     /// loop and stays latched. The latch then refuses every later flush, so the
     /// pages still marked dirty never reach disk.
-    pub fn discard_dirty_main(&self, _realm_id: crate::RealmId) {
+    pub fn discard_dirty_main(&self) {
         self.inner.buffer_pool.lock().discard_dirty(FileKey::Main);
     }
 
     /// Evict unpinned clean main.db pages so later reads fetch and authenticate
     /// durable bytes without discarding in-flight writes.
     #[cfg(any(test, not(target_arch = "wasm32")))]
-    pub fn evict_clean_main_pages(&self, _realm_id: crate::RealmId) -> Result<()> {
+    pub fn evict_clean_main_pages(&self) -> Result<()> {
         self.inner
             .buffer_pool
             .lock()
@@ -990,7 +983,6 @@ impl<V: Vfs> Pager<V> {
         realm_id: RealmId,
         page_kind: PageKind,
         body_plain: &[u8],
-        segment_id: [u8; 16],
     ) -> Result<()> {
         let page_size = self.cfg.page_size;
         if body_plain.len() != page_size - ENVELOPE_OVERHEAD {
@@ -1005,9 +997,6 @@ impl<V: Vfs> Pager<V> {
         let mut cache = cache_lock.lock();
         cache.insert((file, page_id), page)?;
         cache.mark_dirty((file, page_id))?;
-        // Suppress unused warnings; these are used at flush time.
-        let _ = realm_id;
-        let _ = segment_id;
         Ok(())
     }
 
@@ -1581,7 +1570,7 @@ mod tests {
             .await
             .unwrap();
         pager.flush_main(realm).await.unwrap();
-        pager.evict_clean_main_pages(realm).unwrap();
+        pager.evict_clean_main_pages().unwrap();
 
         let in_flight = vfs.park_next_read("/main.db", PAGE_ID * PAGE as u64);
         let racing_read = async {
@@ -1602,7 +1591,7 @@ mod tests {
         bounded(async { tokio::join!(racing_read, writer) }).await;
 
         pager.flush_main(realm).await.unwrap();
-        pager.evict_clean_main_pages(realm).unwrap();
+        pager.evict_clean_main_pages().unwrap();
 
         let guard = pager
             .read_main_page(PAGE_ID, realm, PageKind::BTreeLeaf)
@@ -1661,7 +1650,7 @@ mod tests {
         let (racing_body, ()) = bounded(async { tokio::join!(racing_read, swap) }).await;
         assert_eq!(&racing_body[..16], &newer[..16]);
 
-        pager.evict_clean_main_pages(realm).unwrap();
+        pager.evict_clean_main_pages().unwrap();
         let guard = pager
             .read_main_page(PAGE_ID, realm, PageKind::BTreeLeaf)
             .await
@@ -2033,7 +2022,7 @@ mod tests {
             .unwrap();
 
         pager.inner.buffer_pool.lock().clear_slot(slot);
-        pager.discard_dirty_main(realm);
+        pager.discard_dirty_main();
 
         let err = pager.flush_main(realm).await.unwrap_err();
         assert_dead_slot_fault(&err, "discard_dirty", slot);

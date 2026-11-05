@@ -23,6 +23,8 @@ pub(super) struct PreparedIncremental {
     pub(super) page_size: usize,
     pub(super) pages_applied: u64,
     pub(super) target_page_ids: BTreeSet<u64>,
+    /// Pages a reader at the base can reach. The delta names none of them.
+    pub(super) base_reader_visible: BTreeSet<u64>,
     pub(super) reclaimed_page_ids: BTreeSet<u64>,
     pub(super) delta_page_ids: BTreeSet<u64>,
     pub(super) actions: Vec<JournalAction>,
@@ -99,7 +101,7 @@ impl<V: Vfs + Clone> Db<V> {
         // live one are not both resident at their full configured budget. This
         // runs without the writer lock, so a dirty page belongs to another
         // writer and stays.
-        self.pager.evict_clean_main_pages(self.realm_id)?;
+        self.pager.evict_clean_main_pages()?;
         let staged_view = Arc::new(self.pager.open_main_view(staged_image.to_owned()));
         let target_page_ids = collect_tree_page_ids(
             &staged_view,
@@ -156,6 +158,7 @@ impl<V: Vfs + Clone> Db<V> {
             page_size,
             pages_applied,
             target_page_ids,
+            base_reader_visible,
             reclaimed_page_ids,
             delta_page_ids: plan.page_ids,
             actions,

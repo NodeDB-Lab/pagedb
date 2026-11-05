@@ -500,7 +500,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// errors are ignored).
     pub async fn abort(mut self) {
         tracing::debug!(name = "txn.abort", "write transaction aborted");
-        self.db.pager.discard_dirty_main(self.db.realm_id);
+        self.db.pager.discard_dirty_main();
         self.committed_or_aborted = true;
         self.db
             .spill_bytes_in_use
@@ -529,7 +529,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
 impl<V: Vfs + Clone> Drop for WriteTxn<'_, V> {
     fn drop(&mut self) {
         if !self.committed_or_aborted {
-            self.db.pager.discard_dirty_main(self.db.realm_id);
+            self.db.pager.discard_dirty_main();
             // The gauge describes the live writer's scratch, and the writer
             // lock this drop is about to release means there is no other one to
             // account for. Leaving it set would report bytes of a transaction

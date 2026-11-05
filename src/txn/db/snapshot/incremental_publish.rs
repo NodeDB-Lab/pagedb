@@ -3,7 +3,7 @@
 //! Publish a staged incremental target under writer and visibility ownership.
 
 use super::super::core::{Db, WriterState};
-use super::super::history_carry::CarriedHistory;
+use super::super::history_carry::{CarriedHistory, HistoryCarry};
 use super::super::reclaim::StagedFreeList;
 use super::super::util::page_size_log2;
 use super::incremental_prepare::PreparedIncremental;
@@ -40,6 +40,7 @@ impl<V: Vfs + Clone> Db<V> {
             page_size,
             pages_applied,
             target_page_ids,
+            base_reader_visible,
             mut reclaimed_page_ids,
             delta_page_ids,
             actions,
@@ -74,6 +75,14 @@ impl<V: Vfs + Clone> Db<V> {
         self.refuse_delta_reaching_pinned_reader(base_snapshot, &delta_page_ids)
             .await?;
 
+        // Rows the delta overwrites leave the carried history, so `begin_read_at`
+        // reports them gone. Admission is closed and `main.db` is still the base.
+        // The cut reaches disk only in the staged image, so a failed apply keeps
+        // every row.
+        let pruned_through = self
+            .newest_history_row_reaching_delta(&state, base_reader_visible, &delta_page_ids)
+            .await?;
+
         // Move this handle's own metadata out of the incoming page space. The
         // producer allocates over the ids hosting the follower's commit-history
         // tree and free-list chain because it cannot see them; the delta may
@@ -85,11 +94,14 @@ impl<V: Vfs + Clone> Db<V> {
         let carried = self
             .carry_commit_history(
                 &state,
-                staged_image,
-                &delta_page_ids,
-                &target_page_ids,
-                new_commit_id,
-                alloc_cursor,
+                HistoryCarry {
+                    staged_image,
+                    delta_page_ids: &delta_page_ids,
+                    target_page_ids: &target_page_ids,
+                    history_version: new_commit_id,
+                    alloc_cursor,
+                    pruned_through,
+                },
             )
             .await?;
         reclaimed_page_ids.extend(carried.released_page_ids.iter().copied());

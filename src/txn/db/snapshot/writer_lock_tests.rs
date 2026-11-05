@@ -113,7 +113,7 @@ async fn preparing_an_apply_keeps_another_writers_dirty_page() {
 
     assert_dirty_page_resident(follower, page_id).await;
 
-    follower.pager.discard_dirty_main(REALM);
+    follower.pager.discard_dirty_main();
     drop(other_writer);
     follower.discard_failed_apply(&staged_image).await;
 }

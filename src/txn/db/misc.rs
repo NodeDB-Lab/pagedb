@@ -48,16 +48,16 @@ impl<V: Vfs + Clone> Db<V> {
             .applies_incremental_snapshots()
     }
 
-    /// Drop unpinned clean cached pages of `realm` so the next read goes to
-    /// storage, leaving dirty and pinned entries untouched.
+    /// Drop unpinned clean cached main pages so the next read goes to storage,
+    /// leaving dirty and pinned entries untouched.
     ///
     /// Compiled only for the crate's own tests: nothing an embedder does is
     /// supposed to depend on whether a page is warm, and publishing the lever
     /// invites exactly that dependency. A test that needs a cold read from
     /// outside the crate reopens the handle instead.
     #[cfg(test)]
-    pub(crate) fn evict_main_pages(&self, realm: crate::RealmId) -> Result<()> {
-        self.pager.evict_clean_main_pages(realm)
+    pub(crate) fn evict_main_pages(&self) -> Result<()> {
+        self.pager.evict_clean_main_pages()
     }
 
     /// Current size of `main.db` in bytes, read from the file rather than from
@@ -83,18 +83,19 @@ impl<V: Vfs + Clone> Db<V> {
         crate::compaction::compact_now(self).await
     }
 
-    /// Perform one incremental compaction step bounded by `budget`.
+    /// Run the whole atomic compaction in one call.
     ///
-    /// Each call holds the writer lock for at most one batch commit, then
-    /// releases. The compaction watermark is persisted to the catalog after
-    /// each call, so a crash mid-compaction is safe: call `compact_step` again
-    /// after reopening to resume from where it left off.
+    /// The pass rebuilds `main.db` through a scratch file and a rename, so it
+    /// cannot split across writer-lock releases. `budget` is ignored.
+    /// The call holds the compaction exclusion until the pass finishes.
+    /// A crash mid-pass leaves the old `main.db` in place.
     ///
-    /// Returns a [`crate::CompactProgress`] describing what was done and
-    /// whether more work remains. Loop until `progress.more_work == false` to
-    /// compact fully. A loop that ends with
+    /// Returns a [`crate::CompactProgress`] describing what was reclaimed.
+    /// `more_work` is always `false`, so one call finishes the pass.
+    /// A result with
     /// [`declined_readers_pinned`](crate::CompactProgress::declined_readers_pinned)
     /// set compacted nothing: a registered reader stopped the pass.
+    /// Call again after the readers drop.
     pub async fn compact_step(
         &self,
         budget: crate::compaction::CompactBudget,
@@ -171,9 +172,7 @@ impl<V: Vfs + Clone> Db<V> {
         let dirty_pages = {
             let bp = self.pager.inner.buffer_pool.lock();
             let sc = self.pager.inner.segment_cache.lock();
-            (bp.dirty_for_file(crate::pager::core::FileKey::Main).len()
-                + sc.dirty_for_file(crate::pager::core::FileKey::Segment([0u8; 16]))
-                    .len()) as u64
+            (bp.dirty_for_file(crate::pager::core::FileKey::Main).len() + sc.dirty_len()) as u64
         };
 
         // Tracked readers.
@@ -283,7 +282,7 @@ mod tests {
         }
         let before = db.stats().await.unwrap();
 
-        db.evict_main_pages(REALM).unwrap();
+        db.evict_main_pages().unwrap();
 
         let reader = db.begin_read().await.unwrap();
         assert_eq!(

@@ -3,16 +3,14 @@
 
 /// Per-call budget for [`Db::compact_step`](crate::Db::compact_step).
 ///
-/// Both fields bound the work done in a single call. The call releases the
-/// writer lock once either limit is reached or no more work remains.
+/// `compact_step` runs one atomic pass and ignores both fields. They remain
+/// for interface stability.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct CompactBudget {
-    /// Maximum number of pages that may be relocated (written to new
-    /// low-address slots) in a single call.
+    /// Intended page-relocation limit per call. `compact_step` ignores it.
     pub max_pages_relocated: u64,
-    /// Wall-clock time limit in milliseconds. The call checks this after each
-    /// batch commit and returns early if the budget is exhausted.
+    /// Intended wall-clock limit in milliseconds. `compact_step` ignores it.
     pub max_duration_ms: u64,
 }
 
@@ -40,14 +38,13 @@ impl CompactBudget {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompactProgress {
-    /// Number of pages relocated in this call.
+    /// Number of `main.db` pages reclaimed in this call.
     pub pages_relocated: u64,
-    /// Bytes freed (truncated) in this call. Non-zero only on the final step.
+    /// Bytes truncated from `main.db` in this call.
     pub bytes_freed: u64,
-    /// `true` if at least one more call to `compact_step` is needed to finish.
+    /// Always `false`. One call runs the whole pass or declines.
     pub more_work: bool,
-    /// The `frontier_page_id` persisted to the catalog watermark after this
-    /// call. `None` if the compaction session is complete (watermark cleared).
+    /// Always `None`. `compact_step` keeps no resumable watermark.
     pub watermark: Option<u64>,
     /// True when compaction declined to run because a reader pinned the page
     /// range. See [`CompactStats::declined_readers_pinned`].

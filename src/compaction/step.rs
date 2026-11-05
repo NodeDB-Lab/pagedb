@@ -22,9 +22,9 @@ use super::types::{CompactBudget, CompactProgress};
 /// `budget` is accepted for interface stability with the incremental-style API
 /// but does not chunk the work (see the module docs for why a full rewrite can't
 /// be safely chunked). When the pass runs, it runs atomically to completion.
-/// While any reader is registered the pass does not run, and the progress
-/// report sets `declined_readers_pinned` with zero counts. Either way this
-/// returns `more_work = false`; to reclaim periodically, call this again later.
+/// While any reader is registered the pass declines and does not run. The
+/// progress report then sets `declined_readers_pinned` with zero counts.
+/// Either way this returns `more_work = false`. Call again later to reclaim.
 ///
 /// Returns `PagedbError::WrongMode` if the handle is not in `Standalone` mode.
 pub async fn compact_step<V: Vfs + Clone>(

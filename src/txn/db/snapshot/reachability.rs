@@ -2,11 +2,15 @@
 
 //! Published and reader-visible page sets.
 
-use super::super::core::{Db, ReaderSnapshot};
+use super::super::core::{Db, ReaderSnapshot, WriterState, decode_commit_meta};
 use crate::pager::Pager;
 use crate::vfs::Vfs;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// Commit-history rows read per batch while screening them against a delta.
+/// Rows are 40 bytes, so this is a few KiB resident however deep retention runs.
+const HISTORY_ROW_BATCH: usize = 512;
 
 /// Every page the data and catalog trees rooted at the two ids reach.
 ///
@@ -103,6 +107,118 @@ impl<V: Vfs + Clone> Db<V> {
             }
         }
         Ok(())
+    }
+
+    /// The newest retained commit whose pages a delta overwrites, or `None` when
+    /// every row stays intact.
+    ///
+    /// A retained row reaches pages a later commit freed and the producer can
+    /// recycle. An apply over such a page leaves the row naming newer bytes.
+    /// So that row and every older row must leave the carried history.
+    ///
+    /// Rows run newest to oldest and stop at the first overlap. Pruning a prefix
+    /// keeps the oldest retained commit monotonic.
+    ///
+    /// `visited` arrives holding the base's reader-visible pages. The delta screen
+    /// proved them disjoint from the delta, so a row at the base roots reads
+    /// nothing. Each other page is read once across all rows.
+    ///
+    /// A row that cannot be walked counts as an overlap, because nothing proves
+    /// it disjoint. Reads the live Pager, which serves the unchanged base image.
+    pub(super) async fn newest_history_row_reaching_delta(
+        &self,
+        state: &WriterState,
+        mut visited: BTreeSet<u64>,
+        delta_page_ids: &BTreeSet<u64>,
+    ) -> crate::Result<Option<u64>> {
+        if state.commit_history_root_page_id == 0 || delta_page_ids.is_empty() {
+            return Ok(None);
+        }
+        let history = crate::btree::BTree::open(
+            self.pager.clone(),
+            self.realm_id,
+            state.commit_history_root_page_id,
+            state.next_page_id,
+            self.page_size,
+        );
+        let mut before: Option<bytes::Bytes> = None;
+        loop {
+            let batch = history
+                .collect_rev_batch_before(before.as_deref(), HISTORY_ROW_BATCH)
+                .await?;
+            for (key, row) in &batch {
+                let commit = <[u8; 8]>::try_from(&key[..]).map_err(|_| {
+                    crate::errors::PagedbError::catalog_row_invalid("commit_history.key")
+                })?;
+                let commit = u64::from_be_bytes(commit);
+                if self
+                    .history_row_reaches_delta(commit, row, &mut visited, delta_page_ids)
+                    .await?
+                {
+                    return Ok(Some(commit));
+                }
+            }
+            if batch.len() < HISTORY_ROW_BATCH {
+                return Ok(None);
+            }
+            before = batch.last().map(|(key, _)| key.clone());
+        }
+    }
+
+    /// Whether one history row reaches a delta page, or its pages cannot authenticate.
+    ///
+    /// Pruning is durable, so only proof about the page bytes prunes a row. An I/O
+    /// error or a cache fault says nothing about them, so it fails the apply instead.
+    async fn history_row_reaches_delta(
+        &self,
+        commit: u64,
+        row: &[u8],
+        visited: &mut BTreeSet<u64>,
+        delta_page_ids: &BTreeSet<u64>,
+    ) -> crate::Result<bool> {
+        use crate::errors::PagedbError;
+        match self.collect_history_row_pages(row, visited).await {
+            Ok(reached) => Ok(!reached.is_disjoint(delta_page_ids)),
+            Err(
+                error @ (PagedbError::ChecksumFailure
+                | PagedbError::IllegalPageKind
+                | PagedbError::Corruption(_)),
+            ) => {
+                tracing::debug!(
+                    name = "apply.history_row_unwalkable",
+                    commit,
+                    error = %error,
+                    "pruning a retained commit whose pages cannot authenticate"
+                );
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The pages one history row reaches that `visited` does not hold yet.
+    ///
+    /// The row's own `next_page_id` bounds its trees. Its free-list root is
+    /// superseded writer metadata that no reader follows, so it stays unread.
+    async fn collect_history_row_pages(
+        &self,
+        row: &[u8],
+        visited: &mut BTreeSet<u64>,
+    ) -> crate::Result<BTreeSet<u64>> {
+        let meta = decode_commit_meta(row)?;
+        let mut reached = BTreeSet::new();
+        for root_page_id in [meta.active_root_page_id, meta.catalog_root_page_id] {
+            crate::btree::BTree::open(
+                self.pager.clone(),
+                self.realm_id,
+                root_page_id,
+                meta.next_page_id,
+                self.page_size,
+            )
+            .collect_unvisited_page_ids(visited, &mut reached)
+            .await?;
+        }
+        Ok(reached)
     }
 }
 

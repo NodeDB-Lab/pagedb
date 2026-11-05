@@ -68,6 +68,8 @@ impl From<CacheFault> for PagedbError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FileKey {
     Main,
+    /// Only the pager's own tests build this key. Segment files use their own reader.
+    #[cfg_attr(not(test), allow(dead_code))]
     Segment([u8; 16]),
     /// Apply-journal sidecar at `applyjournal/<hex(id)>`. A receiver-local,
     /// AEAD-authenticated file written before an `apply_incremental` header
@@ -942,8 +944,8 @@ impl PageCache {
     #[must_use]
     pub fn dirty_for_file(&self, file: FileKey) -> Vec<u64> {
         self.dirty
-            .iter()
-            .filter_map(|(f, p)| if *f == file { Some(*p) } else { None })
+            .range((file, 0)..=(file, u64::MAX))
+            .map(|(_, p)| *p)
             .collect()
     }
 
@@ -1422,6 +1424,32 @@ mod tests {
             c.mark_dirty((FileKey::Main, p)).unwrap();
         }
         assert_eq!(c.dirty_for_file(FileKey::Main), vec![25, 50, 75, 100]);
+    }
+
+    #[test]
+    fn dirty_for_file_returns_only_that_files_pages_in_order() {
+        let mut c = PageCache::with_capacity(16);
+        let seg = FileKey::Segment([7; 16]);
+        let journal = FileKey::ApplyJournal([7; 16]);
+        for key in [
+            (seg, 9),
+            (FileKey::Main, 30),
+            (seg, u64::MAX),
+            (journal, 4),
+            (FileKey::Main, 10),
+            (seg, 0),
+            (seg, 3),
+        ] {
+            c.insert(key, page(0)).unwrap();
+            c.mark_dirty(key).unwrap();
+        }
+        assert_eq!(c.dirty_for_file(seg), vec![0, 3, 9, u64::MAX]);
+        assert_eq!(c.dirty_for_file(FileKey::Main), vec![10, 30]);
+        assert_eq!(c.dirty_for_file(journal), vec![4]);
+        assert_eq!(
+            c.dirty_for_file(FileKey::Segment([8; 16])),
+            Vec::<u64>::new()
+        );
     }
 
     #[test]

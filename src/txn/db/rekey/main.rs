@@ -296,9 +296,10 @@ impl<V: Vfs + Clone> Db<V> {
     /// it gets a fresh blank page without a read. A torn page therefore costs
     /// nothing, and old plaintext never reaches disk under the target key.
     ///
-    /// `rewritten` holds every page the root walks re-sealed. A rekey frees
-    /// catalog pages under the latest commit id. A retained row can name those
-    /// pages while the floor passes them, so membership here overrides the floor.
+    /// `rewritten` holds every page the root walks re-sealed. A store written by
+    /// an earlier release tags rekey-freed catalog pages with the latest commit.
+    /// A retained row can name those pages while the floor passes them, so
+    /// membership here overrides the floor.
     /// Chain pages join `rewritten` first. A blank chain page ends the walk early,
     /// which strands the rest of the chain under the source epoch.
     ///
@@ -392,11 +393,7 @@ impl<V: Vfs + Clone> Db<V> {
                         page_id,
                     ));
                 }
-                // The intent write tags superseded catalog pages with the latest
-                // commit, and a retained row at that commit still names them.
-                // The extra one keeps those pages out of the blankable range.
-                let unreachable = freed_at.saturating_add(1) < floor;
-                self.reseal_free_page_keeping_content(&mut file, page_id, unreachable)
+                self.reseal_free_page_keeping_content(&mut file, page_id, freed_at < floor)
                     .await?;
             }
         }
@@ -729,8 +726,8 @@ impl<V: Vfs + Clone> Db<V> {
     /// it a rekey abandons pages at each intent transition: unreachable from
     /// any root, absent from the free list, and — once the source epoch is
     /// retired — sealed under a key that no longer exists. Entries carry the
-    /// current commit id, so the reclamation floor still withholds any page a
-    /// live reader or retained history root can still name.
+    /// commit id after the latest one, so the reclamation floor still withholds
+    /// any page a live reader or retained history root can still name.
     async fn record_rekey_freed_pages(
         &self,
         state: &mut WriterState,
@@ -753,11 +750,12 @@ impl<V: Vfs + Clone> Db<V> {
         )
         .await?;
         let mut entries = window.entries;
-        entries.extend(
-            freed_pages
-                .iter()
-                .map(|&page_id| (state.latest_commit_id, page_id)),
-        );
+        // A rekey advances no commit, so the row at the latest commit still
+        // reaches these pages. An entry is reusable when its tag is at or below
+        // the oldest row. Tagging one past the latest holds them until that row
+        // is gone.
+        let freed_at = state.latest_commit_id.saturating_add(1);
+        entries.extend(freed_pages.iter().map(|&page_id| (freed_at, page_id)));
         // Chain pages are writer-only metadata that no reader snapshot ever
         // traverses, so they carry a commit id below every real floor and are
         // immediately recyclable — the same rule the ordinary commit path uses.

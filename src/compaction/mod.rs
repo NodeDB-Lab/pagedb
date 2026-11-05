@@ -5,7 +5,7 @@
 //! truncation and segment garbage collection.
 //!
 //! Entry points: [`compact_now`] (full one-shot) and [`compact_step`]
-//! (incremental, budget-bounded) on a [`crate::Db`] handle.
+//! (one atomic pass with a progress report) on a [`crate::Db`] handle.
 
 mod full;
 mod helpers;

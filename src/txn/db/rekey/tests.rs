@@ -408,7 +408,7 @@ async fn rekey_preserves_preexisting_main_reader_snapshot_after_cache_evict() {
     }
 
     db.rekey_db(KEK0, 1).await.unwrap();
-    db.evict_main_pages(REALM).unwrap();
+    db.evict_main_pages().unwrap();
 
     assert_eq!(
         reader.get(b"versioned").await.unwrap().as_deref(),
@@ -742,7 +742,7 @@ async fn rekey_refuses_a_torn_free_page_a_retained_root_can_reach() {
     assert!(db.rekey_db(KEK0, 1).await.is_err());
     drop(db);
 
-    let mut file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
+    let file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
     let mut tail = vec![0_u8; PAGE / 2];
     let read = file.read_at(torn_offset, &mut tail).await.unwrap();
     assert_eq!(read, PAGE / 2);
@@ -844,9 +844,8 @@ async fn rekey_blanks_free_pages_nothing_can_read() {
     }
 }
 
-/// A rekey frees the catalog pages its intent write supersedes under the latest
-/// commit id. A retained row at that commit still names them, so they keep their
-/// content even though the reclamation floor passes them.
+/// A rekey frees the catalog pages its intent write supersedes.
+/// A retained row at the latest commit still names them, so they keep their content.
 #[tokio::test(flavor = "current_thread")]
 async fn rekey_keeps_free_pages_a_retained_row_names() {
     let (vfs, db) = fresh_db().await;
@@ -867,4 +866,231 @@ async fn rekey_keeps_free_pages_a_retained_row_names() {
         historical.open_segment("absent").await,
         Err(PagedbError::NotFound)
     ));
+}
+
+/// Rows one draw commit writes. Its allocations exceed every free entry a scenario leaves.
+const DRAW_ROWS: u32 = 64;
+/// A value past the inline threshold that fits in one overflow page.
+const DRAW_VALUE_LEN: usize = 3000;
+
+struct RetainedRowScenario {
+    label: &'static str,
+    /// Retention for the commits before the reopen.
+    before: RetainPolicy,
+    /// Commits before the reopen. The newest is the row under test.
+    commits: u64,
+    /// Retention from the reopen onward, including across the rekey.
+    after: RetainPolicy,
+}
+
+async fn catalog_rows_of(
+    db: &Db<MemVfs>,
+    reader: &crate::ReadTxn<'_, MemVfs>,
+) -> crate::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+    crate::btree::BTree::open(
+        db.pager.clone(),
+        db.realm_id,
+        reader.catalog_root_page_id(),
+        reader.next_page_id(),
+        db.page_size,
+    )
+    .collect_batch_from(&[], 1024)
+    .await
+}
+
+async fn free_entries_of(db: &Db<MemVfs>) -> Vec<(u64, u64)> {
+    let head = db.writer.lock().await.free_list_root_page_id;
+    crate::pager::freelist::read_chain(&db.pager, REALM, head)
+        .await
+        .unwrap()
+        .0
+}
+
+/// The row reads its own values, or `CommitGone` reports it pruned. Anything else is the bug.
+async fn assert_retained_row_reads_back(
+    db: &Db<MemVfs>,
+    label: &str,
+    commit: crate::CommitId,
+    catalog_rows: &[(bytes::Bytes, bytes::Bytes)],
+    versioned: &[u8],
+) {
+    let reader = match db.begin_read_at(commit).await {
+        Ok(reader) => reader,
+        Err(PagedbError::CommitGone { .. }) => return,
+        Err(error) => panic!("{label}: begin_read_at({commit:?}) failed: {error:?}"),
+    };
+    let read_catalog = catalog_rows_of(db, &reader)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: the catalog at {commit:?} broke: {error:?}"));
+    assert_eq!(
+        read_catalog, catalog_rows,
+        "{label}: the catalog at {commit:?} holds other rows"
+    );
+    assert_eq!(
+        reader
+            .get(b"versioned")
+            .await
+            .unwrap_or_else(|error| panic!("{label}: the data at {commit:?} broke: {error:?}"))
+            .as_deref(),
+        Some(versioned),
+        "{label}: the data at {commit:?} holds another value"
+    );
+}
+
+async fn run_retained_row_scenario(scenario: RetainedRowScenario) {
+    let RetainedRowScenario {
+        label,
+        before,
+        commits,
+        after,
+    } = scenario;
+    let vfs = MemVfs::new();
+    let db = Db::open_internal_with_options(
+        vfs.clone(),
+        KEK0,
+        PAGE,
+        REALM,
+        OpenOptions::default().with_commit_history_retain(before),
+    )
+    .await
+    .unwrap();
+    for index in 1..=commits {
+        let mut tx = db.begin_write().await.unwrap();
+        tx.put(b"versioned", &index.to_le_bytes()).await.unwrap();
+        let mut counter = tx.counter("retained").unwrap();
+        counter.set(index).await.unwrap();
+        drop(counter);
+        tx.commit().await.unwrap();
+    }
+    drop(db);
+
+    let options = OpenOptions::default().with_commit_history_retain(after);
+    let db = Db::open_existing_with_options(vfs.clone(), KEK0, PAGE, REALM, options.clone())
+        .await
+        .unwrap();
+    let retained = db.latest_commit();
+    let versioned = commits.to_le_bytes();
+
+    // The published snapshot equals the retained row until the rekey moves the catalog root.
+    let (row_catalog_pages, row_catalog_rows) = {
+        let reader = db.begin_read().await.unwrap();
+        let mut pages = std::collections::BTreeSet::new();
+        crate::btree::BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            reader.catalog_root_page_id(),
+            reader.next_page_id(),
+            db.page_size,
+        )
+        .collect_all_page_ids(&mut pages)
+        .await
+        .unwrap();
+        let rows = catalog_rows_of(&db, &reader).await.unwrap();
+        (pages, rows)
+    };
+    assert!(
+        !row_catalog_rows.is_empty(),
+        "setup error: {label}: the row at {retained:?} has an empty catalog"
+    );
+
+    db.rekey_db(KEK0, 1).await.unwrap();
+
+    assert_eq!(
+        db.latest_commit(),
+        retained,
+        "setup error: {label}: the rekey moved the latest commit"
+    );
+    let oldest = {
+        let state = db.writer.lock().await;
+        db.oldest_retained_history_commit(state.commit_history_root_page_id, state.next_page_id)
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        oldest,
+        Some(retained.0),
+        "setup error: {label}: the row at {retained:?} is not the oldest row"
+    );
+    let rekey_tag = retained.0 + 1;
+    let entries = free_entries_of(&db).await;
+    let tagged_row_pages: Vec<u64> = row_catalog_pages
+        .iter()
+        .copied()
+        .filter(|&page_id| entries.contains(&(rekey_tag, page_id)))
+        .collect();
+    assert!(
+        !tagged_row_pages.is_empty(),
+        "{label}: the rekey tagged no page the row names with {rekey_tag}, \
+         row pages {row_catalog_pages:?}, free entries {entries:?}"
+    );
+    let cursor_before_draw = db.writer.lock().await.next_page_id;
+
+    let drawing_commit = {
+        let mut tx = db.begin_write().await.unwrap();
+        for index in 0..DRAW_ROWS {
+            tx.put(
+                format!("draw-{index:03}").as_bytes(),
+                &[0xDD; DRAW_VALUE_LEN],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap()
+    };
+    assert!(
+        drawing_commit > retained,
+        "setup error: {label}: the draw commit did not advance"
+    );
+    assert!(
+        db.writer.lock().await.next_page_id > cursor_before_draw,
+        "setup error: {label}: the commit did not exhaust the free pages it could draw"
+    );
+    let entries = free_entries_of(&db).await;
+    assert!(
+        tagged_row_pages
+            .iter()
+            .all(|&page_id| entries.contains(&(rekey_tag, page_id))),
+        "{label}: the commit drew a page of {tagged_row_pages:?}, free entries {entries:?}"
+    );
+
+    assert_retained_row_reads_back(&db, label, retained, &row_catalog_rows, &versioned).await;
+    drop(db);
+
+    let reopened = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    assert_retained_row_reads_back(&reopened, label, retained, &row_catalog_rows, &versioned).await;
+}
+
+/// A rekey tags the catalog pages it supersedes with `L + 1`, where `L` is the latest commit.
+/// Row `L` still names those pages.
+/// The floor is `oldest + 1`, so the next commit cannot draw them while `L` is the oldest row.
+///
+/// `Count(1)` prunes row `L` in the next commit, so `CommitGone` is correct there.
+/// The other scenarios keep row `L` through that commit, so it must read its own values.
+#[tokio::test(flavor = "current_thread")]
+async fn historical_read_after_a_rekey_survives_later_commits() {
+    let scenarios = [
+        RetainedRowScenario {
+            label: "Count(1), the drawing commit prunes the row",
+            before: RetainPolicy::Count(1),
+            commits: 1,
+            after: RetainPolicy::Count(1),
+        },
+        RetainedRowScenario {
+            label: "Count(2), one commit below retention",
+            before: RetainPolicy::Count(2),
+            commits: 1,
+            after: RetainPolicy::Count(2),
+        },
+        RetainedRowScenario {
+            label: "Count(1) widened to Count(2) at a reopen",
+            before: RetainPolicy::Count(1),
+            commits: 3,
+            after: RetainPolicy::Count(2),
+        },
+    ];
+    for scenario in scenarios {
+        run_retained_row_scenario(scenario).await;
+    }
 }

@@ -21,6 +21,11 @@
 //! are returned to this handle's free list by the caller. When the delta claims
 //! none of its pages, nothing moves: relocation costs pages, so it happens only
 //! when the alternative is a broken root.
+//!
+//! The rows themselves name data and catalog pages the delta can overwrite. Such
+//! a row and every older row leave the carried tree, so `begin_read_at` reports
+//! them gone instead of admitting a reader over newer bytes. A cut always loads
+//! the surviving rows onto fresh ids, the same way a relocation does.
 
 use std::collections::BTreeSet;
 
@@ -44,6 +49,17 @@ pub(super) struct CarriedHistory {
     pub released_page_ids: BTreeSet<u64>,
 }
 
+/// What one apply asks of the commit-history carry.
+pub(super) struct HistoryCarry<'a> {
+    pub staged_image: &'a str,
+    pub delta_page_ids: &'a BTreeSet<u64>,
+    pub target_page_ids: &'a BTreeSet<u64>,
+    pub history_version: u64,
+    pub alloc_cursor: u64,
+    /// The newest commit whose row leaves the tree, with every older row.
+    pub pruned_through: Option<u64>,
+}
+
 impl<V: Vfs + Clone> Db<V> {
     /// Decide where this handle's commit-history tree lives in the staged image.
     ///
@@ -51,15 +67,22 @@ impl<V: Vfs + Clone> Db<V> {
     /// image. A load past the dirty budget flushes into `staged_image`. The rest
     /// stays dirty for the caller to flush there with everything else this apply
     /// produces. No relocated page reaches the live file.
+    ///
+    /// The tree stays in place unless the delta claims one of its pages or a row
+    /// leaves it. A cut that removes every row publishes an empty history.
     pub(super) async fn carry_commit_history(
         &self,
         state: &WriterState,
-        staged_image: &str,
-        delta_page_ids: &BTreeSet<u64>,
-        target_page_ids: &BTreeSet<u64>,
-        history_version: u64,
-        alloc_cursor: u64,
+        carry: HistoryCarry<'_>,
     ) -> Result<CarriedHistory> {
+        let HistoryCarry {
+            staged_image,
+            delta_page_ids,
+            target_page_ids,
+            history_version,
+            alloc_cursor,
+            pruned_through,
+        } = carry;
         let unmoved = CarriedHistory {
             root_page_id: state.commit_history_root_page_id,
             root_version: state.commit_history_root_version,
@@ -80,16 +103,19 @@ impl<V: Vfs + Clone> Db<V> {
         );
         let mut occupied = BTreeSet::new();
         base_tree.collect_all_page_ids(&mut occupied).await?;
-        if occupied.is_disjoint(delta_page_ids) {
+        if pruned_through.is_none() && occupied.is_disjoint(delta_page_ids) {
             return Ok(unmoved);
         }
 
+        // Keys are the commit id big-endian, so key order is commit order.
+        let pruned_key = pruned_through.map(u64::to_be_bytes);
         // The staged record owns its key, so that is copied; the value carries
         // through by refcount.
         let rows: Vec<(Vec<u8>, Bytes)> = base_tree
             .collect_all()
             .await?
             .into_iter()
+            .filter(|(key, _)| pruned_key.is_none_or(|pruned| &key[..] > pruned.as_slice()))
             .map(|(key, value)| (key.to_vec(), value))
             .collect();
         let entry_count = u64::try_from(rows.len()).ok();
@@ -111,9 +137,16 @@ impl<V: Vfs + Clone> Db<V> {
         let released_page_ids: BTreeSet<u64> =
             occupied.difference(target_page_ids).copied().collect();
 
+        // An empty tree has no root, and a root of zero carries version zero.
+        let root_page_id = relocated.root_page_id();
+        let root_version = if root_page_id == 0 {
+            0
+        } else {
+            history_version
+        };
         Ok(CarriedHistory {
-            root_page_id: relocated.root_page_id(),
-            root_version: history_version,
+            root_page_id,
+            root_version,
             entry_count,
             next_page_id: relocated.next_page_id().max(alloc_cursor),
             released_page_ids,

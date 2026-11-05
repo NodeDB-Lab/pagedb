@@ -35,6 +35,20 @@ impl<V: Vfs + Clone> Db<V> {
     /// Each distinct pinned state older than the base costs one walk of its data
     /// and catalog trees, twice per apply. The second walk runs with reader
     /// admission closed. An apply with no such reader walks nothing extra.
+    ///
+    /// # Retained commits
+    ///
+    /// An apply prunes the retained commits it overwrote, so
+    /// [`begin_read_at`](Self::begin_read_at) reports
+    /// [`PagedbError::CommitGone`](crate::PagedbError::CommitGone) for them.
+    /// The newest such commit and every older commit leave the history together.
+    /// A retained commit that cannot be walked counts as overwritten. A commit
+    /// that survives an apply still reads its own values, after a reopen too.
+    /// A reader already open on a pruned commit stays valid, because the apply
+    /// refuses to rewrite a page it can reach.
+    ///
+    /// The screen reads each retained page the base does not reach once per apply.
+    /// It runs with reader admission closed. A delta with no pages reads nothing.
     pub async fn apply_incremental(
         &self,
         src_path: &std::path::Path,
@@ -87,7 +101,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// receives the original error.
     pub(super) async fn discard_failed_apply(&self, staged_image: &str) {
         let _writer = self.writer.lock().await;
-        self.pager.discard_dirty_main(self.realm_id);
+        self.pager.discard_dirty_main();
         let _ = self.pager.reset_main_pages();
         discard_staged_image(&*self.vfs, staged_image).await;
     }

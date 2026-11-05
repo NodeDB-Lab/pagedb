@@ -79,7 +79,8 @@ pub struct OpenOptions {
     /// Number of 4 KiB / 8 KiB / 16 KiB pages held in the Pager's buffer pool.
     pub buffer_pool_pages: usize,
 
-    /// Number of pages held in the per-segment reader LRU cache.
+    /// Number of pages held in the shared SIEVE cache for segment files.
+    /// The same cache also holds apply-journal pages.
     pub segment_cache_pages: usize,
 
     /// Maximum bytes of already-decrypted scratch that `mmap_view` may map at
@@ -163,7 +164,8 @@ impl OpenOptions {
         self
     }
 
-    /// Set the number of pages held in the per-segment reader LRU cache.
+    /// Set the number of pages held in the shared SIEVE cache for segment
+    /// files. The same cache also holds apply-journal pages.
     #[must_use]
     pub fn with_segment_cache_pages(mut self, v: usize) -> Self {
         self.segment_cache_pages = v;

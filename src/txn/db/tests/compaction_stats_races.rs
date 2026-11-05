@@ -316,7 +316,7 @@ async fn read_during_swap_does_not_cache_the_replaced_file_handle() {
         // Clean compacted pages share ids with the old image, so eviction forces
         // the miss that reopens the file. The published root still names the old
         // image, which is the file this read opens.
-        db.evict_main_pages(REALM).unwrap();
+        db.evict_main_pages().unwrap();
         let old_root = db.snapshot.read().root_page_id;
         db.pager
             .read_main_node(old_root, REALM)
