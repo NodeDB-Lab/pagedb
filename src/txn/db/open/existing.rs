@@ -270,6 +270,8 @@ impl<V: Vfs + Clone> Db<V> {
             free_list_root_page_id: super::super::core::decode_free_list_root(
                 &fields.free_list_root,
             ),
+            // Recovery counts the chain once it has settled the free-list root.
+            free_list_entries: None,
             commit_history_root_page_id: fields.commit_history_root_page_id,
             commit_history_root_version: fields.commit_history_root_version,
             commit_history_count: None,
@@ -339,6 +341,7 @@ impl<V: Vfs + Clone> Db<V> {
                 free_list_root_page_id: super::super::core::decode_free_list_root(
                     &fields.free_list_root,
                 ),
+                free_list_entries: None,
                 commit_history_root_page_id: fields.commit_history_root_page_id,
             })),
             poisoned_commit: parking_lot::Mutex::new(None),

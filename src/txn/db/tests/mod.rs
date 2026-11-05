@@ -3,5 +3,6 @@
 #![allow(clippy::pedantic)]
 
 mod anchor_commit_interruption;
+mod compaction_stats_races;
 mod free_list_recovery;
 mod metadata_errors;

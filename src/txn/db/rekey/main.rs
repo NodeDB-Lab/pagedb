@@ -10,10 +10,11 @@ use crate::btree::BTree;
 use crate::catalog::codec::{Catalog, RekeyIntent, RekeyStage};
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::{CipherId, DerivedKey, MasterKey, SecretKey};
-use crate::errors::PagedbError;
+use crate::errors::{CorruptionDetail, PagedbError};
 use crate::pager::PageKind;
 use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
+use crate::pager::page_space::{is_reserved, page_offset};
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::{OpenMode, Vfs, VfsFile, read_exact_at};
 
@@ -61,6 +62,21 @@ async fn read_main_page_kind<F: VfsFile + ?Sized>(
         return Err(PagedbError::IllegalPageKind);
     }
     Ok(Some(kind))
+}
+
+/// Whether a read error proves a free page's bytes cannot authenticate. A tear
+/// can garble the kind, cipher, or epoch fields, and a page can end past the file.
+/// Any other I/O error or a cache fault says nothing about the bytes.
+fn free_page_is_unreadable(error: &PagedbError) -> bool {
+    match error {
+        PagedbError::ChecksumFailure
+        | PagedbError::IllegalPageKind
+        | PagedbError::Unsupported
+        | PagedbError::MissingPersistedKey { .. }
+        | PagedbError::Corruption(CorruptionDetail::PageUnverifiable { .. }) => true,
+        PagedbError::Io(io_error) => io_error.kind() == std::io::ErrorKind::UnexpectedEof,
+        _ => false,
+    }
 }
 
 impl<V: Vfs + Clone> Db<V> {
@@ -257,7 +273,7 @@ impl<V: Vfs + Clone> Db<V> {
             self.rewrite_retained_history_roots(state, &mut rewritten)
                 .await?;
         }
-        self.rewrite_free_list_pages(state.free_list_root_page_id)
+        self.rewrite_free_list_discarding_dead_pages(state, &mut rewritten)
             .await?;
         // Keep the catalog path carrying the intent source-readable until
         // target-header publication. This is the durable admission anchor
@@ -271,9 +287,79 @@ impl<V: Vfs + Clone> Db<V> {
         Ok(())
     }
 
-    /// Re-encrypt both the durable free-list chain and every reusable page it
-    /// names. Rewriting only the chain would leave those pages sealed under
-    /// the retired epoch, so a later allocation could not authenticate them.
+    /// Move the free list to the target epoch before the target header exists,
+    /// blanking every named page that nothing can still read.
+    ///
+    /// A free-list entry does not prove a page is dead. An entry at or above the
+    /// reclamation floor names a page a live reader or retained root can reach.
+    /// Those pages keep their content. An entry below the floor holds no data, so
+    /// it gets a fresh blank page without a read. A torn page therefore costs
+    /// nothing, and old plaintext never reaches disk under the target key.
+    ///
+    /// `rewritten` holds every page the root walks re-sealed. A rekey frees
+    /// catalog pages under the latest commit id. A retained row can name those
+    /// pages while the floor passes them, so membership here overrides the floor.
+    /// Chain pages join `rewritten` first. A blank chain page ends the walk early,
+    /// which strands the rest of the chain under the source epoch.
+    ///
+    /// The floor is read once. A reader admitted later pins the published
+    /// snapshot, whose pages are not free-listed. A later historical reader pins
+    /// a retained row, whose pages are in `rewritten`.
+    ///
+    /// Resident cost is one id per chain page and one page of entries.
+    async fn rewrite_free_list_discarding_dead_pages(
+        &self,
+        state: &WriterState,
+        rewritten: &mut BTreeMap<u64, PageKind>,
+    ) -> Result<()> {
+        let root_page_id = state.free_list_root_page_id;
+        if root_page_id == 0 {
+            return Ok(());
+        }
+
+        let mut chain = crate::pager::freelist::ChainWalk::new(root_page_id);
+        while let Some(chain_page_id) = chain.advance(&self.pager, self.realm_id).await? {
+            self.pager
+                .rewrite_page_under_current_epoch(chain_page_id, self.realm_id, PageKind::Free)
+                .await?;
+            rewritten.insert(chain_page_id, PageKind::Free);
+        }
+
+        let floor = self.reclamation_floor(state).await?;
+        let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
+        let mut walk = crate::pager::freelist::ChainWalk::new(root_page_id);
+        while let Some(chain_page_id) = walk.advance(&self.pager, self.realm_id).await? {
+            for &(freed_at, page_id) in walk.entries() {
+                if is_reserved(page_id) {
+                    return Err(PagedbError::reserved_page_referenced(
+                        chain_page_id,
+                        page_id,
+                    ));
+                }
+                if rewritten.contains_key(&page_id) {
+                    continue;
+                }
+                if freed_at < floor {
+                    self.pager
+                        .write_blank_free_page(page_id, self.realm_id)
+                        .await?;
+                } else {
+                    self.reseal_free_page_keeping_content(&mut file, page_id, false)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-encrypt the durable free-list chain and every page it names, keeping
+    /// each page's content. Rewriting only the chain leaves those pages sealed
+    /// under the retired epoch, so integrity checks cannot authenticate them.
+    ///
+    /// This pass runs after the target header, once the catalog pages that the
+    /// intent writes superseded are on the list. It has no record of what retained
+    /// roots reach, so it never blanks a readable page. It blanks an unreadable
+    /// page only when the page's entry is older than every retained root's reach.
     ///
     /// The walk is streamed one chain page at a time. Touching every named page
     /// is inherently proportional to the free list's size in IO, but holding
@@ -285,35 +371,88 @@ impl<V: Vfs + Clone> Db<V> {
     /// epoch the first one wrote and marks it dirty again — so no cross-page
     /// deduplication set is needed to tolerate a chain that names one page more
     /// than once.
-    async fn rewrite_free_list_pages(&self, root_page_id: u64) -> Result<()> {
+    async fn rewrite_free_list_pages(&self, state: &WriterState) -> Result<()> {
+        let root_page_id = state.free_list_root_page_id;
         if root_page_id == 0 {
             return Ok(());
         }
 
+        let floor = self.reclamation_floor(state).await?;
         let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
         let mut walk = crate::pager::freelist::ChainWalk::new(root_page_id);
         while let Some(chain_page_id) = walk.advance(&self.pager, self.realm_id).await? {
-            let named: Vec<u64> = walk.entries().iter().map(|&(_, page_id)| page_id).collect();
+            let named: Vec<(u64, u64)> = walk.entries().to_vec();
             self.pager
-                .rewrite_page_under_current_epoch(
-                    chain_page_id,
-                    self.realm_id,
-                    crate::pager::PageKind::Free,
-                )
+                .rewrite_page_under_current_epoch(chain_page_id, self.realm_id, PageKind::Free)
                 .await?;
-            for page_id in named {
-                let offset = page_id
-                    .checked_mul(self.page_size as u64)
-                    .ok_or_else(|| PagedbError::arithmetic_overflow("free-list page offset"))?;
-                let Some(kind) = read_main_page_kind(&mut file, offset).await? else {
-                    continue;
-                };
-                self.pager
-                    .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
+            for (freed_at, page_id) in named {
+                if is_reserved(page_id) {
+                    return Err(PagedbError::reserved_page_referenced(
+                        chain_page_id,
+                        page_id,
+                    ));
+                }
+                // The intent write tags superseded catalog pages with the latest
+                // commit, and a retained row at that commit still names them.
+                // The extra one keeps those pages out of the blankable range.
+                let unreachable = freed_at.saturating_add(1) < floor;
+                self.reseal_free_page_keeping_content(&mut file, page_id, unreachable)
                     .await?;
             }
         }
         Ok(())
+    }
+
+    /// Re-seal a named free page with its content when it authenticates. A hole
+    /// stays a hole. A page that fails to authenticate is replaced with a blank
+    /// page only when `unreachable` says no retained root or reader can name it.
+    /// Otherwise the error returns, because that failure is real corruption and
+    /// its bytes are the evidence.
+    async fn reseal_free_page_keeping_content(
+        &self,
+        file: &mut V::File,
+        page_id: u64,
+        unreachable: bool,
+    ) -> Result<()> {
+        let offset = page_offset(page_id, self.page_size, "free-list page offset")?;
+        let kind = match read_main_page_kind(file, offset).await {
+            Ok(Some(kind)) => kind,
+            Ok(None) => return Ok(()),
+            Err(error) if unreachable => {
+                return self.blank_unreadable_free_page(page_id, error).await;
+            }
+            Err(error) => return Err(error),
+        };
+        let verified = self
+            .pager
+            .read_main_page(page_id, self.realm_id, kind)
+            .await
+            .map(drop);
+        if let Err(error) = verified {
+            if unreachable {
+                return self.blank_unreadable_free_page(page_id, error).await;
+            }
+            return Err(error);
+        }
+        self.pager
+            .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
+            .await
+    }
+
+    /// Replace a free page whose read reported `error` with a blank page, or
+    /// return `error` when it says nothing about the page's bytes.
+    async fn blank_unreadable_free_page(&self, page_id: u64, error: PagedbError) -> Result<()> {
+        if !free_page_is_unreadable(&error) {
+            return Err(error);
+        }
+        tracing::warn!(
+            page_id,
+            %error,
+            "free page cannot authenticate during rekey; replacing it with a blank page"
+        );
+        self.pager
+            .write_blank_free_page(page_id, self.realm_id)
+            .await
     }
 
     /// Re-seal the live catalog tree under the target epoch.
@@ -453,8 +592,7 @@ impl<V: Vfs + Clone> Db<V> {
             // durable free list, so this pass also re-seals them; from here on
             // every catalog page is target-sealed and later transitions can
             // only supersede target-epoch pages.
-            self.rewrite_free_list_pages(state.free_list_root_page_id)
-                .await?;
+            self.rewrite_free_list_pages(state).await?;
             self.pager.flush_main(self.realm_id).await?;
             intent.stage = RekeyStage::MainDone;
             self.write_rekey_intent_locked(
@@ -639,7 +777,12 @@ impl<V: Vfs + Clone> Db<V> {
             window.tail,
         )
         .await?;
+        // The head is dirty in the cache unless the window rewrote no entries.
+        let new_free_list_entries =
+            crate::pager::freelist::count_chain(&self.pager, self.realm_id, new_free_list_root)
+                .await?;
         state.free_list_root_page_id = new_free_list_root;
+        state.free_list_entries = Some(new_free_list_entries);
         self.pager.flush_main(self.realm_id).await?;
         Ok(new_next_page_id)
     }

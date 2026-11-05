@@ -2,15 +2,25 @@
 
 use crate::Result;
 use crate::segment::types::GcStats;
+use crate::txn::mode::DbMode;
 use crate::vfs::Vfs;
 
+use super::DbModeCapabilities;
 use super::core::{Db, PendingTombstone};
 
 impl<V: Vfs + Clone> Db<V> {
     /// Process pending deferred tombstones and delete files in `seg/.tombstone/`.
     /// Returns statistics on reclaimed segments and bytes.
+    ///
+    /// Returns `PagedbError::WrongMode` on a `ReadOnly` or `Observer` handle.
+    /// `Standalone` and `Follower` handles can collect.
     pub async fn gc_now(&self) -> Result<GcStats> {
         self.ensure_usable()?;
+        self.require_mode(
+            "gc_now",
+            DbMode::Standalone,
+            DbModeCapabilities::collects_garbage,
+        )?;
         let _span = tracing::debug_span!("gc.run");
         self.retry_pending_apply_journal().await?;
         // Writer before visibility is the global destructive-operation order.

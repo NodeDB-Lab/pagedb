@@ -38,6 +38,74 @@ pub(super) async fn collect_tree_page_ids<V: Vfs + Clone>(
     Ok(page_ids)
 }
 
+impl<V: Vfs + Clone> Db<V> {
+    /// Refuse a delta that rewrites a page a registered reader can reach.
+    ///
+    /// The delta screen covers the published base only. A reader pinned further
+    /// back can reach a page a later commit freed. The producer recycles that
+    /// id. The new bytes authenticate under the same page id, so that reader
+    /// would receive them with no error.
+    ///
+    /// A reader at the base roots is skipped, because the screen already covers
+    /// it. Readers sharing a pinned state share one walk. A reader whose pages
+    /// cannot be walked counts as a conflict, because nothing proves it disjoint.
+    ///
+    /// Reads the live Pager, which serves the unchanged base image until the swap.
+    pub(super) async fn refuse_delta_reaching_pinned_reader(
+        &self,
+        base: ReaderSnapshot,
+        delta_page_ids: &BTreeSet<u64>,
+    ) -> crate::Result<()> {
+        let pinned: BTreeSet<(u64, u64, u64, u64)> = {
+            let readers = self.tracked_readers.lock();
+            readers
+                .iter()
+                .filter(|reader| {
+                    reader.root_page_id != base.root_page_id
+                        || reader.catalog_root_page_id != base.catalog_root_page_id
+                })
+                .map(|reader| {
+                    (
+                        reader.commit_id.0,
+                        reader.root_page_id,
+                        reader.catalog_root_page_id,
+                        reader.next_page_id,
+                    )
+                })
+                .collect()
+        };
+        for (commit, root_page_id, catalog_root_page_id, next_page_id) in pinned {
+            let conflict = match collect_tree_page_ids(
+                &self.pager,
+                self.realm_id,
+                self.page_size,
+                root_page_id,
+                catalog_root_page_id,
+                next_page_id,
+            )
+            .await
+            {
+                Ok(reachable) => !reachable.is_disjoint(delta_page_ids),
+                Err(error) => {
+                    tracing::debug!(
+                        name = "apply.pinned_reader_unwalkable",
+                        commit,
+                        error = %error,
+                        "refusing an apply over a reader whose pages cannot be walked"
+                    );
+                    true
+                }
+            };
+            if conflict {
+                return Err(crate::errors::PagedbError::apply_blocked_by_pinned_reader(
+                    crate::CommitId(commit),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Every page a published state occupies: the reader-visible data and catalog
 /// trees, plus the free-list chain and commit-history tree hanging off the same
 /// header.

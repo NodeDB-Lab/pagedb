@@ -243,6 +243,10 @@ async fn commit_swap<V: Vfs + Clone>(
     state.commit_history_root_page_id = 0;
     state.commit_history_root_version = 0;
     state.free_list_root_page_id = 0;
+    state.free_list_entries = Some(0);
+    // A read in the window before the rename can reopen the old inode. This close
+    // drops that handle, and the reset below drops whatever it cached.
+    db.pager.close_main_handle().await;
     // The rename is durable, so a failed reset leaves old-image pages resident.
     // Reads must never see them, so the handle poisons and reopen is the way out.
     if db.pager.reset_main_pages().is_err() {

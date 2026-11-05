@@ -81,6 +81,13 @@ impl DbModeCapabilities {
         self.runs_standalone_recovery()
     }
 
+    /// Deleting retired segment files and replaying a pending apply journal. A
+    /// handle without write access holds no authority over those files.
+    #[must_use]
+    pub(crate) const fn collects_garbage(self) -> bool {
+        matches!(self.persistent_access, PersistentAccess::ReadWrite)
+    }
+
     /// Applying an incremental snapshot. Only an apply-authority handle
     /// carries the base-commit identity a delta reconciles against, and only
     /// it is licensed to install a producer's page space over its own.

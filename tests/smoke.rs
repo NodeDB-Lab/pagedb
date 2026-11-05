@@ -115,6 +115,7 @@ fn every_variant_displays() {
         },
         PagedbError::Aborted,
         PagedbError::ReadersPinningTruncatedRange,
+        PagedbError::apply_blocked_by_pinned_reader(CommitId::new(10)),
         PagedbError::Unsupported,
     ];
     for c in &cases {

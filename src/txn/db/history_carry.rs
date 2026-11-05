@@ -48,11 +48,13 @@ impl<V: Vfs + Clone> Db<V> {
     /// Decide where this handle's commit-history tree lives in the staged image.
     ///
     /// Reads run against the live Pager, which still serves the untouched base
-    /// image; any pages written land in the Pager's dirty set for the caller to
-    /// flush into the staged image with everything else this apply produces.
+    /// image. A load past the dirty budget flushes into `staged_image`. The rest
+    /// stays dirty for the caller to flush there with everything else this apply
+    /// produces. No relocated page reaches the live file.
     pub(super) async fn carry_commit_history(
         &self,
         state: &WriterState,
+        staged_image: &str,
         delta_page_ids: &BTreeSet<u64>,
         target_page_ids: &BTreeSet<u64>,
         history_version: u64,
@@ -98,7 +100,11 @@ impl<V: Vfs + Clone> Db<V> {
             alloc_cursor,
             self.page_size,
         );
-        relocated.bulk_load(rows).await?;
+        let mut loader = relocated.bulk_loader_to(staged_image)?;
+        for (key, value) in rows {
+            loader.push(key, value).await?;
+        }
+        loader.finish().await?;
 
         // A vacated page the target reaches is the target's now — the delta
         // brought its new contents — so only the rest is this handle's to free.

@@ -9,6 +9,16 @@ All notable changes to this project are documented here. The format is based on 
 - **Reader observability** — `DbStats` gains `oldest_reader_commit_id`, `oldest_reader_age_ms` (both `None` when no reader is registered) and `tracked_readers_non_abortable` (`u32`), so a long-lived read transaction that holds back free-page reuse is visible from `Db::stats()`.
 - **Compaction decline flag** — `CompactStats` and `CompactProgress` gain `declined_readers_pinned` (`bool`). `compact_now` and `compact_step` set it when a registered reader pins the page range and the pass does not run, so a caller can tell that result apart from a pass that found nothing to reclaim. Every count is zero in both cases, and `CompactProgress::more_work` stays `false`.
 
+### Changed
+
+- **Mode gates on two store writes** — `set_realm_quotas` now returns `WrongMode` on `Follower`, `ReadOnly`, and `Observer` handles. `gc_now` now returns `WrongMode` on `ReadOnly` and `Observer` handles.
+
+### Fixed
+
+- **Pinned follower readers** — `apply_incremental` now returns `ApplyBlockedByPinnedReader`, before it changes `main.db`, when its delta rewrites a page a reader pinned before the base commit can reach. That reader previously read authenticated bytes from the later commit. Retry the same delta after the reader finishes.
+- **Commit-history retention after a reopen** — with `RetainPolicy::Count(n)`, the first commit after a reopen pruned one commit too many and kept `n - 1`.
+- **Relocated commit history on a small buffer pool** — an apply that relocated a commit-history tree larger than the buffer pool flushed part of it to the live `main.db`. The published image then lacked those pages.
+
 ## [0.1.0] - 2026-10-15
 
 The first stable release. The entries describe `0.1.0` as a whole. The `0.1.0-beta.N` pre-releases have no entries of their own.

@@ -93,7 +93,8 @@ pub struct PageGuard {
     /// Slab index of the pinned entry, so releasing it on drop costs an
     /// indexed load rather than another hash of `key`. `key` still identifies
     /// the entry the pin was taken on; the cache verifies the two agree.
-    slot: usize,
+    /// `None` marks a page returned without caching, which holds no pin.
+    slot: Option<usize>,
     inner: Arc<PagerInner>,
 }
 
@@ -147,8 +148,10 @@ impl PageGuard {
 
 impl Drop for PageGuard {
     fn drop(&mut self) {
-        let mut cache = self.inner.cache_for_key(self.key.0).lock();
-        cache.unpin_at(self.slot, self.key);
+        if let Some(slot) = self.slot {
+            let mut cache = self.inner.cache_for_key(self.key.0).lock();
+            cache.unpin_at(slot, self.key);
+        }
     }
 }
 
@@ -206,6 +209,10 @@ pub struct Pager<V: Vfs> {
     active_epoch: AtomicU64,
     read_only: AtomicBool,
     files: AsyncMutex<BTreeMap<FileKey, Arc<AsyncMutex<V::File>>>>,
+    /// Counts how many times the cached file handles were invalidated. Bumped
+    /// under the `files` lock. A handle or a main page fetched under an older
+    /// value is never cached.
+    handle_generation: AtomicU64,
     dek_lru: parking_lot::Mutex<DekLru>,
     main_nonce: parking_lot::Mutex<MainDbNonceGen>,
     /// Header key and A/B cursor for the live `main.db`, installed by the owning
@@ -313,6 +320,7 @@ impl<V: Vfs + Clone> Pager<V> {
             segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             files: AsyncMutex::new(BTreeMap::new()),
+            handle_generation: AtomicU64::new(0),
             inner,
             active_epoch: AtomicU64::new(self.active_epoch.load(AtomOrd::SeqCst)),
             read_only: AtomicBool::new(true),
@@ -410,6 +418,7 @@ impl<V: Vfs> Pager<V> {
             segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             files: AsyncMutex::new(BTreeMap::new()),
+            handle_generation: AtomicU64::new(0),
             inner,
             active_epoch: AtomicU64::new(initial_epoch),
             read_only: AtomicBool::new(false),
@@ -433,7 +442,9 @@ impl<V: Vfs> Pager<V> {
     /// pager operations reopen them with read/write access.
     pub(crate) async fn enable_write_access(&self) {
         self.read_only.store(false, AtomOrd::SeqCst);
-        self.files.lock().await.clear();
+        let mut files = self.files.lock().await;
+        self.handle_generation.fetch_add(1, AtomOrd::SeqCst);
+        files.clear();
     }
 
     /// Install a leased epoch key without changing which epoch flushes use.
@@ -730,8 +741,15 @@ impl<V: Vfs> Pager<V> {
     /// Required around an atomic rename over main.db: closing first lets the
     /// rename replace the file on platforms that reject replacing an open file
     /// (Windows), and reopening afterwards picks up the new inode (Unix).
+    ///
+    /// Each close bumps the handle generation. A swap closes twice. The close
+    /// before the rename releases the file. The close after it drops any handle
+    /// a read reopened in between. The generation then stops a read that fetched
+    /// from the old inode from caching its handle or its page.
     pub async fn close_main_handle(&self) {
-        self.files.lock().await.remove(&FileKey::Main);
+        let mut files = self.files.lock().await;
+        self.handle_generation.fetch_add(1, AtomOrd::SeqCst);
+        files.remove(&FileKey::Main);
     }
 
     /// Flush all dirty pages for one segment to the VFS in physical-id order.
@@ -918,12 +936,34 @@ impl<V: Vfs> Pager<V> {
         Ok(())
     }
 
+    /// Replace a free page with a zeroed `Free` page under the active epoch,
+    /// without reading it. A torn page therefore costs nothing. The old plaintext
+    /// never reaches disk under the active key. Each flush of the page draws one
+    /// fresh nonce.
+    ///
+    /// The caller proves that nothing can still read this page. The dirty set
+    /// stays inside the buffer-pool budget, as in
+    /// [`Self::rewrite_page_under_current_epoch`].
+    pub(crate) async fn write_blank_free_page(
+        &self,
+        page_id: u64,
+        realm_id: RealmId,
+    ) -> Result<()> {
+        let body = vec![0u8; self.cfg.page_size - ENVELOPE_OVERHEAD];
+        self.write_main_page(page_id, realm_id, PageKind::Free, &body)
+            .await?;
+        if self.main_dirty_at_budget() {
+            self.flush_main(realm_id).await?;
+        }
+        Ok(())
+    }
+
     /// Discard all dirty main.db pages from the cache without flushing them.
-    /// Used by `WriteTxn::abort` to undo in-flight `CoW` writes. Pages leave the
-    /// dirty set, and the pool then returns to its budget unless pins hold it
-    /// over. Discarded pages that stay resident are never flushed, because the
-    /// next commit starts from the last durable root. A subsequent read that
-    /// misses the cache re-fetches the last persisted ciphertext from disk.
+    /// Used by `WriteTxn::abort` to undo in-flight `CoW` writes. Unpinned pages
+    /// leave the cache, so an aborted plaintext never stays resident as clean.
+    /// The next read of such an id fetches the last persisted ciphertext. A
+    /// pinned page clears its dirty marker and stays until its guard is released.
+    /// The pool then returns to its budget unless pins hold it over.
     ///
     /// Callers include a drop, so this returns nothing. A cache fault stops the
     /// loop and stays latched. The latch then refuses every later flush, so the
@@ -934,11 +974,7 @@ impl<V: Vfs> Pager<V> {
 
     /// Evict unpinned clean main.db pages so later reads fetch and authenticate
     /// durable bytes without discarding in-flight writes.
-    ///
-    /// Compiled only for the crate's own tests, matching the handle-level
-    /// accessor that is its sole caller: correctness never depends on whether a
-    /// page is warm, so nothing in the shipped crate should be steering that.
-    #[cfg(test)]
+    #[cfg(any(test, not(target_arch = "wasm32")))]
     pub fn evict_clean_main_pages(&self, _realm_id: crate::RealmId) -> Result<()> {
         self.inner
             .buffer_pool
@@ -997,19 +1033,7 @@ impl<V: Vfs> Pager<V> {
         {
             let mut cache = self.inner.cache_for_key(file).lock();
             if let Some((page, slot)) = cache.get_and_pin((file, page_id))? {
-                if page.realm_id_bytes != Some(realm_id.0) {
-                    cache.unpin_at(slot, (file, page_id));
-                    return Err(PagedbError::ChecksumFailure);
-                }
-                // Resolve the page kind under the caller's binding. A `Fixed`
-                // binding enforces the same kind check a cold read's AAD does:
-                // without it, a stale pointer reading a recycled page under the
-                // wrong kind succeeds while the page is warm and only starts
-                // failing after eviction — hiding structural damage until long
-                // after the write that caused it. A `Node` binding instead
-                // trusts the page's own (authenticated) kind byte and returns
-                // it, restricted to the two B+ tree node kinds.
-                let kind = match binding.resolve_cached(page.kind_byte) {
+                let kind = match check_resident_page(&page, realm_id, binding) {
                     Ok(kind) => kind,
                     Err(error) => {
                         cache.unpin_at(slot, (file, page_id));
@@ -1021,7 +1045,7 @@ impl<V: Vfs> Pager<V> {
                     PageGuard {
                         page,
                         key: (file, page_id),
-                        slot,
+                        slot: Some(slot),
                         inner: self.inner.clone(),
                     },
                     kind,
@@ -1034,6 +1058,9 @@ impl<V: Vfs> Pager<V> {
         self.inner.record_miss(file);
         let page_size = self.cfg.page_size;
         let page_offset = crate::pager::page_space::page_offset(page_id, page_size, "page read")?;
+        // Read before the handle is taken. A swap at any later point then shows
+        // as a mismatch when the page is about to enter the cache.
+        let handle_generation = self.handle_generation.load(AtomOrd::SeqCst);
         let file_handle = self.open_file_handle(file).await?;
 
         // Observer-mode retry loop: on AEAD failure retry up to
@@ -1136,16 +1163,43 @@ impl<V: Vfs> Pager<V> {
             match decrypt_result {
                 Ok(_page_kind) => {
                     let page = Arc::new(Page::new_with_meta(buf, auth_kind.as_byte(), realm_id.0));
+                    let key = (file, page_id);
                     let mut cache = self.inner.cache_for_key(file).lock();
-                    let slot = cache.insert_and_pin((file, page_id), page.clone())?;
+                    // A main handle closed since this read began. The bytes can
+                    // belong to the replaced image, so the caller keeps them and
+                    // the cache never sees them.
+                    if matches!(file, FileKey::Main)
+                        && self.handle_generation.load(AtomOrd::SeqCst) != handle_generation
+                    {
+                        return Ok((
+                            PageGuard {
+                                page,
+                                key,
+                                slot: None,
+                                inner: self.inner.clone(),
+                            },
+                            auth_kind,
+                        ));
+                    }
+                    // The cache lock was dropped across the fetch, so another
+                    // page can be resident by now. That page wins, and it gets
+                    // the same checks as a cache hit.
+                    let (page, slot) = cache.insert_and_pin(key, page)?;
+                    let kind = match check_resident_page(&page, realm_id, binding) {
+                        Ok(kind) => kind,
+                        Err(error) => {
+                            cache.unpin_at(slot, key);
+                            return Err(error);
+                        }
+                    };
                     return Ok((
                         PageGuard {
                             page,
-                            key: (file, page_id),
-                            slot,
+                            key,
+                            slot: Some(slot),
                             inner: self.inner.clone(),
                         },
-                        auth_kind,
+                        kind,
                     ));
                 }
                 Err(e @ PagedbError::ChecksumFailure) => {
@@ -1380,15 +1434,11 @@ impl<V: Vfs> Pager<V> {
         Ok(())
     }
 
+    /// The cached handle for `file`, opening and caching one on a miss.
+    ///
+    /// An open that overlaps a handle invalidation can bind the replaced file.
+    /// That handle is discarded and the open runs again.
     async fn open_file_handle(&self, file: FileKey) -> Result<Arc<AsyncMutex<V::File>>> {
-        let cached = {
-            let files = self.files.lock().await;
-            files.get(&file).cloned()
-        };
-        if let Some(handle) = cached {
-            return Ok(handle);
-        }
-
         let path = match file {
             FileKey::Main => self.cfg.main_db_path.clone(),
             FileKey::Segment(id) => format!("seg/{}", crate::hex::to_hex_lower(&id)),
@@ -1396,18 +1446,30 @@ impl<V: Vfs> Pager<V> {
                 format!("applyjournal/{}", crate::hex::to_hex_lower(&id))
             }
         };
-        let mode = if self.read_only.load(AtomOrd::SeqCst) {
-            OpenMode::Read
-        } else {
-            OpenMode::CreateOrOpen
-        };
-        let opened = Arc::new(AsyncMutex::new(self.vfs.open(&path, mode).await?));
-        let mut files = self.files.lock().await;
-        if let Some(handle) = files.get(&file) {
-            return Ok(handle.clone());
+        loop {
+            let generation = {
+                let files = self.files.lock().await;
+                if let Some(handle) = files.get(&file) {
+                    return Ok(handle.clone());
+                }
+                self.handle_generation.load(AtomOrd::SeqCst)
+            };
+            let mode = if self.read_only.load(AtomOrd::SeqCst) {
+                OpenMode::Read
+            } else {
+                OpenMode::CreateOrOpen
+            };
+            let opened = Arc::new(AsyncMutex::new(self.vfs.open(&path, mode).await?));
+            let mut files = self.files.lock().await;
+            if self.handle_generation.load(AtomOrd::SeqCst) != generation {
+                continue;
+            }
+            if let Some(handle) = files.get(&file) {
+                return Ok(handle.clone());
+            }
+            files.insert(file, opened.clone());
+            return Ok(opened);
         }
-        files.insert(file, opened.clone());
-        Ok(opened)
     }
 
     /// How many nonces this flush may still issue before its generator needs an
@@ -1441,6 +1503,20 @@ impl<V: Vfs> Pager<V> {
     }
 }
 
+/// Check a resident page against the caller's realm and kind binding.
+///
+/// A `Fixed` binding enforces the same kind check a cold read's AAD does. Without
+/// it, a stale pointer reading a recycled page under the wrong kind succeeds while
+/// the page is warm. The damage then stays hidden until the page is evicted. A
+/// `Node` binding trusts the page's own authenticated kind byte, restricted to
+/// the two B+ tree node kinds.
+fn check_resident_page(page: &Page, realm_id: RealmId, binding: KindBinding) -> Result<PageKind> {
+    if page.realm_id_bytes != Some(realm_id.0) {
+        return Err(PagedbError::ChecksumFailure);
+    }
+    binding.resolve_cached(page.kind_byte)
+}
+
 fn derive_kind_for_flush(file: FileKey) -> PageKind {
     // The page-kind context is supplied by the caller at write time. For this
     // slice we store it implicitly via the FileKey class: main.db dirty pages
@@ -1465,6 +1541,10 @@ mod tests {
     const PAGE: usize = 4096;
 
     async fn mk_pager() -> Pager<MemVfs> {
+        mk_pager_on(MemVfs::new()).await
+    }
+
+    async fn mk_pager_on<V: Vfs>(vfs: V) -> Pager<V> {
         let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
         let cfg = PagerConfig {
             page_size: PAGE,
@@ -1479,7 +1559,118 @@ mod tests {
             observer_retry_count: 0,
             metrics_enabled: true,
         };
-        Pager::open(MemVfs::new(), mk, cfg).await.unwrap()
+        Pager::open(vfs, mk, cfg).await.unwrap()
+    }
+
+    /// A read that misses before a write and finishes after it holds older bytes.
+    /// Those bytes cannot replace the dirty page, because the flush writes the
+    /// resident page under the dirty marker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_miss_completing_after_a_write_keeps_the_dirty_page() {
+        use crate::vfs::gated::{GatedVfs, bounded};
+
+        const PAGE_ID: u64 = 10;
+        let realm = RealmId([7; 16]);
+        let older = vec![0x11u8; PAGE - ENVELOPE_OVERHEAD];
+        let newer = vec![0x22u8; PAGE - ENVELOPE_OVERHEAD];
+
+        let vfs = GatedVfs::new();
+        let pager = mk_pager_on(vfs.clone()).await;
+        pager
+            .write_main_page(PAGE_ID, realm, PageKind::BTreeLeaf, &older)
+            .await
+            .unwrap();
+        pager.flush_main(realm).await.unwrap();
+        pager.evict_clean_main_pages(realm).unwrap();
+
+        let in_flight = vfs.park_next_read("/main.db", PAGE_ID * PAGE as u64);
+        let racing_read = async {
+            let guard = pager
+                .read_main_page(PAGE_ID, realm, PageKind::BTreeLeaf)
+                .await
+                .unwrap();
+            drop(guard);
+        };
+        let writer = async {
+            in_flight.wait_until_parked().await;
+            pager
+                .write_main_page(PAGE_ID, realm, PageKind::BTreeLeaf, &newer)
+                .await
+                .unwrap();
+            in_flight.release();
+        };
+        bounded(async { tokio::join!(racing_read, writer) }).await;
+
+        pager.flush_main(realm).await.unwrap();
+        pager.evict_clean_main_pages(realm).unwrap();
+
+        let guard = pager
+            .read_main_page(PAGE_ID, realm, PageKind::BTreeLeaf)
+            .await
+            .unwrap();
+        assert_eq!(
+            &guard.body()[..16],
+            &newer[..16],
+            "the flush wrote the older bytes the racing read fetched"
+        );
+    }
+
+    /// An open that starts before a main-file swap binds the old inode and
+    /// finishes after the swap. It runs again, so the new inode is the one cached.
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_overlapping_a_main_swap_retries_on_the_new_inode() {
+        use crate::vfs::gated::{GatedVfs, bounded};
+
+        const PAGE_ID: u64 = 10;
+        const NEW_IMAGE: &str = "/main.db.new";
+        let realm = RealmId([7; 16]);
+        let older = vec![0x11u8; PAGE - ENVELOPE_OVERHEAD];
+        let newer = vec![0x22u8; PAGE - ENVELOPE_OVERHEAD];
+
+        let vfs = GatedVfs::new();
+        let pager = mk_pager_on(vfs.clone()).await;
+        pager
+            .write_main_page(PAGE_ID, realm, PageKind::BTreeLeaf, &older)
+            .await
+            .unwrap();
+        pager.flush_main(realm).await.unwrap();
+        pager
+            .write_main_page(PAGE_ID, realm, PageKind::BTreeLeaf, &newer)
+            .await
+            .unwrap();
+        pager.flush_main_to(realm, NEW_IMAGE).await.unwrap();
+        pager.close_main_handle().await;
+        pager.reset_main_pages().unwrap();
+
+        let in_flight = vfs.park_next_open("/main.db");
+        let racing_read = async {
+            pager
+                .read_main_page(PAGE_ID, realm, PageKind::BTreeLeaf)
+                .await
+                .unwrap()
+                .body()
+        };
+        let swap = async {
+            in_flight.wait_until_parked().await;
+            pager.close_main_handle().await;
+            vfs.rename(NEW_IMAGE, "/main.db").await.unwrap();
+            pager.close_main_handle().await;
+            pager.reset_main_pages().unwrap();
+            in_flight.release();
+        };
+        let (racing_body, ()) = bounded(async { tokio::join!(racing_read, swap) }).await;
+        assert_eq!(&racing_body[..16], &newer[..16]);
+
+        pager.evict_clean_main_pages(realm).unwrap();
+        let guard = pager
+            .read_main_page(PAGE_ID, realm, PageKind::BTreeLeaf)
+            .await
+            .unwrap();
+        assert_eq!(
+            &guard.body()[..16],
+            &newer[..16],
+            "the cached handle still names the replaced file"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1749,7 +1940,7 @@ mod tests {
             .read_main_page(1, realm, PageKind::BTreeLeaf)
             .await
             .unwrap();
-        guard.slot
+        guard.slot.expect("a cached page holds a slot")
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1845,7 +2036,7 @@ mod tests {
         pager.discard_dirty_main(realm);
 
         let err = pager.flush_main(realm).await.unwrap_err();
-        assert_dead_slot_fault(&err, "clear_dirty", slot);
+        assert_dead_slot_fault(&err, "discard_dirty", slot);
     }
 
     #[tokio::test(flavor = "current_thread")]

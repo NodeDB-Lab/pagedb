@@ -53,6 +53,9 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// Open a segment by `(realm, name)` resolved against the live catalog.
+    ///
+    /// The lookup waits while a compaction, an incremental apply, or a commit
+    /// publication holds the visibility gate.
     pub async fn open_segment(&self, realm: RealmId, name: &str) -> Result<SegmentReader<V>> {
         self.ensure_usable()?;
         let meta = self.lookup_segment(realm, name).await?;
@@ -67,9 +70,12 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// List segments in `realm` whose names start with `prefix`. Live catalog.
+    ///
+    /// Waits while a compaction, an incremental apply, or a commit publication
+    /// holds the visibility gate.
     pub async fn list_segments(&self, realm: RealmId, prefix: &str) -> Result<Vec<SegmentMeta>> {
         self.ensure_usable()?;
-        let snap = *self.snapshot.read();
+        let (_hold, snap) = self.hold_published_snapshot().await;
         let (catalog_root, next) = (snap.catalog_root_page_id, snap.next_page_id);
         if catalog_root == 0 {
             return Ok(Vec::new());
@@ -394,7 +400,7 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     async fn lookup_segment(&self, realm: RealmId, name: &str) -> Result<SegmentMeta> {
-        let snap = *self.snapshot.read();
+        let (_hold, snap) = self.hold_published_snapshot().await;
         let (catalog_root, next) = (snap.catalog_root_page_id, snap.next_page_id);
         if catalog_root == 0 {
             return Err(PagedbError::NotFound);

@@ -20,7 +20,7 @@ use crate::pager::format::page_kind::PageKind;
 use crate::pager::page_space::{FIRST_ALLOCATABLE_PAGE_ID, is_reserved, page_offset};
 use crate::pager::{PageGuard, Pager};
 use crate::segment::authenticated_metadata::authenticate_segment_metadata;
-use crate::txn::db::Db;
+use crate::txn::db::{Db, WriterState};
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile, read_exact_at};
 
@@ -195,15 +195,18 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     // that conservative reading if `DbMode` ever grows a variant.
     let owns_page_space = db.is_writer();
 
-    let (next_page_id, catalog_root, catalog_next, free_list_root) = {
-        let state = db.writer.lock().await;
-        (
-            state.next_page_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            state.free_list_root_page_id,
-        )
-    };
+    // Held for the whole walk. Free-chain pages are not protected by any reader
+    // floor, and the next commit can reuse them. The walk also reads every page,
+    // so a commit or compaction running beside it reports false damage. Every
+    // writer takes this lock before the visibility gate. The walk takes neither
+    // the gate nor this lock again, so holding it cannot deadlock.
+    let state = db.writer.lock().await;
+    let (next_page_id, catalog_root, catalog_next, free_list_root) = (
+        state.next_page_id,
+        state.catalog_root_page_id,
+        state.next_page_id,
+        state.free_list_root_page_id,
+    );
 
     // ------------------------------------------------------------------ //
     // 1. Walk every page in main.db from page 0 to next_page_id.
@@ -213,7 +216,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     let realm_id = db.realm_id;
 
     // Collect the set of page IDs reachable from all live roots.
-    let mut reachable = collect_reachable_pages(db, &mut report).await;
+    let mut reachable = collect_reachable_pages(db, &state, &mut report).await;
 
     // Walk and validate the durable free-list chain. Reading it verifies each
     // chain page's AEAD; a corrupt chain surfaces as a page issue. Validate the
@@ -607,6 +610,7 @@ async fn describe_page_read_failure<F: VfsFile>(
 /// Pages 0..=3 (reserved) are always considered reachable.
 async fn collect_reachable_pages<V: Vfs + Clone>(
     db: &Db<V>,
+    state: &WriterState,
     report: &mut DeepWalkReport,
 ) -> BTreeSet<u64> {
     let mut reachable: BTreeSet<u64> = BTreeSet::new();
@@ -616,15 +620,12 @@ async fn collect_reachable_pages<V: Vfs + Clone>(
         reachable.insert(pid);
     }
 
-    let (root, cat_root, hist_root, next) = {
-        let state = db.writer.lock().await;
-        (
-            state.root_page_id,
-            state.catalog_root_page_id,
-            state.commit_history_root_page_id,
-            state.next_page_id,
-        )
-    };
+    let (root, cat_root, hist_root, next) = (
+        state.root_page_id,
+        state.catalog_root_page_id,
+        state.commit_history_root_page_id,
+        state.next_page_id,
+    );
 
     for (tree_name, tree_root) in [
         ("main tree", root),

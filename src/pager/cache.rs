@@ -35,6 +35,7 @@ const MAP_SLOT_DISAGREES: &str = "map entry disagrees with the slot";
 const LIVE_SLOTS_DRIFTED: &str = "live slots differ from the map";
 const NODE_ALREADY_LINKED: &str = "node is already on the list";
 const LIST_MEMBERSHIP_DRIFTED: &str = "list membership disagrees with the dirty marker";
+const DISCARD_DIRTY: &str = "discard_dirty";
 
 /// A broken cache invariant. `operation` names what was running, `detail` what
 /// it found, and `slot` the slab slot when one is known.
@@ -414,21 +415,27 @@ impl PageCache {
         })
     }
 
-    /// [`insert`](Self::insert) that also pins the entry, returning the slab
-    /// index to release it with. A new entry never counts as evictable. A
-    /// present key keeps its list position, takes the new page, and adds a pin.
+    /// Pin the entry for a page a cache miss fetched. Returns the page the entry
+    /// holds and the slab index to release the pin with.
+    ///
+    /// A resident page always wins. The miss fetched its bytes without the cache
+    /// lock, so a page resident now is at least as new. It can also be dirty. A
+    /// present key therefore keeps its page and list position, and adds a pin.
+    /// A new entry never counts as evictable.
     pub fn insert_and_pin(
         &mut self,
         key: (FileKey, u64),
         page: Arc<Page>,
-    ) -> Result<usize, CacheFault> {
+    ) -> Result<(Arc<Page>, usize), CacheFault> {
         const OPERATION: &str = "insert_and_pin";
         self.guarded(|cache| {
             if let Some(&idx) = cache.map.get(&key) {
-                cache.pin_resident(idx, key, OPERATION)?.page = page;
-                return Ok(idx);
+                let node = cache.pin_resident(idx, key, OPERATION)?;
+                node.visited = true;
+                return Ok((node.page.clone(), idx));
             }
-            cache.insert_new(key, page, 1, OPERATION)
+            let idx = cache.insert_new(key, page.clone(), 1, OPERATION)?;
+            Ok((page, idx))
         })
     }
 
@@ -732,17 +739,58 @@ impl PageCache {
         self.guarded(|cache| cache.settle_batch(OPERATION))
     }
 
-    /// Clear every dirty marker of `file` without flushing, then return the pool
+    /// Discard every dirty page of `file` without flushing, then return the pool
     /// to its budget. A fault stops the loop and stays latched, so the pages
     /// still marked dirty never reach disk.
+    ///
+    /// An unpinned dirty entry leaves the cache, so the next read of its id
+    /// fetches the durable bytes. A pinned one clears its marker and stays until
+    /// released, because its guard resolves the entry by slot.
     pub fn discard_dirty(&mut self, file: FileKey) {
-        const OPERATION: &str = "discard_dirty";
         for pid in self.dirty_for_file(file) {
-            if self.clear_dirty((file, pid)).is_err() {
+            if self.discard_dirty_entry((file, pid)).is_err() {
                 return;
             }
         }
-        let _ = self.guarded(|cache| cache.settle_batch(OPERATION));
+        let _ = self.guarded(|cache| cache.settle_batch(DISCARD_DIRTY));
+    }
+
+    /// Discard one dirty entry. A failed call leaves the marker set, so the page
+    /// stays visible to the flush check. A pinned entry rejoins the list as the
+    /// newest, and its release makes it evictable.
+    fn discard_dirty_entry(&mut self, key: (FileKey, u64)) -> Result<(), CacheFault> {
+        self.guarded(|cache| {
+            let Some(&idx) = cache.map.get(&key) else {
+                return Err(CacheFault::new(DISCARD_DIRTY, DIRTY_NOT_RESIDENT, None));
+            };
+            if Self::keyed_node(&cache.slab, idx, key, DISCARD_DIRTY)?.pins > 0 {
+                cache.link_as_head(idx, DISCARD_DIRTY)?;
+            } else {
+                cache.remove_unpinned_entry(key, idx, DISCARD_DIRTY)?;
+            }
+            cache.dirty.remove(&key);
+            Ok(())
+        })
+    }
+
+    /// Remove the unpinned entry at `idx` from the map, the list, and the slab.
+    /// The caller clears any dirty marker. A dirty node is off the list, so its
+    /// unlink is a no-op and it never counted as evictable.
+    fn remove_unpinned_entry(
+        &mut self,
+        key: (FileKey, u64),
+        idx: usize,
+        operation: &'static str,
+    ) -> Result<(), CacheFault> {
+        let node = Self::keyed_node(&self.slab, idx, key, operation)?;
+        let was_evictable = Self::is_evictable(node, &self.dirty);
+        self.map.remove(&key);
+        self.unlink_from_list(idx, operation)?;
+        self.free_node(idx, operation)?;
+        if was_evictable {
+            self.evictable = Self::one_less(self.evictable, operation)?;
+        }
+        Ok(())
     }
 
     /// The single trim that ends a batch, plus its index memory reclaim.
@@ -911,7 +959,7 @@ impl PageCache {
     /// available for a later flush and pinned entries available to readers.
     /// Used to force a re-read of the durable bytes without discarding the
     /// in-flight writes that have not reached them yet.
-    #[cfg(test)]
+    #[cfg(any(test, not(target_arch = "wasm32")))]
     pub fn clear_clean_file(&mut self, file: FileKey) -> Result<(), CacheFault> {
         self.clear_file_entries(file, true)
     }
@@ -936,13 +984,7 @@ impl PageCache {
                 if keep_dirty && cache.dirty.contains(&key) {
                     continue;
                 }
-                let was_evictable = Self::is_evictable(node, &cache.dirty);
-                cache.map.remove(&key);
-                cache.unlink_from_list(idx, OPERATION)?;
-                cache.free_node(idx, OPERATION)?;
-                if was_evictable {
-                    cache.evictable = Self::one_less(cache.evictable, OPERATION)?;
-                }
+                cache.remove_unpinned_entry(key, idx, OPERATION)?;
                 if !keep_dirty {
                     cache.dirty.remove(&key);
                 }
@@ -1043,7 +1085,7 @@ mod tests {
     fn releasing_the_last_pin_makes_an_entry_evictable_again() {
         let mut c = PageCache::with_capacity(2);
         let key = (FileKey::Main, 1);
-        let idx = c.insert_and_pin(key, page(1)).unwrap();
+        let (_, idx) = c.insert_and_pin(key, page(1)).unwrap();
         c.insert((FileKey::Main, 2), page(2)).unwrap();
         c.insert((FileKey::Main, 3), page(3)).unwrap();
         assert!(!c.contains((FileKey::Main, 2)));
@@ -1060,7 +1102,7 @@ mod tests {
     fn nested_pins_each_need_releasing() {
         let mut c = PageCache::with_capacity(2);
         let key = (FileKey::Main, 1);
-        let idx = c.insert_and_pin(key, page(1)).unwrap();
+        let (_, idx) = c.insert_and_pin(key, page(1)).unwrap();
         c.get_and_pin(key).unwrap().unwrap();
 
         c.unpin_at(idx, key);
@@ -1079,7 +1121,7 @@ mod tests {
     fn stale_unpin_latches_a_fault_and_leaves_the_occupant_pinned() {
         let mut c = PageCache::with_capacity(1);
         let old_key = (FileKey::Main, 1);
-        let idx = c.insert_and_pin(old_key, page(1)).unwrap();
+        let (_, idx) = c.insert_and_pin(old_key, page(1)).unwrap();
         c.unpin_at(idx, old_key);
         c.insert((FileKey::Main, 2), page(2)).unwrap();
         assert!(!c.contains(old_key));
@@ -1087,7 +1129,7 @@ mod tests {
         // The slot now belongs to page 2. Pin it, then replay the stale
         // release for page 1 against the same index.
         let new_key = (FileKey::Main, 2);
-        let new_idx = c.insert_and_pin(new_key, page(2)).unwrap();
+        let (_, new_idx) = c.insert_and_pin(new_key, page(2)).unwrap();
         assert_eq!(new_idx, idx, "the fixture must recycle the slot");
         c.unpin_at(idx, old_key);
 
@@ -1159,7 +1201,7 @@ mod tests {
     fn double_release_latches_a_fault() {
         let mut c = PageCache::with_capacity(4);
         let key = (FileKey::Main, 1);
-        let idx = c.insert_and_pin(key, page(1)).unwrap();
+        let (_, idx) = c.insert_and_pin(key, page(1)).unwrap();
         c.unpin_at(idx, key);
         assert_eq!(c.check_usable(), Ok(()));
 
@@ -1178,7 +1220,7 @@ mod tests {
         let healthy = (FileKey::Main, 2);
         let absent = (FileKey::Main, 3);
         c.insert(dead, page(1)).unwrap();
-        let pinned_slot = c.insert_and_pin(healthy, page(2)).unwrap();
+        let (_, pinned_slot) = c.insert_and_pin(healthy, page(2)).unwrap();
         c.mark_dirty(healthy).unwrap();
         let idx = c.map[&dead];
         c.clear_slot(idx);
@@ -1191,7 +1233,10 @@ mod tests {
         assert_eq!(c.get_dirty(healthy).err(), Some(first));
         assert_eq!(c.get_and_pin(healthy).err(), Some(first));
         assert_eq!(c.insert(absent, page(3)), Err(first));
-        assert_eq!(c.insert_and_pin(absent, page(3)), Err(first));
+        assert_eq!(
+            c.insert_and_pin(absent, page(3)).map(|(_, slot)| slot),
+            Err(first)
+        );
         assert_eq!(c.mark_dirty(absent), Err(first));
         assert_eq!(c.clear_dirty(healthy), Err(first));
         assert_eq!(c.finish_flush(FileKey::Main, Vec::new()), Err(first));
@@ -1321,20 +1366,22 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_pin_on_a_present_key_replaces_the_page_and_adds_a_pin() {
+    fn insert_and_pin_on_a_present_key_keeps_the_resident_page_and_adds_a_pin() {
         let mut c = PageCache::with_capacity(4);
         let key = (FileKey::Main, 1);
         c.insert(key, page(1)).unwrap();
         assert_eq!(c.evictable, 1);
 
-        let idx = c.insert_and_pin(key, page(2)).unwrap();
+        let (kept, idx) = c.insert_and_pin(key, page(2)).unwrap();
+        assert_eq!(kept.bytes[0], 1, "the caller receives the resident page");
         assert_eq!(c.evictable, 0, "the pin removes the candidate");
         assert_eq!(c.len(), 1);
 
-        let again = c.insert_and_pin(key, page(3)).unwrap();
+        let (kept, again) = c.insert_and_pin(key, page(3)).unwrap();
+        assert_eq!(kept.bytes[0], 1);
         assert_eq!(again, idx);
         assert_eq!(c.evictable, 0, "a second pin changes no count");
-        assert_eq!(c.get(key).unwrap().unwrap().bytes[0], 3);
+        assert_eq!(c.get(key).unwrap().unwrap().bytes[0], 1);
 
         c.unpin_at(idx, key);
         assert_eq!(c.evictable, 0, "one pin is left");
@@ -1605,8 +1652,37 @@ mod tests {
         assert_eq!(c.dirty_for_file(FileKey::Main), Vec::<u64>::new());
         assert_eq!(c.dirty_len(), 1, "another file keeps its dirty page");
         assert!(c.contains(other_file));
-        assert_eq!(c.len(), 4);
+        assert_eq!(c.len(), 1, "only the other file's dirty page stays");
         c.check_usable().unwrap();
+    }
+
+    #[test]
+    fn discard_removes_unpinned_dirty_entries_and_keeps_pinned_ones() {
+        let mut c = PageCache::with_capacity(8);
+        c.insert(main_key(1), page(1)).unwrap();
+        add_dirty(&mut c, 2..=4);
+        let (_, pinned_slot) = c.get_and_pin(main_key(3)).unwrap().unwrap();
+
+        c.discard_dirty(FileKey::Main);
+
+        c.check_usable().unwrap();
+        assert_eq!(c.dirty_for_file(FileKey::Main), Vec::<u64>::new());
+        assert!(c.contains(main_key(1)), "a clean entry stays");
+        assert!(c.contains(main_key(3)), "a pinned entry stays");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.evictable, 1, "the pinned entry is not yet evictable");
+        assert_list_matches_map(&c);
+        assert!(
+            c.get(main_key(2)).unwrap().is_none(),
+            "a discarded id misses, so the next read fetches durable bytes"
+        );
+        assert!(c.get(main_key(4)).unwrap().is_none());
+
+        c.unpin_at(pinned_slot, main_key(3));
+
+        c.check_usable().unwrap();
+        assert_eq!(c.evictable, 2, "the release makes the entry evictable");
+        assert_list_matches_map(&c);
     }
 
     #[test]
@@ -1615,7 +1691,7 @@ mod tests {
         let mut slots = Vec::new();
         for id in 1u8..=4 {
             let key = main_key(u64::from(id));
-            slots.push((c.insert_and_pin(key, page(id)).unwrap(), key));
+            slots.push((c.insert_and_pin(key, page(id)).unwrap().1, key));
         }
         let (first_slot, first_key) = slots[0];
         c.get_and_pin(first_key).unwrap().unwrap();
@@ -1640,7 +1716,7 @@ mod tests {
     fn trim_spares_pinned_and_dirty_entries() {
         let mut c = PageCache::with_capacity(1);
         let pinned = main_key(1);
-        let slot = c.insert_and_pin(pinned, page(1)).unwrap();
+        let (_, slot) = c.insert_and_pin(pinned, page(1)).unwrap();
         add_dirty(&mut c, 2..=3);
         let gathered = gather(&mut c, 3..=3);
 

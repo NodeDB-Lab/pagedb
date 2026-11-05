@@ -122,25 +122,37 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// Collect a point-in-time snapshot of database runtime metrics.
+    ///
+    /// Waits while a compaction, an incremental apply, or a commit publication
+    /// holds the visibility gate. Registers no reader, so a concurrent compaction
+    /// waits for this call instead of declining.
     pub async fn stats(&self) -> Result<DbStats> {
         // Stats that describe reader-visible state must use the publication
         // snapshot, which remains at the prior commit while a handle is
         // poisoned after a post-header reconciliation failure.
-        let snapshot = *self.snapshot.read();
-        let (next_page_id, catalog_root, catalog_next, free_list_root) = (
+        let (_hold, snapshot) = self.hold_published_snapshot().await;
+        let (next_page_id, catalog_root, catalog_next) = (
             snapshot.next_page_id,
             snapshot.catalog_root_page_id,
             snapshot.next_page_id,
-            snapshot.free_list_root_page_id,
         );
         let latest_commit_id = snapshot.commit_id;
 
-        // Durable free-list depth (chain rooted at the header's free_list_root).
-        // Counted in place rather than collected: how many pages the free list
-        // is carrying grows with the database, and a metrics call must not size
-        // an allocation by it.
-        let free_list_pending_entries =
-            crate::pager::freelist::count_chain(&self.pager, self.realm_id, free_list_root).await?;
+        // The commit that published this snapshot counted its free-list chain.
+        // Only an open that failed to read the chain head leaves the count
+        // unknown. The hold keeps that chain in place, and its read error
+        // surfaces here instead of reading as zero.
+        let free_list_pending_entries = match snapshot.free_list_entries {
+            Some(entries) => entries,
+            None => {
+                crate::pager::freelist::count_chain(
+                    &self.pager,
+                    self.realm_id,
+                    snapshot.free_list_root_page_id,
+                )
+                .await?
+            }
+        };
 
         // Main database file size.
         let main_db_bytes = self

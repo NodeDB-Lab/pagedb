@@ -957,10 +957,25 @@ async fn stats_surfaces_free_list_read_error_then_retry_succeeds() {
     let db = Db::open_existing_with_options(vfs.clone(), [9u8; 32], PAGE, REALM, opts)
         .await
         .unwrap();
-    // Open validates the free-list chain, which leaves it in the page cache. A
-    // read fault only reaches the VFS on a cold read, so drop the cached pages —
-    // otherwise `stats` answers from memory and the injected failure is never
-    // reached, which would test nothing.
+    // Open publishes the count, so a healthy store answers without the chain.
+    db.pager.reset_main_pages().unwrap();
+    let head = db.writer.lock().await.free_list_root_page_id;
+    assert!(db.stats().await.unwrap().free_list_pending_entries > 20);
+    assert!(
+        db.pager
+            .inner
+            .buffer_pool
+            .lock()
+            .get((crate::pager::core::FileKey::Main, head))
+            .unwrap()
+            .is_none(),
+        "stats read the free-list chain although a count was published"
+    );
+
+    // An open that failed to read the chain head leaves the count unknown. Stats
+    // then reads the chain, and a read error is never reported as zero. The
+    // cache is cold, so the injected failure reaches the VFS.
+    db.snapshot.write().free_list_entries = None;
     db.pager.reset_main_pages().unwrap();
     vfs.fail_main_db_read_at.store(true, Ordering::SeqCst);
     let err = db

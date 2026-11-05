@@ -11,3 +11,5 @@ mod incremental_publish;
 mod ownership;
 mod reachability;
 mod restore;
+#[cfg(test)]
+mod writer_lock_tests;

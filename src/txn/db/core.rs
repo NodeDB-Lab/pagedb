@@ -103,6 +103,9 @@ pub(crate) struct WriterState {
     /// A/B header's `free_list_root` slot and rewritten atomically with each
     /// commit. See [`crate::pager::freelist`].
     pub free_list_root_page_id: u64,
+    /// Entries in the free-list chain, copied into [`ReaderSnapshot`] at
+    /// publication. `None` until a commit or an open reads the chain head.
+    pub free_list_entries: Option<u64>,
     /// Root page id of the commit-history B+ tree (0 = not yet created).
     pub commit_history_root_page_id: u64,
     /// Version / `txn_id` of the commit-history tree's last write.
@@ -154,6 +157,9 @@ pub struct Db<V: Vfs + Clone> {
     /// Lock ordering is fixed: writer and apply locks are acquired before this
     /// write lock; reader admission acquires only this read lock. Tokio guards
     /// may cross awaits, while no guard from `parking_lot` may do so.
+    ///
+    /// A metadata walk holds the read side instead of registering a reader. See
+    /// [`Self::hold_published_snapshot`].
     pub(crate) visibility_gate: AsyncRwLock<()>,
     pub(crate) tracked_readers: parking_lot::Mutex<Vec<TrackedReader>>,
     pub(crate) reader_seq: AtomicU64,
@@ -266,6 +272,9 @@ pub(crate) struct ReaderSnapshot {
     pub next_page_id: u64,
     pub catalog_root_page_id: u64,
     pub free_list_root_page_id: u64,
+    /// Entries in the free-list chain this snapshot names. `None` means open
+    /// failed to read the chain head and no commit has counted it since.
+    pub free_list_entries: Option<u64>,
     /// Commit-history root accompanying this published snapshot. Historical
     /// reader admission resolves from this immutable root without taking the
     /// writer lock.

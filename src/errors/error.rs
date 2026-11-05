@@ -413,6 +413,17 @@ pub enum PagedbError {
     #[error("readers pinning truncated range")]
     ReadersPinningTruncatedRange,
 
+    /// An incremental apply was refused before it changed the store: its delta
+    /// rewrites a page a registered reader can still reach, or that reader's
+    /// pages cannot be walked to prove otherwise. Distinct from
+    /// [`Self::ReadersPinningTruncatedRange`], which reports a target already
+    /// durable and published. Here the handle stays at its base commit. Finish
+    /// the reader pinned at `reader_commit`, then retry the same delta.
+    #[error(
+        "apply refused: the reader pinned at {reader_commit:?} reaches a page this delta rewrites; finish that reader and retry the apply"
+    )]
+    ApplyBlockedByPinnedReader { reader_commit: CommitId },
+
     /// Resuming a rekey whose source and target epochs use different KEKs
     /// (`same_kek == false`) requires both the primary and counterpart KEK,
     /// but only the primary was supplied. Retry the resume with the

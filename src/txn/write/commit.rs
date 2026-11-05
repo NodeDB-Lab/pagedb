@@ -278,6 +278,11 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         )
         .await?;
         pending.next_page_id = new_next_page;
+        // The head's suffix summary covers the whole chain. The head is dirty in
+        // the cache unless the window rewrote no entries. In that case it is the
+        // retained tail, which is one page read.
+        let new_free_list_entries =
+            freelist::count_chain(&self.db.pager, self.db.realm_id, new_free_list_root).await?;
 
         // ── Flush + header swap ──────────────────────────────────────────────
         self.db.pager.flush_main(self.db.realm_id).await?;
@@ -350,6 +355,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         self.guard.catalog_root_page_id = new_catalog_root;
         self.guard.catalog_root_txn_id = new_commit_id;
         self.guard.free_list_root_page_id = new_free_list_root;
+        self.guard.free_list_entries = Some(new_free_list_entries);
         self.committed_or_aborted = true;
 
         // Black box: record the commit + how many pages it freed into the

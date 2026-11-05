@@ -67,6 +67,13 @@ impl<V: Vfs + Clone> Db<V> {
         // the bytes agree again.
         let visibility = self.visibility_gate.write().await;
 
+        // Reader admission is closed, so this answer stays true through the
+        // swap. It catches a reader admitted after the screen in the prepare.
+        // `main.db` is still the unchanged base image.
+        let base_snapshot = *self.snapshot.read();
+        self.refuse_delta_reaching_pinned_reader(base_snapshot, &delta_page_ids)
+            .await?;
+
         // Move this handle's own metadata out of the incoming page space. The
         // producer allocates over the ids hosting the follower's commit-history
         // tree and free-list chain because it cannot see them; the delta may
@@ -78,6 +85,7 @@ impl<V: Vfs + Clone> Db<V> {
         let carried = self
             .carry_commit_history(
                 &state,
+                staged_image,
                 &delta_page_ids,
                 &target_page_ids,
                 new_commit_id,
@@ -321,6 +329,7 @@ impl<V: Vfs + Clone> Db<V> {
         state.catalog_root_page_id = new_catalog_root_page_id;
         state.catalog_root_txn_id = new_commit_id;
         state.free_list_root_page_id = staged_free_list.free_list_root_page_id;
+        state.free_list_entries = staged_free_list.entries;
         state.commit_history_root_page_id = carried.root_page_id;
         state.commit_history_root_version = carried.root_version;
         state.commit_history_count = carried.entry_count;
@@ -352,6 +361,9 @@ impl<V: Vfs + Clone> Db<V> {
             self.poison(commit);
             return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
         }
+        // A read in the window before the rename can reopen the old inode. This
+        // close drops that handle, and the reset below drops whatever it cached.
+        self.pager.close_main_handle().await;
         // The staged image is the live image now, so every main page cached
         // from the base predates it. A failed reset leaves those pages resident,
         // so the handle poisons and reopen is the way out.

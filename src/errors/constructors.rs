@@ -35,6 +35,12 @@ impl PagedbError {
         }
     }
 
+    /// Canonical constructor for an apply refused to protect a pinned reader.
+    #[must_use]
+    pub const fn apply_blocked_by_pinned_reader(reader_commit: CommitId) -> Self {
+        Self::ApplyBlockedByPinnedReader { reader_commit }
+    }
+
     /// Canonical constructor for authenticated catalog/file metadata disagreement.
     ///
     /// Was `const fn` before diagnostics capture moved into [`Self::corruption`];

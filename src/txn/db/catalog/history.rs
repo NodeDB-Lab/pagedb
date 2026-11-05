@@ -130,14 +130,14 @@ impl<V: Vfs + Clone> Db<V> {
                 // in bounded batches — never by materialising the tree, which
                 // would size an allocation by how deep retention has run and
                 // put that on every commit once the limit is passed.
-                let known = match state.commit_history_count {
+                //
+                // The walk runs after the put above, so it already counts the
+                // new row. Adding that row again prunes one retained commit too
+                // many.
+                let total = match state.commit_history_count {
+                    Some(cached) if was_new => cached.saturating_add(1),
                     Some(cached) => cached,
                     None => count_history_rows(&hist_tree).await?,
-                };
-                let total = if was_new {
-                    known.saturating_add(1)
-                } else {
-                    known
                 };
                 let excess = total.saturating_sub(u64::from(*n));
                 let deleted = if excess == 0 {
@@ -429,6 +429,42 @@ mod tests {
             "a commit that prunes one row from a {ROWS}-row index cost {pruning} page lookups \
              against {not_pruning} for the same index with no pruning: the prune is reading \
              back what retention holds"
+        );
+    }
+
+    /// The tracked row count is unknown on the first commit after a reopen.
+    /// Recovering it must keep exactly the configured number of commits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_commit_after_a_reopen_retains_the_configured_count() {
+        let vfs = MemVfs::new();
+        let options = || OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(2));
+        let previous = {
+            let db = Db::open(vfs.clone(), [7u8; 32], PAGE, REALM, options())
+                .await
+                .unwrap();
+            let mut last = db.latest_commit();
+            for _ in 0..5 {
+                last = db.begin_write().await.unwrap().commit().await.unwrap();
+            }
+            last
+        };
+
+        let db = Db::open(vfs, [7u8; 32], PAGE, REALM, options())
+            .await
+            .unwrap();
+        let newest = db.begin_write().await.unwrap().commit().await.unwrap();
+
+        assert!(
+            db.begin_read_at(previous).await.is_ok(),
+            "Count(2) retains the commit before the newest one"
+        );
+        assert!(db.begin_read_at(newest).await.is_ok());
+        let Err(pruned) = db.begin_read_at(crate::CommitId(previous.0 - 1)).await else {
+            panic!("Count(2) prunes the third newest commit");
+        };
+        assert!(
+            matches!(pruned, PagedbError::CommitGone { oldest_available, .. } if oldest_available == previous),
+            "got: {pruned:?}"
         );
     }
 

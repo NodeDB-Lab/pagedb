@@ -69,8 +69,34 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id: state.next_page_id,
             catalog_root_page_id: state.catalog_root_page_id,
             free_list_root_page_id: state.free_list_root_page_id,
+            free_list_entries: state.free_list_entries,
             commit_history_root_page_id: state.commit_history_root_page_id,
         };
+    }
+
+    /// Keep the published snapshot intact for a short metadata walk, without
+    /// registering a reader.
+    ///
+    /// Every operation that publishes, relocates, or truncates takes the write
+    /// side of the gate. None of them runs while the returned guard lives. A page
+    /// the snapshot reaches is reused only after a newer snapshot is published.
+    /// Its bytes therefore stay in place for the walk.
+    ///
+    /// A registered reader gives the same guarantee, at a cost a metrics poll
+    /// cannot justify. It makes a concurrent compaction decline, it shows in
+    /// `DbStats`, and the stall policy can abort it.
+    ///
+    /// The cost here is that a commit waits at publication for the walk to end.
+    /// The walk also waits for a compaction, apply, or publication that holds
+    /// the write side.
+    ///
+    /// The caller must not hold the write side of the gate.
+    pub(crate) async fn hold_published_snapshot(
+        &self,
+    ) -> (tokio::sync::RwLockReadGuard<'_, ()>, ReaderSnapshot) {
+        let hold = self.visibility_gate.read().await;
+        let snapshot = *self.snapshot.read();
+        (hold, snapshot)
     }
 
     /// Register a reader with a snapshot pin. Stores the reader in the
@@ -108,6 +134,22 @@ impl<V: Vfs + Clone> Db<V> {
             catalog_root_page_id,
             entry_id,
         )
+    }
+
+    /// Commit id below which free-list entries are recyclable: the older of the
+    /// oldest live-reader pin and the oldest retained commit-history root.
+    /// Same derivation the write path uses at `begin`.
+    pub(in crate::txn::db) async fn reclamation_floor(&self, state: &WriterState) -> Result<u64> {
+        let min_reader = {
+            let readers = self.tracked_readers.lock();
+            readers.iter().map(|reader| reader.commit_id.0).min()
+        };
+        let history_floor = self
+            .oldest_retained_history_commit(state.commit_history_root_page_id, state.next_page_id)
+            .await?;
+        Ok(min_reader
+            .unwrap_or(u64::MAX)
+            .min(history_floor.map_or(u64::MAX, |commit| commit.saturating_add(1))))
     }
 
     /// Unregister a reader by its unique `entry_id`. Called from `ReadTxn::drop`.

@@ -128,10 +128,37 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         db.drop_unreadable_free_list().await;
     }
 
+    db.publish_free_list_count().await;
+
     Ok(())
 }
 
 impl<V: Vfs + Clone> Db<V> {
+    /// Count the settled free-list chain and publish the count, so `stats` never
+    /// reads the chain on a healthy store.
+    ///
+    /// This costs one page read. A read error leaves the count unknown and never
+    /// fails the open, because a free list records reclaimable space, not data.
+    async fn publish_free_list_count(&self) {
+        let mut state = self.writer.lock().await;
+        let entries =
+            match freelist::count_chain(&self.pager, self.realm_id, state.free_list_root_page_id)
+                .await
+            {
+                Ok(entries) => Some(entries),
+                Err(error) => {
+                    tracing::warn!(
+                        free_list_root = state.free_list_root_page_id,
+                        %error,
+                        "free-list head read failed at open; stats reads it on demand"
+                    );
+                    None
+                }
+            };
+        state.free_list_entries = entries;
+        self.snapshot.write().free_list_entries = entries;
+    }
+
     /// Detach the free-list chain when it cannot be read, so a store with a
     /// damaged chain still opens.
     ///

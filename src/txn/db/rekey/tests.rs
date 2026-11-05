@@ -612,3 +612,259 @@ async fn rekey_leaves_no_leaked_pages() {
         report.orphan_page_ids
     );
 }
+
+/// Commit the same key twice with no retained history, which leaves the first
+/// commit's leaf as a free page on disk. Returns the ids the free chain names.
+async fn store_with_a_free_page(options: OpenOptions) -> (MemVfs, Db<MemVfs>, Vec<u64>) {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal_with_options(vfs.clone(), KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    for value in [b"first".as_slice(), b"second".as_slice()] {
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(b"kept", value).await.unwrap();
+        txn.commit().await.unwrap();
+    }
+    let head = db.writer.lock().await.free_list_root_page_id;
+    let (entries, _chain_pages) = crate::pager::freelist::read_chain(&db.pager, REALM, head)
+        .await
+        .unwrap();
+    let free_pages: Vec<u64> = entries.iter().map(|&(_, page_id)| page_id).collect();
+    assert!(!free_pages.is_empty(), "setup error: no free page on disk");
+    (vfs, db, free_pages)
+}
+
+/// An aborted transaction draws free pages and writes other kinds over them in
+/// the cache. A rekey after the abort must not fail against those discarded pages.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_after_abort_reseals_free_pages_from_disk() {
+    use crate::pager::core::FileKey;
+
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    let (vfs, db, free_pages) = store_with_a_free_page(options.clone()).await;
+
+    let mut aborted = db.begin_write().await.unwrap();
+    aborted
+        .put(b"overflowing", &vec![0xCD; PAGE * 4])
+        .await
+        .unwrap();
+    let dirty = db
+        .pager
+        .inner
+        .buffer_pool
+        .lock()
+        .dirty_for_file(FileKey::Main);
+    assert!(
+        free_pages.iter().all(|page_id| dirty.contains(page_id)),
+        "setup error: the put did not draw every free page {free_pages:?}, dirty {dirty:?}"
+    );
+    aborted.abort().await;
+
+    db.rekey_db(KEK0, 1)
+        .await
+        .expect("rekey succeeds after an aborted transaction");
+
+    let reader = db.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"kept").await.unwrap().as_deref(),
+        Some(b"second".as_slice())
+    );
+    assert_eq!(reader.get(b"overflowing").await.unwrap(), None);
+    drop(reader);
+    drop(db);
+
+    let reopened = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    let reader = reopened.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"kept").await.unwrap().as_deref(),
+        Some(b"second".as_slice())
+    );
+}
+
+/// A crash mid-flush can tear a page the durable chain still names as free,
+/// because a later commit drew it and never published. Free pages carry no data,
+/// so a torn one cannot stop a rekey.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_succeeds_when_a_crash_tore_a_free_page() {
+    use crate::vfs::{OpenMode, Vfs, VfsFile};
+
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    let (vfs, db, free_pages) = store_with_a_free_page(options.clone()).await;
+    drop(db);
+
+    // A tear keeps the leading bytes and replaces the rest, so the kind byte
+    // survives and the tag fails.
+    let torn_offset = free_pages[0] * PAGE as u64 + (PAGE / 2) as u64;
+    let mut file = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+    file.write_at(torn_offset, &[0xEE; PAGE / 2]).await.unwrap();
+    file.sync().await.unwrap();
+    drop(file);
+
+    let db = Db::open_existing_with_options(vfs.clone(), KEK0, PAGE, REALM, options.clone())
+        .await
+        .expect("a torn free page leaves the store openable");
+    db.rekey_db(KEK0, 1)
+        .await
+        .expect("rekey succeeds past a torn free page");
+    drop(db);
+
+    let reopened = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options)
+        .await
+        .expect("the store reopens after the rekey");
+    let reader = reopened.begin_read().await.unwrap();
+    assert_eq!(
+        reader.get(b"kept").await.unwrap().as_deref(),
+        Some(b"second".as_slice())
+    );
+}
+
+/// A retained root can still reach this free page, so a tear is real corruption.
+/// The rekey refuses, and the torn bytes stay on disk as evidence.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_refuses_a_torn_free_page_a_retained_root_can_reach() {
+    use crate::vfs::{OpenMode, Vfs, VfsFile};
+
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded);
+    let (vfs, db, free_pages) = store_with_a_free_page(options.clone()).await;
+    drop(db);
+
+    let torn_offset = free_pages[0] * PAGE as u64 + (PAGE / 2) as u64;
+    let mut file = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+    file.write_at(torn_offset, &[0xEE; PAGE / 2]).await.unwrap();
+    file.sync().await.unwrap();
+    drop(file);
+
+    let db = Db::open_existing_with_options(vfs.clone(), KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    assert!(db.rekey_db(KEK0, 1).await.is_err());
+    drop(db);
+
+    let mut file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
+    let mut tail = vec![0_u8; PAGE / 2];
+    let read = file.read_at(torn_offset, &mut tail).await.unwrap();
+    assert_eq!(read, PAGE / 2);
+    assert_eq!(
+        tail,
+        vec![0xEE; PAGE / 2],
+        "the torn bytes stay as evidence"
+    );
+}
+
+/// A crash can tear a free page while a rekey is in flight. The resume runs at
+/// open from the durable intent, so a torn page must not stop the open at any
+/// boundary that still has a free-list pass ahead of it.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_resume_succeeds_past_a_torn_free_page() {
+    use super::super::core::RekeyTestFault;
+    use crate::vfs::{OpenMode, Vfs, VfsFile};
+
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    let boundaries = [
+        RekeyTestFault::Intent,
+        RekeyTestFault::MainPagesTargetReadable,
+        RekeyTestFault::HeaderTargetPublished,
+    ];
+    for point in boundaries {
+        let (vfs, db, free_pages) = store_with_a_free_page(options.clone()).await;
+        db.interrupt_rekey_after(point);
+        assert!(db.rekey_db(KEK0, 1).await.is_err(), "{point:?}");
+        drop(db);
+
+        let torn_offset = free_pages[0] * PAGE as u64 + (PAGE / 2) as u64;
+        let mut file = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+        file.write_at(torn_offset, &[0xEE; PAGE / 2]).await.unwrap();
+        file.sync().await.unwrap();
+        drop(file);
+
+        let db = Db::open_existing_with_options(vfs, KEK0, PAGE, REALM, options.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{point:?}: the resume failed: {error:?}"));
+        {
+            let state = db.writer.lock().await;
+            assert!(
+                db.load_rekey_intent(&state).await.unwrap().is_none(),
+                "{point:?}: the resumed rekey clears its durable intent"
+            );
+        }
+        assert!(
+            matches!(
+                db.pager.mk_for(0, db.cipher_id),
+                Err(PagedbError::MissingPersistedKey { mk_epoch: 0, .. })
+            ),
+            "{point:?}: a completed rekey retires the source epoch"
+        );
+        let reader = db.begin_read().await.unwrap();
+        assert_eq!(
+            reader.get(b"kept").await.unwrap().as_deref(),
+            Some(b"second".as_slice()),
+            "{point:?}"
+        );
+        drop(reader);
+        let report = crate::recovery::deep_walk::run_deep_walk(&db)
+            .await
+            .unwrap();
+        assert!(report.is_clean(), "{point:?}: deep walk report: {report:?}");
+    }
+}
+
+/// A free page nothing can read gets a fresh blank page under the target epoch.
+/// Its old plaintext does not move to the target key.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_blanks_free_pages_nothing_can_read() {
+    use crate::pager::PageKind;
+    use crate::vfs::{OpenMode, Vfs, VfsFile};
+
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    let (vfs, db, free_pages) = store_with_a_free_page(options.clone()).await;
+    db.rekey_db(KEK0, 1).await.unwrap();
+    drop(db);
+
+    let reopened = Db::open_existing_with_options(vfs.clone(), KEK0, PAGE, REALM, options)
+        .await
+        .unwrap();
+    let file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
+    for page_id in free_pages {
+        let guard = reopened
+            .pager
+            .read_main_page(page_id, REALM, PageKind::Free)
+            .await
+            .unwrap();
+        assert!(guard.body_ref().iter().all(|&byte| byte == 0));
+        drop(guard);
+
+        let mut envelope = [0u8; 12];
+        file.read_at(page_id * PAGE as u64, &mut envelope)
+            .await
+            .unwrap();
+        let sealed_epoch = u64::from_le_bytes(envelope[4..12].try_into().unwrap());
+        assert_eq!(sealed_epoch, 1, "page {page_id} left the source epoch");
+    }
+}
+
+/// A rekey frees the catalog pages its intent write supersedes under the latest
+/// commit id. A retained row at that commit still names them, so they keep their
+/// content even though the reclamation floor passes them.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_keeps_free_pages_a_retained_row_names() {
+    let (vfs, db) = fresh_db().await;
+    let first = {
+        let mut tx = db.begin_write().await.unwrap();
+        let mut counter = tx.counter("retained").unwrap();
+        counter.set(1).await.unwrap();
+        drop(counter);
+        tx.commit().await.unwrap()
+    };
+
+    db.rekey_db(KEK0, 1).await.unwrap();
+    drop(db);
+
+    let reopened = Db::open_existing(vfs, KEK0, PAGE, REALM).await.unwrap();
+    let historical = reopened.begin_read_at(first).await.unwrap();
+    assert!(matches!(
+        historical.open_segment("absent").await,
+        Err(PagedbError::NotFound)
+    ));
+}

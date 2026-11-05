@@ -83,6 +83,9 @@ impl<V: Vfs + Clone> Db<V> {
             manifest.next_page_id_at_target,
         )
         .await?;
+        // Refused here, before an image is cloned, so the refusal costs no copy.
+        self.refuse_delta_reaching_pinned_reader(base_snapshot, &plan.page_ids)
+            .await?;
 
         // Assemble the target beside the live file. `main.db` is not opened for
         // writing anywhere in this method; the rename below is the only thing
@@ -92,9 +95,11 @@ impl<V: Vfs + Clone> Db<V> {
             write_delta_into_image(&*self.vfs, staged_image, src_path, page_size, &plan).await?;
 
         // Authenticate the target through a read-only view of the staged image.
-        // Cached base pages are dropped first so the view's buffer pool and the
-        // live one are not both resident at their full configured budget.
-        self.pager.reset_main_pages()?;
+        // Clean base pages are dropped first so the view's buffer pool and the
+        // live one are not both resident at their full configured budget. This
+        // runs without the writer lock, so a dirty page belongs to another
+        // writer and stays.
+        self.pager.evict_clean_main_pages(self.realm_id)?;
         let staged_view = Arc::new(self.pager.open_main_view(staged_image.to_owned()));
         let target_page_ids = collect_tree_page_ids(
             &staged_view,

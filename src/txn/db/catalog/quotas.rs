@@ -11,13 +11,22 @@ use crate::pager::header::commit_header;
 use crate::vfs::Vfs;
 use crate::{RealmId, Result};
 
+use crate::txn::db::DbModeCapabilities;
 use crate::txn::db::core::{Db, HeaderFieldsParams, encode_root_ref};
+use crate::txn::mode::DbMode;
 
 impl<V: Vfs + Clone> Db<V> {
     /// Write per-realm quota caps into the catalog B+ tree and persist the
     /// updated catalog root to the A/B header.
+    ///
+    /// Returns `PagedbError::WrongMode` if the handle is not in Standalone mode.
     pub async fn set_realm_quotas(&self, realm: RealmId, quotas: RealmQuotas) -> Result<()> {
         self.ensure_usable()?;
+        self.require_mode(
+            "set_realm_quotas",
+            DbMode::Standalone,
+            DbModeCapabilities::allows_user_writes,
+        )?;
         let mut state = self.writer.lock().await;
         self.ensure_usable()?;
         let key = Catalog::quota_key(realm);
@@ -93,9 +102,12 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Read per-realm quota caps from the catalog B+ tree. Returns
     /// `RealmQuotas::default()` if no entry has been written for this realm.
+    ///
+    /// Waits while a compaction, an incremental apply, or a commit publication
+    /// holds the visibility gate.
     pub async fn realm_quotas(&self, realm: RealmId) -> Result<RealmQuotas> {
         self.ensure_usable()?;
-        let snapshot = *self.snapshot.read();
+        let (_hold, snapshot) = self.hold_published_snapshot().await;
         let key = Catalog::quota_key(realm);
         let cat_tree = BTree::open(
             self.pager.clone(),
