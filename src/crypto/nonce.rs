@@ -196,9 +196,8 @@ impl SegmentNonceGen {
 
     /// The counter value the next `next_nonce()` call would consume.
     ///
-    /// The segment writer derives page ids from its own append cursor, so the
-    /// only remaining consumers are tests and the pager's cache-backed segment
-    /// append path, which is itself test-only.
+    /// The segment writer derives page ids from its own append cursor, so only
+    /// tests call this.
     #[cfg(test)]
     #[must_use]
     pub fn peek_counter(&self) -> u64 {

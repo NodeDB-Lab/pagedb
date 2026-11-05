@@ -79,8 +79,8 @@ pub struct OpenOptions {
     /// Number of 4 KiB / 8 KiB / 16 KiB pages held in the Pager's buffer pool.
     pub buffer_pool_pages: usize,
 
-    /// Number of pages held in the shared SIEVE cache for segment files.
-    /// The same cache also holds apply-journal pages.
+    /// Number of pages held in the SIEVE cache for apply-journal pages.
+    /// Segment file reads do not use this cache.
     pub segment_cache_pages: usize,
 
     /// Maximum bytes of already-decrypted scratch that `mmap_view` may map at

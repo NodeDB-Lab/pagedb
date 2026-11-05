@@ -174,7 +174,7 @@ impl PagerInner {
     pub(crate) fn cache_for_key(&self, file: FileKey) -> &parking_lot::Mutex<PageCache> {
         match file {
             FileKey::Main => &self.buffer_pool,
-            FileKey::Segment(_) | FileKey::ApplyJournal(_) => &self.segment_cache,
+            FileKey::ApplyJournal(_) => &self.segment_cache,
         }
     }
 
@@ -220,7 +220,6 @@ pub struct Pager<V: Vfs> {
     /// that never writes a main.db header — a read-only image view — which is
     /// also a handle that never issues a main.db nonce.
     live_header: parking_lot::Mutex<Option<LiveHeader>>,
-    segment_nonces: parking_lot::Mutex<BTreeMap<[u8; 16], SegmentNonceGen>>,
     /// Per-journal-sidecar nonce generators. Each apply allocates a fresh,
     /// never-reused `journal_id`, so a generator seeded from that id never
     /// collides with another journal's nonces under one key.
@@ -317,7 +316,6 @@ impl<V: Vfs + Clone> Pager<V> {
             dek_lru: parking_lot::Mutex::new(DekLru::with_capacity(cfg.dek_lru_capacity)),
             main_nonce: parking_lot::Mutex::new(main_nonce),
             live_header: parking_lot::Mutex::new(None),
-            segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             files: AsyncMutex::new(BTreeMap::new()),
             handle_generation: AtomicU64::new(0),
@@ -368,7 +366,7 @@ impl<V: Vfs> Pager<V> {
     pub(crate) fn file_identity(&self, file: FileKey) -> [u8; 16] {
         match file {
             FileKey::Main => self.cfg.main_db_file_id,
-            FileKey::Segment(id) | FileKey::ApplyJournal(id) => id,
+            FileKey::ApplyJournal(id) => id,
         }
     }
 
@@ -415,7 +413,6 @@ impl<V: Vfs> Pager<V> {
             dek_lru: parking_lot::Mutex::new(DekLru::with_capacity(cfg.dek_lru_capacity)),
             main_nonce: parking_lot::Mutex::new(main_nonce),
             live_header: parking_lot::Mutex::new(None),
-            segment_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             journal_nonces: parking_lot::Mutex::new(BTreeMap::new()),
             files: AsyncMutex::new(BTreeMap::new()),
             handle_generation: AtomicU64::new(0),
@@ -519,37 +516,6 @@ impl<V: Vfs> Pager<V> {
         .await
     }
 
-    /// Read a segment page. Decrypts on cache miss; pins the result.
-    ///
-    /// Layer 3b owns its own file framing: `SegmentReader` reads and
-    /// authenticates segment bytes directly against the pager's key material,
-    /// so no production path routes segment pages through the page cache. The
-    /// cache-backed trio here (`read_segment_page`, `append_segment_page`,
-    /// `flush_segment`) is retained as the cache/AEAD round-trip fixture the
-    /// pager's own tests drive.
-    #[cfg(test)]
-    pub async fn read_segment_page(
-        &self,
-        segment_id: [u8; 16],
-        page_id: u64,
-        realm_id: RealmId,
-        expected_kind: PageKind,
-    ) -> Result<PageGuard> {
-        if !expected_kind.is_segment() {
-            return Err(PagedbError::IllegalPageKind);
-        }
-        let (guard, _kind) = self
-            .read_page(
-                FileKey::Segment(segment_id),
-                page_id,
-                realm_id,
-                KindBinding::Fixed(expected_kind),
-                segment_id,
-            )
-            .await?;
-        Ok(guard)
-    }
-
     /// Write (insert into cache as dirty) a main.db page. The copy-on-write caller has
     /// already chosen `page_id`. `body_plain` is the plaintext payload
     /// (length must equal `page_size - 40`).
@@ -565,45 +531,6 @@ impl<V: Vfs> Pager<V> {
             return Err(PagedbError::IllegalPageKind);
         }
         self.write_page(FileKey::Main, page_id, realm_id, page_kind, body_plain)
-    }
-
-    /// Append a fresh segment page; returns the assigned `page_id` (1-based;
-    /// page 0 is the segment header, allocated separately by the segment
-    /// writer in a later slice). Test-only; see [`Self::read_segment_page`].
-    #[cfg(test)]
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn append_segment_page(
-        &self,
-        segment_id: [u8; 16],
-        realm_id: RealmId,
-        page_kind: PageKind,
-        body_plain: &[u8],
-    ) -> Result<u64> {
-        if !page_kind.is_segment() {
-            return Err(PagedbError::IllegalPageKind);
-        }
-        let page_id = {
-            let gens = self.segment_nonces.lock();
-            // peek without consuming — we need the id before writing
-            gens.get(&segment_id)
-                .map_or(1u64, SegmentNonceGen::peek_counter)
-        };
-        self.write_page(
-            FileKey::Segment(segment_id),
-            page_id,
-            realm_id,
-            page_kind,
-            body_plain,
-        )?;
-        // Consume the counter slot after successful insert.
-        {
-            let mut gens = self.segment_nonces.lock();
-            let nonce_gen = gens
-                .entry(segment_id)
-                .or_insert_with(|| SegmentNonceGen::new(&segment_id));
-            let _ = nonce_gen.next_nonce()?;
-        }
-        Ok(page_id)
     }
 
     /// Stage an apply-journal sidecar page into the cache as dirty. `page_id`
@@ -743,14 +670,6 @@ impl<V: Vfs> Pager<V> {
         let mut files = self.files.lock().await;
         self.handle_generation.fetch_add(1, AtomOrd::SeqCst);
         files.remove(&FileKey::Main);
-    }
-
-    /// Flush all dirty pages for one segment to the VFS in physical-id order.
-    /// Test-only; see [`Self::read_segment_page`].
-    #[cfg(test)]
-    pub async fn flush_segment(&self, segment_id: [u8; 16], realm_id: RealmId) -> Result<()> {
-        self.flush_file(FileKey::Segment(segment_id), realm_id, segment_id, None)
-            .await
     }
 
     /// Snapshot of the anchor the header writer should persist next.
@@ -1244,10 +1163,7 @@ impl<V: Vfs> Pager<V> {
                     // An apply-journal sidecar is not a segment, so its id does
                     // not go in a field named `segment_id`; `file` is already
                     // in the diagnostic report above.
-                    segment_id: match file {
-                        FileKey::Segment(id) => Some(id),
-                        FileKey::Main | FileKey::ApplyJournal(_) => None,
-                    },
+                    segment_id: None,
                     page_id,
                     evictable: None,
                 },
@@ -1430,7 +1346,6 @@ impl<V: Vfs> Pager<V> {
     async fn open_file_handle(&self, file: FileKey) -> Result<Arc<AsyncMutex<V::File>>> {
         let path = match file {
             FileKey::Main => self.cfg.main_db_path.clone(),
-            FileKey::Segment(id) => format!("seg/{}", crate::hex::to_hex_lower(&id)),
             FileKey::ApplyJournal(id) => {
                 format!("applyjournal/{}", crate::hex::to_hex_lower(&id))
             }
@@ -1462,13 +1377,12 @@ impl<V: Vfs> Pager<V> {
     }
 
     /// How many nonces this flush may still issue before its generator needs an
-    /// anchor commit. Only `main.db` has an anchor: segment and apply-journal
-    /// counters are committed whole by their own seal record, so their window is
-    /// unbounded here.
+    /// anchor commit. Only `main.db` has an anchor. Apply-journal counters have
+    /// no anchor, so their window is unbounded here.
     fn flush_nonce_window(&self, file: FileKey) -> usize {
         match file {
             FileKey::Main => usize::try_from(self.main_anchor_window()).unwrap_or(usize::MAX),
-            FileKey::Segment(_) | FileKey::ApplyJournal(_) => usize::MAX,
+            FileKey::ApplyJournal(_) => usize::MAX,
         }
     }
 
@@ -1477,11 +1391,6 @@ impl<V: Vfs> Pager<V> {
             FileKey::Main => {
                 let mut g = self.main_nonce.lock();
                 g.next_nonce()
-            }
-            FileKey::Segment(id) => {
-                let mut gens = self.segment_nonces.lock();
-                let nonce_gen = gens.entry(id).or_insert_with(|| SegmentNonceGen::new(&id));
-                nonce_gen.next_nonce()
             }
             FileKey::ApplyJournal(id) => {
                 let mut gens = self.journal_nonces.lock();
@@ -1514,7 +1423,6 @@ fn derive_kind_for_flush(file: FileKey) -> PageKind {
     // page roles are explicit.
     match file {
         FileKey::Main => PageKind::BTreeLeaf,
-        FileKey::Segment(_) => PageKind::SegmentData,
         FileKey::ApplyJournal(_) => PageKind::ApplyJournal,
     }
 }
@@ -1730,32 +1638,30 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "current_thread")]
-    async fn write_flush_read_round_trip_segment() {
+    async fn write_flush_read_round_trip_journal() {
         let pager = mk_pager().await;
         let realm = RealmId([7; 16]);
-        let seg_id = [0x11; 16];
+        let journal_id = [0x11; 16];
         let mut body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
         body[..6].copy_from_slice(b"segdat");
-        let page_id = pager
-            .append_segment_page(seg_id, realm, PageKind::SegmentData, &body)
+        pager
+            .stage_journal_page(journal_id, 0, realm, &body)
             .await
             .unwrap();
-        pager.flush_segment(seg_id, realm).await.unwrap();
+        pager.flush_journal(journal_id, realm).await.unwrap();
         // Push other pages to evict.
         let blank = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
-        for _ in 0..10 {
-            let _ = pager
-                .append_segment_page(seg_id, realm, PageKind::SegmentData, &blank)
+        for page_id in 1..=10u64 {
+            pager
+                .stage_journal_page(journal_id, page_id, realm, &blank)
                 .await
                 .unwrap();
         }
-        pager.flush_segment(seg_id, realm).await.unwrap();
+        pager.flush_journal(journal_id, realm).await.unwrap();
 
-        let guard = pager
-            .read_segment_page(seg_id, page_id, realm, PageKind::SegmentData)
-            .await
-            .unwrap();
+        let guard = pager.read_journal_page(journal_id, 0, realm).await.unwrap();
         let got = guard.body();
         assert_eq!(&got[..6], b"segdat");
     }
@@ -1867,19 +1773,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rejects_illegal_page_kind_on_segment() {
-        let pager = mk_pager().await;
-        let realm = RealmId([0; 16]);
-        let body = vec![0u8; PAGE - ENVELOPE_OVERHEAD];
-        let err = pager
-            .append_segment_page([0; 16], realm, PageKind::BTreeLeaf, &body)
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(err, PagedbError::IllegalPageKind));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn body_size_enforced() {
         let pager = mk_pager().await;
         let realm = RealmId([0; 16]);
@@ -1893,6 +1786,7 @@ mod tests {
         assert!(matches!(err, PagedbError::PayloadTooLarge));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "current_thread")]
     async fn cache_class_isolation() {
         let pager = mk_pager().await;
@@ -1905,11 +1799,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Hammer the segment cache with 8 pages — these go into segment_cache,
-        // not buffer_pool, so main pages must remain dirty and intact.
-        for _ in 0..8u64 {
-            let _ = pager
-                .append_segment_page([9; 16], realm, PageKind::SegmentData, &body)
+        // Hammer the segment cache with 8 journal pages. They go into
+        // segment_cache, not buffer_pool, so main pages must remain dirty and intact.
+        for page_id in 0..8u64 {
+            pager
+                .stage_journal_page([9; 16], page_id, realm, &body)
                 .await
                 .unwrap();
         }

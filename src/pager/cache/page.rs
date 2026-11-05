@@ -6,9 +6,6 @@ use bytes::Bytes;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FileKey {
     Main,
-    /// Only the pager's own tests build this key. Segment files use their own reader.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Segment([u8; 16]),
     /// Apply-journal sidecar at `applyjournal/<hex(id)>`. A receiver-local,
     /// AEAD-authenticated file written before an `apply_incremental` header
     /// swap; it is neither a `main.db` page nor a catalog-tracked segment.

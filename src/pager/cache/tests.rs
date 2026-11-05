@@ -412,8 +412,8 @@ fn dirty_iter_is_sorted_ascending() {
 #[test]
 fn dirty_for_file_returns_only_that_files_pages_in_order() {
     let mut c = PageCache::with_capacity(16);
-    let seg = FileKey::Segment([7; 16]);
-    let journal = FileKey::ApplyJournal([7; 16]);
+    let seg = FileKey::ApplyJournal([7; 16]);
+    let journal = FileKey::ApplyJournal([9; 16]);
     for key in [
         (seg, 9),
         (FileKey::Main, 30),
@@ -430,7 +430,7 @@ fn dirty_for_file_returns_only_that_files_pages_in_order() {
     assert_eq!(c.dirty_for_file(FileKey::Main), vec![10, 30]);
     assert_eq!(c.dirty_for_file(journal), vec![4]);
     assert_eq!(
-        c.dirty_for_file(FileKey::Segment([8; 16])),
+        c.dirty_for_file(FileKey::ApplyJournal([8; 16])),
         Vec::<u64>::new()
     );
 }
@@ -439,9 +439,14 @@ fn dirty_for_file_returns_only_that_files_pages_in_order() {
 fn file_classes_dont_collide() {
     let mut c = PageCache::with_capacity(4);
     c.insert((FileKey::Main, 1), page(1)).unwrap();
-    c.insert((FileKey::Segment([0; 16]), 1), page(2)).unwrap();
+    c.insert((FileKey::ApplyJournal([0; 16]), 1), page(2))
+        .unwrap();
     assert!(c.get((FileKey::Main, 1)).unwrap().is_some());
-    assert!(c.get((FileKey::Segment([0; 16]), 1)).unwrap().is_some());
+    assert!(
+        c.get((FileKey::ApplyJournal([0; 16]), 1))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -653,7 +658,7 @@ fn finish_flush_keeps_a_replaced_page_dirty() {
 #[test]
 fn discard_dirty_returns_pool_to_capacity() {
     let mut c = PageCache::with_capacity(4);
-    let other_file = (FileKey::Segment([1; 16]), 1);
+    let other_file = (FileKey::ApplyJournal([1; 16]), 1);
     add_dirty(&mut c, 1..=10);
     c.insert(other_file, page(1)).unwrap();
     c.mark_dirty(other_file).unwrap();
@@ -923,7 +928,7 @@ fn dirty_entries_stay_off_the_eviction_list_until_clean() {
 /// stays consistent, and another file's entry is evicted in its turn.
 #[test]
 fn clearing_a_file_drops_unlinked_dirty_entries() {
-    let segment_key = (FileKey::Segment([7; 16]), 1);
+    let segment_key = (FileKey::ApplyJournal([7; 16]), 1);
     let mut c = PageCache::with_capacity(3);
     c.insert(main_key(1), page(1)).unwrap();
     c.insert(segment_key, page(2)).unwrap();
