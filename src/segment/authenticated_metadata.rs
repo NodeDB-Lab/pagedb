@@ -380,11 +380,11 @@ fn validate_index_entries(
     unused_tail: &mut bool,
     entries: &mut Vec<ExtentIndexEntry>,
 ) -> Result<()> {
-    let mut chunks = page_body.chunks_exact(EXTENT_INDEX_ENTRY_LEN);
-    if chunks.remainder().iter().any(|byte| *byte != 0) {
+    let (chunks, remainder) = page_body.as_chunks::<EXTENT_INDEX_ENTRY_LEN>();
+    if remainder.iter().any(|byte| *byte != 0) {
         return Err(PagedbError::segment_metadata_mismatch("index.unused_tail"));
     }
-    for encoded in &mut chunks {
+    for encoded in chunks {
         if encoded.iter().all(|byte| *byte == 0) {
             *unused_tail = true;
             continue;
@@ -399,10 +399,7 @@ fn validate_index_entries(
                 "index.entry.reserved",
             ));
         }
-        let entry_bytes: &[u8; EXTENT_INDEX_ENTRY_LEN] = encoded
-            .try_into()
-            .map_err(|_| PagedbError::segment_geometry_invalid("index.entry_length"))?;
-        let entry = ExtentIndexEntry::decode(entry_bytes);
+        let entry = ExtentIndexEntry::decode(encoded);
         if entry.start_page_id == 0 || entry.page_count == 0 {
             return Err(PagedbError::segment_metadata_mismatch("index.entry.zero"));
         }

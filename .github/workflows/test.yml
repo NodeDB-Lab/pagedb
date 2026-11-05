@@ -353,6 +353,25 @@ jobs:
           cargo bench --no-run -p pagedb-engine-comparison
 
   # ─────────────────────────────────────────────────────────────────────────
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: msrv
+
+      - name: cargo check
+        run: cargo check -p pagedb --lib --bins --all-features
+
+  # ─────────────────────────────────────────────────────────────────────────
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
@@ -365,4 +384,4 @@ jobs:
         with:
           tool: cargo-deny
       - name: Run cargo-deny
-        run: cargo deny --exclude-dev check
+        run: cargo deny --workspace --exclude-dev check

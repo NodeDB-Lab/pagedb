@@ -291,15 +291,15 @@ impl<V: Vfs> BTree<V> {
         // no live reader and no retained-history root can observe — so reusing
         // them is safe regardless of `reuse_threshold`. Record each draw so the
         // commit path removes it from the durable free-list.
-        if let Some(source) = &self.page_source {
-            if let Some(id) = source.cache.lock().pop() {
-                assert!(
-                    id >= 4,
-                    "allocate_page recycled reserved page {id} from free-list cache"
-                );
-                source.consumed.record(id);
-                return id;
-            }
+        if let Some(source) = &self.page_source
+            && let Some(id) = source.cache.lock().pop()
+        {
+            assert!(
+                id >= 4,
+                "allocate_page recycled reserved page {id} from free-list cache"
+            );
+            source.consumed.record(id);
+            return id;
         }
         let id = self.next_page_id;
         assert!(

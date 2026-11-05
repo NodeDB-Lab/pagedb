@@ -54,6 +54,7 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"   # warn (not deny) — common in transitive trees
 wildcards = "deny"            # no `foo = "*"` deps in our Cargo.toml
+allow-wildcard-paths = true   # path deps of `publish = false` members have no version
 highlight = "all"
 deny = [
     # { name = "openssl", version = "<0.10" },  # example

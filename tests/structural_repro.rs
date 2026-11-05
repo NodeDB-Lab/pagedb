@@ -52,7 +52,7 @@ fn key(i: u64) -> Vec<u8> {
 /// depends on `generation`, so rewrites flip records between inline and
 /// overflow representations, churning overflow-chain allocation and release.
 fn value(i: u64, generation: u64) -> Vec<u8> {
-    let len = if (i + generation) % 10 == 0 {
+    let len = if (i + generation).is_multiple_of(10) {
         3000
     } else {
         300

@@ -2850,7 +2850,7 @@ async fn apply_incremental_rejects_delta_depending_on_leftover_future_pages() {
     let target_active_root_page_id = u64::from_le_bytes(manifest[102..110].try_into().unwrap());
     let mut corrupt_retry_delta = original_delta;
     let mut corrupted = false;
-    for record in corrupt_retry_delta.chunks_exact_mut(8 + PAGE) {
+    for record in corrupt_retry_delta.as_chunks_mut::<{ 8 + PAGE }>().0 {
         let page_id = u64::from_be_bytes(record[..8].try_into().unwrap());
         if page_id == target_active_root_page_id {
             record[8 + 128] ^= 0xFF;
@@ -3986,7 +3986,9 @@ async fn a_delta_that_recycles_follower_private_page_ids_applies_cleanly() {
 fn delta_page_ids(delta_dir: &std::path::Path) -> std::collections::BTreeSet<u64> {
     let delta = std::fs::read(delta_dir.join("pages.delta")).unwrap();
     delta
-        .chunks_exact(8 + PAGE)
+        .as_chunks::<{ 8 + PAGE }>()
+        .0
+        .iter()
         .map(|record| u64::from_be_bytes(record[..8].try_into().unwrap()))
         .collect()
 }

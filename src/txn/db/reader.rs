@@ -82,12 +82,12 @@ impl<V: Vfs + Clone> Db<V> {
     /// the snapshot reaches is reused only after a newer snapshot is published.
     /// Its bytes therefore stay in place for the walk.
     ///
-    /// A registered reader gives the same guarantee, at a cost a metrics poll
-    /// cannot justify. It makes a concurrent compaction decline, it shows in
-    /// `DbStats`, and the stall policy can abort it.
+    /// A registered reader gives the same guarantee at a cost a metrics poll
+    /// cannot justify. It makes a concurrent compaction decline. It shows in
+    /// `DbStats`. The stall policy can abort it.
     ///
     /// The cost here is that a commit waits at publication for the walk to end.
-    /// The walk also waits for a compaction, apply, or publication that holds
+    /// The walk also waits for any compaction, apply, or publication that holds
     /// the write side.
     ///
     /// The caller must not hold the write side of the gate.
@@ -163,10 +163,8 @@ impl<V: Vfs + Clone> Db<V> {
             }
             readers.is_empty()
         };
-        if readers_drained {
-            if let Err(error) = self.drain_pending_key_retirements() {
-                tracing::error!(error = %error, "deferred rekey source retirement failed");
-            }
+        if readers_drained && let Err(error) = self.drain_pending_key_retirements() {
+            tracing::error!(error = %error, "deferred rekey source retirement failed");
         }
     }
 

@@ -92,10 +92,10 @@ impl Vfs for TokioVfs {
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
         let p = self.resolve(path)?;
         // Ensure parent directories exist for create modes.
-        if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
-            if let Some(parent) = p.parent() {
-                fs::create_dir_all(parent).await.map_err(PagedbError::Io)?;
-            }
+        if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen)
+            && let Some(parent) = p.parent()
+        {
+            fs::create_dir_all(parent).await.map_err(PagedbError::Io)?;
         }
         let (file, writable) = match mode {
             OpenMode::Read => {

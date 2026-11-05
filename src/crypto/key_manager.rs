@@ -120,10 +120,10 @@ impl DekLru {
             }
         };
 
-        if self.map.len() >= self.capacity {
-            if let Some(victim) = self.order.pop_front() {
-                self.map.remove(&victim);
-            }
+        if self.map.len() >= self.capacity
+            && let Some(victim) = self.order.pop_front()
+        {
+            self.map.remove(&victim);
         }
         self.order.push_back(key);
         self.map.insert(key, cipher);

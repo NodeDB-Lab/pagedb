@@ -268,10 +268,10 @@ impl<V: Vfs> BTree<V> {
     /// any workload where the embedder can guarantee monotonic-key insert.
     pub async fn put_append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         // Monotonic invariant: strictly greater than the last appended key.
-        if let Some(last) = &self.append_last_key {
-            if key <= last.as_slice() {
-                return Err(PagedbError::AppendNotMonotonic);
-            }
+        if let Some(last) = &self.append_last_key
+            && key <= last.as_slice()
+        {
+            return Err(PagedbError::AppendNotMonotonic);
         }
         self.validate_insert_record_fits(key, value)?;
 

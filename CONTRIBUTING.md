@@ -92,7 +92,7 @@ These are enforced in review. They are properties of the format and the failure 
 
 **Requirements:**
 
-- Rust 1.85 or later (the MSRV in `Cargo.toml`; edition 2024 needs it).
+- Rust 1.88 or later (the MSRV in `Cargo.toml`). The crate and its dependencies use let-chains, which need it.
 - `cargo-nextest` for the test suite.
 - Linux 5.1+ gets the `io_uring` backend; older kernels and other platforms fall back automatically, and the suite passes on all of them.
 

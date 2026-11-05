@@ -75,10 +75,10 @@ impl Vfs for IouringVfs {
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
         let p = self.resolve(path)?;
         let (file, writable) = offload(move || {
-            if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
-                if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-                }
+            if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen)
+                && let Some(parent) = p.parent()
+            {
+                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
             }
             let opened = match mode {
                 OpenMode::Read => {
