@@ -127,11 +127,12 @@ impl<V: Vfs + Clone> Db<V> {
     /// Waits while a compaction, an incremental apply, or a commit publication
     /// holds the visibility gate. Registers no reader, so a concurrent compaction
     /// waits for this call instead of declining.
+    ///
+    /// A poisoned handle returns the poison error. Its published roots can name
+    /// pages in a file they do not describe, so a walk from them proves nothing.
     pub async fn stats(&self) -> Result<DbStats> {
-        // Stats that describe reader-visible state must use the publication
-        // snapshot, which remains at the prior commit while a handle is
-        // poisoned after a post-header reconciliation failure.
-        let (_hold, snapshot) = self.hold_published_snapshot().await;
+        self.ensure_usable()?;
+        let (_hold, snapshot) = self.hold_published_snapshot().await?;
         let (next_page_id, catalog_root, catalog_next) = (
             snapshot.next_page_id,
             snapshot.catalog_root_page_id,

@@ -156,6 +156,8 @@ impl<V: Vfs + Clone> Db<V> {
         // the writer first. A caller holding a write transaction therefore never
         // blocks on the gate.
         let writer = self.writer.try_lock().ok();
+        // A poisoned handle's roots can name pages over a file they do not describe.
+        self.ensure_usable()?;
         let (data_root, catalog_root, history_root, next_page_id, free_list_root, _published_hold) =
             if let Some(state) = writer.as_ref() {
                 (
@@ -167,7 +169,7 @@ impl<V: Vfs + Clone> Db<V> {
                     None,
                 )
             } else {
-                let (hold, snapshot) = self.hold_published_snapshot().await;
+                let (hold, snapshot) = self.hold_published_snapshot().await?;
                 (
                     snapshot.root_page_id,
                     snapshot.catalog_root_page_id,

@@ -4,7 +4,9 @@
 mod apply_journal;
 mod catalog;
 mod core;
+mod free_fold;
 mod gc;
+mod guards;
 // Serves the native-only incremental-snapshot apply path, like `reclaim` below;
 // gate it the same way.
 #[cfg(not(target_arch = "wasm32"))]

@@ -139,13 +139,22 @@ impl<V: Vfs + Clone> Db<V> {
             )?,
         };
         let mut state = self.writer.lock().await;
+        self.ensure_usable()?;
+        // Armed from the first intent write through completion. That write moves
+        // the free-list root in `state` before its header lands. Every later stage
+        // leaves target-epoch pages and durable headers ahead of memory. A rekey
+        // advances no commit, so the poison names the latest one. A reopen resumes
+        // from whatever intent stage is durable.
+        let publish = self.arm_durable_publish(crate::CommitId(state.latest_commit_id));
         self.write_rekey_intent_locked(&mut state, &intent, source_epoch, &source_header_key)
             .await?;
         #[cfg(test)]
         self.interrupt_rekey_if_requested(RekeyTestFault::Intent)?;
         self.pager
             .install_mk_epoch(target_master_key, new_mk_epoch, self.cipher_id);
-        self.resume_rekey_locked(&mut state, intent).await
+        self.resume_rekey_locked(&mut state, intent).await?;
+        publish.disarm();
+        Ok(())
     }
 
     pub(in crate::txn::db) async fn resume_rekey_intent(&self) -> Result<()> {
@@ -737,52 +746,13 @@ impl<V: Vfs + Clone> Db<V> {
         if freed_pages.is_empty() {
             return Ok(next_page_id);
         }
-        // A bounded window, spliced onto the retained tail, for the same reason
-        // the commit path uses one: the fold only prepends entries, so nothing
-        // here needs a view of the complete set. Hosts are empty, so no page
-        // reaches an allocator from this path at all and the window carries no
-        // duplicate-safety obligation beyond deleting what it rewrites.
-        let window = crate::pager::freelist::read_chain_prefix(
-            &self.pager,
-            self.realm_id,
-            state.free_list_root_page_id,
-            crate::pager::freelist::WINDOW_PAGES,
-        )
-        .await?;
-        let mut entries = window.entries;
-        // A rekey advances no commit, so the row at the latest commit still
-        // reaches these pages. An entry is reusable when its tag is at or below
-        // the oldest row. Tagging one past the latest holds them until that row
-        // is gone.
-        let freed_at = state.latest_commit_id.saturating_add(1);
-        entries.extend(freed_pages.iter().map(|&page_id| (freed_at, page_id)));
-        // Chain pages are writer-only metadata that no reader snapshot ever
-        // traverses, so they carry a commit id below every real floor and are
-        // immediately recyclable — the same rule the ordinary commit path uses.
-        entries.extend(
-            window
-                .chain_pages
-                .into_iter()
-                .map(|page_id| (crate::pager::freelist::CHAIN_METADATA_CID, page_id)),
-        );
-        let (new_free_list_root, new_next_page_id) = crate::pager::freelist::rewrite_chain(
-            &self.pager,
-            self.realm_id,
-            self.page_size,
-            entries,
-            Vec::new(),
-            next_page_id,
-            window.tail,
-        )
-        .await?;
-        // The head is dirty in the cache unless the window rewrote no entries.
-        let new_free_list_entries =
-            crate::pager::freelist::count_chain(&self.pager, self.realm_id, new_free_list_root)
-                .await?;
-        state.free_list_root_page_id = new_free_list_root;
-        state.free_list_entries = Some(new_free_list_entries);
+        let folded = self
+            .fold_freed_catalog_pages(state, freed_pages, next_page_id)
+            .await?;
+        state.free_list_root_page_id = folded.root_page_id;
+        state.free_list_entries = folded.entries;
         self.pager.flush_main(self.realm_id).await?;
-        Ok(new_next_page_id)
+        Ok(folded.next_page_id)
     }
 
     pub(super) async fn commit_rekey_catalog_root(

@@ -3,6 +3,7 @@
 #![allow(clippy::pedantic)]
 
 mod anchor_commit_interruption;
+mod cancellation;
 mod compaction_stats_races;
 #[cfg(not(target_arch = "wasm32"))]
 mod export_free_chain;

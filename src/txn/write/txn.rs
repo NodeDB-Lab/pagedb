@@ -530,19 +530,20 @@ impl<V: Vfs + Clone> Drop for WriteTxn<'_, V> {
     fn drop(&mut self) {
         if !self.committed_or_aborted {
             self.db.pager.discard_dirty_main();
-            // The gauge describes the live writer's scratch, and the writer
-            // lock this drop is about to release means there is no other one to
-            // account for. Leaving it set would report bytes of a transaction
-            // that no longer exists.
-            self.db
-                .spill_bytes_in_use
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-            // Removal has to await, which a drop cannot. Hand the exact path to
-            // the next `begin_write`; if the handle closes first, the next open
-            // sweeps it.
-            if let Some(path) = self.spill_path.take() {
-                self.db.orphaned_spill_paths.lock().push(path);
-            }
+        }
+        // These two run however the transaction ended. A caller can drop `commit`
+        // or `abort` during their spill cleanup, after that flag is set.
+        //
+        // The gauge describes the live writer's scratch. This drop is about to
+        // release the writer lock, so no other writer has scratch to account for.
+        // A gauge left set reports bytes of a transaction that no longer exists.
+        self.db
+            .spill_bytes_in_use
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Removal has to await, which a drop cannot. Hand the exact path to the
+        // next `begin_write`. If the handle closes first, the next open sweeps it.
+        if let Some(path) = self.spill_path.take() {
+            self.db.orphaned_spill_paths.lock().push(path);
         }
     }
 }

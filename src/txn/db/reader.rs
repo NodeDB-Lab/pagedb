@@ -22,6 +22,8 @@ impl<V: Vfs + Clone> Db<V> {
     pub async fn begin_read(&self) -> Result<ReadTxn<'_, V>> {
         self.ensure_usable()?;
         let _admission = self.visibility_gate.read().await;
+        // A holder of the write side can poison the handle while this call waits.
+        self.ensure_usable()?;
         let snap = *self.snapshot.read();
         #[cfg(test)]
         self.pause_after_snapshot_selection().await;
@@ -45,6 +47,8 @@ impl<V: Vfs + Clone> Db<V> {
     pub async fn begin_read_non_abortable(&self) -> Result<ReadTxn<'_, V>> {
         self.ensure_usable()?;
         let _admission = self.visibility_gate.read().await;
+        // A holder of the write side can poison the handle while this call waits.
+        self.ensure_usable()?;
         // The snapshot and registration remain under the admission gate, so a
         // destructive writer cannot decide reader-pin eligibility between them.
         let snap = *self.snapshot.read();
@@ -91,12 +95,17 @@ impl<V: Vfs + Clone> Db<V> {
     /// the write side.
     ///
     /// The caller must not hold the write side of the gate.
+    ///
+    /// A holder of the write side can poison the handle during the wait. The
+    /// published snapshot then names roots over a file it does not describe, so
+    /// this returns the poison error instead.
     pub(crate) async fn hold_published_snapshot(
         &self,
-    ) -> (tokio::sync::RwLockReadGuard<'_, ()>, ReaderSnapshot) {
+    ) -> Result<(tokio::sync::RwLockReadGuard<'_, ()>, ReaderSnapshot)> {
         let hold = self.visibility_gate.read().await;
+        self.ensure_usable()?;
         let snapshot = *self.snapshot.read();
-        (hold, snapshot)
+        Ok((hold, snapshot))
     }
 
     /// Register a reader with a snapshot pin. Stores the reader in the
@@ -277,6 +286,8 @@ impl<V: Vfs + Clone> Db<V> {
     pub async fn begin_read_at(&self, commit: CommitId) -> Result<ReadTxn<'_, V>> {
         self.ensure_usable()?;
         let _admission = self.visibility_gate.read().await;
+        // A holder of the write side can poison the handle while this call waits.
+        self.ensure_usable()?;
         let snap = *self.snapshot.read();
         if commit.0 == snap.commit_id {
             #[cfg(test)]

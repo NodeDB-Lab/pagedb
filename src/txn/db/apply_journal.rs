@@ -19,6 +19,7 @@ impl<V: Vfs + Clone> Db<V> {
         // header clear, and snapshot publication make the target visible.
         // Writer before visibility is the global destructive-operation order.
         let visibility = self.visibility_gate.write().await;
+        self.ensure_usable()?;
         self.retry_pending_apply_journal_visible(&mut state, &visibility)
             .await
     }

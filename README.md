@@ -74,7 +74,7 @@ pagedb's answer: **one substrate, two surfaces.** Engines that want their own fo
 - **Format-portable.** A directory created on any target opens byte-identically on every other target. Identity-keyed segment paths keep UTF-8 names out of the filesystem layer.
 - **Bounded memory.** Explicit `OpenOptions` budgets + SIEVE eviction. No mmap surprises, no uncapped OS page cache.
 - **Realms.** Per-realm DEK + AAD-bound `RealmId` for cryptographic multi-tenancy within one DB.
-- **Online rekey, online compact, incremental snapshots.** Throttled, cancellable, resumable.
+- **Online rekey, online compact, incremental snapshots.** A caller can drop any of these futures at any await, and the store stays safe. A drop past the commit point requires a reopen. A rekey resumes at that reopen. A compact restarts from the beginning on the next call. Neither is throttled.
 - **No `unsafe`** outside the VFS and the opt-in `mmap_view` over decrypted scratch.
 
 ## Position in the stack

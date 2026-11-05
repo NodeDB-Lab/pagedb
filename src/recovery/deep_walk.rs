@@ -201,6 +201,7 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     // writer takes this lock before the visibility gate. The walk takes neither
     // the gate nor this lock again, so holding it cannot deadlock.
     let state = db.writer.lock().await;
+    db.ensure_usable()?;
     let (next_page_id, catalog_root, catalog_next, free_list_root) = (
         state.next_page_id,
         state.catalog_root_page_id,

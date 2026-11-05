@@ -177,7 +177,11 @@ async fn failed_segment_reconciliation_poisoned_handle_keeps_existing_snapshot_u
         Err(PagedbError::DurablyCommittedButUnpublished { commit }) if commit == durable_commit
     ));
     assert_eq!(db.mode(), pagedb::DbMode::Standalone);
-    assert_eq!(db.stats().await.unwrap().latest_commit_id, 0);
+    assert_eq!(db.latest_commit().value(), 0);
+    assert!(matches!(
+        db.stats().await,
+        Err(PagedbError::DurablyCommittedButUnpublished { commit }) if commit == durable_commit
+    ));
 
     vfs.fail_renames(false);
     drop(existing);

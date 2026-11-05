@@ -28,6 +28,7 @@ impl<V: Vfs + Clone> Db<V> {
         // physical tombstone deletion.
         let _writer = self.writer.lock().await;
         let _visibility = self.visibility_gate.write().await;
+        self.ensure_usable()?;
         let (drained, drained_bytes) = self.try_drain_pending_tombstones().await?;
         // Retirement reclaims each file as it happens, so the drain above is
         // where almost everything is freed. The sweep still runs because a
@@ -47,30 +48,20 @@ impl<V: Vfs + Clone> Db<V> {
     /// the mechanism.
     ///
     /// An entry whose reclamation fails is put back as well, along with every
-    /// entry this call had taken but not yet reached. The queue is the only
-    /// record that a retired file still needs deleting, so dropping an entry on
-    /// an I/O error leaks that file for the life of the store — and the caller
-    /// surfaces the error, so a retry has somewhere to resume from.
+    /// entry this call had taken but not yet reached. A dropped future does the
+    /// same. The queue is the only record that a retired file still needs
+    /// deleting. Losing an entry leaks that file for the life of the store. The
+    /// caller surfaces an error, so a retry has somewhere to resume from.
     async fn try_drain_pending_tombstones(&self) -> Result<(u64, u64)> {
-        let pending = std::mem::take(&mut *self.pending_tombstones.lock());
+        let mut taken = self.take_pending_tombstones(usize::MAX);
         let mut count: u64 = 0;
         let mut bytes: u64 = 0;
-        let mut pending = pending.into_iter();
-        while let Some(entry) = pending.next() {
-            match self.reclaim_pending_tombstone(&entry).await {
-                Ok(None) => {}
-                Ok(Some(len)) => {
-                    count += 1;
-                    bytes = bytes.saturating_add(len);
-                }
-                Err(error) => {
-                    self.enqueue_pending_tombstone(entry);
-                    for remaining in pending {
-                        self.enqueue_pending_tombstone(remaining);
-                    }
-                    return Err(error);
-                }
+        while let Some(entry) = taken.front() {
+            if let Some(len) = self.reclaim_pending_tombstone(&entry).await? {
+                count += 1;
+                bytes = bytes.saturating_add(len);
             }
+            taken.finish_front();
         }
         Ok((count, bytes))
     }

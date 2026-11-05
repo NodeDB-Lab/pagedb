@@ -32,6 +32,9 @@ impl<V: Vfs + Clone> Db<V> {
         let key = Catalog::quota_key(realm);
         let value = Catalog::encode_realm_quotas(&quotas);
 
+        // A drop or error before the header write leaves nothing staged in the
+        // cache. A drop from the header write on poisons the handle.
+        let unpublished = self.discard_unpublished_pages_on_drop();
         let mut cat_tree = BTree::open(
             self.pager.clone(),
             self.realm_id,
@@ -71,7 +74,8 @@ impl<V: Vfs + Clone> Db<V> {
             },
         )?;
         let hk_clone = { self.hk.read().clone() };
-        let new_slot = commit_header(
+        let publish = self.arm_durable_publish(crate::CommitId(state.latest_commit_id));
+        let new_slot = match commit_header(
             &*self.vfs,
             &self.main_db_path,
             &hk_clone,
@@ -79,7 +83,15 @@ impl<V: Vfs + Clone> Db<V> {
             header_cursor.slot,
             self.page_size,
         )
-        .await?;
+        .await
+        {
+            Ok(slot) => slot,
+            Err(error) => {
+                publish.disarm();
+                return Err(error);
+            }
+        };
+        unpublished.disarm();
         self.pager.note_header_written(HeaderCursor {
             slot: new_slot,
             seq: new_seq,
@@ -96,6 +108,7 @@ impl<V: Vfs + Clone> Db<V> {
                 &[],
             )
             .await?;
+        publish.disarm();
 
         Ok(())
     }
@@ -107,7 +120,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// holds the visibility gate.
     pub async fn realm_quotas(&self, realm: RealmId) -> Result<RealmQuotas> {
         self.ensure_usable()?;
-        let (_hold, snapshot) = self.hold_published_snapshot().await;
+        let (_hold, snapshot) = self.hold_published_snapshot().await?;
         let key = Catalog::quota_key(realm);
         let cat_tree = BTree::open(
             self.pager.clone(),

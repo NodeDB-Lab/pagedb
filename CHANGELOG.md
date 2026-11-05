@@ -19,6 +19,19 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Fixed
 
+- **Dropped compact after its rename** — dropping `compact_now` or `compact_step` from the rename to publication now poisons the handle. Before, the published snapshot named old roots over the new file. Every later call returns `DurablyCommittedButUnpublished` until a reopen.
+- **Dropped compact before its rename** — dropping `compact_now` or `compact_step` while it builds its scratch now removes the compacted pages from the cache. Before, later reads got compacted pages under source ids, and the next commit wrote the dirty ones over live pages. The handle stays usable.
+- **Dropped commit** — dropping `WriteTxn::commit` from its header write to publication now poisons the handle. A drop before the header write stays a plain abort.
+- **Dropped commit during spill cleanup** — the spill gauge now resets, and the next `begin_write` removes the spill file.
+- **Dropped rekey** — dropping `rekey_db` from its first intent write on now poisons the handle. A reopen resumes the rekey from the durable stage. A drop while it waits for the writer lock changes nothing.
+- **Dropped incremental apply** — dropping `apply_incremental` from its rename to publication now poisons the handle. A drop before the rename removes its staged pages from the cache, and the same delta applies on retry.
+- **Dropped segment repack** — dropping `compact_now` during a segment replacement now poisons the handle from the header write on. A drop before the header write discards the staged catalog pages.
+- **Dropped `set_realm_quotas`** — a drop from the header write on now poisons the handle. A drop before it discards the staged catalog pages.
+- **Dropped `gc_now`** — the deferred tombstones it had taken return to the queue. Before, their files stayed on disk until the next open.
+- **Pages leaked by a segment repack** — `compact_now` now adds the catalog pages each segment replacement supersedes to the free list. The next `compact_now` therefore runs a repack.
+- **Commit history lost by a segment repack** — a segment replacement wrote commit-history root 0 into the header when the main repack was skipped. A reopen then lost every retained commit.
+- **Poison checks after a wait** — `begin_read`, `begin_read_non_abortable`, `begin_read_at`, `open_segment`, `list_segments`, `realm_quotas`, `gc_now`, `rekey_db`, `run_deep_walk`, and the apply-journal retry now check poison again after they get the lock or gate they wait for.
+- **`stats` and `page_provenance` on a poisoned handle** — both now return `DurablyCommittedButUnpublished`. Before, they walked the published roots, which can name pages in a file they do not describe.
 - **Pinned follower readers** — `apply_incremental` now returns `ApplyBlockedByPinnedReader`, before it changes `main.db`, when its delta rewrites a page a reader pinned before the base commit can reach. That reader previously read authenticated bytes from the later commit. Retry the same delta after the reader finishes.
 - **Commit-history retention after a reopen** — with `RetainPolicy::Count(n)`, the first commit after a reopen pruned one commit too many and kept `n - 1`.
 - **Relocated commit history on a small buffer pool** — an apply that relocated a commit-history tree larger than the buffer pool flushed part of it to the live `main.db`. The published image then lacked those pages.

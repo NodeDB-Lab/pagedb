@@ -41,7 +41,7 @@ impl<V: Vfs + Clone> Db<V> {
             pages_applied,
             target_page_ids,
             base_reader_visible,
-            mut reclaimed_page_ids,
+            reclaimed_page_ids,
             delta_page_ids,
             actions,
             segments_promoted,
@@ -67,6 +67,10 @@ impl<V: Vfs + Clone> Db<V> {
         // published replacement snapshot — released only once the roots and
         // the bytes agree again.
         let visibility = self.visibility_gate.write().await;
+        // From here this apply stages pages through the Pager under ids the live
+        // image also uses. A drop before the rename takes them out of the cache.
+        // The guard fires under the writer lock, so every dirty page is this apply's.
+        let unpublished = self.discard_unpublished_pages_on_drop();
 
         // Reader admission is closed, so this answer stays true through the
         // swap. It catches a reader admitted after the screen in the prepare.
@@ -83,16 +87,9 @@ impl<V: Vfs + Clone> Db<V> {
             .newest_history_row_reaching_delta(&state, base_reader_visible, &delta_page_ids)
             .await?;
 
-        // Move this handle's own metadata out of the incoming page space. The
-        // producer allocates over the ids hosting the follower's commit-history
-        // tree and free-list chain because it cannot see them; the delta may
-        // therefore claim any of them. Both are read here from the still-intact
-        // base image and rewritten onto ids the target does not touch, and both
-        // reach disk in the staged image, so the roots and the metadata they
-        // name become durable together or not at all.
         let alloc_cursor = manifest.next_page_id_at_target.max(state.next_page_id);
-        let carried = self
-            .carry_commit_history(
+        let (carried, staged_free_list) = self
+            .stage_incremental_metadata(
                 &state,
                 HistoryCarry {
                     staged_image,
@@ -102,36 +99,8 @@ impl<V: Vfs + Clone> Db<V> {
                     alloc_cursor,
                     pruned_through,
                 },
+                reclaimed_page_ids,
             )
-            .await?;
-        reclaimed_page_ids.extend(carried.released_page_ids.iter().copied());
-
-        // Fold the reclaim set into this handle's own free-list chain, and drop
-        // any entry the target has since put back into service. The rewritten
-        // chain is staged through the Pager and becomes durable with the very
-        // swap that installs the target roots, so the roots and the free-list
-        // accounting for the pages they abandoned can never diverge: a crash
-        // before that swap leaves the previous chain and the previous roots both
-        // intact, and the retry redoes the fold.
-        let staged_free_list = self
-            .stage_reclaimed_free_list(
-                &state,
-                &reclaimed_page_ids,
-                &target_page_ids,
-                new_commit_id,
-                carried.next_page_id,
-            )
-            .await?;
-        // Back the cursor this apply is about to publish with real extent
-        // before the chain pages flush into it, so no observable point has a
-        // header naming pages the image does not contain.
-        self.ensure_image_covers_cursor(staged_image, staged_free_list.next_page_id)
-            .await?;
-        // Everything this apply wrote through the Pager — the rewritten chain
-        // and any relocated history — lands in the staged image, never in the
-        // live file.
-        self.pager
-            .flush_main_to(self.realm_id, staged_image)
             .await?;
 
         let journal_id = self
@@ -151,8 +120,13 @@ impl<V: Vfs + Clone> Db<V> {
             .await?;
         let counter_anchor = staged_header.fields.counter_anchor;
 
+        // Armed through publication. A backend can finish the rename after its
+        // future is dropped. A drop at the rename therefore poisons the handle too.
+        let publish = self.arm_durable_publish(crate::CommitId(new_commit_id));
         self.swap_incremental_image(staged_image, new_commit_id)
             .await?;
+        // The swap reset the cache, so the staged pages are gone.
+        unpublished.disarm();
 
         // The target image is durable. Advance only internal writer state;
         // prior readers remain on the old snapshot until the nonce anchor and
@@ -183,9 +157,20 @@ impl<V: Vfs + Clone> Db<V> {
             // would re-take both guards, and the instant between dropping and
             // re-taking them is the one instant where `main.db` is the target
             // image while the published snapshot still names base roots.
-            self.retry_pending_apply_journal_visible(&mut state, &visibility)
-                .await?;
+            match self
+                .retry_pending_apply_journal_visible(&mut state, &visibility)
+                .await
+            {
+                // The target is published, and only a deferred tombstone remains.
+                // The durable journal pointer keeps that work retryable.
+                Err(crate::errors::PagedbError::ReadersPinningTruncatedRange) => {
+                    publish.disarm();
+                    return Err(crate::errors::PagedbError::ReadersPinningTruncatedRange);
+                }
+                other => other?,
+            }
         }
+        publish.disarm();
         drop(state);
         drop(visibility);
 
@@ -194,6 +179,54 @@ impl<V: Vfs + Clone> Db<V> {
             segments_promoted,
             segments_tombstoned,
         })
+    }
+
+    /// Move this handle's own metadata out of the incoming page space, into the
+    /// staged image.
+    ///
+    /// The producer allocates over the ids hosting the follower's commit-history
+    /// tree and free-list chain, because it cannot see them. The delta can
+    /// therefore claim any of them. Both are read from the still-intact base image
+    /// and rewritten onto ids the target does not touch. Both reach disk in the
+    /// staged image, so the roots and the metadata they name become durable
+    /// together or not at all.
+    async fn stage_incremental_metadata(
+        &self,
+        state: &WriterState,
+        carry: HistoryCarry<'_>,
+        mut reclaimed_page_ids: std::collections::BTreeSet<u64>,
+    ) -> crate::Result<(CarriedHistory, StagedFreeList)> {
+        let staged_image = carry.staged_image;
+        let target_page_ids = carry.target_page_ids;
+        let new_commit_id = carry.history_version;
+        let carried = self.carry_commit_history(state, carry).await?;
+        reclaimed_page_ids.extend(carried.released_page_ids.iter().copied());
+
+        // Fold the reclaim set into this handle's own free-list chain, and drop
+        // any entry the target has since put back into service. The rewritten
+        // chain is staged through the Pager and becomes durable with the swap that
+        // installs the target roots. A crash before that swap leaves the previous
+        // chain and the previous roots both intact, and the retry redoes the fold.
+        let staged_free_list = self
+            .stage_reclaimed_free_list(
+                state,
+                &reclaimed_page_ids,
+                target_page_ids,
+                new_commit_id,
+                carried.next_page_id,
+            )
+            .await?;
+        // Back the cursor this apply is about to publish with real extent
+        // before the chain pages flush into it, so no observable point has a
+        // header naming pages the image does not contain.
+        self.ensure_image_covers_cursor(staged_image, staged_free_list.next_page_id)
+            .await?;
+        // Everything this apply wrote through the Pager lands in the staged image,
+        // never in the live file. That covers the chain and any relocated history.
+        self.pager
+            .flush_main_to(self.realm_id, staged_image)
+            .await?;
+        Ok((carried, staged_free_list))
     }
 
     async fn stage_incremental_journal(

@@ -31,6 +31,36 @@ pub(crate) enum SegmentReconciliation {
     Deferred,
 }
 
+/// Entries taken off the deferred-tombstone queue for one drain.
+///
+/// The queue is the only record that a retired file still needs reclaiming.
+/// `Drop` therefore returns every entry the drain did not finish, including the
+/// one in progress. That covers an error return and a dropped future.
+pub(super) struct TakenTombstones<'db, V: Vfs + Clone> {
+    db: &'db Db<V>,
+    entries: std::collections::VecDeque<PendingTombstone>,
+}
+
+impl<V: Vfs + Clone> TakenTombstones<'_, V> {
+    /// A copy of the next unfinished entry. It stays held here until
+    /// [`Self::finish_front`].
+    pub(super) fn front(&self) -> Option<PendingTombstone> {
+        self.entries.front().cloned()
+    }
+
+    pub(super) fn finish_front(&mut self) {
+        self.entries.pop_front();
+    }
+}
+
+impl<V: Vfs + Clone> Drop for TakenTombstones<'_, V> {
+    fn drop(&mut self) {
+        for entry in self.entries.drain(..) {
+            self.db.enqueue_pending_tombstone(entry);
+        }
+    }
+}
+
 impl<V: Vfs + Clone> Db<V> {
     /// Create a fresh segment in the given realm. The returned writer holds a
     /// handle to `seg/.staging/<hex(segment_id)>`. Sealing the writer makes
@@ -75,7 +105,7 @@ impl<V: Vfs + Clone> Db<V> {
     /// holds the visibility gate.
     pub async fn list_segments(&self, realm: RealmId, prefix: &str) -> Result<Vec<SegmentMeta>> {
         self.ensure_usable()?;
-        let (_hold, snap) = self.hold_published_snapshot().await;
+        let (_hold, snap) = self.hold_published_snapshot().await?;
         let (catalog_root, next) = (snap.catalog_root_page_id, snap.next_page_id);
         if catalog_root == 0 {
             return Ok(Vec::new());
@@ -332,36 +362,33 @@ impl<V: Vfs + Clone> Db<V> {
     /// nothing will ever delete — the unbounded growth this drain exists to
     /// prevent, reintroduced by the error path. A transient I/O failure on one
     /// entry must cost a retry, not the record.
+    ///
+    /// [`TakenTombstones`] puts back whatever a failure or a dropped future
+    /// leaves unfinished.
     async fn drain_some_pending_tombstones(&self) -> Result<()> {
         const MAX_PER_COMMIT: usize = 32;
 
-        let batch: Vec<PendingTombstone> = {
-            let mut entries = self.pending_tombstones.lock();
-            let take = entries.len().min(MAX_PER_COMMIT);
-            entries.drain(..take).collect()
-        };
-        let mut batch = batch.into_iter();
-        while let Some(entry) = batch.next() {
-            let outcome = match self.segment_id_is_reader_pinned(entry.segment_id).await {
-                Ok(true) => {
-                    self.enqueue_pending_tombstone(entry);
-                    continue;
-                }
-                Ok(false) => {
-                    self.tombstone_segment(entry.segment_id, entry.commit_id)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            if let Err(error) = outcome {
+        let mut taken = self.take_pending_tombstones(MAX_PER_COMMIT);
+        while let Some(entry) = taken.front() {
+            if self.segment_id_is_reader_pinned(entry.segment_id).await? {
                 self.enqueue_pending_tombstone(entry);
-                for remaining in batch {
-                    self.enqueue_pending_tombstone(remaining);
-                }
-                return Err(error);
+            } else {
+                self.tombstone_segment(entry.segment_id, entry.commit_id)
+                    .await?;
             }
+            taken.finish_front();
         }
         Ok(())
+    }
+
+    /// Take up to `limit` entries off the front of the deferred-tombstone queue.
+    pub(super) fn take_pending_tombstones(&self, limit: usize) -> TakenTombstones<'_, V> {
+        let entries = {
+            let mut queue = self.pending_tombstones.lock();
+            let take = queue.len().min(limit);
+            queue.drain(..take).collect()
+        };
+        TakenTombstones { db: self, entries }
     }
 
     /// Size of a segment's live file, or `None` if it is already gone.
@@ -400,7 +427,7 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     async fn lookup_segment(&self, realm: RealmId, name: &str) -> Result<SegmentMeta> {
-        let (_hold, snap) = self.hold_published_snapshot().await;
+        let (_hold, snap) = self.hold_published_snapshot().await?;
         let (catalog_root, next) = (snap.catalog_root_page_id, snap.next_page_id);
         if catalog_root == 0 {
             return Err(PagedbError::NotFound);

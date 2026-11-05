@@ -56,6 +56,11 @@ fn scratch_path(db: &Db<impl Vfs + Clone>) -> String {
 /// atomically (see module docs). On success `state` points at the compacted
 /// layout. On failure the partially built scratch and the never-persisted cache
 /// pages are discarded and `state`/main.db are left untouched.
+///
+/// A caller can drop this future at any await. Before the rename, the guard below
+/// drops the compacted pages from the cache. The partial scratch stays on disk,
+/// and the next run or the next open removes it. From the rename on, the guard in
+/// `commit_swap` poisons the handle.
 pub(super) async fn atomic_dense_repack<V: Vfs + Clone>(
     db: &Db<V>,
     state: &mut WriterState,
@@ -65,15 +70,21 @@ pub(super) async fn atomic_dense_repack<V: Vfs + Clone>(
     // Remove any leftover scratch from an earlier interrupted compaction.
     db.vfs.remove(&scratch).await.ok();
 
+    // Compacted pages sit in the cache under source page ids. They must not
+    // answer a source read, and a dirty one must not reach the live file.
+    let unpublished = db.discard_unpublished_pages_on_drop();
     match build_scratch(db, state, &scratch).await {
-        Ok(pending) => commit_swap(db, state, visibility, &scratch, pending).await,
+        Ok(pending) => {
+            let outcome = commit_swap(db, state, visibility, &scratch, pending).await;
+            // The swap either reset the cache itself or poisoned the handle.
+            unpublished.disarm();
+            outcome
+        }
         Err(e) => {
-            // Nothing was written to main.db; drop the never-persisted compacted
-            // pages from the cache so the old tree is read back from disk, and
-            // remove the partial scratch.
-            // Deliberate discard: a cache fault stays latched and the next
-            // operation reports it. The caller receives the original error.
-            let _ = db.pager.reset_main_pages();
+            // Nothing was written to main.db. The old tree reads back from disk
+            // once the cache drops the compacted pages. The caller receives the
+            // original error.
+            drop(unpublished);
             db.vfs.remove(&scratch).await.ok();
             Err(e)
         }
@@ -216,12 +227,15 @@ async fn commit_swap<V: Vfs + Clone>(
     // (Windows) and the next access reopens the new inode (Unix).
     db.pager.close_main_handle().await;
     let new_commit_id = state.latest_commit_id + 1;
+    let commit = crate::CommitId(new_commit_id);
+    // Armed through publication. Every return below that skips the disarm, and
+    // every drop of this future, poisons the handle. A backend can finish the
+    // rename after its future is dropped.
+    let publish = db.arm_durable_publish(commit);
     if db.vfs.rename(scratch, &db.main_db_path).await.is_err() {
         // After closing the old handle, a backend may have performed an
         // ambiguous replacement even when it reports an error. Reopen is the
         // only safe way to establish the durable image.
-        let commit = crate::CommitId(new_commit_id);
-        db.poison(commit);
         return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
     }
 
@@ -251,25 +265,16 @@ async fn commit_swap<V: Vfs + Clone>(
     // The rename is durable, so a failed reset leaves old-image pages resident.
     // Reads must never see them, so the handle poisons and reopen is the way out.
     if db.pager.reset_main_pages().is_err() {
-        let commit = crate::CommitId(new_commit_id);
-        db.poison(commit);
         return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
     }
 
     if db.vfs.sync_dir(db.main_db_parent_dir()).await.is_err() {
-        let commit = crate::CommitId(new_commit_id);
-        db.poison(commit);
         return Err(crate::errors::PagedbError::durably_committed_but_unpublished(commit));
     }
     let _ = db
-        .finish_durable_commit_visible(
-            visibility,
-            state,
-            crate::CommitId(new_commit_id),
-            pending.counter_anchor,
-            &[],
-        )
+        .finish_durable_commit_visible(visibility, state, commit, pending.counter_anchor, &[])
         .await?;
+    publish.disarm();
 
     let pages_reclaimed = pending.old_next.saturating_sub(pending.new_next);
     Ok(RepackOutcome {

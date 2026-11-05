@@ -328,7 +328,12 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         };
 
         let hk_clone = { self.db.hk.read().clone() };
-        let new_slot = commit_header(
+        // A drop from here to publication poisons the handle. Bytes can land while
+        // the header future is pending. The next commit then overwrites pages a
+        // durable header names. Every earlier drop stays a plain abort.
+        let db = self.db;
+        let publish = db.arm_durable_publish(CommitId(new_commit_id));
+        let new_slot = match commit_header(
             &*self.db.vfs,
             &self.db.main_db_path,
             &hk_clone,
@@ -336,7 +341,14 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             header_cursor.slot,
             self.db.page_size,
         )
-        .await?;
+        .await
+        {
+            Ok(slot) => slot,
+            Err(error) => {
+                publish.disarm();
+                return Err(error);
+            }
+        };
         self.db.pager.note_header_written(HeaderCursor {
             slot: new_slot,
             seq: new_seq,
@@ -382,6 +394,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
                 new_commit_id,
             )));
         }
+        publish.disarm();
 
         // The allocator cache is rebuilt from the durable free-list at the next
         // `begin_write`, so nothing is handed off here. The spill tmp file is

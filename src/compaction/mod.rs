@@ -7,6 +7,8 @@
 //! Entry points: [`compact_now`] (full one-shot) and [`compact_step`]
 //! (one atomic pass with a progress report) on a [`crate::Db`] handle.
 
+#[cfg(test)]
+mod cancel_tests;
 mod full;
 mod helpers;
 mod repack;
