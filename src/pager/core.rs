@@ -731,9 +731,9 @@ impl<V: Vfs> Pager<V> {
     }
 
     /// Close the cached main.db file handle. The next access reopens the file.
-    /// Required around an atomic rename over main.db: closing first lets the
+    /// An atomic rename over main.db requires this close. Closing first lets the
     /// rename replace the file on platforms that reject replacing an open file
-    /// (Windows), and reopening afterwards picks up the new inode (Unix).
+    /// (Windows). Reopening afterwards picks up the new inode (Unix).
     ///
     /// Each close bumps the handle generation. A swap closes twice. The close
     /// before the rename releases the file. The close after it drops any handle
@@ -1414,8 +1414,8 @@ impl<V: Vfs> Pager<V> {
         }
         crate::diag::flushed(page_size_u64.saturating_mul(reqs.len() as u64));
 
-        // Clear the flags of pages that still hold the gathered `Arc<Page>`, and
-        // return the pool to its budget now that those pages are evictable.
+        // Clear the flags of pages that still hold the gathered `Arc<Page>`.
+        // Those pages are now evictable, so return the pool to its budget.
         self.inner
             .cache_for_key(file)
             .lock()
