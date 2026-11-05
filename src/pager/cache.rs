@@ -280,7 +280,10 @@ impl PageCache {
         }
         // Use the live list length rather than the configured capacity because
         // pinned or dirty pages can temporarily grow the cache past capacity.
-        let max_steps = self.map.len().saturating_mul(2).max(1);
+        // Each wrap past head uses one loop iteration.
+        // The worst case is one evictable visited entry directly behind the hand.
+        // That entry needs two passes over the list plus two wraps.
+        let max_steps = self.map.len().saturating_add(1).saturating_mul(2);
         let mut cur = self.hand.or(self.tail);
         for _ in 0..max_steps {
             let Some(idx) = cur else {
@@ -357,11 +360,13 @@ impl PageCache {
     }
 
     pub fn clear_dirty(&mut self, key: (FileKey, u64)) {
-        self.dirty.remove(&key);
-        if let Some(idx) = self.map.get(&key).copied()
-            && self.is_evictable(idx)
-        {
-            self.evictable += 1;
+        if !self.dirty.remove(&key) {
+            return;
+        }
+        if let Some(idx) = self.map.get(&key).copied() {
+            if self.is_evictable(idx) {
+                self.evictable += 1;
+            }
         }
     }
 
@@ -682,5 +687,60 @@ mod tests {
         assert_eq!(c.len(), 5);
         assert!(c.get((FileKey::Main, 5)).is_none());
         assert!(c.get((FileKey::Main, 6)).is_some());
+    }
+
+    /// The hand clears the visited bit, wraps past head, and evicts on its
+    /// second visit. The wrap uses a loop iteration of its own.
+    #[test]
+    fn evict_takes_a_lone_visited_head_entry() {
+        let mut c = PageCache::with_capacity(1);
+        let key = (FileKey::Main, 1);
+        c.insert(key, page(1));
+        let _ = c.get(key);
+
+        assert_eq!(c.insert((FileKey::Main, 2), page(2)), Some(key));
+        assert_eq!(c.len(), 1, "the eviction keeps the cache at capacity");
+    }
+
+    /// The longest possible sweep has one evictable visited entry directly
+    /// behind the hand. It takes two passes over the list plus two wraps.
+    #[test]
+    fn evict_takes_a_lone_visited_entry_directly_behind_the_hand() {
+        let mut c = PageCache::with_capacity(4);
+        for id in 1u8..=4 {
+            c.insert((FileKey::Main, u64::from(id)), page(id));
+        }
+        let behind = (FileKey::Main, 1);
+        let _ = c.get(behind);
+
+        // Evicting page 2 leaves the hand on page 3, with page 1 directly behind it.
+        assert_eq!(
+            c.insert((FileKey::Main, 5), page(5)),
+            Some((FileKey::Main, 2))
+        );
+        assert_eq!(c.tail, c.map.get(&behind).copied());
+        assert_eq!(c.hand, c.map.get(&(FileKey::Main, 3)).copied());
+
+        let _ = c.get(behind);
+        for id in 3..=5 {
+            c.mark_dirty((FileKey::Main, id));
+        }
+        assert_eq!(c.evictable, 1, "only page 1 is a candidate");
+
+        assert_eq!(c.insert((FileKey::Main, 6), page(6)), Some(behind));
+        assert_eq!(c.len(), 4, "the eviction keeps the cache at capacity");
+    }
+
+    #[test]
+    fn second_clear_of_a_clean_key_leaves_evictable_count_unchanged() {
+        let mut c = PageCache::with_capacity(4);
+        let key = (FileKey::Main, 1);
+        c.insert(key, page(1));
+        c.mark_dirty(key);
+        c.clear_dirty(key);
+        assert_eq!(c.evictable, 1);
+
+        c.clear_dirty(key);
+        assert_eq!(c.evictable, 1);
     }
 }
