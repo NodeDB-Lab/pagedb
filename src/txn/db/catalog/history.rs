@@ -10,7 +10,9 @@ use crate::btree::BTree;
 use crate::errors::PagedbError;
 use crate::vfs::Vfs;
 
-use crate::txn::db::core::{CommitHistoryMeta, Db, decode_commit_meta, encode_commit_meta};
+use crate::txn::db::core::{
+    CommitHistoryMeta, Db, WriterState, decode_commit_meta, encode_commit_meta,
+};
 use crate::txn::db::pending::PendingWriterState;
 
 /// Commit-history rows read per batch while pruning. A key is 8 bytes and a row
@@ -43,12 +45,54 @@ impl<V: Vfs + Clone> Db<V> {
         let Some(key) = hist.first_key().await? else {
             return Ok(None);
         };
-        if key.len() != 8 {
-            return Err(PagedbError::catalog_row_invalid("commit_history.key"));
+        history_row_commit(&key).map(Some)
+    }
+
+    /// Write this commit's row, after a row for the commit before it if that one
+    /// published none. Returns the page ids the tree's copy-on-write freed.
+    ///
+    /// A segment repack bumps the commit id and writes no row. An export with that
+    /// commit as its base then finds no roots, and a follower sitting on it is
+    /// stuck. Its roots stay live until this commit, so its pages are still intact
+    /// here and the row is true.
+    ///
+    /// A store with no history tree gets no such row. A main repack and a
+    /// `Disabled` commit both leave root zero, and their rows stay gone.
+    pub(crate) async fn write_commit_history_rows(
+        &self,
+        state: &mut PendingWriterState,
+        previous: &WriterState,
+        new_commit_id: u64,
+        meta: CommitHistoryMeta,
+    ) -> Result<Vec<u64>> {
+        let mut freed = Vec::new();
+        if state.commit_history_root_page_id != 0 && previous.latest_commit_id != 0 {
+            let history = BTree::open(
+                self.pager.clone(),
+                self.realm_id,
+                state.commit_history_root_page_id,
+                state.next_page_id,
+                self.page_size,
+            );
+            let key = previous.latest_commit_id.to_be_bytes();
+            if history.get(&key).await?.is_none() {
+                let row = CommitHistoryMeta {
+                    active_root_page_id: previous.root_page_id,
+                    catalog_root_page_id: previous.catalog_root_page_id,
+                    free_list_root_page_id: previous.free_list_root_page_id,
+                    next_page_id: previous.next_page_id,
+                    unix_seconds: meta.unix_seconds,
+                };
+                freed = self
+                    .write_commit_history_entry(state, previous.latest_commit_id, row)
+                    .await?;
+            }
         }
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&key[..8]);
-        Ok(Some(u64::from_be_bytes(b)))
+        freed.extend(
+            self.write_commit_history_entry(state, new_commit_id, meta)
+                .await?,
+        );
+        Ok(freed)
     }
 
     /// Insert the new commit-history entry and prune per the retention policy.
@@ -176,12 +220,7 @@ impl<V: Vfs + Clone> Db<V> {
                         if k == &key {
                             break 'prune;
                         }
-                        if k.len() != 8 {
-                            return Err(PagedbError::catalog_row_invalid("commit_history.key"));
-                        }
-                        let mut b = [0u8; 8];
-                        b.copy_from_slice(&k[..8]);
-                        let cid = u64::from_be_bytes(b);
+                        let cid = history_row_commit(k)?;
                         if min_pinned.is_some_and(|min| cid >= min) {
                             break 'prune;
                         }
@@ -300,12 +339,8 @@ async fn prune_oldest_history_rows<V: Vfs + Clone>(
             if deleted >= excess {
                 return Ok(deleted);
             }
-            if key.len() != 8 {
-                return Err(PagedbError::catalog_row_invalid("commit_history.key"));
-            }
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&key[..8]);
-            if min_pinned.is_some_and(|min| u64::from_be_bytes(raw) >= min) {
+            let commit = history_row_commit(key)?;
+            if min_pinned.is_some_and(|min| commit >= min) {
                 return Ok(deleted);
             }
             if tree.delete(key).await? {
@@ -317,6 +352,13 @@ async fn prune_oldest_history_rows<V: Vfs + Clone>(
         }
     }
     Ok(deleted)
+}
+
+/// The commit id a commit-history key encodes.
+pub(super) fn history_row_commit(key: &[u8]) -> Result<u64> {
+    let commit = <[u8; 8]>::try_from(key)
+        .map_err(|_| PagedbError::catalog_row_invalid("commit_history.key"))?;
+    Ok(u64::from_be_bytes(commit))
 }
 
 #[cfg(test)]

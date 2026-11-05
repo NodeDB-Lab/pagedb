@@ -5265,6 +5265,66 @@ impl VfsFile for HeaderFaultFile {
     }
 }
 
+/// The stamp must beat the delta to disk. A byte copy interrupted at its image swap
+/// holds no delta page in `main.db`, and it already refuses `Standalone`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_byte_copy_interrupted_at_its_first_image_swap_already_refuses_standalone() {
+    let src_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+    let mut txn = source.begin_write().await.unwrap();
+    txn.put(b"base", b"base-value").await.unwrap();
+    let base_commit = txn.commit().await.unwrap();
+    drop(source);
+    std::fs::copy(src_dir.join("main.db"), dst_dir.join("main.db")).unwrap();
+
+    let source = make_db(&src_dir).await;
+    let mut txn = source.begin_write().await.unwrap();
+    txn.put(b"target", b"target-value").await.unwrap();
+    txn.commit().await.unwrap();
+    source
+        .snapshot_incremental_to(base_commit, &delta_dir)
+        .await
+        .unwrap();
+    drop(source);
+
+    let fault_vfs = RenameFaultVfs::new(&dst_dir);
+    let follower = Db::open_follower(fault_vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
+    fault_vfs.fail_main_db_renames(true);
+    assert!(follower.apply_incremental(&delta_dir).await.is_err());
+    fault_vfs.fail_main_db_renames(false);
+    drop(follower);
+
+    let standalone = Db::open(
+        TokioVfs::new(&dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await;
+    assert!(matches!(standalone, Err(PagedbError::RestoredNotPromoted)));
+    let reopened = Db::<TokioVfs>::open_read_only(
+        TokioVfs::new(&dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.latest_commit(), base_commit);
+
+    drop(reopened);
+    for dir in [&src_dir, &delta_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
 /// An apply interrupted at its commit point — the rename of the fully sealed
 /// staged image over `main.db` — leaves the follower wholly at the base commit.
 ///

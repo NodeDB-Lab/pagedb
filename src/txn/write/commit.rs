@@ -130,7 +130,12 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         if !self.db.history_disabled() {
             hist_freed.extend(
                 self.db
-                    .write_commit_history_entry(&mut pending, new_commit_id, history_meta)
+                    .write_commit_history_rows(
+                        &mut pending,
+                        &self.guard,
+                        new_commit_id,
+                        history_meta,
+                    )
                     .await?,
             );
         }

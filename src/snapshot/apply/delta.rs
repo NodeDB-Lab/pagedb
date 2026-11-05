@@ -17,12 +17,16 @@ use crate::Result;
 use crate::errors::PagedbError;
 use crate::pager::page_space::is_reserved;
 use crate::vfs::types::OpenMode;
-use crate::vfs::{Vfs, VfsFile, write_all_at};
+use crate::vfs::{Vfs, VfsFile, read_exact_at, write_all_at};
 
 /// What one validated `pages.delta` stream will contribute.
 pub(crate) struct DeltaPlan {
-    /// Page ids supplied by this exact delta stream, in ascending order.
+    /// Page ids this delta stream writes, in ascending order. A record whose page
+    /// the base already holds byte for byte is not one of them.
     pub page_ids: BTreeSet<u64>,
+    /// Base-live pages whose records match the base image byte for byte. Nothing
+    /// staged changes for these.
+    unchanged_page_ids: BTreeSet<u64>,
     /// Number of page records in the stream.
     pub record_count: u64,
     /// Bytes per record: the 8-byte big-endian page id plus one page.
@@ -32,18 +36,25 @@ pub(crate) struct DeltaPlan {
 /// Validate the framing and every page id of `src_path/pages.delta` without
 /// writing anything.
 ///
-/// `base_live_page_ids` is the base commit's *reader-visible* page set — the
-/// pages both sides of the protocol can name. A delta is defined as
-/// target-reachable minus base-reader-visible, so a record naming one of those
-/// pages cannot come from a well-formed export; it is refused by identity, up
-/// front, before any image is built.
+/// `base_live_page_ids` is the follower's *reader-visible* page set. A delta is
+/// target-reachable minus the producer's view of the base.
+///
+/// Those two views can differ. `set_realm_quotas` and `rekey_db` move the catalog
+/// root under one commit id, and the base row keeps the old root. A follower
+/// restored after the move holds the new catalog as live, while the producer ships
+/// it as new. The producer cannot tell which root a follower sits on. So a record
+/// naming a live page is compared against the base image at `base_image_path`.
+/// Identical bytes change nothing, so that record leaves the plan. Different bytes
+/// return `SnapshotBasePageReused`, before any image is built.
 ///
 /// A collision with the follower's own free-list chain or commit-history pages
 /// is deliberately *not* refused here. Those pages are invisible to the
 /// producer, which can neither predict nor avoid them, and the apply relocates
 /// both structures out of the incoming page space rather than declaring an
 /// otherwise-healthy delta inapplicable.
-pub(crate) async fn plan_delta_stream(
+pub(crate) async fn plan_delta_stream<V: Vfs>(
+    vfs: &V,
+    base_image_path: &str,
     src_path: &Path,
     page_size: usize,
     base_live_page_ids: &BTreeSet<u64>,
@@ -60,6 +71,7 @@ pub(crate) async fn plan_delta_stream(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DeltaPlan {
                 page_ids: BTreeSet::new(),
+                unchanged_page_ids: BTreeSet::new(),
                 record_count: 0,
                 record_size,
             });
@@ -74,6 +86,10 @@ pub(crate) async fn plan_delta_stream(
 
     let record_count = delta_len / record_size;
     let mut page_ids = BTreeSet::new();
+    let mut unchanged_page_ids = BTreeSet::new();
+    let mut base_image = None;
+    let mut record_page = vec![0u8; page_size];
+    let mut base_page = vec![0u8; page_size];
     let mut id_buf = [0u8; 8];
     let page_skip = i64::try_from(page_size)
         .map_err(|_| PagedbError::snapshot_artifact_invalid("pages.delta.page_size"))?;
@@ -93,7 +109,27 @@ pub(crate) async fn plan_delta_stream(
             ));
         }
         if base_live_page_ids.contains(&page_id) {
-            return Err(PagedbError::snapshot_base_page_reused(page_id));
+            delta
+                .read_exact(&mut record_page)
+                .await
+                .map_err(PagedbError::Io)?;
+            let offset = page_id
+                .checked_mul(page_size_u64)
+                .ok_or_else(|| PagedbError::snapshot_artifact_invalid("pages.delta.page_offset"))?;
+            let image = match base_image.as_mut() {
+                Some(image) => image,
+                None => base_image.insert(vfs.open(base_image_path, OpenMode::Read).await?),
+            };
+            read_exact_at(image, offset, &mut base_page).await?;
+            if record_page != base_page {
+                return Err(PagedbError::snapshot_base_page_reused(page_id));
+            }
+            if !unchanged_page_ids.insert(page_id) {
+                return Err(PagedbError::snapshot_artifact_invalid(
+                    "pages.delta.duplicate_page_id",
+                ));
+            }
+            continue;
         }
         if !page_ids.insert(page_id) {
             return Err(PagedbError::snapshot_artifact_invalid(
@@ -108,6 +144,7 @@ pub(crate) async fn plan_delta_stream(
 
     Ok(DeltaPlan {
         page_ids,
+        unchanged_page_ids,
         record_count,
         record_size,
     })
@@ -162,6 +199,9 @@ pub(crate) async fn write_delta_into_image<V: Vfs>(
             .read_exact(&mut page_buf)
             .await
             .map_err(PagedbError::Io)?;
+        if plan.unchanged_page_ids.contains(&page_id) {
+            continue;
+        }
         if !plan.page_ids.contains(&page_id) {
             return Err(PagedbError::snapshot_artifact_invalid(
                 "pages.delta.page_id",

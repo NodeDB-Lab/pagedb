@@ -3,6 +3,7 @@
 //! Published and reader-visible page sets.
 
 use super::super::catalog::history_policy::{ALL_HISTORY_ROWS, proves_unreadable_pages};
+use super::super::catalog::history_seals::HistorySealScan;
 use super::super::core::{Db, ReaderSnapshot, WriterState, decode_commit_meta};
 use crate::pager::Pager;
 use crate::vfs::Vfs;
@@ -137,9 +138,14 @@ impl<V: Vfs + Clone> Db<V> {
     /// Rows run newest to oldest and stop at the first overlap. Pruning a prefix
     /// keeps the oldest retained commit monotonic.
     ///
+    /// A row also leaves when seal order proves an earlier apply overwrote it. See
+    /// the `history_seals` module. This needs each shared page's newest seal, so
+    /// the scan also reads the pages a row shares with the base, once each.
+    ///
     /// `visited` arrives holding the base's reader-visible pages. The delta screen
-    /// proved them disjoint from the delta, so a row at the base roots reads
-    /// nothing. Each other page is read once across all rows.
+    /// proved them disjoint from the delta. When the store cannot show seal order,
+    /// a row at the base roots reads nothing, and each other page is read once
+    /// across all rows.
     ///
     /// A row that cannot be walked counts as an overlap, because nothing proves
     /// it disjoint. Reads the live Pager, which serves the unchanged base image.
@@ -159,6 +165,7 @@ impl<V: Vfs + Clone> Db<V> {
             state.next_page_id,
             self.page_size,
         );
+        let mut scan = self.begin_history_seal_scan(state);
         let mut before: Option<bytes::Bytes> = None;
         loop {
             let batch = history
@@ -170,7 +177,7 @@ impl<V: Vfs + Clone> Db<V> {
                 })?;
                 let commit = u64::from_be_bytes(commit);
                 if self
-                    .history_row_reaches_delta(commit, row, &mut visited, delta_page_ids)
+                    .history_row_reaches_delta(commit, row, &mut visited, &mut scan, delta_page_ids)
                     .await?
                 {
                     return Ok(Some(commit));
@@ -183,7 +190,8 @@ impl<V: Vfs + Clone> Db<V> {
         }
     }
 
-    /// Whether one history row reaches a delta page, or its pages cannot authenticate.
+    /// Whether one history row reaches a delta page, holds a page sealed after a
+    /// later commit's root, or has pages that cannot authenticate.
     ///
     /// Pruning is durable, so only proof about the page bytes prunes a row. An I/O
     /// error or a cache fault says nothing about them, so it fails the apply instead.
@@ -192,10 +200,16 @@ impl<V: Vfs + Clone> Db<V> {
         commit: u64,
         row: &[u8],
         visited: &mut BTreeSet<u64>,
+        scan: &mut HistorySealScan,
         delta_page_ids: &BTreeSet<u64>,
     ) -> crate::Result<bool> {
-        match self.collect_history_row_pages(row, visited).await {
-            Ok(reached) => Ok(!reached.is_disjoint(delta_page_ids)),
+        let walked = if scan.void().is_some() {
+            self.collect_history_row_pages(row, visited).await
+        } else {
+            self.scan_history_row_pages(commit, row, scan).await
+        };
+        match walked {
+            Ok(reached) => Ok(reached.is_none_or(|pages| !pages.is_disjoint(delta_page_ids))),
             Err(error) if proves_unreadable_pages(&error) => {
                 tracing::debug!(
                     name = "apply.history_row_unwalkable",
@@ -209,6 +223,30 @@ impl<V: Vfs + Clone> Db<V> {
         }
     }
 
+    /// The row's new pages, or `None` when seal order proves it stale.
+    async fn scan_history_row_pages(
+        &self,
+        commit: u64,
+        row: &[u8],
+        scan: &mut HistorySealScan,
+    ) -> crate::Result<Option<BTreeSet<u64>>> {
+        let meta = decode_commit_meta(row)?;
+        let (reached, resealed) = self.scan_history_row(scan, &meta).await?;
+        if let Some(found) = resealed {
+            tracing::warn!(
+                name = "apply.history_row_resealed",
+                commit,
+                page = found.page.page_id,
+                page_counter = found.page.counter,
+                later_root = found.later_root.page_id,
+                later_root_counter = found.later_root.counter,
+                "pruning a retained commit with a page sealed after it"
+            );
+            return Ok(None);
+        }
+        Ok(Some(reached))
+    }
+
     /// The pages one history row reaches that `visited` does not hold yet.
     ///
     /// The row's own `next_page_id` bounds its trees. Its free-list root is
@@ -217,7 +255,7 @@ impl<V: Vfs + Clone> Db<V> {
         &self,
         row: &[u8],
         visited: &mut BTreeSet<u64>,
-    ) -> crate::Result<BTreeSet<u64>> {
+    ) -> crate::Result<Option<BTreeSet<u64>>> {
         let meta = decode_commit_meta(row)?;
         let mut reached = BTreeSet::new();
         for root_page_id in [meta.active_root_page_id, meta.catalog_root_page_id] {
@@ -231,7 +269,7 @@ impl<V: Vfs + Clone> Db<V> {
             .collect_unvisited_page_ids(visited, &mut reached)
             .await?;
         }
-        Ok(reached)
+        Ok(Some(reached))
     }
 }
 

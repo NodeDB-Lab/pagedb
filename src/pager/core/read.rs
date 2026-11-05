@@ -45,7 +45,7 @@ impl KindBinding {
     /// Resolve the kind to authenticate under on a cold read, from the on-disk
     /// page header. For `Node`, the header kind byte selects a leaf or internal
     /// node; anything else means the pointer led to a non-node page.
-    fn resolve_on_disk(self, page_buf: &[u8]) -> Result<PageKind> {
+    pub(super) fn resolve_on_disk(self, page_buf: &[u8]) -> Result<PageKind> {
         match self {
             Self::Fixed(k) => Ok(k),
             Self::Node => match extract_page_kind(page_buf) {

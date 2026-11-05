@@ -171,6 +171,11 @@ pub struct Db<V: Vfs + Clone> {
     /// non-ordinary writers (including rekey) can preserve them verbatim.
     pub(crate) format_version: u16,
     pub(crate) header_flags: u32,
+    /// Whether the store's restore mode can still need its first-apply stamp.
+    /// An apply prepares without the writer lock, so a store already stamped
+    /// answers from here and takes no lock.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) first_apply_unstamped: std::sync::atomic::AtomicBool,
     pub(crate) mk_epoch: AtomicU64,
     pub(crate) file_id: [u8; 16],
     pub(crate) kek_salt: [u8; 16],

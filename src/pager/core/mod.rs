@@ -11,6 +11,7 @@ mod inner;
 mod journal;
 mod pager;
 mod read;
+mod sealed;
 #[cfg(test)]
 #[allow(clippy::too_many_lines)]
 mod tests;

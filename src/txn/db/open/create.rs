@@ -101,6 +101,10 @@ impl<V: Vfs + Clone> Db<V> {
             cipher_id,
             format_version: initial.format_version,
             header_flags: initial.flags,
+            #[cfg(not(target_arch = "wasm32"))]
+            first_apply_unstamped: std::sync::atomic::AtomicBool::new(
+                initial.restore_mode == super::super::restore_mode::STANDALONE,
+            ),
             mk_epoch: AtomicU64::new(mk_epoch),
             file_id,
             kek_salt,

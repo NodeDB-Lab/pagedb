@@ -106,6 +106,34 @@ async fn rekey_prunes_a_stale_row_and_every_older_row_and_the_store_reopens() {
     assert_pruned_through_second(&reopened, &commits).await;
 }
 
+/// The page authenticates, so the read-only walk passes it. Its counter is the only
+/// evidence, and the rekey is about to reseal it for good.
+#[tokio::test(flavor = "current_thread")]
+async fn rekey_prunes_a_row_holding_a_page_sealed_after_a_later_root() {
+    let vfs = MemVfs::new();
+    let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
+    let commits = commit_versions(&db, COMMITS).await;
+    let root = root_of(&db, commits[1]).await;
+    let (guard, kind) = db.pager.read_main_node(root, REALM).await.unwrap();
+    let body = guard.body_ref().to_vec();
+    drop(guard);
+    db.pager
+        .write_main_page(root, REALM, kind, &body)
+        .await
+        .unwrap();
+    db.pager.flush_main(REALM).await.unwrap();
+    db.evict_main_pages().unwrap();
+    assert_reads_version(&db, commits[1], 1).await;
+
+    db.rekey_db(KEK, 1).await.unwrap();
+    drop(db);
+
+    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    assert_pruned_through_second(&reopened, &commits).await;
+}
+
 /// At an epoch above zero a row's bound is `oldest`, so the torn page's tag sits
 /// at the bound. No surviving row reaches that page, so it must not stop the pass.
 #[tokio::test(flavor = "current_thread")]

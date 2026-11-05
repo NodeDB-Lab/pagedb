@@ -105,6 +105,36 @@ pub fn extract_page_kind(page_buf: &[u8]) -> Result<PageKind> {
     PageKind::from_byte(page_buf[OFF_PAGE_KIND])
 }
 
+/// What a page's envelope records about the seal that wrote it.
+///
+/// The envelope is cleartext. Under an AEAD cipher the nonce feeds the tag, so
+/// an opened page proves these bytes. `PlaintextMac` tags only the AAD and body,
+/// so its nonce proves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealStamp {
+    /// The first six bytes of the nonce: the sealing file's identity prefix.
+    pub identity: [u8; 6],
+    /// The last six bytes of the nonce, little-endian.
+    pub counter: u64,
+    pub mk_epoch: u64,
+    pub cipher_id: CipherId,
+}
+
+/// Read the seal fields of a page envelope without decrypting.
+pub fn read_seal_stamp(page_buf: &[u8]) -> Result<SealStamp> {
+    let (cipher_id, mk_epoch) = extract_page_header_ids(page_buf)?;
+    let mut identity = [0u8; 6];
+    identity.copy_from_slice(&page_buf[OFF_NONCE..OFF_NONCE + 6]);
+    let mut counter = [0u8; 8];
+    counter[..6].copy_from_slice(&page_buf[OFF_NONCE + 6..OFF_NONCE + 12]);
+    Ok(SealStamp {
+        identity,
+        counter: u64::from_le_bytes(counter),
+        mk_epoch,
+        cipher_id,
+    })
+}
+
 /// Open a data page in place. On success the body slot of `page_buf` holds the
 /// decrypted plaintext and the authenticated `page_kind` is returned. On
 /// failure (`ChecksumFailure`), the body slot is in an unspecified state and
@@ -201,6 +231,57 @@ mod tests {
         let page_kind = open_data_page(&mut buf, &aad, &cipher).unwrap();
         assert_eq!(page_kind, PageKind::BTreeLeaf);
         assert_eq!(&body(&buf)[..5], b"hello");
+    }
+
+    #[test]
+    fn seal_stamp_reads_the_nonce_parts_and_ids_a_seal_wrote() {
+        let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
+        let (cipher, aad, _) = build_aead(RealmId([3; 16]), 42, &mk, PageKind::BTreeLeaf);
+        let nonce = Nonce::from_parts([0xAB; 6], 0x0102_0304_0506);
+        let mut buf = vec![0u8; PAGE];
+        seal_data_page(&mut buf, PageKind::BTreeLeaf, 0, 0, &nonce, &aad, &cipher).unwrap();
+        let stamp = read_seal_stamp(&buf).unwrap();
+        assert_eq!(stamp.identity, [0xAB; 6]);
+        assert_eq!(stamp.counter, 0x0102_0304_0506);
+        assert_eq!(stamp.mk_epoch, 0);
+        assert_eq!(stamp.cipher_id, cipher.id());
+    }
+
+    /// A counter edited in the cleartext envelope fails the tag under an AEAD.
+    /// This is why a page must open before its counter counts as evidence.
+    #[test]
+    fn an_edited_counter_fails_the_tag_under_an_aead() {
+        let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
+        let (cipher, aad, nonce) = build_aead(RealmId([3; 16]), 42, &mk, PageKind::BTreeLeaf);
+        let mut buf = vec![0u8; PAGE];
+        seal_data_page(&mut buf, PageKind::BTreeLeaf, 0, 0, &nonce, &aad, &cipher).unwrap();
+        buf[OFF_NONCE + 6] ^= 1;
+        assert!(matches!(
+            open_data_page(&mut buf, &aad, &cipher),
+            Err(PagedbError::ChecksumFailure)
+        ));
+    }
+
+    /// The MAC covers the AAD and body only, so an edited counter still opens.
+    /// A `PlaintextMac` store therefore holds no evidence about seal order.
+    #[test]
+    fn an_edited_counter_still_opens_under_plaintext_mac() {
+        let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
+        let ik = derive_ik(&mk, RealmId([0; 16]), &TEST_FILE_ID).unwrap();
+        let cipher = Cipher::new_plaintext_mac(ik);
+        let aad = Aad::from_fields(AadFields {
+            cipher_id: cipher.id().as_byte(),
+            page_kind: PageKind::BTreeLeaf.as_byte(),
+            mk_epoch: 0,
+            page_id: 1,
+            realm_id: RealmId([0; 16]),
+            segment_id: MAIN_DB_SEGMENT_ID,
+        });
+        let nonce = Nonce::from_parts([0xCD; 6], 1);
+        let mut buf = vec![0u8; PAGE];
+        seal_data_page(&mut buf, PageKind::BTreeLeaf, 0, 0, &nonce, &aad, &cipher).unwrap();
+        buf[OFF_NONCE + 6] ^= 1;
+        assert!(open_data_page(&mut buf, &aad, &cipher).is_ok());
     }
 
     #[test]

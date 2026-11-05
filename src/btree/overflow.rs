@@ -134,6 +134,11 @@ fn decode_overflow_root(body: &[u8]) -> Result<(u32, u64, &[u8])> {
     Ok((refcount, next, &body[16..16 + data_len]))
 }
 
+/// The chain link an overflow root page's body names. Zero ends the chain.
+pub(crate) fn overflow_root_next(body: &[u8]) -> Result<u64> {
+    decode_overflow_root(body).map(|(_, next, _)| next)
+}
+
 /// Decoded contents of an overflow root page.
 pub struct RootPageInfo {
     /// Reference count (shared-chain owner count).

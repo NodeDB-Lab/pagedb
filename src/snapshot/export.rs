@@ -98,6 +98,20 @@ pub fn encode_manifest(m: &SnapshotManifest, hk_key: &[u8; 32]) -> [u8; MANIFEST
     buf
 }
 
+/// Whether a manifest's unauthenticated bytes name this file at a later epoch.
+///
+/// Only classifies a refusal. A caller must have already refused the manifest,
+/// and nothing here admits one.
+#[must_use]
+pub fn manifest_names_later_epoch(
+    buf: &[u8; MANIFEST_RESERVED_SIZE],
+    file_id: &[u8; 16],
+    mk_epoch: u64,
+) -> bool {
+    let stored_epoch = u64::from_le_bytes(buf[45..53].try_into().unwrap_or([0; 8]));
+    &buf[..8] == MAGIC && &buf[29..45] == file_id.as_slice() && stored_epoch > mk_epoch
+}
+
 /// Decode and verify a manifest. Returns `PagedbError::Corruption` if the
 /// HK-MAC check fails.
 pub fn decode_manifest(

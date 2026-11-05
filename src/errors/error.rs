@@ -130,6 +130,9 @@ pub enum PagedbError {
     /// explicitly promoted before they can be opened normally; open with the
     /// restore-completion path (or discard the directory and restore again)
     /// instead of the standard open.
+    ///
+    /// A byte copy of a store that took an `apply_incremental` reports this too.
+    /// It shares the source's key and nonce space, as a restored directory does.
     #[error("restored directory not promoted")]
     RestoredNotPromoted,
 
@@ -249,6 +252,9 @@ pub enum PagedbError {
     /// see those pages, so it cannot avoid them; the apply relocates both
     /// structures out of the incoming page space instead of refusing an
     /// otherwise-healthy delta.
+    ///
+    /// A record that matches the base page byte for byte is not this condition.
+    /// A catalog root moved under one commit id produces such a record.
     ///
     /// Not a corruption of this store: both states are internally sound, they
     /// simply cannot be related by this delta — which is why this is distinct

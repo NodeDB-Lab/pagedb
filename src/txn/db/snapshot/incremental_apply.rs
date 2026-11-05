@@ -10,6 +10,11 @@ use crate::vfs::Vfs;
 impl<V: Vfs + Clone> Db<V> {
     /// Apply an incremental snapshot to this Follower handle.
     ///
+    /// On a byte copy of a store, the first apply past the delta screens records
+    /// the follower stamp durably. Every later `Standalone` open then reports
+    /// [`PagedbError::RestoredNotPromoted`](crate::PagedbError::RestoredNotPromoted),
+    /// even when that apply fails later. Use `rekey_into_writer` to fork a writer.
+    ///
     /// The target state is assembled in a staged copy of `main.db` and renamed
     /// over it. That rename is the operation's only commit point: an apply
     /// interrupted before it leaves the follower wholly at its base commit, and
@@ -21,8 +26,8 @@ impl<V: Vfs + Clone> Db<V> {
     /// An apply never overwrites a page a registered reader can reach, so a
     /// reader always sees its own snapshot.
     ///
-    /// A reader pinned at the base commit never conflicts. A delta cannot name a
-    /// page the base reaches. A reader pinned further back can reach a page a
+    /// A reader pinned at the base commit never conflicts. A delta cannot change
+    /// a page the base reaches. A reader pinned further back can reach a page a
     /// later commit freed and the producer recycled. An apply whose delta
     /// rewrites such a page returns
     /// [`PagedbError::ApplyBlockedByPinnedReader`](crate::PagedbError::ApplyBlockedByPinnedReader).
@@ -47,8 +52,16 @@ impl<V: Vfs + Clone> Db<V> {
     /// A reader already open on a pruned commit stays valid, because the apply
     /// refuses to rewrite a page it can reach.
     ///
-    /// The screen reads each retained page the base does not reach once per apply.
-    /// It runs with reader admission closed. A delta with no pages reads nothing.
+    /// An apply also prunes a retained commit whose page was sealed after a later
+    /// commit's root. An earlier release's apply leaves that state, and the row
+    /// still authenticates. The evidence stops at a rekey, and some pages stay
+    /// undetectable. See the `history_seals` module for the proof and its limits.
+    ///
+    /// The screen reads each page the retained commits reach once per apply, past
+    /// the cache, shared base pages included. A rekeyed store skips the pages a
+    /// retained commit shares with the base, because it cannot show seal order.
+    /// The screen runs with reader admission closed. A delta with no pages reads
+    /// nothing.
     pub async fn apply_incremental(
         &self,
         src_path: &std::path::Path,

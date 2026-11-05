@@ -14,6 +14,10 @@
 //! proof about page bytes prunes. A transient error fails the operation and
 //! leaves every row in place.
 //!
+//! A row can also authenticate and still name newer bytes. Seal order shows this
+//! only until the rewrite below destroys it, so the same pass compares it first.
+//! See the `history_seals` module for the proof and what voids it.
+//!
 //! The read path picks each page's key from the epoch in that page's envelope.
 //! A resume therefore reads a mix of source and target pages with no extra work.
 
@@ -61,7 +65,14 @@ impl<V: Vfs + Clone> Db<V> {
         if self.history_rows_gone(state) {
             return Ok(Some(ALL_HISTORY_ROWS));
         }
-        self.newest_unreadable_history_row(state, walked).await
+        let unreadable = self.newest_unreadable_history_row(state, walked).await?;
+        if unreadable == Some(ALL_HISTORY_ROWS) {
+            return Ok(unreadable);
+        }
+        // A rekey reseals in walk order, so this is the last chance to read seal
+        // order. A store that cannot show it answers `None`.
+        let resealed = self.newest_resealed_history_row(state, unreadable).await?;
+        Ok(unreadable.max(resealed))
     }
 
     async fn newest_unreadable_history_row(

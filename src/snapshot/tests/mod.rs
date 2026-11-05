@@ -4,3 +4,4 @@
 
 mod basic;
 mod generated_artifacts;
+mod stale_history;
