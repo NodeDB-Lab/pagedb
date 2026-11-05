@@ -7,6 +7,8 @@ pub mod file;
 // Raw completion-port plumbing — an internal detail of this backend, never
 // something an embedder drives directly.
 pub(crate) mod port;
+#[cfg(test)]
+mod tests;
 pub mod vfs;
 
 pub use file::IocpFile;

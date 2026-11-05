@@ -1,13 +1,21 @@
-//! Cross-platform native VFS backed by `tokio::fs`. Advisory locking is the
-//! shared two-layer protocol behind [`TokioLockHandle`], so this backend and every
-//! other native backend exclude each other over the same directory. The trait
-//! contract from `traits.rs` is the durable surface.
+//! Cross-platform native VFS on the Tokio blocking pool. Path operations use
+//! `tokio::fs`. Advisory locking is the shared two-layer protocol behind
+//! [`TokioLockHandle`], so this backend and every other native backend exclude
+//! each other over the same directory. The trait contract from `traits.rs` is the
+//! durable surface.
+//!
+//! File I/O runs `std::fs` calls through [`offload`], as the other pool-backed
+//! backends do. `tokio::fs::File` orders work inside one handle only. Its queued
+//! write outlives a closed handle, and nothing outside it can see that write
+//! finish. Each closure here owns its buffer and its [`WriteOrder`] turn instead,
+//! so a write stays ordered after its future drops, across every handle of a file.
 
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::Result;
 use crate::errors::PagedbError;
@@ -16,6 +24,7 @@ use super::blocking::offload;
 use super::oslock::LockKind;
 use super::traits::{Vfs, VfsFile, canonical_native_path, resolve_native_path};
 use super::types::{OpenMode, ReadReq, WriteReq};
+use super::write_order::WriteOrder;
 
 /// RAII advisory lock handle returned by `TokioVfs::lock_exclusive` /
 /// `lock_shared`. The one native handle type, shared with every other
@@ -72,13 +81,66 @@ impl TokioVfs {
 // TokioFile
 // ---------------------------------------------------------------------------
 
-/// Handle to an open file. Wraps `tokio::fs::File` behind a `tokio::sync::Mutex`
-/// so that `read_at(&self, …)` can seek and read without requiring `&mut self`.
-/// All I/O is serialized per file handle; concurrent access across cloned
-/// handles is not supported (matches `MemVfs` semantics).
+/// Handle to an open file.
+///
+/// Reads and writes seek the shared file cursor and then transfer, on a pool
+/// thread, under `cursor`. Each handle owns its cursor, so its I/O is serialized.
+/// Writes, syncs, and truncates also hold the file's order until they finish.
 pub struct TokioFile {
-    inner: tokio::sync::Mutex<fs::File>,
+    file: Arc<std::fs::File>,
+    /// Serializes one seek and transfer pair. Taken only on a pool thread.
+    cursor: Arc<Mutex<()>>,
+    order: WriteOrder,
     writable: bool,
+}
+
+impl TokioFile {
+    fn shared(&self) -> (Arc<std::fs::File>, Arc<Mutex<()>>) {
+        (Arc::clone(&self.file), Arc::clone(&self.cursor))
+    }
+}
+
+/// Seek and read until `buf` is full or the file ends. Returns the bytes read.
+fn read_request(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    let mut handle = file;
+    handle
+        .seek(SeekFrom::Start(offset))
+        .map_err(PagedbError::Io)?;
+    let mut total = 0;
+    while let Some(rest) = buf.get_mut(total..).filter(|rest| !rest.is_empty()) {
+        match handle.read(rest) {
+            Ok(0) => break,
+            Ok(read) => total += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(PagedbError::Io(error)),
+        }
+    }
+    Ok(total)
+}
+
+/// Seek and write all of `buf`.
+fn write_request(file: &std::fs::File, offset: u64, buf: &[u8]) -> Result<()> {
+    let mut handle = file;
+    handle
+        .seek(SeekFrom::Start(offset))
+        .map_err(PagedbError::Io)?;
+    handle.write_all(buf).map_err(PagedbError::Io)
+}
+
+/// Copy the bytes a pool call read into the caller's buffer.
+fn copy_read(dest: &mut [u8], scratch: &[u8]) {
+    for (byte, read) in dest.iter_mut().zip(scratch) {
+        *byte = *read;
+    }
+}
+
+fn checked_write_range(offset: u64, len: usize) -> Result<()> {
+    let len = u64::try_from(len)
+        .map_err(|_| PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;
+    offset
+        .checked_add(len)
+        .ok_or_else(|| PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +199,17 @@ impl Vfs for TokioVfs {
                 (f, true)
             }
         };
+        let file = file.into_std().await;
+        let (file, order) = offload(move || {
+            let order = WriteOrder::for_file(&file)?;
+            Ok((file, order))
+        })
+        .await?;
+        order.settled().await;
         Ok(TokioFile {
-            inner: tokio::sync::Mutex::new(file),
+            file: Arc::new(file),
+            cursor: Arc::new(Mutex::new(())),
+            order,
             writable,
         })
     }
@@ -247,42 +318,47 @@ impl Vfs for TokioVfs {
 
 impl VfsFile for TokioFile {
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut f = self.inner.lock().await;
-        f.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(PagedbError::Io)?;
-        let mut total = 0;
-        while total < buf.len() {
-            let n = f.read(&mut buf[total..]).await.map_err(PagedbError::Io)?;
-            if n == 0 {
-                break;
-            }
-            total += n;
+        if buf.is_empty() {
+            return Ok(0);
         }
-        Ok(total)
+        let len = buf.len();
+        let (file, cursor) = self.shared();
+        let scratch = offload(move || {
+            let mut scratch = vec![0u8; len];
+            let _cursor = cursor.lock();
+            let read = read_request(&file, offset, &mut scratch)?;
+            scratch.truncate(read);
+            Ok(scratch)
+        })
+        .await?;
+        copy_read(buf, &scratch);
+        Ok(scratch.len())
     }
 
     async fn read_at_vectored(&self, reqs: &mut [ReadReq<'_>]) -> Result<()> {
-        let mut f = self.inner.lock().await;
-        for req in reqs.iter_mut() {
-            f.seek(std::io::SeekFrom::Start(req.offset))
-                .await
-                .map_err(PagedbError::Io)?;
-            let mut total = 0;
-            while total < req.buf.len() {
-                let n = f
-                    .read(&mut req.buf[total..])
-                    .await
-                    .map_err(PagedbError::Io)?;
-                if n == 0 {
-                    break;
-                }
-                total += n;
+        if reqs.is_empty() {
+            return Ok(());
+        }
+        let plan: Vec<(u64, usize)> = reqs.iter().map(|req| (req.offset, req.buf.len())).collect();
+        let (file, cursor) = self.shared();
+        let completed = offload(move || {
+            let _cursor = cursor.lock();
+            let mut out = Vec::with_capacity(plan.len());
+            for (offset, len) in plan {
+                let mut scratch = vec![0u8; len];
+                let read = read_request(&file, offset, &mut scratch)?;
+                scratch.truncate(read);
+                out.push(scratch);
             }
+            Ok(out)
+        })
+        .await?;
+        for (req, scratch) in reqs.iter_mut().zip(completed) {
+            copy_read(req.buf, &scratch);
             // Zero the tail past EOF, matching vectored contract: callers see
             // a deterministic buffer state (mirrors MemVfs behaviour).
-            for b in &mut req.buf[total..] {
-                *b = 0;
+            for byte in req.buf.iter_mut().skip(scratch.len()) {
+                *byte = 0;
             }
         }
         Ok(())
@@ -292,17 +368,18 @@ impl VfsFile for TokioFile {
         if !self.writable {
             return Err(PagedbError::ReadOnly);
         }
-        let buf_len = u64::try_from(buf.len())
-            .map_err(|_| PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;
-        offset.checked_add(buf_len).ok_or_else(|| {
-            PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
-        })?;
-        let mut f = self.inner.lock().await;
-        f.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(PagedbError::Io)?;
-        f.write_all(buf).await.map_err(PagedbError::Io)?;
-        Ok(buf.len())
+        checked_write_range(offset, buf.len())?;
+        let turn = self.order.enter().await;
+        let (file, cursor) = self.shared();
+        // The pool thread outlives this future, so it writes from its own copy.
+        let data = buf.to_vec();
+        offload(move || {
+            let _turn = turn;
+            let _cursor = cursor.lock();
+            write_request(&file, offset, &data)?;
+            Ok(data.len())
+        })
+        .await
     }
 
     async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> Result<()> {
@@ -310,45 +387,54 @@ impl VfsFile for TokioFile {
             return Err(PagedbError::ReadOnly);
         }
         for req in reqs {
-            let buf_len = u64::try_from(req.buf.len()).map_err(|_| {
-                PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
-            })?;
-            req.offset.checked_add(buf_len).ok_or_else(|| {
-                PagedbError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
-            })?;
+            checked_write_range(req.offset, req.buf.len())?;
         }
-        let mut f = self.inner.lock().await;
-        for req in reqs {
-            f.seek(std::io::SeekFrom::Start(req.offset))
-                .await
-                .map_err(PagedbError::Io)?;
-            f.write_all(req.buf).await.map_err(PagedbError::Io)?;
+        if reqs.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let batch: Vec<(u64, Vec<u8>)> = reqs
+            .iter()
+            .map(|req| (req.offset, req.buf.to_vec()))
+            .collect();
+        let turn = self.order.enter().await;
+        let (file, cursor) = self.shared();
+        offload(move || {
+            let _turn = turn;
+            let _cursor = cursor.lock();
+            for (offset, data) in &batch {
+                write_request(&file, *offset, data)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn sync(&mut self) -> Result<()> {
-        let f = self.inner.lock().await;
-        f.sync_all().await.map_err(PagedbError::Io)
+        let turn = self.order.enter().await;
+        let file = Arc::clone(&self.file);
+        offload(move || {
+            let _turn = turn;
+            file.sync_all().map_err(PagedbError::Io)
+        })
+        .await
     }
 
     async fn truncate(&mut self, len: u64) -> Result<()> {
         if !self.writable {
             return Err(PagedbError::ReadOnly);
         }
-        let f = self.inner.lock().await;
-        f.set_len(len).await.map_err(PagedbError::Io)
+        let turn = self.order.enter().await;
+        let file = Arc::clone(&self.file);
+        offload(move || {
+            let _turn = turn;
+            file.set_len(len).map_err(PagedbError::Io)
+        })
+        .await
     }
 
     async fn len(&self) -> Result<u64> {
-        let mut f = self.inner.lock().await;
-        // `metadata` is the one file operation that does not wait for a write
-        // already submitted to the runtime's background pool, so on a loaded
-        // pool it can observe the pre-write length even though `write_at` has
-        // returned. Flush first so the reported length reflects every
-        // completed write. On a read-only handle this is a no-op.
-        f.flush().await.map_err(PagedbError::Io)?;
-        Ok(f.metadata().await.map_err(PagedbError::Io)?.len())
+        let file = Arc::clone(&self.file);
+        offload(move || Ok(file.metadata().map_err(PagedbError::Io)?.len())).await
     }
 
     async fn is_empty(&self) -> Result<bool> {
@@ -360,249 +446,5 @@ impl VfsFile for TokioFile {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tempdir() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let mut p = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-        p.push(format!(
-            "pagedb-tokio-unit-{}-{nanos}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&p).unwrap();
-        p
-    }
-
-    #[test]
-    fn tempdir_helper_allocates_unique_roots() {
-        let dirs: Vec<_> = (0..128).map(|_| tempdir()).collect();
-        let mut paths = dirs.clone();
-        paths.sort();
-        paths.dedup();
-        assert_eq!(paths.len(), dirs.len());
-
-        for dir in dirs {
-            std::fs::remove_dir_all(dir).ok();
-        }
-    }
-
-    #[test]
-    fn canonical_logical_paths_have_one_spelling() {
-        assert_eq!(
-            TokioVfs::canonical_logical_path("/main.db").unwrap(),
-            "/main.db"
-        );
-        assert_eq!(
-            TokioVfs::canonical_logical_path("main.db").unwrap(),
-            "/main.db"
-        );
-        assert_eq!(
-            TokioVfs::canonical_logical_path("/seg/file/").unwrap(),
-            "/seg/file"
-        );
-        assert_eq!(
-            TokioVfs::canonical_logical_path(r"seg\file").unwrap(),
-            "/seg/file"
-        );
-        assert_eq!(TokioVfs::canonical_logical_path("/").unwrap(), "/");
-    }
-
-    #[test]
-    fn rejects_parent_current_and_empty_path_components() {
-        let vfs = TokioVfs::new("/tmp/pagedb-root");
-
-        for path in [
-            "../escape",
-            "/seg/../escape",
-            "./main.db",
-            "seg/./x",
-            "seg//x",
-        ] {
-            let error = vfs.resolve(path).unwrap_err();
-            match error {
-                PagedbError::Io(error) => {
-                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-                }
-                other => panic!("expected InvalidInput, got {other:?}"),
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn write_and_read_round_trip() {
-        let dir = tempdir();
-        let vfs = TokioVfs::new(&dir);
-
-        let mut f = vfs.open("/hello", OpenMode::CreateNew).await.unwrap();
-        f.write_at(0, b"pagedb").await.unwrap();
-        f.sync().await.unwrap();
-        drop(f);
-
-        let g = vfs.open("/hello", OpenMode::Read).await.unwrap();
-        let mut buf = vec![0u8; 6];
-        let n = g.read_at(0, &mut buf).await.unwrap();
-        assert_eq!(n, 6);
-        assert_eq!(&buf, b"pagedb");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn vectored_read_write() {
-        let dir = tempdir();
-        let vfs = TokioVfs::new(&dir);
-
-        let mut f = vfs.open("/vec", OpenMode::CreateNew).await.unwrap();
-        f.write_at_vectored(&[
-            WriteReq {
-                offset: 0,
-                buf: b"foo",
-            },
-            WriteReq {
-                offset: 10,
-                buf: b"bar",
-            },
-        ])
-        .await
-        .unwrap();
-        drop(f);
-
-        let g = vfs.open("/vec", OpenMode::Read).await.unwrap();
-        let mut a = [0u8; 3];
-        let mut b = [0u8; 3];
-        g.read_at_vectored(&mut [
-            ReadReq {
-                offset: 0,
-                buf: &mut a,
-            },
-            ReadReq {
-                offset: 10,
-                buf: &mut b,
-            },
-        ])
-        .await
-        .unwrap();
-        assert_eq!(&a, b"foo");
-        assert_eq!(&b, b"bar");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn exclusive_lock_conflicts() {
-        let dir = tempdir();
-        let vfs = TokioVfs::new(&dir);
-
-        let _h = vfs.lock_exclusive("/db").await.unwrap();
-        assert!(vfs.lock_exclusive("/db").await.is_err());
-        assert!(vfs.lock_shared("/db").await.is_err());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Two independent `TokioVfs` instances over the same directory have
-    /// separate in-process lock tables, so only the OS-level lock can stop them
-    /// double-opening the same store. On Linux the OFD lock conflicts even
-    /// within one process; classic `F_SETLK` would not (it is process-owned and
-    /// self-non-conflicting). This is the defense-in-depth that keeps a single
-    /// buggy process from concurrently opening one store's writer twice.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn exclusive_lock_conflicts_across_vfs_instances_same_process() {
-        let dir = tempdir();
-        let vfs_a = TokioVfs::new(&dir);
-        let vfs_b = TokioVfs::new(&dir);
-
-        let _h = vfs_a.lock_exclusive("/db").await.unwrap();
-        // Different instance, same process, same path: the in-proc guard cannot
-        // see across instances, so the OFD lock must reject this.
-        assert!(matches!(
-            vfs_b.lock_exclusive("/db").await,
-            Err(PagedbError::AlreadyLocked)
-        ));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn shared_locks_coexist() {
-        let dir = tempdir();
-        let vfs = TokioVfs::new(&dir);
-
-        let h1 = vfs.lock_shared("/db").await.unwrap();
-        let h2 = vfs.lock_shared("/db").await.unwrap();
-        assert!(vfs.lock_exclusive("/db").await.is_err());
-
-        drop(h1);
-        drop(h2);
-        // After releasing both shared locks, exclusive should succeed.
-        let h3 = vfs.lock_exclusive("/db").await.unwrap();
-        drop(h3);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn list_dir_and_mkdir_all() {
-        let dir = tempdir();
-        let vfs = TokioVfs::new(&dir);
-
-        vfs.mkdir_all("/sub/nested").await.unwrap();
-        let mut f = vfs
-            .open("/sub/nested/a", OpenMode::CreateNew)
-            .await
-            .unwrap();
-        f.write_at(0, b"x").await.unwrap();
-        drop(f);
-
-        let entries = vfs.list_dir("/sub/nested").await.unwrap();
-        assert!(entries.contains(&"a".to_string()));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn truncate_and_len() {
-        let dir = tempdir();
-        let vfs = TokioVfs::new(&dir);
-
-        let mut f = vfs.open("/trunc", OpenMode::CreateNew).await.unwrap();
-        f.write_at(0, b"abcdefgh").await.unwrap();
-        assert_eq!(f.len().await.unwrap(), 8);
-        f.truncate(4).await.unwrap();
-        assert_eq!(f.len().await.unwrap(), 4);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn read_only_rejects_writes() {
-        let dir = tempdir();
-        let vfs = TokioVfs::new(&dir);
-
-        {
-            let mut f = vfs.open("/ro", OpenMode::CreateNew).await.unwrap();
-            f.write_at(0, b"data").await.unwrap();
-        }
-
-        let mut g = vfs.open("/ro", OpenMode::Read).await.unwrap();
-        assert!(matches!(
-            g.write_at(0, b"x").await,
-            Err(PagedbError::ReadOnly)
-        ));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+mod tests;

@@ -22,6 +22,7 @@ use crate::vfs::blocking::offload;
 use crate::vfs::oslock::LockKind;
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
+use crate::vfs::write_order::WriteOrder;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
@@ -74,7 +75,7 @@ impl Vfs for IocpVfs {
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
         let p = self.resolve(path)?;
-        let (file, writable) = offload(move || {
+        let (file, writable, order) = offload(move || {
             if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
@@ -84,7 +85,7 @@ impl Vfs for IocpVfs {
             // FILE_SHARE_DELETE is required so tombstone-rename protocols
             // succeed while readers hold handles open.
             const FILE_SHARE_RWD: u32 = 0x0000_0007;
-            let opened = match mode {
+            let (file, writable) = match mode {
                 OpenMode::Read => {
                     let f = std::fs::OpenOptions::new()
                         .read(true)
@@ -128,9 +129,11 @@ impl Vfs for IocpVfs {
                     (f, true)
                 }
             };
-            Ok(opened)
+            let order = WriteOrder::for_file(&file)?;
+            Ok((file, writable, order))
         })
         .await?;
+        order.settled().await;
         let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
         let handle = file.as_raw_handle() as HANDLE;
         // `CreateIoCompletionPort` only registers the handle with the port; it
@@ -141,6 +144,7 @@ impl Vfs for IocpVfs {
             writable,
             key,
             Arc::clone(&self.inner.port.inner),
+            order,
         ))
     }
 

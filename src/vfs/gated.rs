@@ -50,6 +50,51 @@ pub(crate) async fn cancel_when<F: Future, U: Future<Output = ()>>(future: F, un
     .await;
 }
 
+/// Holds a lock on its own thread until dropped.
+///
+/// Work on a blocking pool that needs the lock parks there, so it completes only
+/// after the release. A test future never holds the guard across an await.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct LockStall {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LockStall {
+    /// Run `locker` on a new thread. It takes its lock and then calls `park`, which
+    /// returns at the release. This returns once the lock is held.
+    pub(crate) fn hold(locker: impl FnOnce(&dyn Fn()) + Send + 'static) -> Self {
+        let (announce, wait_held) = std::sync::mpsc::channel::<()>();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            locker(&|| {
+                announce.send(()).unwrap();
+                let _ = wait_release.recv();
+            });
+        });
+        wait_held.recv().unwrap();
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for LockStall {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+fn injected_fault() -> crate::PagedbError {
+    crate::PagedbError::Io(std::io::Error::other("injected I/O fault"))
+}
+
 /// One parked operation. Both semaphores hold no permits, so closing one is a
 /// one-shot latch that wakes every waiter.
 pub(crate) struct Gate {
@@ -86,6 +131,20 @@ enum Trigger {
     Read { path: String, offset: u64 },
     /// Parks an open after it binds the handle to the current inode.
     Open { path: String },
+    /// Parks an open like `Open`, for a path whose final name is random.
+    OpenUnder { prefix: String },
+    /// Parks a read like `Read`, at any offset other than `except`.
+    ReadOtherThan { path: String, except: u64 },
+    /// Fails a read of `offset` before any byte is copied.
+    FailReadAt { path: String, offset: u64 },
+    /// Fails an open in `OpenMode::ReadWrite` before the file opens. A header
+    /// write opens this way, and the pager's cached handle does not.
+    FailReadWriteOpen { path: String },
+    /// Fails a write at `offset` before any byte lands.
+    FailWriteAt { path: String, offset: u64 },
+    /// Fails the file sync that follows a write at `offset`. The bytes landed, so
+    /// the header is durable although its writer got an error.
+    FailSyncAfterWriteAt { path: String, offset: u64 },
     /// Parks a rename onto `to` before the rename happens.
     Rename { to: String },
     /// Parks a truncate to a length above `min_len` before it happens.
@@ -157,6 +216,50 @@ impl<I> Gated<I> {
         })
     }
 
+    /// `prefix` is a canonical path prefix, such as `/applyjournal/`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn park_next_open_under(&self, prefix: &str) -> Arc<Gate> {
+        self.arm(Trigger::OpenUnder {
+            prefix: prefix.to_string(),
+        })
+    }
+
+    /// Park the first read of `path` away from `except`. A descent reads the root
+    /// first, so with the root at `except` this parks the read below it.
+    pub(crate) fn park_next_read_other_than(&self, path: &str, except: u64) -> Arc<Gate> {
+        self.arm(Trigger::ReadOtherThan {
+            path: canonical(path),
+            except,
+        })
+    }
+
+    pub(crate) fn fail_next_read_at(&self, path: &str, offset: u64) {
+        self.arm(Trigger::FailReadAt {
+            path: canonical(path),
+            offset,
+        });
+    }
+
+    pub(crate) fn fail_next_read_write_open(&self, path: &str) {
+        self.arm(Trigger::FailReadWriteOpen {
+            path: canonical(path),
+        });
+    }
+
+    pub(crate) fn fail_next_write_at(&self, path: &str, offset: u64) {
+        self.arm(Trigger::FailWriteAt {
+            path: canonical(path),
+            offset,
+        });
+    }
+
+    pub(crate) fn fail_sync_after_next_write_at(&self, path: &str, offset: u64) {
+        self.arm(Trigger::FailSyncAfterWriteAt {
+            path: canonical(path),
+            offset,
+        });
+    }
+
     pub(crate) fn park_next_rename(&self, to: &str) -> Arc<Gate> {
         self.arm(Trigger::Rename { to: canonical(to) })
     }
@@ -201,6 +304,7 @@ pub(crate) struct GatedFile<F> {
     inner: F,
     path: String,
     armed: Armed,
+    fail_next_sync: bool,
 }
 
 #[allow(clippy::unused_async_trait_impl)]
@@ -212,12 +316,23 @@ where
     type LockHandle = I::LockHandle;
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
+        if matches!(mode, OpenMode::ReadWrite) {
+            let target = canonical_native_path(path)?;
+            let fault = take_gate(
+                &self.armed,
+                |trigger| matches!(trigger, Trigger::FailReadWriteOpen { path } if *path == target),
+            );
+            if fault.is_some() {
+                return Err(injected_fault());
+            }
+        }
         let inner = self.inner.open(path, mode).await?;
         let path = canonical_native_path(path)?;
-        let gate = take_gate(
-            &self.armed,
-            |trigger| matches!(trigger, Trigger::Open { path: armed } if *armed == path),
-        );
+        let gate = take_gate(&self.armed, |trigger| match trigger {
+            Trigger::Open { path: armed } => *armed == path,
+            Trigger::OpenUnder { prefix } => path.starts_with(prefix.as_str()),
+            _ => false,
+        });
         if let Some(gate) = gate {
             gate.park().await;
         }
@@ -225,6 +340,7 @@ where
             inner,
             path,
             armed: self.armed.clone(),
+            fail_next_sync: false,
         })
     }
 
@@ -288,12 +404,24 @@ where
 #[allow(clippy::unused_async_trait_impl)]
 impl<F: VfsFile + Sync> VfsFile for GatedFile<F> {
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let read = self.inner.read_at(offset, buf).await?;
-        let gate = take_gate(&self.armed, |trigger| {
+        let fault = take_gate(&self.armed, |trigger| {
             matches!(
                 trigger,
-                Trigger::Read { path, offset: armed } if *path == self.path && *armed == offset
+                Trigger::FailReadAt { path, offset: armed }
+                    if *path == self.path && *armed == offset
             )
+        });
+        if fault.is_some() {
+            return Err(injected_fault());
+        }
+        let read = self.inner.read_at(offset, buf).await?;
+        let gate = take_gate(&self.armed, |trigger| match trigger {
+            Trigger::Read {
+                path,
+                offset: armed,
+            } => *path == self.path && *armed == offset,
+            Trigger::ReadOtherThan { path, except } => *path == self.path && *except != offset,
+            _ => false,
         });
         if let Some(gate) = gate {
             gate.park().await;
@@ -306,7 +434,25 @@ impl<F: VfsFile + Sync> VfsFile for GatedFile<F> {
     }
 
     async fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize> {
+        let write_fault = take_gate(&self.armed, |trigger| {
+            matches!(
+                trigger,
+                Trigger::FailWriteAt { path, offset: armed }
+                    if *path == self.path && *armed == offset
+            )
+        });
+        if write_fault.is_some() {
+            return Err(injected_fault());
+        }
         let written = self.inner.write_at(offset, buf).await?;
+        let sync_fault = take_gate(&self.armed, |trigger| {
+            matches!(
+                trigger,
+                Trigger::FailSyncAfterWriteAt { path, offset: armed }
+                    if *path == self.path && *armed == offset
+            )
+        });
+        self.fail_next_sync |= sync_fault.is_some();
         let gate = take_gate(&self.armed, |trigger| {
             matches!(
                 trigger,
@@ -324,6 +470,9 @@ impl<F: VfsFile + Sync> VfsFile for GatedFile<F> {
     }
 
     async fn sync(&mut self) -> Result<()> {
+        if std::mem::take(&mut self.fail_next_sync) {
+            return Err(injected_fault());
+        }
         let gate = take_gate(
             &self.armed,
             |trigger| matches!(trigger, Trigger::Sync { path } if *path == self.path),

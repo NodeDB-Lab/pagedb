@@ -9,6 +9,10 @@
 //! that drops the future mid-flight cannot free memory the kernel is still
 //! writing into. Each cycle holds the port mutex across submit + dequeue, so
 //! the completion packet it drains is unambiguously its own.
+//!
+//! The pool thread also outlives the future in time. Writes, syncs, and truncates
+//! therefore hold the file's [`WriteOrder`] turn inside the closure, so the next
+//! one cannot overtake a write whose future was dropped.
 #![allow(unsafe_code)]
 
 use std::os::windows::io::AsRawHandle;
@@ -22,6 +26,7 @@ use crate::vfs::traits::{
     checked_read_count, checked_readfile_len, checked_signed_file_len, checked_write_progress,
 };
 use crate::vfs::types::{ReadReq, WriteReq};
+use crate::vfs::write_order::WriteOrder;
 
 use super::port::{Port, PortInner};
 
@@ -43,6 +48,7 @@ pub struct IocpFile {
     /// associating handles.
     _key: usize,
     port: Arc<PortInner>,
+    order: WriteOrder,
 }
 
 impl IocpFile {
@@ -51,13 +57,22 @@ impl IocpFile {
         writable: bool,
         key: usize,
         port: Arc<PortInner>,
+        order: WriteOrder,
     ) -> Self {
         Self {
             file: Arc::new(file),
             writable,
             _key: key,
             port,
+            order,
         }
+    }
+
+    /// The port this handle submits through. A test holds its lock to park a
+    /// write on the blocking pool.
+    #[cfg(test)]
+    pub(super) fn port(&self) -> Arc<PortInner> {
+        Arc::clone(&self.port)
     }
 
     /// The two owned handles a blocking-pool cycle needs. Both are cheap `Arc`
@@ -293,11 +308,13 @@ impl VfsFile for IocpFile {
             return Ok(0);
         }
         Self::writefile_len(buf.len())?;
+        let turn = self.order.enter().await;
         let (file, port) = self.shared();
         // The pool thread outlives this future, so it writes from its own copy
         // rather than from the caller's borrow.
         let data = buf.to_vec();
         offload(move || {
+            let _turn = turn;
             let handle = file.as_raw_handle() as HANDLE;
             let _guard = port.lock();
             IocpFile::write_locked(handle, &port, offset, &data)
@@ -317,8 +334,10 @@ impl VfsFile for IocpFile {
             Self::writefile_len(req.buf.len())?;
             batch.push((req.offset, req.buf.to_vec()));
         }
+        let turn = self.order.enter().await;
         let (file, port) = self.shared();
         offload(move || {
+            let _turn = turn;
             let handle = file.as_raw_handle() as HANDLE;
             let _guard = port.lock();
             for (start, data) in &batch {
@@ -336,8 +355,10 @@ impl VfsFile for IocpFile {
     }
 
     async fn sync(&mut self) -> Result<()> {
+        let turn = self.order.enter().await;
         let file = Arc::clone(&self.file);
         offload(move || {
+            let _turn = turn;
             let handle = file.as_raw_handle() as HANDLE;
             // SAFETY: the `Arc` keeps the handle valid for the whole call;
             // `FlushFileBuffers` is self-contained.
@@ -358,8 +379,10 @@ impl VfsFile for IocpFile {
         // pointer for subsequent I/O (all our ops are positional/overlapped),
         // so we just seek to `len` and set EOF there.
         let len = checked_signed_file_len(len, "SetFilePointerEx")?;
+        let turn = self.order.enter().await;
         let file = Arc::clone(&self.file);
         offload(move || {
+            let _turn = turn;
             let handle = file.as_raw_handle() as HANDLE;
             // SAFETY: the `Arc` keeps the handle valid; the output ptr is null
             // because we don't need the new position back, and `len` was

@@ -17,6 +17,7 @@ use crate::vfs::blocking::offload;
 use crate::vfs::oslock::LockKind;
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
+use crate::vfs::write_order::WriteOrder;
 
 pub use crate::vfs::oslock::NativeLockHandle as GcdLockHandle;
 
@@ -59,13 +60,13 @@ impl Vfs for GcdVfs {
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
         let p = self.resolve(path)?;
-        let (file, writable) = offload(move || {
+        let (file, writable, order) = offload(move || {
             if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen) {
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
                 }
             }
-            let opened = match mode {
+            let (file, writable) = match mode {
                 OpenMode::Read => (
                     std::fs::OpenOptions::new()
                         .read(true)
@@ -101,13 +102,15 @@ impl Vfs for GcdVfs {
                     true,
                 ),
             };
-            Ok(opened)
+            let order = WriteOrder::for_file(&file)?;
+            Ok((file, writable, order))
         })
         .await?;
+        order.settled().await;
         // Creating the channel only registers the descriptor with libdispatch;
         // it performs no I/O, so it stays on the executor. Clone the queue
         // retain so the file holds its own reference.
-        GcdFile::new(file, writable, self.inner.queue.clone())
+        GcdFile::new(file, writable, self.inner.queue.clone(), order)
     }
 
     async fn remove(&self, path: &str) -> Result<()> {

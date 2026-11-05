@@ -41,6 +41,8 @@ pub mod tokio_backend;
 pub(crate) mod traits;
 pub(crate) mod types;
 pub mod wasi;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod write_order;
 
 #[cfg(all(target_os = "android", target_arch = "arm"))]
 pub use android::AndroidVfs;

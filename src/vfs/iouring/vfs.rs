@@ -20,6 +20,7 @@ use crate::vfs::blocking::offload;
 use crate::vfs::oslock::LockKind;
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
+use crate::vfs::write_order::WriteOrder;
 
 /// RAII advisory lock handle returned by `IouringVfs::lock_exclusive` /
 /// `lock_shared`. The one native handle type, shared with every other
@@ -74,13 +75,13 @@ impl Vfs for IouringVfs {
 
     async fn open(&self, path: &str, mode: OpenMode) -> Result<Self::File> {
         let p = self.resolve(path)?;
-        let (file, writable) = offload(move || {
+        let (file, writable, order) = offload(move || {
             if matches!(mode, OpenMode::CreateNew | OpenMode::CreateOrOpen)
                 && let Some(parent) = p.parent()
             {
                 std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
             }
-            let opened = match mode {
+            let (file, writable) = match mode {
                 OpenMode::Read => {
                     let f = std::fs::OpenOptions::new()
                         .read(true)
@@ -116,13 +117,16 @@ impl Vfs for IouringVfs {
                     (f, true)
                 }
             };
-            Ok(opened)
+            let order = WriteOrder::for_file(&file)?;
+            Ok((file, writable, order))
         })
         .await?;
+        order.settled().await;
         Ok(IouringFile::new(
             file,
             writable,
             Arc::clone(&self.inner.ring.inner),
+            order,
         ))
     }
 

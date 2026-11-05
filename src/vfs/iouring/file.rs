@@ -18,6 +18,10 @@
 //! the group-commit batcher down to unrelated readers. That is a correctness
 //! failure with a latency symptom, not a slow path, so it loses to the copy
 //! every time.
+//!
+//! The pool thread also outlives the future in time. Writes, syncs, and truncates
+//! therefore hold the file's [`WriteOrder`] turn inside the closure, so the next
+//! one cannot overtake a write whose future was dropped.
 #![allow(unsafe_code)]
 
 use std::os::unix::io::AsRawFd;
@@ -35,6 +39,7 @@ use crate::vfs::traits::{
     write_all_at,
 };
 use crate::vfs::types::{ReadReq, WriteReq};
+use crate::vfs::write_order::WriteOrder;
 
 /// Per-file handle backed by an `std::fs::File` fd and the shared `io_uring`.
 ///
@@ -49,15 +54,29 @@ pub struct IouringFile {
     file: Arc<std::fs::File>,
     writable: bool,
     ring: Arc<SharedRing>,
+    order: WriteOrder,
 }
 
 impl IouringFile {
-    pub(crate) fn new(file: std::fs::File, writable: bool, ring: Arc<SharedRing>) -> Self {
+    pub(crate) fn new(
+        file: std::fs::File,
+        writable: bool,
+        ring: Arc<SharedRing>,
+        order: WriteOrder,
+    ) -> Self {
         Self {
             file: Arc::new(file),
             writable,
             ring,
+            order,
         }
+    }
+
+    /// Submit this handle's later operations to `ring`. A test stalls one ring
+    /// to hold a write in flight, and lets the next operation use another.
+    #[cfg(test)]
+    pub(super) fn use_ring(&mut self, ring: Arc<SharedRing>) {
+        self.ring = ring;
     }
 
     /// The two owned handles a blocking-pool cycle needs. Both are `Arc`
@@ -213,11 +232,13 @@ impl VfsFile for IouringFile {
         }
         Self::check_write_range(offset, buf.len())?;
         Self::entry_len(buf.len())?;
+        let turn = self.order.enter().await;
         let (file, ring) = self.shared();
         // The pool thread outlives this future, so it writes from its own copy
         // rather than from the caller's borrow.
         let data = buf.to_vec();
         offload(move || {
+            let _turn = turn;
             let fd = Fd(file.as_raw_fd());
             let entry_len = IouringFile::entry_len(data.len())?;
             let entry = opcode::Write::new(fd, data.as_ptr(), entry_len)
@@ -260,8 +281,10 @@ impl VfsFile for IouringFile {
         if plan.is_empty() {
             return Ok(());
         }
+        let turn = self.order.enter().await;
         let (file, ring) = self.shared();
         let short_writes = offload(move || {
+            let _turn = turn;
             let fd = Fd(file.as_raw_fd());
             let mut entries: Vec<io_uring::squeue::Entry> = Vec::with_capacity(plan.len());
             for (slot, (_, offset, data)) in plan.iter().enumerate() {
@@ -329,8 +352,10 @@ impl VfsFile for IouringFile {
     }
 
     async fn sync(&mut self) -> Result<()> {
+        let turn = self.order.enter().await;
         let (file, ring) = self.shared();
         offload(move || {
+            let _turn = turn;
             let fd = Fd(file.as_raw_fd());
             let entry = opcode::Fsync::new(fd).build().user_data(0);
             // `Fsync` carries no buffer pointer, so there is nothing the
@@ -352,8 +377,10 @@ impl VfsFile for IouringFile {
         // thread (shrinking a file can free extents on a busy device) and
         // belongs on the blocking pool.
         let len = checked_signed_file_len(len, "ftruncate")?;
+        let turn = self.order.enter().await;
         let file = Arc::clone(&self.file);
         offload(move || {
+            let _turn = turn;
             // SAFETY: the `Arc` keeps the fd valid for the whole call and
             // `len` was checked before entering the signed native syscall.
             let rc = unsafe { libc::ftruncate(file.as_raw_fd(), len) };
