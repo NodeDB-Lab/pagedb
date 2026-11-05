@@ -72,10 +72,12 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Drains eligible deferred-free pages into the persistent free-list,
     /// repacks the main and catalog B+ trees into densely-allocated page space,
-    /// truncates `main.db` if no reader pins the old high-water range, and
-    /// repacks segment files whose garbage ratio exceeds 5%.
+    /// truncates `main.db`, and repacks segment files whose garbage ratio
+    /// exceeds 5%.
     ///
-    /// Returns a [`crate::CompactStats`] summary of what was reclaimed.
+    /// Returns a [`crate::CompactStats`] summary of what was reclaimed. While
+    /// any reader is registered the pass does not run, and the summary sets
+    /// [`declined_readers_pinned`](crate::CompactStats::declined_readers_pinned).
     pub async fn compact_now(&self) -> Result<crate::compaction::CompactStats> {
         self.ensure_usable()?;
         crate::compaction::compact_now(self).await
@@ -90,7 +92,9 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// Returns a [`crate::CompactProgress`] describing what was done and
     /// whether more work remains. Loop until `progress.more_work == false` to
-    /// compact fully.
+    /// compact fully. A loop that ends with
+    /// [`declined_readers_pinned`](crate::CompactProgress::declined_readers_pinned)
+    /// set compacted nothing: a registered reader stopped the pass.
     pub async fn compact_step(
         &self,
         budget: crate::compaction::CompactBudget,

@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format is based on 
 ### Added
 
 - **Reader observability** — `DbStats` gains `oldest_reader_commit_id`, `oldest_reader_age_ms` (both `None` when no reader is registered) and `tracked_readers_non_abortable` (`u32`), so a long-lived read transaction that holds back free-page reuse is visible from `Db::stats()`.
+- **Compaction decline flag** — `CompactStats` and `CompactProgress` gain `declined_readers_pinned` (`bool`). `compact_now` and `compact_step` set it when a registered reader pins the page range and the pass does not run, so a caller can tell that result apart from a pass that found nothing to reclaim. Every count is zero in both cases, and `CompactProgress::more_work` stays `false`.
 
 ## [0.1.0] - 2026-10-15
 

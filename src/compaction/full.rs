@@ -68,6 +68,9 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
         !readers.is_empty()
     };
     if has_readers {
+        // The flag separates a declined pass from a pass that ran and found
+        // nothing to reclaim. Both report zero counts.
+        result.declined_readers_pinned = true;
         return Ok(result);
     }
 
