@@ -90,11 +90,12 @@ impl<V: Vfs + Clone> Db<V> {
             // it keeps a `Db::open` of the snapshot directory from taking
             // independent writes under this store's key.
             let hk = self.hk.read().clone();
-            crate::txn::db::restore_mode::stamp_read_only(
+            crate::txn::db::restore_mode::stamp_exported_read_only(
                 &TokioVfs::new(dst_path),
                 "/main.db",
                 self.page_size,
-                crate::txn::db::restore_mode::HeaderKey::Hk(&hk),
+                &hk,
+                published_snapshot.free_list_root_page_id,
             )
             .await?;
             Ok::<_, crate::errors::PagedbError>(stats)

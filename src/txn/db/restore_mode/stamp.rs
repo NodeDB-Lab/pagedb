@@ -35,6 +35,39 @@ pub(in crate::txn::db) async fn stamp_read_only<V: Vfs>(
     page_size: usize,
     key: HeaderKey<'_>,
 ) -> Result<()> {
+    stamp_slots(vfs, path, page_size, key, None).await
+}
+
+/// Stamp an exported `main.db`, and record the free-list root the exporting
+/// handle publishes.
+///
+/// The export copies the file byte for byte. An open can detach a torn chain in
+/// memory, and the source header then still names that chain. This keeps the
+/// detachment in the copy. A root that matches the header changes nothing.
+pub(in crate::txn::db) async fn stamp_exported_read_only<V: Vfs>(
+    vfs: &V,
+    path: &str,
+    page_size: usize,
+    hk: &DerivedKey,
+    free_list_root_page_id: u64,
+) -> Result<()> {
+    stamp_slots(
+        vfs,
+        path,
+        page_size,
+        HeaderKey::Hk(hk),
+        Some(free_list_root_page_id),
+    )
+    .await
+}
+
+async fn stamp_slots<V: Vfs>(
+    vfs: &V,
+    path: &str,
+    page_size: usize,
+    key: HeaderKey<'_>,
+    free_list_root_page_id: Option<u64>,
+) -> Result<()> {
     let slot_b_offset = u64::try_from(page_size)
         .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
     let mut buf_a = vec![0u8; page_size];
@@ -64,6 +97,9 @@ pub(in crate::txn::db) async fn stamp_read_only<V: Vfs>(
     };
 
     fields.restore_mode = READ_ONLY;
+    if let Some(root_page_id) = free_list_root_page_id {
+        fields.free_list_root = crate::txn::db::encode_free_list_root(root_page_id);
+    }
     // `commit_header` writes the slot after `previous`: B first names A, then
     // A names B.
     commit_header(vfs, path, &hk, &fields, ActiveSlot::B, page_size).await?;

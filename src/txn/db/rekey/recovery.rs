@@ -16,21 +16,30 @@ impl<V: Vfs + Clone> Db<V> {
     /// Establish every epoch lease required by a durable intent before catalog
     /// reconciliation. A KEK-changing interruption is never auto-recovered
     /// with a guessed or persisted counterpart key.
+    ///
+    /// Admission writes nothing. A legacy intent gets its target proof in memory
+    /// here, and the resume persists it. That write folds the free list, so it
+    /// waits for the mode gate and the chain detach.
     pub(in crate::txn::db) async fn admit_rekey_recovery(
         &self,
         primary_kek: &SecretKey,
         counterpart_kek: Option<&SecretKey>,
     ) -> Result<bool> {
-        let mut state = self.writer.lock().await;
+        let state = self.writer.lock().await;
         let Some(mut intent) = self.load_rekey_intent(&state).await? else {
             return Ok(false);
         };
+        drop(state);
         let source_cipher = CipherId::from_byte(intent.source_cipher_id)?;
         let target_cipher = CipherId::from_byte(intent.target_cipher_id)?;
 
         if intent.same_kek && intent.target_hk_proof == [0; 16] {
-            self.persist_legacy_rekey_proof(&mut state, &mut intent, primary_kek, target_cipher)
-                .await?;
+            let target_master_key = derive_mk(
+                primary_kek.as_bytes(),
+                &self.kek_salt,
+                intent.target_mk_epoch,
+            )?;
+            intent.target_hk_proof = self.legacy_target_proof(&intent, &target_master_key)?;
         }
 
         let proof_context = RekeyProofContext {
@@ -65,30 +74,33 @@ impl<V: Vfs + Clone> Db<V> {
         Ok(true)
     }
 
-    async fn persist_legacy_rekey_proof(
+    /// The target proof an intent from an earlier release left as zeros.
+    fn legacy_target_proof(
         &self,
-        state: &mut WriterState,
-        intent: &mut RekeyIntent,
-        primary_kek: &SecretKey,
-        target_cipher: CipherId,
-    ) -> Result<()> {
-        let target_master_key = derive_mk(
-            primary_kek.as_bytes(),
-            &self.kek_salt,
-            intent.target_mk_epoch,
-        )?;
-        let target_header_key = derive_hk(&target_master_key)?;
-        intent.target_hk_proof = intent_proof(
-            &target_header_key,
+        intent: &RekeyIntent,
+        target_master_key: &MasterKey,
+    ) -> Result<[u8; 16]> {
+        intent_proof(
+            &derive_hk(target_master_key)?,
             &self.file_id,
             &self.kek_salt,
             intent.source_mk_epoch,
             intent.target_mk_epoch,
             intent.target_mk_epoch,
             intent.target_cipher_id,
-        )?;
-        self.pager
-            .install_mk_epoch(target_master_key, intent.target_mk_epoch, target_cipher);
+        )
+    }
+
+    /// Write the target proof into a legacy intent row. Admission installed the
+    /// target key this derives from.
+    pub(super) async fn persist_legacy_rekey_proof(
+        &self,
+        state: &mut WriterState,
+        intent: &mut RekeyIntent,
+    ) -> Result<()> {
+        let target_cipher = CipherId::from_byte(intent.target_cipher_id)?;
+        let target_master_key = self.pager.mk_for(intent.target_mk_epoch, target_cipher)?;
+        intent.target_hk_proof = self.legacy_target_proof(intent, &target_master_key)?;
         let source_header_key = self.hk.read().clone();
         let header_epoch = self.mk_epoch.load(std::sync::atomic::Ordering::SeqCst);
         self.write_rekey_intent_locked(state, intent, header_epoch, &source_header_key)

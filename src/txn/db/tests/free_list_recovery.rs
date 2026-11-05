@@ -77,6 +77,11 @@ async fn an_unreadable_chain_is_detached_and_the_data_survives() {
         0,
         "an unreadable chain must be detached rather than left to fail every later read"
     );
+    assert_eq!(
+        db.snapshot.read().free_list_root_page_id,
+        0,
+        "the published snapshot must stop naming a detached chain"
+    );
 
     // The whole point: the store is still usable and still holds its data.
     let rtxn = db.begin_read().await.unwrap();

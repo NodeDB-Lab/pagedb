@@ -20,5 +20,5 @@ mod stamp;
 mod values;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(in crate::txn::db) use stamp::{HeaderKey, stamp_read_only};
+pub(in crate::txn::db) use stamp::{HeaderKey, stamp_exported_read_only, stamp_read_only};
 pub(crate) use values::{FOLLOWER, READ_ONLY, STANDALONE};

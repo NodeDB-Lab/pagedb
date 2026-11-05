@@ -15,6 +15,9 @@ use crate::{
 #[path = "history_preflight_tests.rs"]
 mod history_preflight_tests;
 
+#[path = "torn_chain_tests.rs"]
+mod torn_chain_tests;
+
 const PAGE: usize = 4096;
 const KEK0: [u8; 32] = [0xAA; 32];
 const REALM: RealmId = RealmId::new([0x01; 16]);

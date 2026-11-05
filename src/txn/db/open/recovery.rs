@@ -87,6 +87,10 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         if !capabilities.runs_standalone_recovery() {
             return Err(crate::errors::PagedbError::Unsupported);
         }
+        // A resume reads the chain, and a torn page fails that read. Admission
+        // above installed both intent keys, so the classifier can trust a key
+        // error here. The next rekey header persists root 0.
+        db.drop_unreadable_free_list().await;
         db.resume_rekey_intent().await?;
     }
 
@@ -178,6 +182,9 @@ impl<V: Vfs + Clone> Db<V> {
     /// before then leaves the same unreadable chain to be dropped again on the
     /// following open, which is why repeating this is safe.
     ///
+    /// The published snapshot moves with the writer state. An export reads the
+    /// chain through that snapshot, so a stale root fails the export.
+    ///
     /// Rebuilding the free set instead — walking the roots and treating every
     /// unreachable page as free — is deliberately NOT done here. It would
     /// recover the space, but a reachability computation that errs in the unsafe
@@ -229,5 +236,7 @@ impl<V: Vfs + Clone> Db<V> {
         );
         let mut state = self.writer.lock().await;
         state.free_list_root_page_id = 0;
+        state.free_list_entries = Some(0);
+        self.publish_snapshot(&state);
     }
 }

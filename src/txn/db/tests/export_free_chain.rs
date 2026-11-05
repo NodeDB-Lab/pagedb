@@ -189,6 +189,70 @@ async fn free_chain_of<V: Vfs + Clone>(db: &Db<V>) -> (Vec<(u64, u64)>, Vec<u64>
     read_chain(&db.pager, REALM, head).await.unwrap()
 }
 
+/// An open detaches a chain with a torn page, in memory only, so its header still
+/// names that chain. The export must neither read the torn page nor name the chain.
+#[tokio::test(flavor = "current_thread")]
+async fn export_after_a_detached_chain_skips_the_torn_page_and_restores_without_the_chain() {
+    for torn_index in [0_usize, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_dir = dir.path().join("snapshot");
+        let restored_dir = dir.path().join("restored");
+        let vfs = ParkedReadVfs::new(&dir.path().join("source"));
+        let gate = vfs.gate.clone();
+        let db = Db::open(vfs.clone(), KEK, PAGE, REALM, options())
+            .await
+            .unwrap();
+        overwrite_every_row(&db, 0).await;
+        let target = overwrite_every_row(&db, 1).await;
+        let (_entries, chain_pages) = free_chain_of(&db).await;
+        assert!(
+            chain_pages.len() >= 2,
+            "setup error: the free chain has {} pages",
+            chain_pages.len()
+        );
+        let torn_offset = chain_pages[torn_index] * PAGE as u64;
+        drop(db);
+
+        let mut file = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+        file.write_at(torn_offset + (PAGE / 2) as u64, &[0xEE; PAGE / 2])
+            .await
+            .unwrap();
+        file.sync().await.unwrap();
+        drop(file);
+
+        let db = Db::open(vfs, KEK, PAGE, REALM, options()).await.unwrap();
+        assert_eq!(db.latest_commit(), target);
+        // The open read the torn page to detach the chain. Only later reads count.
+        gate.armed_offset.store(torn_offset, Ordering::SeqCst);
+        let exported = tokio::select! {
+            outcome = db.snapshot_to(&snapshot_dir) => outcome,
+            () = gate.parked.notified() => {
+                panic!("chain page {torn_index}: the export read the torn page");
+            }
+        };
+        exported.expect("the export ignores a detached chain");
+
+        let restored = Db::<TokioVfs>::restore_from(&snapshot_dir, &restored_dir, options(), KEK)
+            .await
+            .expect("the exported image restores");
+        assert_eq!(restored.latest_commit(), target);
+        let (entries, restored_chain_pages) = free_chain_of(&restored).await;
+        assert!(
+            entries.is_empty() && restored_chain_pages.is_empty(),
+            "chain page {torn_index}: the exported header still names a chain"
+        );
+        assert_eq!(restored.stats().await.unwrap().free_list_pending_entries, 0);
+        let reader = restored.begin_read().await.unwrap();
+        for row in 0..ROWS {
+            assert_eq!(
+                reader.get(&row_key(row)).await.unwrap().as_deref(),
+                Some(row_value(row, 1).as_slice()),
+                "row {row} has the wrong value in the restored copy"
+            );
+        }
+    }
+}
+
 /// The walk parks on the free-chain head, and a commit queues behind the export.
 /// The export succeeds, and the restored copy holds the target values and the same chain.
 /// Later commits reuse that chain page, so the writer hold is what protects the walk.

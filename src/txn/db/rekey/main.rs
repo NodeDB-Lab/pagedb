@@ -161,10 +161,14 @@ impl<V: Vfs + Clone> Db<V> {
 
     pub(in crate::txn::db) async fn resume_rekey_intent(&self) -> Result<()> {
         let mut state = self.writer.lock().await;
-        let intent = self
+        let mut intent = self
             .load_rekey_intent(&state)
             .await?
             .ok_or_else(|| PagedbError::rekey_state_invalid("rekey.intent_missing"))?;
+        if intent.same_kek && intent.target_hk_proof == [0; 16] {
+            self.persist_legacy_rekey_proof(&mut state, &mut intent)
+                .await?;
+        }
         self.settle_history_for_resume(&mut state, &intent).await?;
         self.resume_rekey_locked(&mut state, intent).await
     }
