@@ -20,7 +20,7 @@
 //! every time.
 //!
 //! The pool thread also outlives the future in time. Writes, syncs, and truncates
-//! therefore hold the file's [`WriteOrder`] turn inside the closure, so the next
+//! therefore hold the file's `WriteOrder` turn inside the closure, so the next
 //! one cannot overtake a write whose future was dropped.
 #![allow(unsafe_code)]
 

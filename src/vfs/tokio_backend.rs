@@ -4,10 +4,10 @@
 //! each other over the same directory. The trait contract from `traits.rs` is the
 //! durable surface.
 //!
-//! File I/O runs `std::fs` calls through [`offload`], as the other pool-backed
+//! File I/O runs `std::fs` calls through `offload`, as the other pool-backed
 //! backends do. `tokio::fs::File` orders work inside one handle only. Its queued
 //! write outlives a closed handle, and nothing outside it can see that write
-//! finish. Each closure here owns its buffer and its [`WriteOrder`] turn instead,
+//! finish. Each closure here owns its buffer and its `WriteOrder` turn instead,
 //! so a write stays ordered after its future drops, across every handle of a file.
 
 use std::io::{Read, Seek, SeekFrom, Write};
