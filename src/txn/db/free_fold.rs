@@ -34,26 +34,53 @@ impl<V: Vfs + Clone> Db<V> {
         freed_pages: &[u64],
         next_page_id: u64,
     ) -> Result<FoldedFreeList> {
-        if freed_pages.is_empty() {
+        let freed = freed_pages
+            .iter()
+            .map(|&page_id| (Self::catalog_free_tag(state), page_id))
+            .collect();
+        self.fold_free_entries(
+            state.free_list_root_page_id,
+            state.free_list_entries,
+            freed,
+            next_page_id,
+        )
+        .await
+    }
+
+    /// The tag a page superseded by a catalog-only header commit carries.
+    ///
+    /// The latest commit's retained row still reaches these pages. An entry is
+    /// reusable when its tag is at or below the oldest row. Tagging one past the
+    /// latest holds them until that row is gone.
+    pub(crate) fn catalog_free_tag(state: &WriterState) -> u64 {
+        state.latest_commit_id.saturating_add(1)
+    }
+
+    /// Prepend `new_entries`, as `(tag, page_id)`, to the chain rooted at
+    /// `root_page_id`. The chain's current entry count is `entries_now`.
+    pub(crate) async fn fold_free_entries(
+        &self,
+        root_page_id: u64,
+        entries_now: Option<u64>,
+        new_entries: Vec<(u64, u64)>,
+        next_page_id: u64,
+    ) -> Result<FoldedFreeList> {
+        if new_entries.is_empty() {
             return Ok(FoldedFreeList {
-                root_page_id: state.free_list_root_page_id,
-                entries: state.free_list_entries,
+                root_page_id,
+                entries: entries_now,
                 next_page_id,
             });
         }
         let window = crate::pager::freelist::read_chain_prefix(
             &self.pager,
             self.realm_id,
-            state.free_list_root_page_id,
+            root_page_id,
             crate::pager::freelist::WINDOW_PAGES,
         )
         .await?;
         let mut entries = window.entries;
-        // The latest commit's retained row still reaches these pages. An entry is
-        // reusable when its tag is at or below the oldest row. Tagging one past
-        // the latest holds them until that row is gone.
-        let freed_at = state.latest_commit_id.saturating_add(1);
-        entries.extend(freed_pages.iter().map(|&page_id| (freed_at, page_id)));
+        entries.extend(new_entries);
         // Chain pages are writer-only metadata that no reader snapshot traverses.
         // They carry a commit id below every real floor and are recyclable at
         // once. The ordinary commit path uses the same rule.

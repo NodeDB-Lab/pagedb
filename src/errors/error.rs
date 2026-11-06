@@ -305,18 +305,51 @@ pub enum PagedbError {
     #[error("a mutation on this write transaction did not finish; abort it")]
     WriteTxnInterrupted,
 
-    /// A rekey resume began writing pages under the target epoch — an
-    /// operation with no safe in-process rollback — and then failed before
-    /// recovery could complete. The handle is poisoned at `commit` and
-    /// `source` carries the underlying failure. The remedy is the same as
-    /// [`Self::DurablyCommittedButUnpublished`]: reopen the store, which
-    /// drives recovery from the durable header rather than resuming on a
-    /// handle with mixed-epoch state in flight.
+    /// A rekey reached the rename of its rebuilt `main.db`, or passed it, and
+    /// then failed before it finished. The handle is poisoned at `commit` and
+    /// `source` carries the underlying failure. Reopen the store. The open reads
+    /// which file the rename left and finishes the rekey from there.
     #[error("rekey activated a target epoch at commit {commit:?}; reopen required: {source}")]
     RekeyTargetEpochActivated {
         commit: CommitId,
         #[source]
         source: Box<PagedbError>,
+    },
+
+    /// The device filled while a rekey built its replacement `main.db`.
+    /// `main.db` is intact and its scratch copy is gone. The rebuild needs free
+    /// space up to the size of `main.db`. Free that space, then reopen the store
+    /// or call `rekey_db` again.
+    #[error(
+        "rekey from epoch {source_epoch} to epoch {target_epoch} needs free space for a full copy of main.db. main.db is intact. To continue, free disk space, then reopen the store or call rekey_db again"
+    )]
+    RekeyNoSpace {
+        source_epoch: u64,
+        target_epoch: u64,
+    },
+
+    /// `link_segment` or `replace_segment` named a segment sealed under another
+    /// master-key epoch. A rekey moved the store on while this segment was still
+    /// being written, so no later open holds its key. The catalog stays as it was.
+    /// Write the segment again on this handle, then link the new one.
+    #[error(
+        "segment sealed under epoch {segment_epoch} cannot link into a store at epoch {store_epoch}. Write it again, then link the new one"
+    )]
+    SegmentEpochStale {
+        segment_epoch: u64,
+        store_epoch: u64,
+    },
+
+    /// An export found a rekey intent that a dropped or failed `rekey_db` left
+    /// durable. A restored copy has no writer that can settle that intent, and
+    /// `rekey_into_writer` refuses it, so the export refuses it first. Call
+    /// `rekey_db` again or reopen the store to settle it, then retry the export.
+    #[error(
+        "export refused: the rekey from epoch {source_epoch} to epoch {target_epoch} is pending. Call rekey_db again or reopen the store, then retry"
+    )]
+    RekeyPending {
+        source_epoch: u64,
+        target_epoch: u64,
     },
 
     /// `begin_read_at(commit)` named a commit that has been pruned from the

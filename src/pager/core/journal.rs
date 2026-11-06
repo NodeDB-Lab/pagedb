@@ -45,7 +45,7 @@ impl<V: Vfs> Pager<V> {
             FileKey::ApplyJournal(journal_id),
             realm_id,
             journal_id,
-            None,
+            super::flush::FlushDest::Live,
         )
         .await
     }

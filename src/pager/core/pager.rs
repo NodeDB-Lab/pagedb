@@ -221,8 +221,13 @@ impl<V: Vfs> Pager<V> {
     }
 
     /// Install a leased epoch key without changing which epoch flushes use.
+    ///
+    /// The DEK cache keys on the epoch and holds no key identity, so a cipher cached
+    /// under an earlier key for this epoch leaves here. It must not answer for the
+    /// new key.
     pub(crate) fn install_mk_epoch(&self, mk: MasterKey, epoch: u64, cipher_id: CipherId) {
         self.keyring.install(epoch, cipher_id, mk);
+        self.dek_lru.lock().invalidate_epoch(epoch, cipher_id);
     }
 
     /// Retire an inactive epoch and all cached derived cipher state for it.

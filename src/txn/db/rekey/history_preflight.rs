@@ -28,7 +28,7 @@ use bytes::Bytes;
 
 use crate::Result;
 use crate::btree::BTree;
-use crate::catalog::codec::{RekeyIntent, RekeyStage};
+use crate::catalog::codec::RekeyIntent;
 use crate::crypto::{CipherId, DerivedKey};
 use crate::pager::PageKind;
 use crate::vfs::Vfs;
@@ -36,7 +36,8 @@ use crate::vfs::Vfs;
 use super::super::catalog::history_policy::{ALL_HISTORY_ROWS, proves_unreadable_pages};
 use super::super::core::{Db, WriterState, decode_commit_meta};
 use super::super::history_carry::HistoryCarry;
-use super::main::{HISTORY_ROOT_BATCH, RekeyCatalogCommit};
+use super::main::{HISTORY_ROOT_BATCH, RekeyCatalogCommit, RekeyHistoryRoot};
+use super::rebuild::stage_needs_rebuild;
 
 impl<V: Vfs + Clone> Db<V> {
     /// The newest row this rekey must prune before it writes, or `None`.
@@ -180,9 +181,6 @@ impl<V: Vfs + Clone> Db<V> {
             .await?;
         self.pager.flush_main(self.realm_id).await?;
         let freed_pages: Vec<u64> = carried.released_page_ids.iter().copied().collect();
-        state.commit_history_root_page_id = carried.root_page_id;
-        state.commit_history_root_version = carried.root_version;
-        state.commit_history_count = carried.entry_count;
         let catalog_root_page_id = state.catalog_root_page_id;
         self.commit_rekey_catalog_root(
             state,
@@ -191,6 +189,11 @@ impl<V: Vfs + Clone> Db<V> {
                 next_page_id: carried.next_page_id,
                 freed_pages: &freed_pages,
                 effects: &[],
+                history: Some(RekeyHistoryRoot {
+                    root_page_id: carried.root_page_id,
+                    root_version: carried.root_version,
+                    entry_count: carried.entry_count,
+                }),
             },
             header_epoch,
             header_hk,
@@ -201,8 +204,8 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Settle history for an intent an earlier open or an older release wrote.
     ///
-    /// Only these two stages still have a pass that a stale row can fail. The
-    /// first holds the row walk. The second holds the free-list pass.
+    /// Only the stages that still rebuild `main.db` have a walk a stale row can
+    /// fail.
     ///
     /// Both intent keys must be installed first. `MissingPersistedKey` proves
     /// a page's envelope is wrong only while no key the store can use is absent.
@@ -221,10 +224,7 @@ impl<V: Vfs + Clone> Db<V> {
             intent.target_mk_epoch,
             CipherId::from_byte(intent.target_cipher_id)?,
         )?;
-        if !matches!(
-            intent.stage,
-            RekeyStage::Intent | RekeyStage::HeaderTargetPublished
-        ) {
+        if !stage_needs_rebuild(intent.stage) {
             return Ok(());
         }
         let Some(pruned_through) = self.history_rows_rekey_prunes(state).await? else {

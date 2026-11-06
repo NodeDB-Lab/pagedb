@@ -13,6 +13,7 @@ use crate::segment::writer::SegmentWriter;
 use crate::txn::write::SegmentSideEffect;
 use crate::vfs::Vfs;
 
+use super::super::catalog::history_policy::proves_unreadable_pages;
 #[cfg(test)]
 use super::super::core::RekeyTestFault;
 use super::super::core::{Db, WriterState};
@@ -80,12 +81,15 @@ impl<V: Vfs + Clone> Db<V> {
     /// only the disjoint progress-row prefix, so key order is stable across the
     /// mutations and the cursor stays valid. The tree is reopened per batch
     /// because every catalog swap commits a new root.
+    ///
+    /// Returns how many rows stayed behind because their file cannot authenticate.
     pub(super) async fn migrate_rekey_segments(
         &self,
         state: &mut WriterState,
         intent: &RekeyIntent,
         target_hk: &DerivedKey,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut left_behind = 0;
         let mut cursor: Vec<u8> = vec![CatalogRowKind::Segment as u8];
         loop {
             let batch = self.segment_batch_from(state, &cursor).await?;
@@ -98,7 +102,8 @@ impl<V: Vfs + Clone> Db<V> {
             let exhausted = batch.len() < REKEY_ROW_BATCH;
 
             for entry in batch {
-                self.migrate_rekey_segment_entry(state, intent, target_hk, entry)
+                left_behind += self
+                    .migrate_rekey_segment_entry(state, intent, target_hk, entry)
                     .await?;
             }
             if exhausted {
@@ -107,7 +112,43 @@ impl<V: Vfs + Clone> Db<V> {
         }
 
         self.drain_orphaned_rekey_progress(state, intent, target_hk)
-            .await
+            .await?;
+        Ok(left_behind)
+    }
+
+    /// Refuse a rekey over a linked segment whose file cannot authenticate.
+    ///
+    /// The rekey cannot move such a file off the source key. Refusing here writes
+    /// nothing, and the caller can unlink the segment first. Any other error says
+    /// nothing about the file, and it returns as it is too.
+    pub(super) async fn refuse_rekey_over_unverifiable_segment(
+        &self,
+        state: &WriterState,
+    ) -> Result<()> {
+        let limit = u64::try_from(self.options.mmap_view_scratch_bytes).unwrap_or(u64::MAX);
+        let mut cursor: Vec<u8> = vec![CatalogRowKind::Segment as u8];
+        loop {
+            let batch = self.segment_batch_from(state, &cursor).await?;
+            let Some(last) = batch.last() else {
+                return Ok(());
+            };
+            cursor.clear();
+            cursor.extend_from_slice(&last.key);
+            cursor.push(0);
+            let exhausted = batch.len() < REKEY_ROW_BATCH;
+            for entry in batch {
+                SegmentReader::open_internal(
+                    self.pager.clone(),
+                    entry.meta,
+                    self.mmap_bytes_in_use.clone(),
+                    limit,
+                )
+                .await?;
+            }
+            if exhausted {
+                return Ok(());
+            }
+        }
     }
 
     /// Resolve every progress row the segment pass left behind.
@@ -155,7 +196,8 @@ impl<V: Vfs + Clone> Db<V> {
                 // finished as an orphan.
                 match self.segment_entry_by_id(state, source_id).await? {
                     Some(entry) => {
-                        self.migrate_rekey_segment_entry(state, intent, target_hk, entry)
+                        let _ = self
+                            .migrate_rekey_segment_entry(state, intent, target_hk, entry)
                             .await?;
                     }
                     None => {
@@ -187,22 +229,40 @@ impl<V: Vfs + Clone> Db<V> {
     /// present means a previous attempt sealed the replacement and was
     /// interrupted before the swap — resume from it rather than sealing a second
     /// copy.
+    ///
+    /// Returns 1 when the row stays behind, and 0 otherwise. A file that went bad
+    /// after the rekey's own check cannot move to the target key. One such row
+    /// must not fail every open that resumes this rekey. It keeps its source
+    /// epoch, so reads of it report the missing key until the embedder unlinks it.
     async fn migrate_rekey_segment_entry(
         &self,
         state: &mut WriterState,
         intent: &RekeyIntent,
         target_hk: &DerivedKey,
         source: SegmentEntry,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let source_id = source.meta.segment_id;
         let progress = if let Some(progress) = self.rekey_progress_row(state, source_id).await? {
             progress
         } else {
             if !Self::segment_needs_rekey(&source.meta, intent) {
-                return Ok(());
+                return Ok(0);
             }
-            self.seal_rekey_replacement(state, intent, target_hk, &source)
-                .await?
+            match self
+                .seal_rekey_replacement(state, intent, target_hk, &source)
+                .await
+            {
+                Ok(progress) => progress,
+                Err(error) if proves_unreadable_pages(&error) => {
+                    tracing::error!(
+                        %error,
+                        segment_id = %crate::hex::to_hex_lower(&source_id),
+                        "a linked segment cannot authenticate, so it stays under the source key"
+                    );
+                    return Ok(1);
+                }
+                Err(error) => return Err(error),
+            }
         };
 
         let replacement = SegmentReader::open_rekey_replacement(
@@ -231,7 +291,8 @@ impl<V: Vfs + Clone> Db<V> {
         // defer the old-file tombstone, but that queue owns eventual GC and
         // must not keep this durable transition open.
         self.delete_rekey_progress(state, source_id, intent.target_mk_epoch, target_hk)
-            .await
+            .await?;
+        Ok(0)
     }
 
     /// Copy one source segment into a fresh target-epoch file and record the
@@ -383,6 +444,7 @@ impl<V: Vfs + Clone> Db<V> {
                 next_page_id: tree.next_page_id(),
                 freed_pages: &freed_pages,
                 effects: &effects,
+                history: None,
             },
             intent.target_mk_epoch,
             target_hk,
@@ -414,6 +476,7 @@ impl<V: Vfs + Clone> Db<V> {
                 next_page_id: tree.next_page_id(),
                 freed_pages: &freed_pages,
                 effects: &[],
+                history: None,
             },
             header_epoch,
             header_hk,
@@ -444,6 +507,7 @@ impl<V: Vfs + Clone> Db<V> {
                 next_page_id: tree.next_page_id(),
                 freed_pages: &freed_pages,
                 effects: &[],
+                history: None,
             },
             header_epoch,
             header_hk,

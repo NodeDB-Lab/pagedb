@@ -281,6 +281,33 @@ impl PagedbError {
         }
     }
 
+    /// Canonical constructor for a rekey rebuild that ran out of disk space.
+    #[must_use]
+    pub const fn rekey_no_space(source_epoch: u64, target_epoch: u64) -> Self {
+        Self::RekeyNoSpace {
+            source_epoch,
+            target_epoch,
+        }
+    }
+
+    /// Canonical constructor for a link of a segment from an earlier epoch.
+    #[must_use]
+    pub const fn segment_epoch_stale(segment_epoch: u64, store_epoch: u64) -> Self {
+        Self::SegmentEpochStale {
+            segment_epoch,
+            store_epoch,
+        }
+    }
+
+    /// Canonical constructor for an export that found a pending rekey intent.
+    #[must_use]
+    pub const fn rekey_pending(source_epoch: u64, target_epoch: u64) -> Self {
+        Self::RekeyPending {
+            source_epoch,
+            target_epoch,
+        }
+    }
+
     /// Canonical constructor for a rekey admission that needs both KEKs.
     #[must_use]
     pub const fn rekey_resume_key_required(source_epoch: u64, target_epoch: u64) -> Self {

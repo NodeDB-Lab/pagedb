@@ -30,7 +30,9 @@ pub enum CorruptionDetail {
     ///
     /// The file is left in place: pagedb never auto-GCs a catalog-referenced
     /// segment, since that would destroy forensics and possibly recoverable
-    /// bytes. Quarantine is the embedder's call, via `WriteTxn::unlink_segment`.
+    /// bytes. Quarantine is the embedder's call, via `WriteTxn::unlink_segment`. An
+    /// open does not fail over this, so a handle exists to make that call. The read
+    /// of the segment reports it.
     FooterUnverifiable {
         realm_id: RealmId,
         segment_id: [u8; 16],

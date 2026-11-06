@@ -15,6 +15,9 @@ use crate::{
 #[path = "history_preflight_tests.rs"]
 mod history_preflight_tests;
 
+#[path = "rebuild_tests.rs"]
+mod rebuild_tests;
+
 #[path = "torn_chain_tests.rs"]
 mod torn_chain_tests;
 

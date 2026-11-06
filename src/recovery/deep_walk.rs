@@ -1264,9 +1264,13 @@ mod tests {
         };
         assert_eq!(free_list_root, 0, "setup error: a chain page holds epoch 0");
         let mut resealed = std::collections::BTreeMap::new();
+        let image = db
+            .pager
+            .rebuild_image(REALM, db.main_db_path.clone(), 1, &db.pager.mk().unwrap())
+            .unwrap();
         for root in roots {
             BTree::open(db.pager.clone(), REALM, root, next_page_id, PAGE)
-                .rekey_walk_unique(&mut resealed)
+                .rekey_walk_unique(&mut resealed, &image)
                 .await
                 .unwrap();
         }

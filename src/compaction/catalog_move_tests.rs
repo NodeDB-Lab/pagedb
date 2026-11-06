@@ -8,6 +8,8 @@ use tempfile::TempDir;
 
 use crate::catalog::codec::{SegmentKind, SegmentMeta};
 use crate::options::RetainPolicy;
+use crate::pager::PageKind;
+use crate::pager::format::data_page::body_capacity;
 use crate::recovery::deep_walk::run_deep_walk;
 use crate::segment::types::SegmentPageKind;
 use crate::vfs::tokio_backend::TokioVfs;
@@ -21,10 +23,15 @@ const REALM: RealmId = RealmId::new([0x6D; 16]);
 const SEGMENT: &str = "engine.idx";
 const VERSIONS: u8 = 3;
 const TARGET_VERSION: u8 = 9;
+/// Commits and rows per commit a store gets to draw a free page.
+const DRAW_ROUNDS: u32 = 32;
+const DRAW_ROWS: u32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogMove {
     Rekey,
+    /// A rekey over a store with a page no root and no free list names.
+    RekeyOverOrphan,
     Quotas,
     SegmentRepack,
 }
@@ -42,6 +49,8 @@ struct Fixture {
     follower: Db<TokioVfs>,
     rows: Vec<CommitId>,
     delta_dir: TempDir,
+    /// The page a `RekeyOverOrphan` sealed, which a later commit drew.
+    orphan: Option<u64>,
     _dirs: [TempDir; 3],
 }
 
@@ -81,6 +90,55 @@ async fn restore_follower(source: &Db<TokioVfs>, snap: &TempDir, dst: &TempDir) 
         .unwrap()
 }
 
+/// Commit overflow values until the data tree reaches `page_id`. The allocator draws
+/// from the free list, so this is what proves the commit drew that page. A chain
+/// host does not count, because no delta ships one. Reports whether that happened.
+async fn commit_until_drawn(db: &Db<TokioVfs>, page_id: u64) -> bool {
+    for round in 0..DRAW_ROUNDS {
+        let mut txn = db.begin_write().await.unwrap();
+        for row in 0..DRAW_ROWS {
+            txn.put(format!("draw-{round}-{row}").as_bytes(), &[0xDD; 3000])
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+        let (root, next) = {
+            let state = db.writer.lock().await;
+            (state.root_page_id, state.next_page_id)
+        };
+        let mut reachable = std::collections::BTreeSet::new();
+        crate::btree::BTree::open(db.pager.clone(), REALM, root, next, PAGE)
+            .collect_all_page_ids(&mut reachable)
+            .await
+            .unwrap();
+        if reachable.contains(&page_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Seal a page no root and no free list names, under the store's current key.
+async fn seal_orphan_below_the_cursor(db: &Db<TokioVfs>) -> u64 {
+    let page_id = {
+        let mut state = db.writer.lock().await;
+        let page_id = state.next_page_id;
+        state.next_page_id = page_id + 1;
+        page_id
+    };
+    db.pager
+        .write_main_page(
+            page_id,
+            REALM,
+            PageKind::BTreeLeaf,
+            &vec![0x5A; body_capacity(PAGE)],
+        )
+        .await
+        .unwrap();
+    db.pager.flush_main(REALM).await.unwrap();
+    page_id
+}
+
 /// Rows, a catalog move, a follower restored on the chosen side, then one more
 /// producer commit exported from the follower's commit.
 async fn fixture(catalog_move: CatalogMove, restored: Restored) -> Fixture {
@@ -118,8 +176,13 @@ async fn fixture(catalog_move: CatalogMove, restored: Restored) -> Fixture {
     if restored == Restored::BeforeMove {
         follower = Some(restore_follower(&source, &snap, &dst).await);
     }
+    let mut orphan = None;
     match catalog_move {
         CatalogMove::Rekey => source.rekey_db(KEK, 1).await.unwrap(),
+        CatalogMove::RekeyOverOrphan => {
+            orphan = Some(seal_orphan_below_the_cursor(&source).await);
+            source.rekey_db(KEK, 1).await.unwrap();
+        }
         CatalogMove::Quotas => source
             .set_realm_quotas(REALM, RealmQuotas::default().with_max_pages(1 << 20))
             .await
@@ -135,6 +198,12 @@ async fn fixture(catalog_move: CatalogMove, restored: Restored) -> Fixture {
     };
 
     let base = follower.latest_commit();
+    if let Some(page_id) = orphan {
+        assert!(
+            commit_until_drawn(&source, page_id).await,
+            "setup error: {DRAW_ROUNDS} commits never drew page {page_id}"
+        );
+    }
     commit_version(&source, TARGET_VERSION).await;
     source
         .snapshot_incremental_to(base, delta_dir.path())
@@ -145,6 +214,7 @@ async fn fixture(catalog_move: CatalogMove, restored: Restored) -> Fixture {
         follower,
         rows,
         delta_dir,
+        orphan,
         _dirs: [src, snap, dst],
     }
 }
@@ -196,6 +266,53 @@ async fn assert_apply_reads_correctly(catalog_move: CatalogMove, restored: Resto
 #[tokio::test(flavor = "current_thread")]
 async fn a_follower_restored_after_a_rekey_applies_its_first_delta() {
     assert_apply_reads_correctly(CatalogMove::Rekey, Restored::AfterMove).await;
+}
+
+/// The producer's rebuild turned the orphan into a free zero hole. The next commits
+/// draw it, so the delta ships that page as a new one over the follower's hole.
+#[tokio::test(flavor = "current_thread")]
+async fn a_follower_restored_after_a_rekey_over_an_orphan_applies_a_delta_that_drew_the_hole() {
+    let fixture = fixture(CatalogMove::RekeyOverOrphan, Restored::AfterMove).await;
+    let orphan = fixture
+        .orphan
+        .expect("setup error: the fixture sealed no orphan");
+    let head = fixture.source.writer.lock().await.free_list_root_page_id;
+    let (free_entries, _) = crate::pager::freelist::read_chain(&fixture.source.pager, REALM, head)
+        .await
+        .unwrap();
+    assert!(
+        free_entries.iter().all(|&(_, page_id)| page_id != orphan),
+        "setup error: no commit drew page {orphan}"
+    );
+    let report = run_deep_walk(&fixture.source).await.unwrap();
+    assert!(report.is_clean(), "{report:?}");
+
+    fixture
+        .follower
+        .apply_incremental(fixture.delta_dir.path())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.follower.latest_commit(),
+        fixture.source.latest_commit()
+    );
+    assert_latest_and_every_row_read_their_values(&fixture).await;
+    let drawn = fixture
+        .follower
+        .pager
+        .read_main_node(orphan, REALM)
+        .await
+        .map(drop);
+    let overflow = fixture
+        .follower
+        .pager
+        .read_main_page(orphan, REALM, PageKind::OverflowRoot)
+        .await
+        .map(drop);
+    assert!(
+        drawn.is_ok() || overflow.is_ok(),
+        "page {orphan} is not on the follower: {drawn:?} {overflow:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

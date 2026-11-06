@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use super::flush::RebuildImage;
 use super::pager::Pager;
 use crate::errors::PagedbError;
 use crate::pager::cache::{FileKey, Page};
@@ -40,27 +41,24 @@ impl<V: Vfs> Pager<V> {
         self.inner.buffer_pool.lock().dirty_len() >= self.cfg.buffer_pool_pages.max(1)
     }
 
-    /// Re-encrypt a main.db page that is already in cache under its original
-    /// epoch, writing fresh ciphertext under `self.active_epoch`. The page is
-    /// read from cache (or disk), marked dirty, and will be flushed with the
-    /// new epoch's DEK on the next `flush_main`.
+    /// Re-seal a main.db page under `image`'s epoch and key, into `image`. The page
+    /// is read from cache or from disk, then marked dirty.
     ///
-    /// `read_main_page` now always routes to the on-disk epoch/cipher, so this
-    /// simply reads then marks dirty.
+    /// The live file never receives the page. It keeps the only intact copy
+    /// until a rename replaces it, so a torn write here costs a scratch page.
+    /// The cached plaintext stays valid either way, because `image` holds the same
+    /// logical page at the same id.
     ///
-    /// The dirty set is kept inside the configured buffer-pool budget. A rekey
-    /// re-seals every page a root can reach. Dirty entries are never evicted, and
-    /// they are off the cache's eviction list. Without an intermediate flush, the
-    /// walk pins the whole decrypted database in memory whatever the budget the
-    /// caller asked for. Flushing mid-walk is safe and
-    /// idempotent: the active epoch is already the target, so a page re-read
-    /// after being re-sealed opens under the same key, and a crash resumes
-    /// from the durable rekey intent.
-    pub async fn rewrite_page_under_current_epoch(
+    /// The dirty set stays inside the configured buffer-pool budget. A rekey
+    /// re-seals every page a root can reach, and dirty entries are never evicted.
+    /// Without a flush mid-walk, the walk pins the whole decrypted database in
+    /// memory.
+    pub(crate) async fn reseal_page_to(
         &self,
         page_id: u64,
         realm_id: RealmId,
         expected_kind: PageKind,
+        image: &RebuildImage,
     ) -> Result<()> {
         let guard = self
             .read_main_page(page_id, realm_id, expected_kind)
@@ -73,29 +71,28 @@ impl<V: Vfs> Pager<V> {
         };
         drop(guard);
         if over_budget {
-            self.flush_main(realm_id).await?;
+            self.flush_main_to_image(realm_id, image).await?;
         }
         Ok(())
     }
 
-    /// Replace a free page with a zeroed `Free` page under the active epoch,
-    /// without reading it. A torn page therefore costs nothing. The old plaintext
-    /// never reaches disk under the active key. Each flush of the page draws one
-    /// fresh nonce.
+    /// Write a zeroed `Free` page into `image`, without reading the page. A torn
+    /// page therefore costs nothing. The old plaintext never reaches disk under
+    /// the image's key.
     ///
     /// The caller proves that nothing can still read this page. The dirty set
-    /// stays inside the buffer-pool budget, as in
-    /// [`Self::rewrite_page_under_current_epoch`].
-    pub(crate) async fn write_blank_free_page(
+    /// stays inside the buffer-pool budget, as in [`Self::reseal_page_to`].
+    pub(crate) async fn write_blank_free_page_to(
         &self,
         page_id: u64,
         realm_id: RealmId,
+        image: &RebuildImage,
     ) -> Result<()> {
         let body = vec![0u8; self.cfg.page_size - ENVELOPE_OVERHEAD];
         self.write_main_page(page_id, realm_id, PageKind::Free, &body)
             .await?;
         if self.main_dirty_at_budget() {
-            self.flush_main(realm_id).await?;
+            self.flush_main_to_image(realm_id, image).await?;
         }
         Ok(())
     }

@@ -19,5 +19,6 @@ mod write;
 
 pub use crate::pager::cache::FileKey;
 pub use config::PagerConfig;
+pub(crate) use flush::RebuildImage;
 pub use guard::PageGuard;
 pub use pager::Pager;

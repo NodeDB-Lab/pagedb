@@ -7,8 +7,10 @@ use rayon::prelude::*;
 
 use super::pager::Pager;
 use crate::crypto::Aad;
+use crate::crypto::MasterKey;
 use crate::crypto::Nonce;
 use crate::crypto::aad::{AadFields, MAIN_DB_SEGMENT_ID};
+use crate::crypto::key_manager::derive_cipher;
 use crate::crypto::nonce::SegmentNonceGen;
 use crate::errors::PagedbError;
 use crate::pager::cache::{FileKey, Page};
@@ -18,11 +20,31 @@ use crate::vfs::types::{OpenMode, WriteReq};
 use crate::vfs::{Vfs, VfsFile};
 use crate::{RealmId, Result};
 
+/// The file a rekey rebuilds `main.db` into, with the epoch and key that file's
+/// pages seal under. A rebuild passes this to every page it writes, so the pager's
+/// active epoch stays on the epoch the live header names until the rename.
+pub(crate) struct RebuildImage {
+    path: String,
+    epoch: u64,
+    cipher: crate::crypto::Cipher,
+}
+
+/// Where a flush writes, and so which epoch it seals under.
+#[derive(Clone, Copy)]
+pub(super) enum FlushDest<'a> {
+    /// The file itself, under the active epoch.
+    Live,
+    /// Another file, under the active epoch.
+    Path(&'a str),
+    /// A rebuild image, under the image's epoch and key.
+    Image(&'a RebuildImage),
+}
+
 impl<V: Vfs> Pager<V> {
     /// Flush all dirty main.db pages to the VFS in physical-id order.
     pub async fn flush_main(&self, realm_id: RealmId) -> Result<()> {
         tracing::debug!(name = "pager.flush", "flushing dirty main db pages");
-        self.flush_file(FileKey::Main, realm_id, MAIN_DB_SEGMENT_ID, None)
+        self.flush_file(FileKey::Main, realm_id, MAIN_DB_SEGMENT_ID, FlushDest::Live)
             .await
     }
 
@@ -32,8 +54,54 @@ impl<V: Vfs> Pager<V> {
     /// main.db. Used by compaction to build a compacted copy that is then
     /// atomically renamed into place.
     pub async fn flush_main_to(&self, realm_id: RealmId, dest_path: &str) -> Result<()> {
-        self.flush_file(FileKey::Main, realm_id, MAIN_DB_SEGMENT_ID, Some(dest_path))
-            .await
+        self.flush_file(
+            FileKey::Main,
+            realm_id,
+            MAIN_DB_SEGMENT_ID,
+            FlushDest::Path(dest_path),
+        )
+        .await
+    }
+
+    /// Flush all dirty main.db pages into a rekey's rebuild image, sealed under
+    /// the image's own epoch and key. The active epoch does not move.
+    pub(crate) async fn flush_main_to_image(
+        &self,
+        realm_id: RealmId,
+        image: &RebuildImage,
+    ) -> Result<()> {
+        self.flush_file(
+            FileKey::Main,
+            realm_id,
+            MAIN_DB_SEGMENT_ID,
+            FlushDest::Image(image),
+        )
+        .await
+    }
+
+    /// A rebuild image at `path`, sealed under `key` as `epoch`.
+    ///
+    /// The cipher stays out of the shared DEK cache, whose key has no key identity.
+    /// A rebuild that never reaches its rename therefore leaves no trace of `key`
+    /// in the pager.
+    pub(crate) fn rebuild_image(
+        &self,
+        realm_id: RealmId,
+        path: String,
+        epoch: u64,
+        key: &MasterKey,
+    ) -> Result<RebuildImage> {
+        let cipher = derive_cipher(
+            self.cfg.cipher_id,
+            key,
+            realm_id,
+            &self.file_identity(FileKey::Main),
+        )?;
+        Ok(RebuildImage {
+            path,
+            epoch,
+            cipher,
+        })
     }
 
     /// Drop all cached main.db pages so subsequent reads re-fetch from disk.
@@ -65,7 +133,7 @@ impl<V: Vfs> Pager<V> {
         file: FileKey,
         realm_id: RealmId,
         segment_id: [u8; 16],
-        dest_path: Option<&str>,
+        dest: FlushDest<'_>,
     ) -> Result<()> {
         if self.read_only.load(AtomOrd::SeqCst) {
             return Err(PagedbError::ReadOnly);
@@ -83,7 +151,10 @@ impl<V: Vfs> Pager<V> {
         let page_size = self.cfg.page_size;
         let page_size_u64 =
             u64::try_from(page_size).map_err(|_| PagedbError::arithmetic_overflow("page size"))?;
-        let flush_epoch = self.active_epoch.load(AtomOrd::SeqCst);
+        let flush_epoch = match dest {
+            FlushDest::Image(image) => image.epoch,
+            FlushDest::Live | FlushDest::Path(_) => self.active_epoch.load(AtomOrd::SeqCst),
+        };
 
         // Serial gather: snapshot each dirty page's plaintext + kind under the
         // cache lock. Cheap memcpy; no AEAD work happens here. The gathered
@@ -157,26 +228,40 @@ impl<V: Vfs> Pager<V> {
         // `encrypt` method takes `&self`, so it's safe to share across rayon
         // workers.
         let cipher_id = self.cfg.cipher_id;
-        let cipher: crate::crypto::Cipher = {
-            let mk_snapshot = self.mk_for(flush_epoch, cipher_id)?;
-            let mut lru = self.dek_lru.lock();
-            let derived = lru.get_or_derive(
-                realm_id,
-                self.file_identity(file),
-                flush_epoch,
-                cipher_id,
-                &mk_snapshot,
-            )?;
-            // Clone the cipher (cheap; carries a derived key) so we drop the
-            // LRU lock before the parallel section.
-            match derived {
-                crate::crypto::Cipher::Aes256Gcm(c) => crate::crypto::Cipher::Aes256Gcm(c.clone()),
-                crate::crypto::Cipher::ChaCha20Poly1305(c) => {
-                    crate::crypto::Cipher::ChaCha20Poly1305(c.clone())
-                }
-                crate::crypto::Cipher::PlaintextMac(k) => {
-                    crate::crypto::Cipher::PlaintextMac(k.clone())
-                }
+        let leased_cipher: Option<crate::crypto::Cipher> = match dest {
+            FlushDest::Image(_) => None,
+            FlushDest::Live | FlushDest::Path(_) => {
+                let mk_snapshot = self.mk_for(flush_epoch, cipher_id)?;
+                let mut lru = self.dek_lru.lock();
+                let derived = lru.get_or_derive(
+                    realm_id,
+                    self.file_identity(file),
+                    flush_epoch,
+                    cipher_id,
+                    &mk_snapshot,
+                )?;
+                // Clone the cipher (cheap; carries a derived key) so we drop the
+                // LRU lock before the parallel section.
+                Some(match derived {
+                    crate::crypto::Cipher::Aes256Gcm(c) => {
+                        crate::crypto::Cipher::Aes256Gcm(c.clone())
+                    }
+                    crate::crypto::Cipher::ChaCha20Poly1305(c) => {
+                        crate::crypto::Cipher::ChaCha20Poly1305(c.clone())
+                    }
+                    crate::crypto::Cipher::PlaintextMac(k) => {
+                        crate::crypto::Cipher::PlaintextMac(k.clone())
+                    }
+                })
+            }
+        };
+        let cipher: &crate::crypto::Cipher = match (&dest, &leased_cipher) {
+            (FlushDest::Image(image), _) => &image.cipher,
+            (_, Some(leased)) => leased,
+            (_, None) => {
+                return Err(PagedbError::Io(std::io::Error::other(
+                    "flush cipher contract",
+                )));
             }
         };
 
@@ -195,7 +280,7 @@ impl<V: Vfs> Pager<V> {
                     realm_id,
                     segment_id,
                 });
-                seal_data_page(wire, *kind, 0, flush_epoch, nonce, &aad, &cipher)
+                seal_data_page(wire, *kind, 0, flush_epoch, nonce, &aad, cipher)
             })?;
 
         // Issue physical-id-order vectored writes.
@@ -203,9 +288,14 @@ impl<V: Vfs> Pager<V> {
         for ((_, _kind, wire), offset) in prepared.iter().zip(offsets) {
             reqs.push(WriteReq { offset, buf: wire });
         }
-        if let Some(path) = dest_path {
-            // Alternate destination (compaction's compacted copy): open it
-            // directly, never via the cached main handle.
+        let alternate_path = match dest {
+            FlushDest::Live => None,
+            FlushDest::Path(path) => Some(path),
+            FlushDest::Image(image) => Some(image.path.as_str()),
+        };
+        if let Some(path) = alternate_path {
+            // Alternate destination (compaction's compacted copy, a rekey's
+            // rebuild image): open it directly, never via the cached main handle.
             let mut f = self.vfs.open(path, OpenMode::CreateOrOpen).await?;
             f.write_at_vectored(&reqs).await?;
             f.sync().await?;

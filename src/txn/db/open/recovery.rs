@@ -8,6 +8,7 @@ use crate::vfs::{Vfs, remove_if_present};
 
 use super::super::catalog::history_policy::proves_unreadable_pages;
 use super::super::core::Db;
+use super::super::rekey::recovery::RekeyAdmission;
 
 pub(super) async fn recover_open_state<V: Vfs + Clone>(
     db: &Db<V>,
@@ -16,7 +17,7 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     fields: &MainDbHeaderFields,
 ) -> Result<()> {
     let capabilities = db.mode.open_capabilities();
-    let rekey_in_flight = db
+    let admission = db
         .admit_rekey_recovery(primary_kek, counterpart_kek)
         .await?;
 
@@ -28,10 +29,11 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     }
 
     if capabilities.runs_standalone_recovery() {
-        // Compaction and `rekey_into_writer` each build a replacement
+        // Compaction, `rekey_db`, and `rekey_into_writer` each build a replacement
         // `main.db` beside the live one and publish it by rename. A scratch
-        // still present at open is one whose rename never happened.
-        for suffix in [".compact", ".fork"] {
+        // still present at open is one whose rename never happened. A rekey's
+        // durable intent starts its rebuild over below.
+        for suffix in [".compact", ".fork", ".rekey"] {
             remove_if_present(&*db.vfs, &format!("{}{suffix}", db.main_db_path)).await?;
         }
 
@@ -83,15 +85,28 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         }
     }
 
-    if rekey_in_flight {
-        if !capabilities.runs_standalone_recovery() {
-            return Err(crate::errors::PagedbError::Unsupported);
+    match admission {
+        RekeyAdmission::NotPending => {}
+        RekeyAdmission::Resume if capabilities.runs_standalone_recovery() => {
+            // A resume reads the chain, and a torn page fails that read. Admission
+            // above installed both intent keys, so the classifier can trust a key
+            // error here. The next rekey header persists root 0.
+            db.drop_unreadable_free_list().await;
+            db.resume_rekey_intent().await?;
         }
-        // A resume reads the chain, and a torn page fails that read. Admission
-        // above installed both intent keys, so the classifier can trust a key
-        // error here. The next rekey header persists root 0.
-        db.drop_unreadable_free_list().await;
-        db.resume_rekey_intent().await?;
+        // A handle without recovery authority reads a store that holds one key,
+        // and refuses a store that needs a resume first.
+        RekeyAdmission::Resume => {
+            if !db.pending_rekey_left_source_intact().await? {
+                return Err(crate::errors::PagedbError::Unsupported);
+            }
+        }
+        RekeyAdmission::SourceKeyOnly => {
+            if capabilities.runs_standalone_recovery() {
+                db.drop_unreadable_free_list().await;
+                db.withdraw_rekey_with_source_key().await?;
+            }
+        }
     }
 
     let (catalog_root_page_id, next_page_id) = {

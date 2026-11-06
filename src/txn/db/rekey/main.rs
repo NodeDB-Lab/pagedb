@@ -1,6 +1,5 @@
 //! Main-database rekey transition and durable intent publication.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 use subtle::ConstantTimeEq;
@@ -11,20 +10,16 @@ use crate::catalog::codec::{Catalog, RekeyIntent, RekeyStage};
 use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::{CipherId, DerivedKey, MasterKey, SecretKey};
 use crate::errors::PagedbError;
-use crate::pager::PageKind;
 use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
-use crate::pager::page_space::{is_reserved, page_offset};
 use crate::pager::structural_header::MainDbHeaderFields;
-use crate::vfs::{OpenMode, Vfs, VfsFile, read_exact_at};
+use crate::vfs::Vfs;
 
-use super::super::catalog::history_policy::proves_unreadable_pages;
 #[cfg(test)]
 use super::super::core::RekeyTestFault;
-use super::super::core::{
-    Db, WriterState, decode_commit_meta, encode_free_list_root, encode_root_ref,
-};
+use super::super::core::{Db, WriterState, encode_free_list_root, encode_root_ref};
 use super::intent::{intent_proof, validate_intent_for_current_cipher};
+use super::rebuild::stage_needs_rebuild;
 
 /// Commit-history rows read per batch while rekeying the roots they name.
 /// Rows are 40 bytes, so this is a few KiB resident regardless of how deep
@@ -41,38 +36,51 @@ pub(super) struct RekeyCatalogCommit<'a> {
     pub next_page_id: u64,
     pub freed_pages: &'a [u64],
     pub effects: &'a [crate::txn::write::SegmentSideEffect],
+    /// The commit-history tree this header publishes, when it moves.
+    pub history: Option<RekeyHistoryRoot>,
 }
 
-/// Read the cleartext kind byte of a `main.db` page, or `None` when the page
-/// has been cleared.
-///
-/// Only selects which AAD binding to authenticate under; the pager still
-/// verifies the full envelope against that same kind, so a tampered byte
-/// cannot launder a page into another role — it fails the tag instead.
-async fn read_main_page_kind<F: VfsFile + ?Sized>(
-    file: &mut F,
-    offset: u64,
-) -> Result<Option<PageKind>> {
-    let mut envelope = [0u8; 2];
-    read_exact_at(file, offset, &mut envelope).await?;
-    if envelope == [0, 0] {
-        return Ok(None);
-    }
-    let kind = PageKind::from_byte(envelope[1])?;
-    if !kind.is_main_db() {
-        return Err(PagedbError::IllegalPageKind);
-    }
-    Ok(Some(kind))
+/// A rewritten commit-history tree. `WriterState` takes it with its header.
+pub(super) struct RekeyHistoryRoot {
+    pub root_page_id: u64,
+    pub root_version: u64,
+    pub entry_count: Option<u64>,
 }
 
 impl<V: Vfs + Clone> Db<V> {
-    /// Rekey the reachable main database and every catalog-linked immutable
-    /// segment under `new_mk_epoch`.
+    /// Rekey the main database and every catalog-linked immutable segment under
+    /// `new_mk_epoch`.
     ///
     /// A read-only walk runs first, and an error there changes nothing. A live
     /// page that fails authentication refuses the rekey. A retained commit whose
     /// pages fail authentication leaves durably with every older commit, and
     /// [`begin_read_at`](Self::begin_read_at) then reports them gone.
+    ///
+    /// The rekey rebuilds `main.db` in a scratch file and renames it into place.
+    /// That needs free space up to the size of `main.db`. Pages nothing names do
+    /// not survive the rename, so no page stays under the source key.
+    ///
+    /// An error before the rename leaves the handle usable and `main.db` intact,
+    /// with every page under the source key. No target key stays in the handle.
+    /// On a full device the rekey also withdraws its intent and returns
+    /// [`PagedbError::RekeyNoSpace`], and the store opens as it did before. Any other
+    /// error, or a dropped future, leaves the intent durable, and exports return
+    /// [`PagedbError::RekeyPending`] until it settles. Three things settle it:
+    ///
+    /// - The next `rekey_db`, with any target key. It replaces the intent.
+    /// - The next open with both keys. It finishes the rekey.
+    /// - The next open with the source key alone. It proves every page is under
+    ///   the source key, then withdraws the intent. The target key is not needed.
+    ///
+    /// From the rename on, the store needs the target key to open at all, and the
+    /// source key too until the rekey finishes. Keep both until this call returns
+    /// `Ok`, or until a reopen finishes the rekey. Losing either one past the rename
+    /// loses the store or its unmigrated segments.
+    ///
+    /// A linked segment that fails to authenticate refuses the rekey before any
+    /// write. Unlink it first, because the rekey cannot move it off the source key.
+    /// A segment file sealed before the rename cannot link after it. See
+    /// [`PagedbError::SegmentEpochStale`].
     pub async fn rekey_db(&self, kek: impl Into<SecretKey>, new_mk_epoch: u64) -> Result<()> {
         let kek = kek.into();
         self.ensure_usable()?;
@@ -87,11 +95,75 @@ impl<V: Vfs + Clone> Db<V> {
 
         let source_epoch = self.mk_epoch.load(Ordering::SeqCst);
         let source_header_key = self.hk.read().clone();
+        let (intent, target_master_key) =
+            self.new_rekey_intent(&kek, source_epoch, &source_header_key, new_mk_epoch)?;
+        let mut state = self.writer.lock().await;
+        self.ensure_usable()?;
+        // Read-only, so an error here leaves the store and the handle as they were.
+        let pruned_through = self.history_rows_rekey_prunes(&state).await?;
+        self.refuse_rekey_over_unverifiable_segment(&state).await?;
+        // `state` takes each write's values only once its header landed, so memory
+        // and the header agree throughout. An error before that point leaves the
+        // handle usable. A header write with an unknown outcome poisons it, in
+        // `commit_rekey_catalog_root`. This guard drops the pages of a write that
+        // stopped before its header.
+        let unpublished = self.discard_unpublished_pages_on_drop();
+        let first_writes = async {
+            if let Some(pruned_through) = pruned_through {
+                self.prune_history_rows_locked(
+                    &mut state,
+                    pruned_through,
+                    source_epoch,
+                    &source_header_key,
+                )
+                .await?;
+            }
+            self.write_rekey_intent_locked(&mut state, &intent, source_epoch, &source_header_key)
+                .await
+        }
+        .await;
+        match first_writes {
+            Ok(()) => unpublished.disarm(),
+            Err(error) => {
+                drop(unpublished);
+                return Err(match error {
+                    PagedbError::NoSpace => PagedbError::rekey_no_space(source_epoch, new_mk_epoch),
+                    other => other,
+                });
+            }
+        }
+        #[cfg(test)]
+        self.interrupt_rekey_if_requested(RekeyTestFault::Intent)?;
+        let source_master_key = self.pager.mk_for(source_epoch, self.cipher_id)?;
+        let outcome = self
+            .resume_rekey_locked(&mut state, intent, &source_master_key, &target_master_key)
+            .await;
+        if matches!(outcome, Err(PagedbError::RekeyNoSpace { .. }))
+            && let Err(error) = self
+                .withdraw_rekey_intent(&mut state, source_epoch, &source_header_key)
+                .await
+        {
+            tracing::error!(
+                %error,
+                "a rekey intent stayed on a full device, and the next open resumes it"
+            );
+        }
+        outcome
+    }
+
+    /// The intent row for a rekey to `new_mk_epoch` under `kek`, and the target key.
+    fn new_rekey_intent(
+        &self,
+        kek: &SecretKey,
+        source_epoch: u64,
+        source_header_key: &DerivedKey,
+        new_mk_epoch: u64,
+    ) -> Result<(RekeyIntent, MasterKey)> {
         let supplied_source_header_key =
             derive_hk(&derive_mk(kek.as_bytes(), &self.kek_salt, source_epoch)?)?;
         let cipher_id = self.cipher_id.as_byte();
         let source_proof = intent_proof(
-            &source_header_key,
+            source_header_key,
             &self.file_id,
             &self.kek_salt,
             source_epoch,
@@ -129,34 +201,30 @@ impl<V: Vfs + Clone> Db<V> {
                 cipher_id,
             )?,
         };
-        let mut state = self.writer.lock().await;
-        self.ensure_usable()?;
-        // Read-only, so an error here leaves the store and the handle as they were.
-        let pruned_through = self.history_rows_rekey_prunes(&state).await?;
-        // Armed from the first header write through completion. A prune or an
-        // intent moves the free-list root in `state` before its header lands. Every
-        // later stage leaves target-epoch pages and durable headers ahead of memory.
-        // A rekey advances no commit, so the poison names the latest one. A reopen
-        // resumes from whatever intent stage is durable.
-        let publish = self.arm_durable_publish(crate::CommitId(state.latest_commit_id));
-        if let Some(pruned_through) = pruned_through {
-            self.prune_history_rows_locked(
-                &mut state,
-                pruned_through,
-                source_epoch,
-                &source_header_key,
-            )
-            .await?;
+        Ok((intent, target_master_key))
+    }
+
+    /// Remove a durable intent whose rebuild never renamed, so the next open needs
+    /// neither room for a rebuild nor the target key.
+    ///
+    /// The caller proves `main.db` holds no page under the target key, so nothing
+    /// else is left to undo. `rekey_db` knows this, because its handle sealed under
+    /// the source key throughout. An open proves it by reading every page's envelope.
+    /// An error here leaves the intent, and the store stays intact.
+    pub(super) async fn withdraw_rekey_intent(
+        &self,
+        state: &mut WriterState,
+        source_epoch: u64,
+        source_header_key: &DerivedKey,
+    ) -> Result<()> {
+        let unpublished = self.discard_unpublished_pages_on_drop();
+        let outcome = self
+            .clear_rekey_intent_locked(state, source_epoch, source_header_key)
+            .await;
+        if outcome.is_ok() {
+            unpublished.disarm();
         }
-        self.write_rekey_intent_locked(&mut state, &intent, source_epoch, &source_header_key)
-            .await?;
-        #[cfg(test)]
-        self.interrupt_rekey_if_requested(RekeyTestFault::Intent)?;
-        self.pager
-            .install_mk_epoch(target_master_key, new_mk_epoch, self.cipher_id);
-        self.resume_rekey_locked(&mut state, intent).await?;
-        publish.disarm();
-        Ok(())
+        outcome
     }
 
     pub(in crate::txn::db) async fn resume_rekey_intent(&self) -> Result<()> {
@@ -170,21 +238,31 @@ impl<V: Vfs + Clone> Db<V> {
                 .await?;
         }
         self.settle_history_for_resume(&mut state, &intent).await?;
-        self.resume_rekey_locked(&mut state, intent).await
+        let source_master_key = self.pager.mk_for(
+            intent.source_mk_epoch,
+            CipherId::from_byte(intent.source_cipher_id)?,
+        )?;
+        let target_master_key = self.pager.mk_for(
+            intent.target_mk_epoch,
+            CipherId::from_byte(intent.target_cipher_id)?,
+        )?;
+        self.resume_rekey_locked(&mut state, intent, &source_master_key, &target_master_key)
+            .await
     }
 
+    /// Run a rekey from its durable intent, under keys the caller supplies. A
+    /// `rekey_db` holds the target key here and nowhere in the pager, so a rebuild
+    /// that stops before its rename leaves no trace of that key.
     async fn resume_rekey_locked(
         &self,
         state: &mut WriterState,
         mut intent: RekeyIntent,
+        source_master_key: &MasterKey,
+        target_master_key: &MasterKey,
     ) -> Result<()> {
         validate_intent_for_current_cipher(&intent, self.cipher_id.as_byte())?;
-        let source_cipher = CipherId::from_byte(intent.source_cipher_id)?;
-        let target_cipher = CipherId::from_byte(intent.target_cipher_id)?;
-        let source_master_key = self.pager.mk_for(intent.source_mk_epoch, source_cipher)?;
-        let target_master_key = self.pager.mk_for(intent.target_mk_epoch, target_cipher)?;
-        let source_header_key = derive_hk(&source_master_key)?;
-        let target_header_key = derive_hk(&target_master_key)?;
+        let source_header_key = derive_hk(source_master_key)?;
+        let target_header_key = derive_hk(target_master_key)?;
         let source_proof = intent_proof(
             &source_header_key,
             &self.file_id,
@@ -212,30 +290,32 @@ impl<V: Vfs + Clone> Db<V> {
             ));
         }
 
-        // After this point the Pager may write with the target epoch while
-        // the durable A/B header still names the source epoch. That state has
-        // no safe in-process rollback: dirty and cached pages may already
-        // depend on target-key routing. Preserve existing reader snapshots,
-        // poison the handle, and require recovery through a fresh open.
-        let mut target_epoch_active = matches!(
-            intent.stage,
-            RekeyStage::HeaderTargetPublished | RekeyStage::MainDone | RekeyStage::SegmentsPending
-        );
+        // Any stage before `MainDone` rebuilds `main.db` in a scratch file. An error
+        // before its rename leaves the live file and this handle as they were, so
+        // it returns as it is. Past the rename, durable state runs ahead of memory
+        // and only a reopen can settle it. A resume at `MainDone` from an earlier
+        // release's file keeps whatever unnamed pages that file holds.
+        let rebuilt = stage_needs_rebuild(intent.stage);
+        if rebuilt {
+            self.rebuild_main_under_target_key(
+                state,
+                &mut intent,
+                target_master_key,
+                &target_header_key,
+            )
+            .await?;
+        }
+
+        // The header names the target epoch from here on, and every later stage
+        // writes it. A rekey advances no commit, so the poison names the latest one.
+        let commit = crate::CommitId(state.latest_commit_id);
+        let publish = self.arm_durable_publish(commit);
         let result = async {
-            if matches!(intent.stage, RekeyStage::Intent) {
-                target_epoch_active = true;
-                self.rewrite_rekey_main_pages(state, &mut intent, &target_master_key)
-                    .await?;
-            }
-            if matches!(intent.stage, RekeyStage::MainPagesTargetReadable) {
-                target_epoch_active = true;
-                self.publish_rekey_target_header(
-                    state,
-                    &mut intent,
-                    &target_master_key,
-                    &target_header_key,
-                )
-                .await?;
+            #[cfg(test)]
+            {
+                if rebuilt {
+                    self.interrupt_rekey_if_requested(RekeyTestFault::MainDone)?;
+                }
             }
             self.finish_rekey_locked(state, &mut intent, &target_header_key)
                 .await
@@ -243,375 +323,21 @@ impl<V: Vfs + Clone> Db<V> {
         .await;
 
         match result {
-            Ok(()) => Ok(()),
-            Err(error) if target_epoch_active => {
-                let commit = crate::CommitId(state.latest_commit_id);
-                self.poison(commit);
+            Ok(()) => {
+                publish.disarm();
+                Ok(())
+            }
+            Err(error) => {
                 tracing::error!(
                     commit = commit.0,
                     error = %error,
-                    "rekey target epoch activation failed before recovery completed; reopening required"
+                    "rekey failed past its rename, so a reopen is required"
                 );
+                // The guard poisons as it drops.
+                drop(publish);
                 Err(PagedbError::rekey_target_epoch_activated(commit, error))
             }
-            Err(error) => Err(error),
         }
-    }
-
-    async fn rewrite_rekey_main_pages(
-        &self,
-        state: &WriterState,
-        intent: &mut RekeyIntent,
-        target_master_key: &MasterKey,
-    ) -> Result<()> {
-        // Rewriting is idempotent only when the active writer epoch is the
-        // target: recovery may revisit pages already rewritten before the
-        // target header was published.
-        self.pager
-            .set_active_mk_epoch(target_master_key.clone(), intent.target_mk_epoch);
-        // One traversal set spans every root below. Retained snapshots share
-        // most of their pages by construction, so this is what keeps the walk
-        // proportional to unique reachable pages instead of to the number of
-        // retained commits. It is bounded by the page count of the live
-        // database, strictly below the dirty-page set the same walk is already
-        // accumulating in the buffer pool for the single `flush_main` at the
-        // end — a page id and kind against a whole decrypted page.
-        let mut rewritten = BTreeMap::new();
-        let main_tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        main_tree.rekey_walk_unique(&mut rewritten).await?;
-        if state.commit_history_root_page_id != 0 {
-            self.rewrite_retained_history_roots(state, &mut rewritten)
-                .await?;
-        }
-        self.rewrite_free_list_discarding_dead_pages(state, &mut rewritten)
-            .await?;
-        // Keep the catalog path carrying the intent source-readable until
-        // target-header publication. This is the durable admission anchor
-        // for an ordinary open that can verify only the stale A/B side.
-        self.pager
-            .set_active_mk_epoch(target_master_key.clone(), intent.target_mk_epoch);
-        self.pager.flush_main(self.realm_id).await?;
-        intent.stage = RekeyStage::MainPagesTargetReadable;
-        #[cfg(test)]
-        self.interrupt_rekey_if_requested(RekeyTestFault::MainPagesTargetReadable)?;
-        Ok(())
-    }
-
-    /// Move the free list to the target epoch before the target header exists,
-    /// blanking every named page that nothing can still read.
-    ///
-    /// A free-list entry does not prove a page is dead. An entry at or above the
-    /// reclamation floor names a page a live reader or retained root can reach.
-    /// Those pages keep their content. An entry below the floor holds no data.
-    /// It gets a fresh blank page without a read. A torn page therefore costs
-    /// nothing. Old plaintext never reaches disk under the target key.
-    ///
-    /// `rewritten` holds every page the root walks re-sealed. A store written by
-    /// an earlier release tags rekey-freed catalog pages with the latest commit.
-    /// A retained row can name those pages while the floor passes them. Membership
-    /// here therefore overrides the floor.
-    /// Chain pages join `rewritten` first. A blank chain page ends the walk early.
-    /// An early end strands the rest of the chain under the source epoch.
-    ///
-    /// The floor is read once. A reader admitted later pins the published
-    /// snapshot, whose pages are not free-listed. A later historical reader pins
-    /// a retained row, whose pages are in `rewritten`.
-    ///
-    /// A page outside `rewritten` is out of every retained row's reach, whatever
-    /// its tag says. Only a registered reader can still read it. A page that
-    /// fails to authenticate therefore gets a blank page unless a reader's pin
-    /// covers its tag.
-    ///
-    /// Resident cost is one id per chain page and one page of entries.
-    async fn rewrite_free_list_discarding_dead_pages(
-        &self,
-        state: &WriterState,
-        rewritten: &mut BTreeMap<u64, PageKind>,
-    ) -> Result<()> {
-        let root_page_id = state.free_list_root_page_id;
-        if root_page_id == 0 {
-            return Ok(());
-        }
-
-        let mut chain = crate::pager::freelist::ChainWalk::new(root_page_id);
-        while let Some(chain_page_id) = chain.advance(&self.pager, self.realm_id).await? {
-            self.pager
-                .rewrite_page_under_current_epoch(chain_page_id, self.realm_id, PageKind::Free)
-                .await?;
-            rewritten.insert(chain_page_id, PageKind::Free);
-        }
-
-        let floor = self.reclamation_floor(state).await?;
-        let reader_pin = self.oldest_reader_pin();
-        let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
-        let mut walk = crate::pager::freelist::ChainWalk::new(root_page_id);
-        while let Some(chain_page_id) = walk.advance(&self.pager, self.realm_id).await? {
-            for &(freed_at, page_id) in walk.entries() {
-                if is_reserved(page_id) {
-                    return Err(PagedbError::reserved_page_referenced(
-                        chain_page_id,
-                        page_id,
-                    ));
-                }
-                if rewritten.contains_key(&page_id) {
-                    continue;
-                }
-                if freed_at < floor {
-                    self.pager
-                        .write_blank_free_page(page_id, self.realm_id)
-                        .await?;
-                } else {
-                    self.reseal_free_page_keeping_content(
-                        &mut file,
-                        page_id,
-                        freed_at < reader_pin,
-                    )
-                    .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Re-encrypt the durable free-list chain and every page it names, keeping
-    /// each page's content. Rewriting only the chain leaves those pages sealed
-    /// under the retired epoch, so integrity checks cannot authenticate them.
-    ///
-    /// This pass runs after the target header, once the catalog pages that the
-    /// intent writes superseded are on the list. It has no record of what retained
-    /// roots reach, so it never blanks a readable page. Every retained row
-    /// authenticated before this pass, so an unreadable page is not one a row
-    /// reaches. This pass blanks it unless a registered reader's pin covers its tag.
-    ///
-    /// The walk is streamed one chain page at a time. Touching every named page
-    /// is inherently proportional to the free list's size in IO, but holding
-    /// their ids was proportional to it in memory too, on a path that already
-    /// flushes to stay inside the buffer-pool budget. Streaming keeps a single
-    /// page of ids resident instead.
-    ///
-    /// Re-sealing a page twice is harmless — the second read opens it under the
-    /// epoch the first one wrote and marks it dirty again — so no cross-page
-    /// deduplication set is needed to tolerate a chain that names one page more
-    /// than once.
-    async fn rewrite_free_list_pages(&self, state: &WriterState) -> Result<()> {
-        let root_page_id = state.free_list_root_page_id;
-        if root_page_id == 0 {
-            return Ok(());
-        }
-
-        let reader_pin = self.oldest_reader_pin();
-        let mut file = self.vfs.open(&self.main_db_path, OpenMode::Read).await?;
-        let mut walk = crate::pager::freelist::ChainWalk::new(root_page_id);
-        while let Some(chain_page_id) = walk.advance(&self.pager, self.realm_id).await? {
-            let named: Vec<(u64, u64)> = walk.entries().to_vec();
-            self.pager
-                .rewrite_page_under_current_epoch(chain_page_id, self.realm_id, PageKind::Free)
-                .await?;
-            for (freed_at, page_id) in named {
-                if is_reserved(page_id) {
-                    return Err(PagedbError::reserved_page_referenced(
-                        chain_page_id,
-                        page_id,
-                    ));
-                }
-                self.reseal_free_page_keeping_content(&mut file, page_id, freed_at < reader_pin)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// The oldest registered reader's commit, or `u64::MAX` with no reader.
-    fn oldest_reader_pin(&self) -> u64 {
-        self.tracked_readers
-            .lock()
-            .iter()
-            .map(|reader| reader.commit_id.0)
-            .min()
-            .unwrap_or(u64::MAX)
-    }
-
-    /// Re-seal a named free page with its content when it authenticates. A hole
-    /// stays a hole. A page that fails to authenticate is replaced with a blank
-    /// page only when `unreachable` says no reader can name it.
-    /// Otherwise the error returns. That error is real corruption, and the page
-    /// bytes are the evidence.
-    async fn reseal_free_page_keeping_content(
-        &self,
-        file: &mut V::File,
-        page_id: u64,
-        unreachable: bool,
-    ) -> Result<()> {
-        let offset = page_offset(page_id, self.page_size, "free-list page offset")?;
-        let kind = match read_main_page_kind(file, offset).await {
-            Ok(Some(kind)) => kind,
-            Ok(None) => return Ok(()),
-            Err(error) if unreachable => {
-                return self.blank_unreadable_free_page(page_id, error).await;
-            }
-            Err(error) => return Err(error),
-        };
-        let verified = self
-            .pager
-            .read_main_page(page_id, self.realm_id, kind)
-            .await
-            .map(drop);
-        if let Err(error) = verified {
-            if unreachable {
-                return self.blank_unreadable_free_page(page_id, error).await;
-            }
-            return Err(error);
-        }
-        self.pager
-            .rewrite_page_under_current_epoch(page_id, self.realm_id, kind)
-            .await
-    }
-
-    /// Replace a free page whose read reported `error` with a blank page.
-    /// Return `error` instead when it says nothing about the page's bytes.
-    async fn blank_unreadable_free_page(&self, page_id: u64, error: PagedbError) -> Result<()> {
-        if !proves_unreadable_pages(&error) {
-            return Err(error);
-        }
-        tracing::warn!(
-            page_id,
-            %error,
-            "free page cannot authenticate during rekey; replacing it with a blank page"
-        );
-        self.pager
-            .write_blank_free_page(page_id, self.realm_id)
-            .await
-    }
-
-    /// Re-seal the live catalog tree under the target epoch.
-    ///
-    /// Every other reader-visible root is re-sealed before the target header is
-    /// published. The catalog is the one that cannot be: until the target
-    /// header is durable it must stay source-readable, because it carries the
-    /// rekey intent that an open able to verify only the stale A/B side uses to
-    /// admit recovery. So it is re-sealed here instead, once that anchor is in
-    /// place and while both keys are still installed.
-    ///
-    /// The walk is the same bounded, deduplicating traversal the data tree
-    /// uses — proportional to unique reachable catalog pages, not to the size
-    /// of the file.
-    async fn rewrite_rekey_catalog_pages(&self, state: &WriterState) -> Result<()> {
-        if state.catalog_root_page_id == 0 {
-            return Ok(());
-        }
-        let catalog = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        catalog.rekey_walk_unique(&mut BTreeMap::new()).await?;
-        Ok(())
-    }
-
-    /// Rewrite the commit-history index and every reader-visible root its
-    /// retained rows still name.
-    ///
-    /// `begin_read_at` resolves a commit through this index and then opens the
-    /// data and catalog roots recorded in the row. Copy-on-write means those
-    /// roots are usually unreachable from the current header, so a rekey that
-    /// walked only the current header would return `Ok(())`, retire the source
-    /// epoch, and leave every retained snapshot naming pages that no live key
-    /// can open. Rewriting them is part of the success contract, not extra
-    /// safety: failing here is correct, because completing after a partial walk
-    /// recreates exactly that defect.
-    ///
-    /// The row's own `next_page_id` bounds each historical tree. Using the
-    /// current allocator bound instead would silently widen an old tree's
-    /// addressable page space beyond what its metadata claims.
-    async fn rewrite_retained_history_roots(
-        &self,
-        state: &WriterState,
-        rewritten: &mut BTreeMap<u64, crate::pager::PageKind>,
-    ) -> Result<()> {
-        let history_tree = BTree::open(
-            self.pager.clone(),
-            self.realm_id,
-            state.commit_history_root_page_id,
-            state.next_page_id,
-            self.page_size,
-        );
-        history_tree.rekey_walk_unique(rewritten).await?;
-
-        // Retention can be unbounded, so the rows are streamed in fixed-size
-        // batches rather than collected: the resident cost is one batch, not
-        // one entry per retained commit. Rewriting the index first means each
-        // batch is read back through the pages this walk has already re-sealed.
-        let mut cursor: Vec<u8> = Vec::new();
-        loop {
-            let batch = history_tree
-                .collect_batch_from(&cursor, HISTORY_ROOT_BATCH)
-                .await?;
-            let Some((last_key, _)) = batch.last() else {
-                return Ok(());
-            };
-            cursor.clear();
-            cursor.extend_from_slice(last_key);
-            cursor.push(0);
-            let exhausted = batch.len() < HISTORY_ROOT_BATCH;
-
-            for (_, value) in &batch {
-                let historical = decode_commit_meta(value)?;
-                // Only the data and catalog roots are reader-visible. The row's
-                // free-list root is writer-only metadata whose superseded chain
-                // pages a later commit may already have recycled; following it
-                // would reinterpret a live page as `PageKind::Free`, so only the
-                // current header's live chain is safe to walk.
-                for root_page_id in [
-                    historical.active_root_page_id,
-                    historical.catalog_root_page_id,
-                ] {
-                    if root_page_id == 0 {
-                        continue;
-                    }
-                    BTree::open(
-                        self.pager.clone(),
-                        self.realm_id,
-                        root_page_id,
-                        historical.next_page_id,
-                        self.page_size,
-                    )
-                    .rekey_walk_unique(rewritten)
-                    .await?;
-                }
-            }
-
-            if exhausted {
-                return Ok(());
-            }
-        }
-    }
-
-    async fn publish_rekey_target_header(
-        &self,
-        state: &mut WriterState,
-        intent: &mut RekeyIntent,
-        target_master_key: &MasterKey,
-        target_header_key: &DerivedKey,
-    ) -> Result<()> {
-        self.pager
-            .set_active_mk_epoch(target_master_key.clone(), intent.target_mk_epoch);
-        intent.stage = RekeyStage::HeaderTargetPublished;
-        self.write_rekey_intent_locked(state, intent, intent.target_mk_epoch, target_header_key)
-            .await?;
-        self.mk_epoch
-            .store(intent.target_mk_epoch, Ordering::SeqCst);
-        *self.hk.write() = target_header_key.clone();
-        #[cfg(test)]
-        self.interrupt_rekey_if_requested(RekeyTestFault::HeaderTargetPublished)?;
-        Ok(())
     }
 
     async fn finish_rekey_locked(
@@ -620,25 +346,6 @@ impl<V: Vfs + Clone> Db<V> {
         intent: &mut RekeyIntent,
         target_header_key: &DerivedKey,
     ) -> Result<()> {
-        if matches!(intent.stage, RekeyStage::HeaderTargetPublished) {
-            self.rewrite_rekey_catalog_pages(state).await?;
-            // The pages the intent write above superseded are already on the
-            // durable free list, so this pass also re-seals them; from here on
-            // every catalog page is target-sealed and later transitions can
-            // only supersede target-epoch pages.
-            self.rewrite_free_list_pages(state).await?;
-            self.pager.flush_main(self.realm_id).await?;
-            intent.stage = RekeyStage::MainDone;
-            self.write_rekey_intent_locked(
-                state,
-                intent,
-                intent.target_mk_epoch,
-                target_header_key,
-            )
-            .await?;
-            #[cfg(test)]
-            self.interrupt_rekey_if_requested(RekeyTestFault::MainDone)?;
-        }
         if !matches!(intent.stage, RekeyStage::SegmentsPending) {
             intent.stage = RekeyStage::SegmentsPending;
             self.write_rekey_intent_locked(
@@ -651,9 +358,10 @@ impl<V: Vfs + Clone> Db<V> {
             #[cfg(test)]
             self.interrupt_rekey_if_requested(RekeyTestFault::SegmentsPending)?;
         }
-        self.migrate_rekey_segments(state, intent, target_header_key)
+        let left_behind = self
+            .migrate_rekey_segments(state, intent, target_header_key)
             .await?;
-        if self.rekey_segments_pending(state, intent).await? {
+        if left_behind == 0 && self.rekey_segments_pending(state, intent).await? {
             return Err(PagedbError::rekey_state_invalid("rekey.segments_pending"));
         }
         self.clear_rekey_intent_locked(state, intent.target_mk_epoch, target_header_key)
@@ -714,6 +422,7 @@ impl<V: Vfs + Clone> Db<V> {
                 next_page_id: tree.next_page_id(),
                 freed_pages: &freed_pages,
                 effects: &[],
+                history: None,
             },
             header_epoch,
             header_hk,
@@ -722,7 +431,7 @@ impl<V: Vfs + Clone> Db<V> {
         .map(|_| ())
     }
 
-    async fn clear_rekey_intent_locked(
+    pub(super) async fn clear_rekey_intent_locked(
         &self,
         state: &mut WriterState,
         header_epoch: u64,
@@ -748,6 +457,7 @@ impl<V: Vfs + Clone> Db<V> {
                 next_page_id: tree.next_page_id(),
                 freed_pages: &freed_pages,
                 effects: &[],
+                history: None,
             },
             header_epoch,
             header_hk,
@@ -756,33 +466,21 @@ impl<V: Vfs + Clone> Db<V> {
         .map(|_| ())
     }
 
-    /// Fold pages a rekey-time catalog rewrite superseded into the durable free
-    /// list, returning the allocation cursor the header must record.
+    /// Make one catalog rewrite durable under one header.
     ///
-    /// Every ordinary commit routes its copy-on-write leftovers here. Without
-    /// it a rekey abandons pages at each intent transition. No root reaches
-    /// them and the free list lacks them. Once the source epoch is retired, a
-    /// key that no longer exists seals them. Entries carry the commit id after
-    /// the latest one. The reclamation floor therefore still withholds any page
-    /// a live reader or retained history root can name.
-    async fn record_rekey_freed_pages(
-        &self,
-        state: &mut WriterState,
-        freed_pages: &[u64],
-        next_page_id: u64,
-    ) -> Result<u64> {
-        if freed_pages.is_empty() {
-            return Ok(next_page_id);
-        }
-        let folded = self
-            .fold_freed_catalog_pages(state, freed_pages, next_page_id)
-            .await?;
-        state.free_list_root_page_id = folded.root_page_id;
-        state.free_list_entries = folded.entries;
-        self.pager.flush_main(self.realm_id).await?;
-        Ok(folded.next_page_id)
-    }
-
+    /// Pages the rewrite superseded join the free list here, as every ordinary
+    /// commit's copy-on-write leftovers do. Without it a rekey abandons pages at
+    /// each intent transition. No root reaches them and the free list lacks them.
+    /// Once the source epoch is retired, a key that no longer exists seals them.
+    /// Entries carry the commit id after the latest one. The reclamation floor
+    /// therefore still withholds any page a live reader or retained history root
+    /// can name.
+    ///
+    /// `state` takes the new values only after the header lands. An error or a drop
+    /// before that point leaves memory describing the durable header. The caller
+    /// drops the staged pages, and the handle stays usable. From the header write
+    /// through publication the guard poisons, because the header outcome can be
+    /// unknown.
     pub(super) async fn commit_rekey_catalog_root(
         &self,
         state: &mut WriterState,
@@ -795,25 +493,36 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id,
             freed_pages,
             effects,
+            history,
         } = catalog;
-        let next_page_id = self
-            .record_rekey_freed_pages(state, freed_pages, next_page_id)
+        let folded = self
+            .fold_freed_catalog_pages(state, freed_pages, next_page_id)
             .await?;
-        let next_page_id = next_page_id.max(state.next_page_id);
-        // Re-sealing pages under the target epoch refreshes the anchor whenever
-        // the window runs out, so the live cursor — not this writer's memory of
-        // it — names the slot this header supersedes.
+        if !freed_pages.is_empty() {
+            self.pager.flush_main(self.realm_id).await?;
+        }
+        let next_page_id = folded.next_page_id.max(state.next_page_id);
+        // An anchor refresh can run whenever the window runs out, so the live
+        // cursor — not this writer's memory of it — names the slot this header
+        // supersedes.
         let header_cursor = self.pager.header_cursor()?;
         let new_seq = header_cursor.next_seq()?;
-        let counter_anchor = self.pager.pending_anchor();
-        let fields = self.rekey_header_fields(
+        let mut fields = self.rekey_header_fields(
             state,
             header_epoch,
             new_seq,
             catalog_root_page_id,
             next_page_id,
         )?;
-        let slot = commit_header(
+        fields.free_list_root = encode_free_list_root(folded.root_page_id);
+        if let Some(history) = &history {
+            fields.commit_history_root_page_id = history.root_page_id;
+            fields.commit_history_root_version = history.root_version;
+        }
+        let counter_anchor = fields.counter_anchor;
+        let commit = crate::CommitId(state.latest_commit_id);
+        let publish = self.arm_durable_publish(commit);
+        let slot = match commit_header(
             &*self.vfs,
             &self.main_db_path,
             hk,
@@ -821,21 +530,31 @@ impl<V: Vfs + Clone> Db<V> {
             header_cursor.slot,
             self.page_size,
         )
-        .await?;
+        .await
+        {
+            Ok(slot) => slot,
+            Err(error) => return Err(publish.header_write_failed(error)),
+        };
         self.pager
             .note_header_written(HeaderCursor { slot, seq: new_seq });
         state.catalog_root_page_id = catalog_root_page_id;
         state.next_page_id = next_page_id;
-        self.finish_durable_commit(
-            state,
-            crate::CommitId(state.latest_commit_id),
-            counter_anchor,
-            effects,
-        )
-        .await
+        state.free_list_root_page_id = folded.root_page_id;
+        state.free_list_entries = folded.entries;
+        if let Some(history) = history {
+            state.commit_history_root_page_id = history.root_page_id;
+            state.commit_history_root_version = history.root_version;
+            state.commit_history_count = history.entry_count;
+        }
+        let outcome = self
+            .finish_durable_commit(state, commit, counter_anchor, effects)
+            .await;
+        // An error above poisoned the handle itself, with the first cause.
+        publish.disarm();
+        outcome
     }
 
-    fn rekey_header_fields(
+    pub(super) fn rekey_header_fields(
         &self,
         state: &WriterState,
         mk_epoch: u64,
@@ -933,7 +652,8 @@ mod tests {
         writer.commit().await.unwrap();
         let existing_reader = db.begin_read().await.unwrap();
 
-        db.interrupt_rekey_after(RekeyTestFault::MainPagesTargetReadable);
+        // Past the rename. A stop before it no longer activates anything.
+        db.interrupt_rekey_after(RekeyTestFault::MainDone);
         let durable_commit = match db.rekey_db(TARGET_KEK, 1).await {
             Err(PagedbError::RekeyTargetEpochActivated { commit, source }) => {
                 assert!(matches!(*source, PagedbError::Io(_)));
@@ -974,11 +694,64 @@ mod tests {
         );
     }
 
-    /// A rekey re-seals every reachable page and writes no header between the
-    /// intent row and the target-header publication, so the whole re-seal draws
-    /// nonces from one anchor window. On a store larger than that window it must
-    /// still complete — and the anchor must end more than a whole budget above
-    /// where it started, which only an advance *during* the re-seal can produce.
+    /// A stop before the rename leaves `main.db` whole, so the handle stays usable
+    /// and its header, epoch, and readers stay as they were. A reopen still finishes
+    /// the rekey from the durable intent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rekey_stopped_before_the_rename_leaves_the_handle_usable_and_a_reopen_finishes_it() {
+        for point in [
+            RekeyTestFault::MainPagesTargetReadable,
+            RekeyTestFault::HeaderTargetPublished,
+        ] {
+            let vfs = MemVfs::new();
+            let db = Db::open_internal(vfs.clone(), SOURCE_KEK, PAGE, REALM)
+                .await
+                .unwrap();
+            let mut writer = db.begin_write().await.unwrap();
+            writer.put(b"preserved", b"source-epoch").await.unwrap();
+            writer.commit().await.unwrap();
+            let existing_reader = db.begin_read().await.unwrap();
+
+            db.interrupt_rekey_after(point);
+            assert!(db.rekey_db(TARGET_KEK, 1).await.is_err(), "{point:?}");
+
+            db.ensure_usable().unwrap();
+            assert_eq!(db.mk_epoch.load(Ordering::SeqCst), 0, "{point:?}");
+            assert_eq!(db.pager.active_mk_epoch(), 0, "{point:?}");
+            assert_eq!(
+                existing_reader.get(b"preserved").await.unwrap().as_deref(),
+                Some(b"source-epoch".as_slice())
+            );
+            drop(existing_reader);
+            let mut writer = db.begin_write().await.unwrap();
+            writer.put(b"after-the-stop", b"value").await.unwrap();
+            writer.commit().await.unwrap();
+            drop(db);
+
+            let reopened = Db::open_existing_with_counterpart_kek(
+                vfs,
+                SOURCE_KEK,
+                TARGET_KEK,
+                PAGE,
+                REALM,
+                crate::OpenOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reopened.mk_epoch.load(Ordering::SeqCst), 1, "{point:?}");
+            let reader = reopened.begin_read().await.unwrap();
+            assert_eq!(
+                reader.get(b"after-the-stop").await.unwrap().as_deref(),
+                Some(b"value".as_slice())
+            );
+        }
+    }
+
+    /// A rekey re-seals every reachable page and writes no header before its rename,
+    /// so the whole re-seal draws nonces from one anchor window. On a store larger
+    /// than that window it must still complete — and the anchor must end more than
+    /// a whole budget above where it started, which only an advance *during* the
+    /// re-seal can produce.
     #[tokio::test(flavor = "current_thread")]
     async fn rekey_is_not_bounded_by_the_anchor_budget() {
         const BUDGET: u64 = 64;
@@ -1283,6 +1056,7 @@ mod tests {
             RekeyTestFault::Intent,
             RekeyTestFault::MainPagesTargetReadable,
             RekeyTestFault::HeaderTargetPublished,
+            RekeyTestFault::MainFileRenamed,
             RekeyTestFault::MainDone,
             RekeyTestFault::SegmentsPending,
             RekeyTestFault::SegmentSeal,
@@ -1331,6 +1105,7 @@ mod tests {
             RekeyTestFault::Intent,
             RekeyTestFault::MainPagesTargetReadable,
             RekeyTestFault::HeaderTargetPublished,
+            RekeyTestFault::MainFileRenamed,
             RekeyTestFault::MainDone,
             RekeyTestFault::SegmentsPending,
             RekeyTestFault::SegmentSeal,
@@ -1386,7 +1161,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn missing_or_wrong_counterpart_does_not_mutate_a_kek_change_intent() {
-        let vfs = interrupted_rekey(RekeyTestFault::Intent).await;
+        // Past the rename. Before it, the source key alone can withdraw the intent.
+        let vfs = interrupted_rekey(RekeyTestFault::SegmentsPending).await;
         let header_before = {
             let header = vfs.open("/main.db", OpenMode::Read).await.unwrap();
             let mut bytes = vec![0u8; PAGE * 2];
@@ -1394,13 +1170,13 @@ mod tests {
             bytes
         };
         assert!(matches!(
-            Db::open_existing(vfs.clone(), SOURCE_KEK, PAGE, REALM).await,
+            Db::open_existing(vfs.clone(), TARGET_KEK, PAGE, REALM).await,
             Err(PagedbError::RekeyResumeKeyRequired { .. })
         ));
         assert!(matches!(
             Db::open_existing_with_counterpart_kek(
                 vfs.clone(),
-                SOURCE_KEK,
+                TARGET_KEK,
                 WRONG_KEK,
                 PAGE,
                 REALM,
@@ -1475,6 +1251,7 @@ mod tests {
                 next_page_id: catalog.next_page_id(),
                 freed_pages: &freed_pages,
                 effects: &[],
+                history: None,
             },
             0,
             &source_header_key,
@@ -1498,11 +1275,14 @@ mod tests {
         );
     }
 
+    /// The rename leaves one header, in slot A. The `SegmentsPending` write fills
+    /// slot B, so this is the first point with two target headers. Losing the newer
+    /// one falls back to slot A at `MainDone`, and the resume redoes the rest.
     #[tokio::test(flavor = "current_thread")]
     async fn stale_ab_header_falls_back_with_both_rekey_keys() {
-        let vfs = interrupted_rekey(RekeyTestFault::HeaderTargetPublished).await;
+        let vfs = interrupted_rekey(RekeyTestFault::SegmentsPending).await;
         let mut header = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
-        header.write_at(0, &[0]).await.unwrap();
+        header.write_at(PAGE as u64, &[0]).await.unwrap();
         drop(header);
 
         let resumed = Db::open_existing_with_counterpart_kek(
@@ -1516,6 +1296,34 @@ mod tests {
         .await
         .unwrap();
         assert!(resumed.open_segment(REALM, "boundary").await.is_ok());
+    }
+
+    /// Before the rename the live file holds two source headers, so a torn newer
+    /// one falls back to the older one. Which of them names the intent decides
+    /// whether a rekey resumes. Either way, every commit reads back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_torn_live_header_before_the_rename_opens_with_both_rekey_keys() {
+        for slot in [0, 1] {
+            let vfs = interrupted_rekey(RekeyTestFault::HeaderTargetPublished).await;
+            let mut header = vfs.open("/main.db", OpenMode::ReadWrite).await.unwrap();
+            header.write_at(slot * PAGE as u64, &[0]).await.unwrap();
+            drop(header);
+
+            let resumed = Db::open_existing_with_counterpart_kek(
+                vfs,
+                SOURCE_KEK,
+                TARGET_KEK,
+                PAGE,
+                REALM,
+                crate::OpenOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                resumed.open_segment(REALM, "boundary").await.is_ok(),
+                "{slot}"
+            );
+        }
     }
 
     #[test]

@@ -489,6 +489,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// of its staging file to the live path on commit.
     pub async fn link_segment(&mut self, name: &str, meta: &SegmentMeta) -> Result<()> {
         self.ensure_mutations_finished()?;
+        self.refuse_segment_from_another_epoch(meta)?;
         let key = Catalog::segment_key(self.db.realm_id, name.as_bytes())?;
         if self.catalog_tree.get(&key).await?.is_some() {
             return Err(PagedbError::AlreadyLinked);
@@ -500,6 +501,20 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         self.pending_segments.push(SegmentSideEffect::Promote {
             segment_id: meta.segment_id,
         });
+        Ok(())
+    }
+
+    /// Refuse a segment sealed under an epoch other than the store's.
+    ///
+    /// A store derives only its header epoch's key at open. A row naming another
+    /// epoch reads nowhere after that open, even while this handle's keyring still
+    /// holds the key for a reader. This transaction holds the writer slot, so no
+    /// rekey can move the epoch before its commit.
+    fn refuse_segment_from_another_epoch(&self, meta: &SegmentMeta) -> Result<()> {
+        let store_epoch = self.db.mk_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        if meta.mk_epoch != store_epoch {
+            return Err(PagedbError::segment_epoch_stale(meta.mk_epoch, store_epoch));
+        }
         Ok(())
     }
 
@@ -533,6 +548,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// segment id and promote `new_meta`'s staging file on commit.
     pub async fn replace_segment(&mut self, name: &str, new_meta: &SegmentMeta) -> Result<()> {
         self.ensure_mutations_finished()?;
+        self.refuse_segment_from_another_epoch(new_meta)?;
         let key = Catalog::segment_key(self.db.realm_id, name.as_bytes())?;
         let existing = self
             .catalog_tree

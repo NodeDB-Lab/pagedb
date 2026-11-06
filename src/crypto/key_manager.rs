@@ -16,6 +16,20 @@ use super::keys::MasterKey;
 
 const DEFAULT_DEK_LRU_CAPACITY: usize = 256;
 
+/// Build the cipher state one realm and file use under `mk`.
+pub(crate) fn derive_cipher(
+    cipher_id: CipherId,
+    mk: &MasterKey,
+    realm: RealmId,
+    file_id: &[u8; 16],
+) -> Result<Cipher> {
+    Ok(match cipher_id {
+        CipherId::Aes256Gcm => Cipher::new_aes_gcm(&derive_dek(mk, realm, file_id)?),
+        CipherId::ChaCha20Poly1305 => Cipher::new_chacha20(&derive_dek(mk, realm, file_id)?),
+        CipherId::PlaintextMac => Cipher::new_plaintext_mac(derive_ik(mk, realm, file_id)?),
+    })
+}
+
 /// Cache key: one realm, in one file, under one master-key epoch and cipher
 /// resolves to one cipher state. During rekey, multiple epochs may coexist;
 /// the cache holds entries for each.
@@ -105,20 +119,7 @@ impl DekLru {
                 .ok_or_else(|| PagedbError::Io(std::io::Error::other("dek lru contract")));
         }
 
-        let cipher = match cipher_id {
-            CipherId::Aes256Gcm => {
-                let dek = derive_dek(mk, realm, &file_id)?;
-                Cipher::new_aes_gcm(&dek)
-            }
-            CipherId::ChaCha20Poly1305 => {
-                let dek = derive_dek(mk, realm, &file_id)?;
-                Cipher::new_chacha20(&dek)
-            }
-            CipherId::PlaintextMac => {
-                let ik = derive_ik(mk, realm, &file_id)?;
-                Cipher::new_plaintext_mac(ik)
-            }
-        };
+        let cipher = derive_cipher(cipher_id, mk, realm, &file_id)?;
 
         if self.map.len() >= self.capacity
             && let Some(victim) = self.order.pop_front()

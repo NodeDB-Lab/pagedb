@@ -1,9 +1,8 @@
 //! A torn free-list chain page must not stop the open that resumes a rekey.
 //!
-//! The open detaches the chain before the resume reads it. The physical sweep in
-//! the deep walk still reports abandoned pages it cannot authenticate, until a
-//! compaction rebuilds the file. So these tests hold every page issue to the
-//! abandoned set, and require a clean walk after the compaction.
+//! The open detaches the chain before the resume reads it. The rebuild then copies
+//! none of the abandoned pages. These tests hold every page issue to the abandoned
+//! set, and require a clean walk after a compaction as well.
 
 use std::collections::BTreeSet;
 
@@ -158,6 +157,49 @@ async fn resume_opens_past_any_torn_chain_page_at_every_stage_and_tear_shape() {
             }
         }
     }
+}
+
+/// The open detaches the torn chain, so the rebuild finds its pages named by
+/// nothing and copies none of them. Their old plaintext leaves with the old file.
+#[tokio::test(flavor = "current_thread")]
+async fn a_detached_torn_free_chain_leaves_the_file_with_the_rekey() {
+    let (vfs, chain_pages, abandoned) = interrupted_store(RekeyTestFault::Intent).await;
+    tear(&vfs, chain_pages[0], Tear::TailHalf).await;
+    let file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
+    let mut envelope = [0u8; 12];
+    file.read_at(chain_pages[1] * PAGE as u64, &mut envelope)
+        .await
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(envelope[4..12].try_into().unwrap()),
+        0,
+        "setup error: the chain is not under the source key"
+    );
+    drop(file);
+
+    let db = Db::open_existing_with_options(vfs.clone(), KEK0, PAGE, REALM, options())
+        .await
+        .unwrap();
+
+    let file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
+    let file_len = file.len().await.unwrap();
+    for page_id in abandoned {
+        let offset = page_id * PAGE as u64;
+        if offset >= file_len {
+            continue;
+        }
+        let mut page = vec![0u8; PAGE];
+        file.read_at(offset, &mut page).await.unwrap();
+        assert!(
+            page.iter().all(|&byte| byte == 0),
+            "page {page_id} of the detached chain stayed on disk"
+        );
+    }
+    drop(file);
+    let report = crate::recovery::deep_walk::run_deep_walk(&db)
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "deep walk report: {report:?}");
 }
 
 /// A store holding an intent row from an earlier release, whose target proof is

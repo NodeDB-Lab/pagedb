@@ -76,9 +76,11 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
     ) -> Result<Self> {
         let page_size = pager.page_size();
         let cipher_id = pager.cipher_id().as_byte();
+        // The epoch this file names for life. Every later key derives from it, so
+        // the file's label and its keys cannot part ways across a rekey.
         let mk_epoch = pager.mk_epoch();
-        let pager_mk = pager.mk()?;
-        let hk = derive_hk(&pager_mk)?;
+        let pinned_mk = pager.mk_for(mk_epoch, pager.cipher_id())?;
+        let hk = derive_hk(&pinned_mk)?;
         let page_size_log2 = page_size_to_log2(page_size)?;
 
         // Ensure the staging directory exists and its entry is durable before
@@ -195,6 +197,16 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         Ok(writer)
     }
 
+    /// The master key of the epoch this writer pinned at create. Once a rekey
+    /// retires that epoch, this fails with `MissingPersistedKey`, and the segment
+    /// has no further use. A link of it fails anyway.
+    fn pinned_master_key(&self) -> Result<crate::crypto::MasterKey> {
+        self.pager.mk_for(
+            self.mk_epoch,
+            crate::crypto::CipherId::from_byte(self.cipher_id)?,
+        )
+    }
+
     pub(crate) async fn append_rekey_page(
         &mut self,
         kind: SegmentPageKind,
@@ -223,7 +235,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         let mut buf = vec![0u8; self.page_size];
         body_mut(&mut buf)[..payload.len()].copy_from_slice(payload);
         {
-            let pager_mk_append = self.pager.mk()?;
+            let pager_mk_append = self.pinned_master_key()?;
             let mut lru = self.pager.dek_lru().lock();
             let cipher = lru.get_or_derive(
                 self.realm_id,
@@ -286,7 +298,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
     #[allow(clippy::too_many_lines)]
     pub async fn seal(mut self) -> Result<SegmentMeta> {
         tracing::debug!(name = "segment.seal", "sealing segment file");
-        let pager_mk_seal = self.pager.mk()?;
+        let pager_mk_seal = self.pinned_master_key()?;
         let hk = derive_hk(&pager_mk_seal)?;
 
         // ── Write extent index block ──────────────────────────────────────────
@@ -349,7 +361,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
                 crate::pager::format::data_page::body_mut(&mut buf)[..body_cap]
                     .copy_from_slice(&body);
                 {
-                    let pager_mk_idx = self.pager.mk()?;
+                    let pager_mk_idx = self.pinned_master_key()?;
                     let mut lru = self.pager.dek_lru().lock();
                     let cipher = lru.get_or_derive(
                         self.realm_id,
@@ -394,7 +406,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             index_page_count,
         };
         let footer_bytes = {
-            let pager_mk_footer = self.pager.mk()?;
+            let pager_mk_footer = self.pinned_master_key()?;
             let mut lru = self.pager.dek_lru().lock();
             let cipher = lru.get_or_derive(
                 self.realm_id,

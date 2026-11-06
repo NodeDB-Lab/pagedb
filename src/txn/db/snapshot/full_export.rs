@@ -36,6 +36,8 @@ impl<V: Vfs + Clone> Db<V> {
         let (target_commit, next_page_id) = { (txn.commit_id().0, txn.next_page_id()) };
         let target_active_root_page_id = txn.root_page_id();
         let target_catalog_root_page_id = txn.catalog_root_page_id();
+        self.refuse_export_with_pending_rekey(target_catalog_root_page_id, next_page_id)
+            .await?;
 
         // Collect live segment ids from the pinned catalog snapshot.
         let segments = txn.list_segments("").await?;

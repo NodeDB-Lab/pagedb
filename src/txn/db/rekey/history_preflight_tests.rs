@@ -262,13 +262,10 @@ async fn a_torn_live_page_refuses_the_rekey_and_writes_no_intent() {
 }
 
 /// An index that cannot authenticate names no row a reader can trust. Every row
-/// leaves, and its pages stay on disk because a partial walk cannot free them.
-///
-/// The deep walk reports each one, because none authenticates. The torn page has
-/// no valid tag, and the source epoch sealing the others is retired. None counts
-/// as an orphan. A compaction rebuilds the file and clears them.
+/// leaves. A partial walk cannot free the index pages, so nothing names them, and
+/// the rebuild copies none of them.
 #[tokio::test(flavor = "current_thread")]
-async fn a_torn_history_index_removes_every_row_and_stays_reported_until_a_compaction() {
+async fn a_torn_history_index_removes_every_row_and_its_pages_leave_with_the_rekey() {
     let vfs = MemVfs::new();
     let db = Db::open_internal(vfs.clone(), KEK, PAGE, REALM)
         .await
@@ -293,7 +290,9 @@ async fn a_torn_history_index_removes_every_row_and_stays_reported_until_a_compa
     db.rekey_db(KEK, 1).await.unwrap();
     drop(db);
 
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open_existing(vfs.clone(), KEK, PAGE, REALM)
+        .await
+        .unwrap();
     assert_eq!(reopened.writer.lock().await.commit_history_root_page_id, 0);
     let (&latest, older) = commits.split_last().unwrap();
     for &commit in older {
@@ -301,23 +300,18 @@ async fn a_torn_history_index_removes_every_row_and_stays_reported_until_a_compa
     }
     assert_reads_version(&reopened, latest, INDEX_SPANNING_COMMITS - 1).await;
 
-    let report = crate::recovery::deep_walk::run_deep_walk(&reopened)
-        .await
-        .unwrap();
-    let reported: Vec<(u64, &str)> = report
-        .page_issues
-        .iter()
-        .map(|issue| (issue.page_id, issue.description.as_str()))
-        .collect();
-    let expected: Vec<(u64, &str)> = index_pages
-        .iter()
-        .map(|&page_id| (page_id, "AEAD verification failed"))
-        .collect();
-    assert_eq!(reported, expected);
-    assert!(report.orphan_page_ids.is_empty(), "{report:?}");
-    assert!(!report.is_clean());
-
-    reopened.compact_now().await.unwrap();
+    let file = vfs.open("/main.db", OpenMode::Read).await.unwrap();
+    for &page_id in &index_pages {
+        let mut page = vec![0u8; PAGE];
+        file.read_at(page_id * PAGE as u64, &mut page)
+            .await
+            .unwrap();
+        assert!(
+            page.iter().all(|&byte| byte == 0),
+            "index page {page_id} stayed on disk"
+        );
+    }
+    drop(file);
     let report = crate::recovery::deep_walk::run_deep_walk(&reopened)
         .await
         .unwrap();
@@ -386,6 +380,7 @@ async fn move_row_root_past_the_cursor(db: &Db<MemVfs>, commit: CommitId) -> u64
             next_page_id: history.next_page_id(),
             freed_pages: &freed_pages,
             effects: &[],
+            history: None,
         },
         header_epoch,
         &header_hk,

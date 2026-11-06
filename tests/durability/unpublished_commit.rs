@@ -55,6 +55,11 @@ impl Vfs for RenameFaultVfs {
     }
 
     async fn rename(&self, from: &str, to: &str) -> pagedb::Result<()> {
+        // These faults target the segment renames behind a durable header. A rekey's
+        // main-file rename comes first, and it has tests of its own.
+        if from.ends_with("main.db.rekey") {
+            return self.inner.rename(from, to).await;
+        }
         let fail_once = self.fail_rename_once.swap(false, Ordering::SeqCst);
         if self.fail_renames.load(Ordering::SeqCst) || fail_once {
             return Err(PagedbError::Io(std::io::Error::other(

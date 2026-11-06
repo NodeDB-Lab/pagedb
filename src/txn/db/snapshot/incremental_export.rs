@@ -25,6 +25,8 @@ impl<V: Vfs + Clone> Db<V> {
         let target_next_page_id = txn.next_page_id();
         let target_active_root_page_id = txn.root_page_id();
         let target_catalog_root_page_id = txn.catalog_root_page_id();
+        self.refuse_export_with_pending_rekey(target_catalog_root_page_id, target_next_page_id)
+            .await?;
 
         // A missing base is not an empty baseline: without its roots there is
         // no sound way to determine which pages the follower must preserve.

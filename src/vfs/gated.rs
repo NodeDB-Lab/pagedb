@@ -10,6 +10,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -157,6 +158,13 @@ enum Trigger {
     Sync { path: String },
     /// Parks a remove before it happens.
     Remove { path: String },
+    /// Parks the write to `path` that `remaining` other writes precede, single or
+    /// vectored, after its bytes land and before its file sync.
+    WriteNumber { path: String, remaining: AtomicU64 },
+    /// Fails the next write to `path` with a full device, before any byte lands.
+    NoSpaceOnWrite { path: String },
+    /// Fails a rename onto `to` before the rename happens.
+    FailRename { to: String },
 }
 
 type Armed = Arc<Mutex<Vec<(Trigger, Arc<Gate>)>>>;
@@ -298,6 +306,25 @@ impl<I> Gated<I> {
             path: canonical(path),
         })
     }
+
+    /// Park the write to `path` that `preceding` other writes come before. A flush
+    /// writes through the vectored call, which the offset gates above never see.
+    pub(crate) fn park_write_number(&self, path: &str, preceding: u64) -> Arc<Gate> {
+        self.arm(Trigger::WriteNumber {
+            path: canonical(path),
+            remaining: AtomicU64::new(preceding),
+        })
+    }
+
+    pub(crate) fn fail_next_write_with_no_space(&self, path: &str) {
+        self.arm(Trigger::NoSpaceOnWrite {
+            path: canonical(path),
+        });
+    }
+
+    pub(crate) fn fail_next_rename(&self, to: &str) {
+        self.arm(Trigger::FailRename { to: canonical(to) });
+    }
 }
 
 pub(crate) struct GatedFile<F> {
@@ -305,6 +332,31 @@ pub(crate) struct GatedFile<F> {
     path: String,
     armed: Armed,
     fail_next_sync: bool,
+}
+
+impl<F> GatedFile<F> {
+    fn check_no_space(&self) -> Result<()> {
+        let fault = take_gate(
+            &self.armed,
+            |trigger| matches!(trigger, Trigger::NoSpaceOnWrite { path } if *path == self.path),
+        );
+        match fault {
+            Some(_) => Err(crate::PagedbError::NoSpace),
+            None => Ok(()),
+        }
+    }
+
+    /// Count one write against the numbered gate on this path. Returns the gate
+    /// when this write is the one it names.
+    fn take_numbered_write_gate(&self) -> Option<Arc<Gate>> {
+        take_gate(&self.armed, |trigger| {
+            matches!(
+                trigger,
+                Trigger::WriteNumber { path, remaining }
+                    if *path == self.path && remaining.fetch_sub(1, Ordering::SeqCst) == 0
+            )
+        })
+    }
 }
 
 #[allow(clippy::unused_async_trait_impl)]
@@ -358,6 +410,13 @@ where
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let target = canonical_native_path(to)?;
+        let fault = take_gate(
+            &self.armed,
+            |trigger| matches!(trigger, Trigger::FailRename { to: armed } if *armed == target),
+        );
+        if fault.is_some() {
+            return Err(injected_fault());
+        }
         let gate = take_gate(
             &self.armed,
             |trigger| matches!(trigger, Trigger::Rename { to: armed } if *armed == target),
@@ -434,6 +493,7 @@ impl<F: VfsFile + Sync> VfsFile for GatedFile<F> {
     }
 
     async fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize> {
+        self.check_no_space()?;
         let write_fault = take_gate(&self.armed, |trigger| {
             matches!(
                 trigger,
@@ -462,11 +522,19 @@ impl<F: VfsFile + Sync> VfsFile for GatedFile<F> {
         if let Some(gate) = gate {
             gate.park().await;
         }
+        if let Some(gate) = self.take_numbered_write_gate() {
+            gate.park().await;
+        }
         Ok(written)
     }
 
     async fn write_at_vectored(&mut self, reqs: &[WriteReq<'_>]) -> Result<()> {
-        self.inner.write_at_vectored(reqs).await
+        self.check_no_space()?;
+        self.inner.write_at_vectored(reqs).await?;
+        if let Some(gate) = self.take_numbered_write_gate() {
+            gate.park().await;
+        }
+        Ok(())
     }
 
     async fn sync(&mut self) -> Result<()> {

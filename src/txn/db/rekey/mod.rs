@@ -5,6 +5,7 @@ mod history_preflight;
 pub(crate) mod intent;
 pub(crate) mod keyring;
 pub(crate) mod main;
+mod rebuild;
 pub(crate) mod recovery;
 pub(crate) mod segments;
 #[cfg(test)]

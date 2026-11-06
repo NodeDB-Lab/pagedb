@@ -71,9 +71,14 @@ pub(crate) struct VisibilityTestHook {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RekeyTestFault {
+    /// The intent is durable in the live file, and no scratch exists.
     Intent,
+    /// Every named page is in the scratch. Its header and intent are not.
     MainPagesTargetReadable,
+    /// The scratch is a complete `main.db`, and the rename has not run.
     HeaderTargetPublished,
+    /// The rename has landed, and the directory sync has not run.
+    MainFileRenamed,
     /// The main database is fully target-sealed and the intent says so, but no
     /// segment has been touched yet. Without a fault here a crash landing in
     /// `MainDone` cannot be produced at all, so the resume path that starts
