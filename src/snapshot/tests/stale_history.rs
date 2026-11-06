@@ -11,21 +11,21 @@ use crate::{
     SealOrderVoid, StaleRowEvidence, run_deep_walk,
 };
 
-const PAGE: usize = 4096;
-const KEK: [u8; 32] = [7u8; 32];
-const REALM: RealmId = RealmId::new([1u8; 16]);
+pub(super) const PAGE: usize = 4096;
+pub(super) const KEK: [u8; 32] = [7u8; 32];
+pub(super) const REALM: RealmId = RealmId::new([1u8; 16]);
 const KEYS: u32 = 200;
-const VALUE_LEN: usize = 128;
+pub(super) const VALUE_LEN: usize = 128;
 const OVERWRITTEN: [u8; VALUE_LEN] = [0xEE; VALUE_LEN];
 
 /// Directories that leave with the test, passed or failed.
-struct Scratch {
+pub(super) struct Scratch {
     root: tempfile::TempDir,
     next: std::cell::Cell<u32>,
 }
 
 impl Scratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             root: tempfile::Builder::new()
                 .prefix("pagedb-stale-")
@@ -35,7 +35,7 @@ impl Scratch {
         }
     }
 
-    fn dir(&self) -> std::path::PathBuf {
+    pub(super) fn dir(&self) -> std::path::PathBuf {
         let index = self.next.get();
         self.next.set(index + 1);
         let path = self.root.path().join(index.to_string());
@@ -44,22 +44,22 @@ impl Scratch {
     }
 }
 
-fn key(index: u32) -> Vec<u8> {
+pub(super) fn key(index: u32) -> Vec<u8> {
     format!("stale-{index:05}").into_bytes()
 }
 
-fn unbounded() -> OpenOptions {
+pub(super) fn unbounded() -> OpenOptions {
     OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded)
 }
 
-async fn open_source(root: &std::path::Path, options: OpenOptions) -> Db<TokioVfs> {
+pub(super) async fn open_source(root: &std::path::Path, options: OpenOptions) -> Db<TokioVfs> {
     Db::open(TokioVfs::new(root), KEK, PAGE, REALM, options)
         .await
         .unwrap()
 }
 
 /// Rewrites every key, so each row reaches leaves no other row reaches.
-async fn commit_all(db: &Db<TokioVfs>, value: u8) -> CommitId {
+pub(super) async fn commit_all(db: &Db<TokioVfs>, value: u8) -> CommitId {
     let mut write = db.begin_write().await.unwrap();
     for index in 0..KEYS {
         write.put(&key(index), &[value; VALUE_LEN]).await.unwrap();
@@ -179,7 +179,8 @@ async fn pages_at<V: crate::vfs::Vfs + Clone>(
 
 /// Replace one retained leaf's value with [`OVERWRITTEN`], keeping its kind. The
 /// page authenticates afterwards, which is the state an earlier apply left. A real
-/// delta page carries the producer's counter, and this one carries the local one.
+/// delta page carries the producer's prefix and counter. This one carries that
+/// prefix and the local counter.
 async fn overwrite_leaf_holding<V: crate::vfs::Vfs + Clone>(
     db: &Db<V>,
     commit: CommitId,
@@ -200,11 +201,13 @@ async fn overwrite_leaf_holding<V: crate::vfs::Vfs + Clone>(
             continue;
         };
         body[offset..offset + VALUE_LEN].copy_from_slice(&OVERWRITTEN);
+        let replaced_prefix = db.pager.swap_to_file_nonce_prefix();
         db.pager
             .write_main_page(page_id, REALM, PageKind::BTreeLeaf, &body)
             .await
             .unwrap();
         db.pager.flush_main(REALM).await.unwrap();
+        db.pager.restore_nonce_prefix(replaced_prefix);
         db.pager.reset_main_pages().unwrap();
         return page_id;
     }

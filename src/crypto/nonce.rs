@@ -2,6 +2,10 @@
 //! anchor state machine for main.db nonces. Durability of the anchor
 //! (fsync to A/B header) is the header layer's responsibility — this module
 //! exposes `pending_anchor()` so the header writer can persist the right value.
+//!
+//! A follower shares its source's key and `file_id`. So a Follower handle seals
+//! its own `main.db` pages under a random prefix drawn at each open, never under
+//! `file_id[0..6]`. Delta pages land verbatim and keep the source's prefix.
 
 use crate::Result;
 use crate::errors::PagedbError;
@@ -56,12 +60,23 @@ impl Nonce {
 /// `durable_anchor < n ≤ durable_anchor + N` for every issued nonce `n`.
 pub const DEFAULT_ANCHOR_BUDGET: u64 = 1024;
 
+/// Largest budget a generator honours. A larger option issues under this value.
+///
+/// No file records the budget of an earlier run, so an open cannot rely on the
+/// current option. Every run stays inside this window above its durable anchor.
+/// [`MainDbNonceGen::recover`] always skips the whole window.
+///
+/// One open that writes a header spends `2^20` counter values. The 48-bit counter
+/// therefore lasts `2^48 / 2^20 = 2^28` (268,435,456) such opens, before sealed
+/// pages are counted. That is about 8.5 years at one such open per second.
+pub const MAX_ANCHOR_BUDGET: u64 = 1 << 20;
+
 /// main.db nonce generator. Tracks `(durable_anchor, next_nonce)`. When
 /// `next_nonce` would exceed `durable_anchor + budget`, callers must persist
 /// `pending_anchor()` to the A/B header and call `commit_anchor()` before
 /// requesting another nonce.
 pub struct MainDbNonceGen {
-    file_id6: [u8; 6],
+    prefix: [u8; 6],
     next: u64,
     durable_anchor: u64,
     budget: u64,
@@ -73,34 +88,48 @@ impl MainDbNonceGen {
     /// `(0, budget]`).
     #[must_use]
     pub fn new(file_id: &[u8; 16], budget: u64) -> Self {
-        let mut f = [0u8; 6];
-        f.copy_from_slice(&file_id[..6]);
+        let mut prefix = [0u8; 6];
+        prefix.copy_from_slice(&file_id[..6]);
         Self {
-            file_id6: f,
+            prefix,
             next: 1,
             durable_anchor: 0,
-            budget,
+            budget: budget.min(MAX_ANCHOR_BUDGET),
         }
     }
 
-    /// Reconstruct on recovery: `next_nonce := recovered_anchor + budget + 1`.
-    /// Guarantees `next` is strictly greater than every pre-crash issued nonce.
-    /// `durable_anchor` is advanced to `next - 1` so the first post-recovery
-    /// nonce issue succeeds without requiring an immediate anchor commit.
+    /// Reconstruct at an open: `next_nonce := recovered_anchor + MAX_ANCHOR_BUDGET + 1`.
+    ///
+    /// `next` is strictly greater than every counter an earlier run issued under
+    /// this anchor, whichever budget that run used.
+    ///
+    /// `durable_anchor` stays at the recovered value, because the header holds that
+    /// value. The issuing window therefore starts empty. The first flush persists
+    /// `pending_anchor()` and calls `commit_anchor` before it seals a page.
     #[must_use]
     pub fn recover(file_id: &[u8; 16], recovered_anchor: u64, budget: u64) -> Self {
-        let mut f = [0u8; 6];
-        f.copy_from_slice(&file_id[..6]);
-        let next = recovered_anchor.saturating_add(budget).saturating_add(1);
-        // Treat the post-crash skip as already anchored: the pager will write
-        // the new anchor to the A/B header on the next commit.
-        let durable_anchor = next.saturating_sub(1);
+        let mut prefix = [0u8; 6];
+        prefix.copy_from_slice(&file_id[..6]);
+        let next = recovered_anchor
+            .saturating_add(MAX_ANCHOR_BUDGET)
+            .saturating_add(1);
         Self {
-            file_id6: f,
+            prefix,
             next,
-            durable_anchor,
-            budget,
+            durable_anchor: recovered_anchor,
+            budget: budget.min(MAX_ANCHOR_BUDGET),
         }
+    }
+
+    /// Issue every later nonce under `prefix`. The counter and the anchor stay as
+    /// they are.
+    pub(crate) fn use_prefix(&mut self, prefix: [u8; 6]) {
+        self.prefix = prefix;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefix(&self) -> [u8; 6] {
+        self.prefix
     }
 
     /// Issue the next nonce. Returns `Aborted` if a commit is required first
@@ -115,7 +144,7 @@ impl MainDbNonceGen {
             // Caller must commit the anchor first.
             return Err(PagedbError::Aborted);
         }
-        let n = Nonce::from_parts(self.file_id6, self.next);
+        let n = Nonce::from_parts(self.prefix, self.next);
         self.next += 1;
         Ok(n)
     }
@@ -272,19 +301,62 @@ mod tests {
         assert!(matches!(g.next_nonce(), Err(PagedbError::Aborted)));
     }
 
-    #[test]
-    fn main_db_recover_jumps_past_pre_crash_window() {
-        let g = MainDbNonceGen::recover(&[0; 16], 1000, 1024);
-        // Next issued counter must be > 1000 + 1024 = 2024.
-        assert_eq!(g.pending_anchor(), 2024);
-        // next == 2025
-        let mut g = g;
-        let n = g.next_nonce().unwrap();
-        // The first issued counter is 2025.
-        let counter_le = &n.as_bytes()[6..];
+    fn counter_of(nonce: &Nonce) -> u64 {
         let mut buf = [0u8; 8];
-        buf[..6].copy_from_slice(counter_le);
-        assert_eq!(u64::from_le_bytes(buf), 2025);
+        buf[..6].copy_from_slice(&nonce.as_bytes()[6..]);
+        u64::from_le_bytes(buf)
+    }
+
+    #[test]
+    fn first_flush_after_open_persists_the_anchor_before_sealing() {
+        let mut g = MainDbNonceGen::recover(&[0; 16], 1000, 1024);
+        assert_eq!(g.window_remaining(), 0);
+        assert_eq!(g.durable_anchor(), 1000);
+        assert!(matches!(g.next_nonce(), Err(PagedbError::Aborted)));
+
+        let pending = g.pending_anchor();
+        assert_eq!(pending, 1000 + MAX_ANCHOR_BUDGET);
+        g.commit_anchor(pending).unwrap();
+
+        assert_eq!(g.window_remaining(), 1024);
+        let first = g.next_nonce().unwrap();
+        assert_eq!(counter_of(&first), 1000 + MAX_ANCHOR_BUDGET + 1);
+    }
+
+    #[test]
+    fn an_open_skips_the_maximum_budget_whatever_the_option() {
+        for budget in [1, 8, 1024, MAX_ANCHOR_BUDGET, MAX_ANCHOR_BUDGET * 4] {
+            let g = MainDbNonceGen::recover(&[0; 16], 1000, budget);
+            assert_eq!(g.pending_anchor(), 1000 + MAX_ANCHOR_BUDGET, "{budget}");
+        }
+    }
+
+    #[test]
+    fn a_budget_above_the_maximum_issues_under_the_maximum() {
+        let fresh = MainDbNonceGen::new(&[0; 16], MAX_ANCHOR_BUDGET + 5);
+        assert_eq!(fresh.window_remaining(), MAX_ANCHOR_BUDGET);
+
+        let mut recovered = MainDbNonceGen::recover(&[0; 16], 7, MAX_ANCHOR_BUDGET + 5);
+        let pending = recovered.pending_anchor();
+        recovered.commit_anchor(pending).unwrap();
+        assert_eq!(recovered.window_remaining(), MAX_ANCHOR_BUDGET);
+    }
+
+    #[test]
+    fn the_counter_lasts_the_stated_number_of_opens() {
+        assert_eq!((Nonce::COUNTER_MAX + 1) / MAX_ANCHOR_BUDGET, 1 << 28);
+    }
+
+    #[test]
+    fn a_local_prefix_replaces_the_file_prefix_and_keeps_the_counter() {
+        let mut g = MainDbNonceGen::new(&[0xAA; 16], 8);
+        let before = g.next_nonce().unwrap();
+        assert_eq!(&before.as_bytes()[..6], &[0xAA; 6]);
+
+        g.use_prefix([0x5C; 6]);
+        let after = g.next_nonce().unwrap();
+        assert_eq!(&after.as_bytes()[..6], &[0x5C; 6]);
+        assert_eq!(counter_of(&after), counter_of(&before) + 1);
     }
 
     #[test]

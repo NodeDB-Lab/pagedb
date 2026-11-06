@@ -131,8 +131,11 @@ pub struct OpenOptions {
     /// A/B header, not how much work an operation may do: a run that would
     /// exhaust the window rewrites the live header with a larger anchor and
     /// nothing else changed, then continues. A smaller budget therefore costs
-    /// extra header writes on large operations, and a crash re-opens having
-    /// skipped at most one budget's worth of counter values. Default: 1024.
+    /// extra header writes on large operations. Default: 1024.
+    ///
+    /// A value above 1,048,576 (2^20) issues under 1,048,576. Each open that
+    /// writes a header skips that many counter values, whatever this value is.
+    /// The first flush after an open writes a header before it seals a page.
     pub anchor_budget: u64,
 
     /// Cipher for a database this open *creates*.
@@ -223,8 +226,9 @@ impl OpenOptions {
     }
 
     /// Set how far the main-db nonce counter may run ahead of the anchor in the
-    /// durable header. A larger value trades a wider post-crash counter skip for
-    /// fewer anchor writes during large operations. Default: 1024.
+    /// durable header. A larger value means fewer anchor writes during large
+    /// operations. A value above 1,048,576 (2^20) issues under 1,048,576.
+    /// Default: 1024.
     #[must_use]
     pub fn with_anchor_budget(mut self, v: u64) -> Self {
         self.anchor_budget = v;

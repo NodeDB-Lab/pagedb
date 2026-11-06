@@ -206,6 +206,10 @@ impl<V: Vfs> Pager<V> {
         // refreshes again mid-allocation; that anchor covers nonces this flush
         // has claimed but not yet written, which is over-advancing — it can only
         // skip counter values, never repeat one.
+        //
+        // An open writes no header, so its window starts empty. The first flush
+        // after an open therefore persists the anchor before it seals a page. A
+        // failed refresh returns here, and no page is sealed or written.
         let mut nonces: Vec<Nonce> = Vec::with_capacity(prepared.len());
         while nonces.len() < prepared.len() {
             let still_needed = prepared.len() - nonces.len();

@@ -10,3 +10,4 @@ mod export_free_chain;
 mod free_list_recovery;
 mod history_retention;
 mod metadata_errors;
+mod page_nonces;

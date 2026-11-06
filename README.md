@@ -142,10 +142,15 @@ defend against, stated plainly so nobody has to infer it.
   moved to another offset, another realm, another segment, or reinterpreted as
   another kind without failing verification.
 - **Key separation.** One key per `(realm, file, master-key epoch, cipher)`,
-  derived by HKDF-SHA-256 from the embedder's KEK. Because the nonce is
-  `file_identity[0..6] ‖ counter48`, scoping the key by the _full_ file identity
-  is what makes nonce reuse impossible by construction rather than merely
-  improbable — two files can never share a nonce space.
+  derived by HKDF-SHA-256 from the embedder's KEK. The nonce is
+  `file_identity[0..6] ‖ counter48`, and the key is scoped by the _full_ file
+  identity, so two files never share a nonce space.
+- **Follower pages.** A follower holds its source's key and file identity, and
+  delta pages keep the source's nonces. Its local pages use a random 6-byte
+  prefix drawn at each open. Those pages are its free-list chain and a relocated
+  commit history. An
+  open refuses a draw equal to `file_identity[0..6]`. Two followers can still draw
+  one prefix, so a match between them is improbable rather than impossible.
 - **Torn writes.** A crash mid-write cannot corrupt committed state: the B+
   tree uses copy-on-write shadow paging behind alternating A/B headers, and a
   segment is committed by its seal record or not at all.

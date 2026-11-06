@@ -4,4 +4,5 @@
 
 mod basic;
 mod generated_artifacts;
+mod page_nonces;
 mod stale_history;

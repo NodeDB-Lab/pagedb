@@ -146,6 +146,10 @@ impl<V: Vfs> Pager<V> {
     /// said one identity while its nonce said another would be back to sharing
     /// a nonce space across keys.
     ///
+    /// A Follower handle keeps this identity for its key. Its generator seals the
+    /// handle's own pages under a random prefix, because the source holds this key
+    /// and this identity's prefix too.
+    ///
     /// Note this is *not* the AAD's `segment_id` field, which is all-zero for
     /// `main.db`; that field names the segment a page belongs to, while this
     /// names the file the page is written into.

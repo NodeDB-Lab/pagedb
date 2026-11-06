@@ -17,11 +17,11 @@
 //! - One writer lock orders flushes, and one generator serves them. Its counter
 //!   only rises for committed pages, across restarts too. Every commit header
 //!   carries an anchor covering its pages, and `MainDbNonceGen::recover` resumes
-//!   past that anchor.
+//!   past that anchor by the largest budget any run can use.
 //!
 //! So each page of an intact `C` holds a counter below `D`'s root. A page at or
 //! above that counter was sealed after `C`, and row `C` names bytes it never held.
-//! A delta page is verbatim, so it keeps the producer's counter.
+//! A delta page is verbatim, so it keeps the producer's prefix and counter.
 //!
 //! The roots of both trees bound both trees, because one generator seals them.
 //! The nearest such commit gives the tightest bound. A row whose roots match the
@@ -47,9 +47,12 @@
 //! - **A main repack.** It resets every row, so no row spans its reseal order. A
 //!   segment-only repack keeps rows and writes catalog pages copy-on-write.
 //! - **A fork.** It starts with no rows.
-//! - **A follower's own seals.** They prove nothing false. Free-list chain pages
-//!   carry kind `Free`, so they fail as a node. A relocated history tree lands at
-//!   or above the allocation cursor, past every row's `next_page_id`.
+//! - **A follower's own seals.** They carry a per-open random prefix, and a walked
+//!   page under another identity voids the scan. No walk reaches them. Free-list
+//!   chain pages carry kind `Free`, so they fail as a node. A relocated history
+//!   tree lands at or above the allocation cursor, past every row's `next_page_id`.
+//!   The scan reads the history tree's rows through ordinary reads, and its pages
+//!   never enter the ledger.
 //!
 //! # The one path this cannot exclude
 //!

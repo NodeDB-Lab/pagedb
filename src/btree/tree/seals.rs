@@ -89,6 +89,9 @@ impl SealLedger {
     /// A rekey reseals pages in walk order under a non-zero epoch. A stamp from
     /// another epoch, cipher, or identity therefore orders nothing. `PlaintextMac`
     /// leaves the nonce outside its tag, so its counter proves nothing either.
+    ///
+    /// A follower's own pages carry a per-open prefix, so they count as another
+    /// identity. No row walk reaches them, so they leave a follower's scan intact.
     pub(crate) fn comparable(&mut self, page_id: u64, stamp: &SealStamp) -> Option<SealedPage> {
         if stamp.identity == self.identity
             && stamp.mk_epoch == 0

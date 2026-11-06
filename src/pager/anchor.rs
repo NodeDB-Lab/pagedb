@@ -9,6 +9,10 @@
 //! swap, so without this they draw their entire run from a single window and
 //! stop working above a fixed store size.
 //!
+//! An open writes no header, so a recovered generator starts with an empty window.
+//! The first flush after an open runs a refresh before it seals a page. A crash
+//! after that flush therefore reopens from an anchor above every counter it used.
+//!
 //! The refresh here rewrites the live header with **every field unchanged
 //! except the anchor** (and the `seq` the A/B protocol requires to make the new
 //! slot authoritative). That publishes nothing: the roots, the allocation

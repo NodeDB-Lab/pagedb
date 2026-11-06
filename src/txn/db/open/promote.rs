@@ -25,6 +25,8 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// A restored directory records the promotion in its header. A later
     /// open still refuses to make it a Standalone writer.
+    ///
+    /// The handle seals its own pages under a random nonce prefix from here on.
     pub async fn promote_to_follower(mut self) -> Result<Self> {
         self.ensure_usable()?;
         self.require_mode(
@@ -33,6 +35,7 @@ impl<V: Vfs + Clone> Db<V> {
             DbModeCapabilities::promotes_to_follower,
         )?;
         self.take_exclusive_writer_sentinel("follower").await?;
+        self.pager.use_local_nonce_prefix()?;
         self.pager.enable_write_access().await;
         self.record_follower_mode().await?;
         self.lock_required = true;
@@ -51,6 +54,7 @@ impl<V: Vfs + Clone> Db<V> {
     ///   [`Db::promote_to_follower`] does.
     /// - Changes nothing on an unstamped store until its first apply. That apply
     ///   makes every later `Standalone` open report `RestoredNotPromoted`.
+    /// - Seals its own pages under a random nonce prefix drawn for this open.
     pub async fn open_follower(
         vfs: V,
         kek: impl Into<SecretKey>,

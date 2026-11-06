@@ -249,6 +249,10 @@ impl<V: Vfs + Clone> Db<V> {
             pager.set_read_only();
         }
         pager.recover_main_nonce(fields.counter_anchor);
+        // Before open recovery, so every seal of this handle uses the prefix.
+        if capabilities.seals_under_a_local_nonce_prefix() {
+            pager.use_local_nonce_prefix()?;
+        }
 
         let catalog_root_page_id = {
             let mut bytes = [0u8; 8];

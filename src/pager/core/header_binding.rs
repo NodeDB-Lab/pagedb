@@ -140,6 +140,9 @@ impl<V: Vfs> Pager<V> {
     /// Replace the main.db nonce generator with one recovered from a
     /// persisted anchor. Called by `Db::open_existing` after reading the
     /// header.
+    ///
+    /// The open writes no header, so the recovered window starts empty. The first
+    /// flush after an open persists the anchor before it seals a page.
     pub fn recover_main_nonce(&self, recovered_anchor: u64) {
         let mut g = self.main_nonce.lock();
         *g = crate::crypto::nonce::MainDbNonceGen::recover(
@@ -147,5 +150,33 @@ impl<V: Vfs> Pager<V> {
             recovered_anchor,
             self.cfg.anchor_budget,
         );
+    }
+
+    /// Seal every later `main.db` page of this handle under a fresh random prefix.
+    ///
+    /// A handle calls this when it becomes a Follower, before it seals any page.
+    /// The key, `file_identity`, counter, and anchor stay as they are.
+    pub(crate) fn use_local_nonce_prefix(&self) -> Result<()> {
+        let prefix = crate::crypto::random::local_nonce_prefix(&self.cfg.main_db_file_id)?;
+        self.main_nonce.lock().use_prefix(prefix);
+        Ok(())
+    }
+
+    /// Issue later nonces under the file prefix, and return the prefix it replaced.
+    /// A test uses this to write a page the way a producer's delta carries it.
+    #[cfg(test)]
+    pub(crate) fn swap_to_file_nonce_prefix(&self) -> [u8; 6] {
+        let mut file_prefix = [0u8; 6];
+        file_prefix.copy_from_slice(&self.cfg.main_db_file_id[..6]);
+        let mut generator = self.main_nonce.lock();
+        let replaced = generator.prefix();
+        generator.use_prefix(file_prefix);
+        replaced
+    }
+
+    /// Restore a prefix [`Self::swap_to_file_nonce_prefix`] returned.
+    #[cfg(test)]
+    pub(crate) fn restore_nonce_prefix(&self, prefix: [u8; 6]) {
+        self.main_nonce.lock().use_prefix(prefix);
     }
 }

@@ -96,6 +96,13 @@ impl DbModeCapabilities {
         matches!(self.recovery_authority, RecoveryAuthority::ApplyOnly)
     }
 
+    /// A handle that takes a producer's pages holds the producer's key and
+    /// `file_id`. Its own seals therefore need a nonce prefix of their own.
+    #[must_use]
+    pub(in crate::txn::db) const fn seals_under_a_local_nonce_prefix(self) -> bool {
+        matches!(self.recovery_authority, RecoveryAuthority::ApplyOnly)
+    }
+
     /// Promotion to `Follower`. The promotion trades the frozen-reader
     /// sentinel for the writer sentinel, so only the mode that actually holds
     /// the frozen-reader lock has anything to trade — which is what separates
