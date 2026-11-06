@@ -48,16 +48,16 @@ impl<V: Vfs + Clone> Db<V> {
             .applies_incremental_snapshots()
     }
 
-    /// Drop unpinned clean cached pages of `realm` so the next read goes to
-    /// storage, leaving dirty and pinned entries untouched.
+    /// Drop unpinned clean cached main pages so the next read goes to storage,
+    /// leaving dirty and pinned entries untouched.
     ///
     /// Compiled only for the crate's own tests: nothing an embedder does is
     /// supposed to depend on whether a page is warm, and publishing the lever
     /// invites exactly that dependency. A test that needs a cold read from
     /// outside the crate reopens the handle instead.
     #[cfg(test)]
-    pub(crate) fn evict_main_pages(&self, realm: crate::RealmId) {
-        self.pager.evict_clean_main_pages(realm);
+    pub(crate) fn evict_main_pages(&self) -> Result<()> {
+        self.pager.evict_clean_main_pages()
     }
 
     /// Current size of `main.db` in bytes, read from the file rather than from
@@ -83,18 +83,19 @@ impl<V: Vfs + Clone> Db<V> {
         crate::compaction::compact_now(self).await
     }
 
-    /// Perform one incremental compaction step bounded by `budget`.
+    /// Run the whole atomic compaction in one call.
     ///
-    /// Each call holds the writer lock for at most one batch commit, then
-    /// releases. The compaction watermark is persisted to the catalog after
-    /// each call, so a crash mid-compaction is safe: call `compact_step` again
-    /// after reopening to resume from where it left off.
+    /// The pass rebuilds `main.db` through a scratch file and a rename, so it
+    /// cannot split across writer-lock releases. `budget` is ignored.
+    /// The call holds the compaction exclusion until the pass finishes.
+    /// A crash mid-pass leaves the old `main.db` in place.
     ///
-    /// Returns a [`crate::CompactProgress`] describing what was done and
-    /// whether more work remains. Loop until `progress.more_work == false` to
-    /// compact fully. A loop that ends with
+    /// Returns a [`crate::CompactProgress`] describing what was reclaimed.
+    /// `more_work` is always `false`, so one call finishes the pass.
+    /// A result with
     /// [`declined_readers_pinned`](crate::CompactProgress::declined_readers_pinned)
     /// set compacted nothing: a registered reader stopped the pass.
+    /// Call again after the readers drop.
     pub async fn compact_step(
         &self,
         budget: crate::compaction::CompactBudget,
@@ -122,25 +123,38 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     /// Collect a point-in-time snapshot of database runtime metrics.
+    ///
+    /// Waits while a compaction, an incremental apply, or a commit publication
+    /// holds the visibility gate. Registers no reader, so a concurrent compaction
+    /// waits for this call instead of declining.
+    ///
+    /// A poisoned handle returns the poison error. Its published roots can name
+    /// pages in a file they do not describe, so a walk from them proves nothing.
     pub async fn stats(&self) -> Result<DbStats> {
-        // Stats that describe reader-visible state must use the publication
-        // snapshot, which remains at the prior commit while a handle is
-        // poisoned after a post-header reconciliation failure.
-        let snapshot = *self.snapshot.read();
-        let (next_page_id, catalog_root, catalog_next, free_list_root) = (
+        self.ensure_usable()?;
+        let (_hold, snapshot) = self.hold_published_snapshot().await?;
+        let (next_page_id, catalog_root, catalog_next) = (
             snapshot.next_page_id,
             snapshot.catalog_root_page_id,
             snapshot.next_page_id,
-            snapshot.free_list_root_page_id,
         );
         let latest_commit_id = snapshot.commit_id;
 
-        // Durable free-list depth (chain rooted at the header's free_list_root).
-        // Counted in place rather than collected: how many pages the free list
-        // is carrying grows with the database, and a metrics call must not size
-        // an allocation by it.
-        let free_list_pending_entries =
-            crate::pager::freelist::count_chain(&self.pager, self.realm_id, free_list_root).await?;
+        // The commit that published this snapshot counted its free-list chain.
+        // Only an open that failed to read the chain head leaves the count
+        // unknown. The hold keeps that chain in place, and its read error
+        // surfaces here instead of reading as zero.
+        let free_list_pending_entries = match snapshot.free_list_entries {
+            Some(entries) => entries,
+            None => {
+                crate::pager::freelist::count_chain(
+                    &self.pager,
+                    self.realm_id,
+                    snapshot.free_list_root_page_id,
+                )
+                .await?
+            }
+        };
 
         // Main database file size.
         let main_db_bytes = self
@@ -159,9 +173,7 @@ impl<V: Vfs + Clone> Db<V> {
         let dirty_pages = {
             let bp = self.pager.inner.buffer_pool.lock();
             let sc = self.pager.inner.segment_cache.lock();
-            (bp.dirty_for_file(crate::pager::core::FileKey::Main).len()
-                + sc.dirty_for_file(crate::pager::core::FileKey::Segment([0u8; 16]))
-                    .len()) as u64
+            (bp.dirty_for_file(crate::pager::core::FileKey::Main).len() + sc.dirty_len()) as u64
         };
 
         // Tracked readers.
@@ -271,7 +283,7 @@ mod tests {
         }
         let before = db.stats().await.unwrap();
 
-        db.evict_main_pages(REALM);
+        db.evict_main_pages().unwrap();
 
         let reader = db.begin_read().await.unwrap();
         assert_eq!(

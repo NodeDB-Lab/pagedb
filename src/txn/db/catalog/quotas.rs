@@ -11,18 +11,30 @@ use crate::pager::header::commit_header;
 use crate::vfs::Vfs;
 use crate::{RealmId, Result};
 
+use crate::txn::db::DbModeCapabilities;
 use crate::txn::db::core::{Db, HeaderFieldsParams, encode_root_ref};
+use crate::txn::mode::DbMode;
 
 impl<V: Vfs + Clone> Db<V> {
     /// Write per-realm quota caps into the catalog B+ tree and persist the
     /// updated catalog root to the A/B header.
+    ///
+    /// Returns `PagedbError::WrongMode` if the handle is not in Standalone mode.
     pub async fn set_realm_quotas(&self, realm: RealmId, quotas: RealmQuotas) -> Result<()> {
         self.ensure_usable()?;
+        self.require_mode(
+            "set_realm_quotas",
+            DbMode::Standalone,
+            DbModeCapabilities::allows_user_writes,
+        )?;
         let mut state = self.writer.lock().await;
         self.ensure_usable()?;
         let key = Catalog::quota_key(realm);
         let value = Catalog::encode_realm_quotas(&quotas);
 
+        // A drop or error before the header write leaves nothing staged in the
+        // cache. A drop or error from the header write on poisons the handle.
+        let unpublished = self.discard_unpublished_pages_on_drop();
         let mut cat_tree = BTree::open(
             self.pager.clone(),
             self.realm_id,
@@ -34,7 +46,18 @@ impl<V: Vfs + Clone> Db<V> {
         cat_tree.flush().await?;
 
         let new_catalog_root = cat_tree.root_page_id();
-        let new_next = cat_tree.next_page_id();
+        // No root reaches the pages this rewrite superseded. Without the fold, no
+        // free-list entry names them either, and they stay lost for good.
+        let freed_pages = cat_tree.drain_freed();
+        let folded = self
+            .fold_freed_catalog_pages(
+                &state,
+                &freed_pages,
+                cat_tree.next_page_id().max(state.next_page_id),
+            )
+            .await?;
+        self.pager.flush_main(self.realm_id).await?;
+        let new_next = folded.next_page_id;
         let new_catalog_txn_id = state
             .latest_commit_id
             .checked_add(1)
@@ -57,12 +80,13 @@ impl<V: Vfs + Clone> Db<V> {
                 catalog_root: catalog_root_bytes,
                 commit_history_root_page_id: state.commit_history_root_page_id,
                 commit_history_root_version: state.commit_history_root_version,
-                free_list_root_page_id: state.free_list_root_page_id,
+                free_list_root_page_id: folded.root_page_id,
                 next_page_id: new_next,
             },
         )?;
         let hk_clone = { self.hk.read().clone() };
-        let new_slot = commit_header(
+        let publish = self.arm_durable_publish(crate::CommitId(state.latest_commit_id));
+        let new_slot = match commit_header(
             &*self.vfs,
             &self.main_db_path,
             &hk_clone,
@@ -70,7 +94,12 @@ impl<V: Vfs + Clone> Db<V> {
             header_cursor.slot,
             self.page_size,
         )
-        .await?;
+        .await
+        {
+            Ok(slot) => slot,
+            Err(error) => return Err(publish.header_write_failed(error)),
+        };
+        unpublished.disarm();
         self.pager.note_header_written(HeaderCursor {
             slot: new_slot,
             seq: new_seq,
@@ -79,6 +108,8 @@ impl<V: Vfs + Clone> Db<V> {
         state.catalog_root_page_id = new_catalog_root;
         state.catalog_root_txn_id = new_catalog_txn_id;
         state.next_page_id = new_next;
+        state.free_list_root_page_id = folded.root_page_id;
+        state.free_list_entries = folded.entries;
         let _ = self
             .finish_durable_commit(
                 &state,
@@ -87,15 +118,19 @@ impl<V: Vfs + Clone> Db<V> {
                 &[],
             )
             .await?;
+        publish.disarm();
 
         Ok(())
     }
 
     /// Read per-realm quota caps from the catalog B+ tree. Returns
     /// `RealmQuotas::default()` if no entry has been written for this realm.
+    ///
+    /// Waits while a compaction, an incremental apply, or a commit publication
+    /// holds the visibility gate.
     pub async fn realm_quotas(&self, realm: RealmId) -> Result<RealmQuotas> {
         self.ensure_usable()?;
-        let snapshot = *self.snapshot.read();
+        let (_hold, snapshot) = self.hold_published_snapshot().await?;
         let key = Catalog::quota_key(realm);
         let cat_tree = BTree::open(
             self.pager.clone(),

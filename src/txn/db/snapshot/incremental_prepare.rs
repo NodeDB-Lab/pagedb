@@ -11,7 +11,7 @@ use crate::snapshot::apply::{
     clone_base_image, plan_delta_stream, stage_snapshot_segments, validate_snapshot_segment_count,
     write_delta_into_image,
 };
-use crate::snapshot::export::{SnapshotManifest, decode_manifest};
+use crate::snapshot::export::{SnapshotManifest, decode_manifest, manifest_names_later_epoch};
 use crate::vfs::Vfs;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -23,6 +23,8 @@ pub(super) struct PreparedIncremental {
     pub(super) page_size: usize,
     pub(super) pages_applied: u64,
     pub(super) target_page_ids: BTreeSet<u64>,
+    /// Pages a reader at the base can reach. The delta writes none of them.
+    pub(super) base_reader_visible: BTreeSet<u64>,
     pub(super) reclaimed_page_ids: BTreeSet<u64>,
     pub(super) delta_page_ids: BTreeSet<u64>,
     pub(super) actions: Vec<JournalAction>,
@@ -73,16 +75,25 @@ impl<V: Vfs + Clone> Db<V> {
 
         // Frame and screen the whole delta stream before a byte of it is
         // copied anywhere. A malformed record late in the stream must not cost
-        // a staged image, and a record naming a base-reader-visible page is
-        // refused by identity here rather than being caught later as a set
-        // mismatch.
+        // a staged image. A record naming a base-reader-visible page either
+        // matches it byte for byte and leaves the plan, or is refused here rather
+        // than being caught later as a set mismatch.
         let plan = plan_delta_stream(
+            &*self.vfs,
+            &self.main_db_path,
             src_path,
             page_size,
             &base_reader_visible,
             manifest.next_page_id_at_target,
         )
         .await?;
+        // Refused here, before an image is cloned, so the refusal costs no copy.
+        self.refuse_delta_reaching_pinned_reader(base_snapshot, &plan.page_ids)
+            .await?;
+
+        // After every refusal that costs no copy, so a delta refused above leaves
+        // an unstamped store as it was. A failure past this point keeps the stamp.
+        self.record_first_apply().await?;
 
         // Assemble the target beside the live file. `main.db` is not opened for
         // writing anywhere in this method; the rename below is the only thing
@@ -92,9 +103,11 @@ impl<V: Vfs + Clone> Db<V> {
             write_delta_into_image(&*self.vfs, staged_image, src_path, page_size, &plan).await?;
 
         // Authenticate the target through a read-only view of the staged image.
-        // Cached base pages are dropped first so the view's buffer pool and the
-        // live one are not both resident at their full configured budget.
-        self.pager.reset_main_pages();
+        // Drop clean base pages first. The view's buffer pool and the live one
+        // then are not both resident at their full configured budget. This runs
+        // without the writer lock. A dirty page belongs to another writer and
+        // stays.
+        self.pager.evict_clean_main_pages()?;
         let staged_view = Arc::new(self.pager.open_main_view(staged_image.to_owned()));
         let target_page_ids = collect_tree_page_ids(
             &staged_view,
@@ -151,6 +164,7 @@ impl<V: Vfs + Clone> Db<V> {
             page_size,
             pages_applied,
             target_page_ids,
+            base_reader_visible,
             reclaimed_page_ids,
             delta_page_ids: plan.page_ids,
             actions,
@@ -194,7 +208,17 @@ impl<V: Vfs + Clone> Db<V> {
                 .map_err(crate::errors::PagedbError::Io)?;
             buf
         };
-        let manifest = decode_manifest(&manifest_bytes, &hk_raw)?;
+        let manifest = decode_manifest(&manifest_bytes, &hk_raw).map_err(|error| {
+            // A producer rekeyed past this follower MACs under a header key this
+            // follower lacks. Name that, so the remedy reads as a full snapshot
+            // and not as damage. Unauthenticated bytes only pick the refusal.
+            let epoch = self.mk_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            if manifest_names_later_epoch(&manifest_bytes, &self.file_id, epoch) {
+                crate::errors::PagedbError::snapshot_incompatible("mk_epoch")
+            } else {
+                error
+            }
+        })?;
         Ok((manifest, manifest_bytes))
     }
 

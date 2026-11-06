@@ -264,8 +264,11 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// Remove the spill tmp file if it was created. Errors are swallowed
     /// (best-effort cleanup); the file is transient anyway.
     pub(crate) async fn cleanup_spill_async(&mut self) {
-        if let Some(path) = self.spill_path.take() {
-            let _ = self.db.vfs.remove(&path).await;
+        // The path stays set across the await. A dropped future then leaves it for
+        // `Drop`, which hands it to the next `begin_write`.
+        if let Some(path) = self.spill_path.as_deref() {
+            let _ = self.db.vfs.remove(path).await;
         }
+        self.spill_path = None;
     }
 }

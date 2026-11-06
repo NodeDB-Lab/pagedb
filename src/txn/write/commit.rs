@@ -49,7 +49,9 @@ use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 use std::collections::HashSet;
 
-use super::super::db::{CommitHistoryMeta, PendingWriterState, encode_free_list_root};
+use super::super::db::{
+    CommitHistoryMeta, PendingWriterState, RETAIN_POLICY_TAG_DISABLED, encode_free_list_root,
+};
 use super::txn::WriteTxn;
 
 impl<V: Vfs + Clone> WriteTxn<'_, V> {
@@ -80,6 +82,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             self.db.write_lock_satisfied(),
             "page write without held writer lock"
         );
+        self.ensure_mutations_finished()?;
         let _span = tracing::debug_span!("txn.commit");
         // Note: span is not entered via `.entered()` to keep this async fn's
         // future `Send`. Use `tracing::instrument` or enter in sync sections only.
@@ -118,15 +121,23 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             next_page_id: pending.next_page_id,
             unix_seconds,
         };
+        // Rows this handle must not keep leave first. A policy that keeps history
+        // then starts a fresh tree holding this commit alone.
         let mut hist_freed: Vec<u64> = Vec::new();
-        if !matches!(
-            self.db.options.commit_history_retain,
-            crate::options::RetainPolicy::Disabled
-        ) {
-            hist_freed = self
-                .db
-                .write_commit_history_entry(&mut pending, new_commit_id, history_meta)
-                .await?;
+        if self.db.history_rows_gone(&self.guard) {
+            hist_freed = self.db.drop_commit_history(&mut pending).await?;
+        }
+        if !self.db.history_disabled() {
+            hist_freed.extend(
+                self.db
+                    .write_commit_history_rows(
+                        &mut pending,
+                        &self.guard,
+                        new_commit_id,
+                        history_meta,
+                    )
+                    .await?,
+            );
         }
 
         // ── Account freed and reused pages ───────────────────────────────────
@@ -278,6 +289,11 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         )
         .await?;
         pending.next_page_id = new_next_page;
+        // The head's suffix summary covers the whole chain. The head is dirty in
+        // the cache unless the window rewrote no entries. In that case it is the
+        // retained tail, which is one page read.
+        let new_free_list_entries =
+            freelist::count_chain(&self.db.pager, self.db.realm_id, new_free_list_root).await?;
 
         // ── Flush + header swap ──────────────────────────────────────────────
         self.db.pager.flush_main(self.db.realm_id).await?;
@@ -323,7 +339,13 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         };
 
         let hk_clone = { self.db.hk.read().clone() };
-        let new_slot = commit_header(
+        // A drop or a header error from here to publication poisons the handle.
+        // Bytes can land while the header future is pending, or before a sync
+        // fails. The next commit then overwrites pages a durable header names.
+        // Every earlier drop stays a plain abort.
+        let db = self.db;
+        let publish = db.arm_durable_publish(CommitId(new_commit_id));
+        let new_slot = match commit_header(
             &*self.db.vfs,
             &self.db.main_db_path,
             &hk_clone,
@@ -331,7 +353,11 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
             header_cursor.slot,
             self.db.page_size,
         )
-        .await?;
+        .await
+        {
+            Ok(slot) => slot,
+            Err(error) => return Err(publish.header_write_failed(error)),
+        };
         self.db.pager.note_header_written(HeaderCursor {
             slot: new_slot,
             seq: new_seq,
@@ -350,6 +376,11 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
         self.guard.catalog_root_page_id = new_catalog_root;
         self.guard.catalog_root_txn_id = new_commit_id;
         self.guard.free_list_root_page_id = new_free_list_root;
+        self.guard.free_list_entries = Some(new_free_list_entries);
+        // A later header that is not a commit repeats these. A stale tag there
+        // either marks maintained rows as abandoned or hides abandoned ones.
+        self.guard.commit_retain_policy_tag = policy_tag;
+        self.guard.commit_retain_policy_value = policy_value;
         self.committed_or_aborted = true;
 
         // Black box: record the commit + how many pages it freed into the
@@ -376,6 +407,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
                 new_commit_id,
             )));
         }
+        publish.disarm();
 
         // The allocator cache is rebuilt from the durable free-list at the next
         // `begin_write`, so nothing is handed off here. The spill tmp file is
@@ -513,7 +545,7 @@ fn encode_retain_policy(policy: &crate::options::RetainPolicy) -> (u8, u64) {
         crate::options::RetainPolicy::Count(n) => (0, u64::from(*n)),
         crate::options::RetainPolicy::Age(d) => (1, d.as_secs()),
         crate::options::RetainPolicy::Unbounded => (2, 0),
-        crate::options::RetainPolicy::Disabled => (3, 0),
+        crate::options::RetainPolicy::Disabled => (RETAIN_POLICY_TAG_DISABLED, 0),
     }
 }
 
@@ -633,7 +665,7 @@ mod tests {
             .await
             .unwrap();
         db.pager.flush_main(REALM).await.unwrap();
-        db.pager.reset_main_pages();
+        db.pager.reset_main_pages().unwrap();
 
         let tree =
             crate::btree::BTree::open(db.pager.clone(), REALM, forged, forged + 1, db.page_size);

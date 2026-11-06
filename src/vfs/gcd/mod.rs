@@ -6,6 +6,8 @@
 //! libc — `dispatch_io` has no equivalent.
 
 pub mod file;
+#[cfg(test)]
+mod tests;
 pub mod vfs;
 
 pub use file::GcdFile;

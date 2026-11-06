@@ -76,13 +76,16 @@ pub fn derive_mk(kek: &[u8; 32], kek_salt: &[u8; 16], mk_epoch: u64) -> Result<M
 /// GCM nonce reuse leaks the plaintext XOR and exposes the authentication key.
 ///
 /// Scoping the key by the full 16-byte identity removes the question instead of
-/// making it unlikely: each file gets its own key, so its 48-bit counter is the
-/// *whole* nonce space for that key and reuse is impossible by construction
-/// rather than improbable by measure.
+/// making it unlikely: each file gets its own key, so no two files share a nonce
+/// space. A file's own 48-bit counter is the whole space for that key, with one
+/// exception. A follower's `main.db` shares its source's key, so the follower's
+/// own pages use a random per-open prefix. A match between two followers is
+/// improbable there, not impossible.
 ///
 /// `file_id` must be the same identity that seeds the file's nonce generator:
 /// the header's `file_id` for `main.db`, the `segment_id` for a segment, the
-/// journal id for an apply journal.
+/// journal id for an apply journal. A Follower handle derives from the header's
+/// `file_id` too, and replaces only its generator's prefix.
 pub fn derive_dek(mk: &MasterKey, realm_id: RealmId, file_id: &[u8; 16]) -> Result<DerivedKey> {
     let info: [u8; DEK_INFO_LEN] = scoped_info(INFO_REALM_PREFIX, realm_id, file_id);
     expand(mk.as_bytes(), &info)

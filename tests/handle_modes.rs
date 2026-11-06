@@ -1,6 +1,6 @@
 use pagedb::vfs::memory::MemVfs;
 use pagedb::vfs::{OpenMode, Vfs, VfsFile};
-use pagedb::{Db, DbMode, OpenOptions, PagedbError, RealmId, SegmentKind};
+use pagedb::{Db, DbMode, OpenOptions, PagedbError, RealmId, RealmQuotas, SegmentKind};
 
 const PAGE: usize = 4096;
 const SENTINEL_PATHS: [&str; 4] = [
@@ -418,6 +418,97 @@ async fn lock_released_on_drop_lets_second_open_succeed() {
     )
     .await
     .unwrap();
+}
+
+/// A follower has no user writes. A quota row seals fresh pages under the
+/// identity the follower shares with its source. The follower refuses the write.
+#[tokio::test(flavor = "current_thread")]
+async fn set_realm_quotas_on_a_follower_is_refused() {
+    let vfs = MemVfs::new();
+    let realm = RealmId::new([1; 16]);
+    {
+        let _db = Db::open(vfs.clone(), [9u8; 32], PAGE, realm, OpenOptions::default())
+            .await
+            .unwrap();
+    }
+    let read_only = Db::open_read_only(vfs, [9u8; 32], PAGE, realm, OpenOptions::default())
+        .await
+        .unwrap();
+    let follower = read_only.promote_to_follower().await.unwrap();
+
+    let mut quotas = RealmQuotas::default();
+    quotas.max_segment_bytes.replace(1_000);
+    let outcome = follower.set_realm_quotas(realm, quotas).await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(PagedbError::WrongMode {
+                operation: "set_realm_quotas",
+                required: DbMode::Standalone,
+                actual: DbMode::Follower,
+            })
+        ),
+        "got: {outcome:?}"
+    );
+    assert_eq!(
+        follower
+            .realm_quotas(realm)
+            .await
+            .unwrap()
+            .max_segment_bytes,
+        None,
+        "a refused write leaves the quota row absent"
+    );
+}
+
+/// Handles without write access refuse a quota write and a collection. The mode
+/// gate refuses them before the operation reaches the store.
+#[tokio::test(flavor = "current_thread")]
+async fn store_writes_on_read_only_and_observer_handles_are_refused() {
+    let vfs = MemVfs::new();
+    let realm = RealmId::new([1; 16]);
+    {
+        let _db = Db::open(vfs.clone(), [9u8; 32], PAGE, realm, OpenOptions::default())
+            .await
+            .unwrap();
+    }
+    let read_only = Db::open_read_only(vfs.clone(), [9u8; 32], PAGE, realm, OpenOptions::default())
+        .await
+        .unwrap();
+    let observer = Db::open_observer(vfs, [9u8; 32], PAGE, realm, OpenOptions::default())
+        .await
+        .unwrap();
+
+    for (handle, mode) in [
+        (&read_only, DbMode::ReadOnly),
+        (&observer, DbMode::Observer),
+    ] {
+        let quotas = handle.set_realm_quotas(realm, RealmQuotas::default()).await;
+        assert!(
+            matches!(
+                quotas,
+                Err(PagedbError::WrongMode {
+                    operation: "set_realm_quotas",
+                    required: DbMode::Standalone,
+                    actual,
+                }) if actual == mode
+            ),
+            "got: {quotas:?}"
+        );
+        let collection = handle.gc_now().await;
+        assert!(
+            matches!(
+                collection,
+                Err(PagedbError::WrongMode {
+                    operation: "gc_now",
+                    required: DbMode::Standalone,
+                    actual,
+                }) if actual == mode
+            ),
+            "got: {collection:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

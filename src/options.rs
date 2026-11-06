@@ -5,9 +5,10 @@
 //! (decrypted `mmap_view` scratch), and `reader_stall_threshold_pages`
 //! (deferred-free backlog). `buffer_pool_pages` and `segment_cache_pages` cap
 //! their caches by eviction rather than by refusal: a clean, unpinned page is
-//! evicted to stay within the count. Dirty pages are exempt from eviction
-//! until they are flushed, so a single very large write transaction can hold
-//! more than `buffer_pool_pages` resident between flushes.
+//! evicted to stay within the count. A cache exceeds its count only while every
+//! entry is dirty or pinned. A transaction's dirty pages and pinned pages can
+//! exceed the budget. The cache returns to the count once they are flushed or
+//! released.
 
 use std::time::Duration;
 
@@ -28,16 +29,29 @@ pub enum RetainPolicy {
     /// Never prune; keep every commit entry.
     Unbounded,
     /// **Pagedb extension beyond the architecture spec** (which defines
-    /// only `Count` / `Age` / `Bytes` / `Unbounded`). Do not maintain the
-    /// commit-history index at all. `WriteTxn::commit` skips the
-    /// history-tree `CoW` + flush entirely (no per-commit insert, no
-    /// pruning). The header's `commit_history_root_page_id` stays at zero.
+    /// only `Count` / `Age` / `Bytes` / `Unbounded`). Keep no commit-history
+    /// rows. `WriteTxn::commit` writes no row and prunes nothing.
     ///
-    /// Selecting this disables every API that depends on commit history:
+    /// Selecting this on a store that holds rows removes them:
+    /// - The handle refuses them at once.
+    /// - The first `WriteTxn::commit`, `rekey_db`, or `apply_incremental` frees
+    ///   the history tree and writes root zero. No later policy gets them back.
+    /// - A read-only or observer handle changes nothing. Reopening under another
+    ///   policy before any such write still finds them.
+    /// - Until the removal is durable, the rows still hold back free-page reuse.
+    ///   A crash cannot leave them naming overwritten pages.
+    ///
+    /// These APIs serve the latest commit only, and return
+    /// [`PagedbError::CommitGone`](crate::PagedbError::CommitGone) for any other:
     /// - `Db::begin_read_at(commit_id)` — point-in-time reads
-    /// - `Db::restore_from(commit_id)` — snapshot-restore by id
-    /// - `apply_incremental` from a `base_commit` (Follower-mode replication)
-    /// - `snapshot_to(since=Some(base))` — incremental snapshot exports
+    /// - `Db::snapshot_incremental_to(base, ..)` — incremental snapshot exports
+    ///
+    /// `apply_incremental` still works, because its base is the follower's latest
+    /// commit. `snapshot_to` and `restore_from` copy the store as it stands.
+    ///
+    /// A header holding this policy's tag beside a non-zero history root proves
+    /// an earlier release left those rows unmaintained. They count as gone under
+    /// every policy, and a writable handle removes them at its first write.
     ///
     /// Use only when the embedder will never need any of those APIs (e.g.
     /// pure ephemeral KV workloads, benchmarks against engines that don't
@@ -78,7 +92,8 @@ pub struct OpenOptions {
     /// Number of 4 KiB / 8 KiB / 16 KiB pages held in the Pager's buffer pool.
     pub buffer_pool_pages: usize,
 
-    /// Number of pages held in the per-segment reader LRU cache.
+    /// Number of pages held in the SIEVE cache for apply-journal pages.
+    /// Segment file reads do not use this cache.
     pub segment_cache_pages: usize,
 
     /// Maximum bytes of already-decrypted scratch that `mmap_view` may map at
@@ -116,8 +131,11 @@ pub struct OpenOptions {
     /// A/B header, not how much work an operation may do: a run that would
     /// exhaust the window rewrites the live header with a larger anchor and
     /// nothing else changed, then continues. A smaller budget therefore costs
-    /// extra header writes on large operations, and a crash re-opens having
-    /// skipped at most one budget's worth of counter values. Default: 1024.
+    /// extra header writes on large operations. Default: 1024.
+    ///
+    /// A value above 1,048,576 (2^20) issues under 1,048,576. Each open that
+    /// writes a header skips that many counter values, whatever this value is.
+    /// The first flush after an open writes a header before it seals a page.
     pub anchor_budget: u64,
 
     /// Cipher for a database this open *creates*.
@@ -162,7 +180,8 @@ impl OpenOptions {
         self
     }
 
-    /// Set the number of pages held in the per-segment reader LRU cache.
+    /// Set the number of pages held in the shared SIEVE cache for segment
+    /// files. The same cache also holds apply-journal pages.
     #[must_use]
     pub fn with_segment_cache_pages(mut self, v: usize) -> Self {
         self.segment_cache_pages = v;
@@ -207,8 +226,9 @@ impl OpenOptions {
     }
 
     /// Set how far the main-db nonce counter may run ahead of the anchor in the
-    /// durable header. A larger value trades a wider post-crash counter skip for
-    /// fewer anchor writes during large operations. Default: 1024.
+    /// durable header. A larger value means fewer anchor writes during large
+    /// operations. A value above 1,048,576 (2^20) issues under 1,048,576.
+    /// Default: 1024.
     #[must_use]
     pub fn with_anchor_budget(mut self, v: u64) -> Self {
         self.anchor_budget = v;

@@ -9,6 +9,8 @@
 pub mod android;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod blocking;
+#[cfg(test)]
+pub(crate) mod gated;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod gcd;
 #[cfg(target_os = "windows")]
@@ -39,6 +41,8 @@ pub mod tokio_backend;
 pub(crate) mod traits;
 pub(crate) mod types;
 pub mod wasi;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod write_order;
 
 #[cfg(all(target_os = "android", target_arch = "arm"))]
 pub use android::AndroidVfs;

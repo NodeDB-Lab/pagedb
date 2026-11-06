@@ -11,7 +11,7 @@ use crate::errors::PagedbError;
 use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
 use crate::pager::structural_header::MainDbHeaderFields;
-use crate::txn::db::{Db, WriterState};
+use crate::txn::db::{Db, WriterState, encode_free_list_root};
 use crate::txn::write::SegmentSideEffect;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
@@ -62,7 +62,7 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
     let mut cursor: Vec<u8> = Vec::new();
     loop {
         db.pager.flush_main_to(db.realm_id, scratch).await?;
-        db.pager.reset_main_pages();
+        db.pager.reset_main_pages()?;
 
         let batch = source
             .collect_batch_from(&cursor, REPACK_RECORD_BATCH)
@@ -94,7 +94,7 @@ pub(super) async fn stream_dense_tree<V: Vfs + Clone>(
         // resident compacted page at the same page id.
         if db.pager.main_dirty_at_budget() {
             db.pager.flush_main_to(db.realm_id, scratch).await?;
-            db.pager.reset_main_pages();
+            db.pager.reset_main_pages()?;
         }
 
         if exhausted {
@@ -151,6 +151,14 @@ pub(super) async fn segment_rows_from<V: Vfs + Clone>(
     Ok(out)
 }
 
+/// Point the catalog row `name` at `new_meta` and publish that as one commit.
+///
+/// The header republishes the commit history and free list `state` holds. A
+/// repack that ran has already emptied both in `state`. A skipped repack leaves
+/// both live, and the header must not disagree with them.
+///
+/// A drop before the header write discards the staged catalog pages and changes
+/// nothing else. A drop or error from the header write on poisons the handle.
 pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     db: &Db<V>,
     state: &mut WriterState,
@@ -162,6 +170,7 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     let key = Catalog::segment_key(db.realm_id, name.as_bytes())?;
     let value = Catalog::encode_segment_meta(new_meta);
 
+    let unpublished = db.discard_unpublished_pages_on_drop();
     let mut cat_tree = BTree::open(
         db.pager.clone(),
         db.realm_id,
@@ -173,7 +182,16 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     cat_tree.flush().await?;
 
     let new_cat_root = cat_tree.root_page_id();
-    let new_next = cat_tree.next_page_id().max(state.next_page_id);
+    let freed_pages = cat_tree.drain_freed();
+    let folded = db
+        .fold_freed_catalog_pages(
+            state,
+            &freed_pages,
+            cat_tree.next_page_id().max(state.next_page_id),
+        )
+        .await?;
+    db.pager.flush_main(db.realm_id).await?;
+    let new_next = folded.next_page_id;
     let new_commit_id = state.latest_commit_id + 1;
     let header_cursor = db.pager.header_cursor()?;
     let new_seq = header_cursor.next_seq()?;
@@ -196,12 +214,12 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
         active_root_txn_id: state.latest_commit_id,
         counter_anchor,
         commit_id: CommitId(new_commit_id),
-        free_list_root: [0u8; 16],
+        free_list_root: encode_free_list_root(folded.root_page_id),
         catalog_root: catalog_root_bytes,
         apply_journal_root_page_id: 0,
         apply_journal_root_version: 0,
-        commit_history_root_page_id: 0,
-        commit_history_root_version: 0,
+        commit_history_root_page_id: state.commit_history_root_page_id,
+        commit_history_root_version: state.commit_history_root_version,
         restore_mode: state.restore_mode,
         next_page_id: new_next,
         commit_retain_policy_tag: state.commit_retain_policy_tag,
@@ -210,7 +228,9 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     };
 
     let hk_clone = { db.hk.read().clone() };
-    let new_slot = commit_header(
+    let commit = CommitId(new_commit_id);
+    let publish = db.arm_durable_publish(commit);
+    let new_slot = match commit_header(
         &*db.vfs,
         &db.main_db_path,
         &hk_clone,
@@ -218,7 +238,12 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
         header_cursor.slot,
         db.page_size,
     )
-    .await?;
+    .await
+    {
+        Ok(slot) => slot,
+        Err(error) => return Err(publish.header_write_failed(error)),
+    };
+    unpublished.disarm();
     db.pager.note_header_written(HeaderCursor {
         slot: new_slot,
         seq: new_seq,
@@ -229,26 +254,28 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
     state.catalog_root_txn_id = new_commit_id;
     state.next_page_id = new_next;
     state.latest_commit_id = new_commit_id;
+    state.free_list_root_page_id = folded.root_page_id;
+    state.free_list_entries = folded.entries;
 
-    let effects = [
+    let effects = segment_swap_effects(old_segment_id, &new_meta.segment_id);
+    let _ = db
+        .finish_durable_commit_visible(visibility, state, commit, counter_anchor, &effects)
+        .await?;
+    publish.disarm();
+    Ok(())
+}
+
+/// The filesystem work a segment replacement owes once its catalog is durable.
+fn segment_swap_effects(old_id: &[u8; 16], new_id: &[u8; 16]) -> [SegmentSideEffect; 2] {
+    [
         SegmentSideEffect::Tombstone {
-            segment_id: *old_segment_id,
+            segment_id: *old_id,
             tombstone_commit_id: None,
         },
         SegmentSideEffect::Promote {
-            segment_id: new_meta.segment_id,
+            segment_id: *new_id,
         },
-    ];
-    let _ = db
-        .finish_durable_commit_visible(
-            visibility,
-            state,
-            CommitId(new_commit_id),
-            counter_anchor,
-            &effects,
-        )
-        .await?;
-    Ok(())
+    ]
 }
 
 /// Build [`MainDbHeaderFields`] for a compaction commit.
@@ -272,6 +299,7 @@ pub(super) fn make_header_fields<V: Vfs + Clone>(
     new_next: u64,
     free_list_root_page_id: u64,
 ) -> MainDbHeaderFields {
+    // The repack's header. `commit_swap` empties history and free list in `state`.
     let mut catalog_root_bytes = [0u8; 16];
     catalog_root_bytes[..8].copy_from_slice(&new_cat_root.to_le_bytes());
     catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());

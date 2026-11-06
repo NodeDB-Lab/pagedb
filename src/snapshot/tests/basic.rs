@@ -48,6 +48,9 @@ struct RenameFaultVfs {
     inner: TokioVfs,
     fail_renames: Arc<AtomicBool>,
     fail_main_db_renames: Arc<AtomicBool>,
+    park_staged_open: Arc<AtomicBool>,
+    staged_open_parked: Arc<tokio::sync::Notify>,
+    staged_open_released: Arc<tokio::sync::Notify>,
 }
 
 impl RenameFaultVfs {
@@ -56,7 +59,15 @@ impl RenameFaultVfs {
             inner: TokioVfs::new(root),
             fail_renames: Arc::new(AtomicBool::new(false)),
             fail_main_db_renames: Arc::new(AtomicBool::new(false)),
+            park_staged_open: Arc::new(AtomicBool::new(false)),
+            staged_open_parked: Arc::new(tokio::sync::Notify::new()),
+            staged_open_released: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Park the next open of the staged image until the test releases it.
+    fn park_next_staged_open(&self) {
+        self.park_staged_open.store(true, Ordering::SeqCst);
     }
 
     fn fail_renames(&self, fail: bool) {
@@ -73,6 +84,12 @@ impl Vfs for RenameFaultVfs {
     type LockHandle = TokioLockHandle;
 
     async fn open(&self, path: &str, mode: OpenMode) -> crate::Result<Self::File> {
+        if path.trim_start_matches('/') == "main.db.applying"
+            && self.park_staged_open.swap(false, Ordering::SeqCst)
+        {
+            self.staged_open_parked.notify_one();
+            self.staged_open_released.notified().await;
+        }
         self.inner.open(path, mode).await
     }
 
@@ -2833,7 +2850,7 @@ async fn apply_incremental_rejects_delta_depending_on_leftover_future_pages() {
     let target_active_root_page_id = u64::from_le_bytes(manifest[102..110].try_into().unwrap());
     let mut corrupt_retry_delta = original_delta;
     let mut corrupted = false;
-    for record in corrupt_retry_delta.chunks_exact_mut(8 + PAGE) {
+    for record in corrupt_retry_delta.as_chunks_mut::<{ 8 + PAGE }>().0 {
         let page_id = u64::from_be_bytes(record[..8].try_into().unwrap());
         if page_id == target_active_root_page_id {
             record[8 + 128] ^= 0xFF;
@@ -3965,6 +3982,766 @@ async fn a_delta_that_recycles_follower_private_page_ids_applies_cleanly() {
     std::fs::remove_dir_all(&full_dst_dir).ok();
 }
 
+/// Page ids a delta directory ships. A record is an 8-byte big-endian id plus a page.
+fn delta_page_ids(delta_dir: &std::path::Path) -> std::collections::BTreeSet<u64> {
+    let delta = std::fs::read(delta_dir.join("pages.delta")).unwrap();
+    delta
+        .as_chunks::<{ 8 + PAGE }>()
+        .0
+        .iter()
+        .map(|record| u64::from_be_bytes(record[..8].try_into().unwrap()))
+        .collect()
+}
+
+/// A relocated history tree larger than the pool flushes as it loads. Those flushes
+/// have to land in the staged image, or the published root names lost pages.
+///
+/// The source frees the follower's history pages when a retention cut prunes them.
+/// `Count(2)` recycles a page two commits after its free. So the delta that claims
+/// a history page is the third one, with each base still retained.
+///
+/// A retained row leaves the history when a delta overwrites its pages. Rows after
+/// the last data write share the base roots, and a delta cannot name those pages.
+/// The first two rounds are empty, so those rows survive and the tree stays large.
+#[tokio::test(flavor = "current_thread")]
+async fn relocated_history_larger_than_the_pool_lands_in_the_staged_image() {
+    const DATA_COMMITS: u64 = 40;
+
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dirs = [tempdir(), tempdir(), tempdir()];
+
+    let source = make_db_with_options(
+        &src_dir,
+        OpenOptions::default().with_commit_history_retain(RetainPolicy::Unbounded),
+    )
+    .await;
+    let history_key = |index: u64| format!("history-{index:05}").into_bytes();
+    let mut first_commit = CommitId(0);
+    for index in 0u32..300 {
+        let mut write = source.begin_write().await.unwrap();
+        if u64::from(index) < DATA_COMMITS {
+            write
+                .put(&history_key(u64::from(index)), b"row")
+                .await
+                .unwrap();
+        }
+        let commit = write.commit().await.unwrap();
+        if index == 0 {
+            first_commit = commit;
+        }
+    }
+    source.snapshot_to(&snap_dir).await.unwrap();
+    drop(source);
+
+    let restored = Db::<TokioVfs>::restore_from(
+        &snap_dir,
+        &dst_dir,
+        OpenOptions::default().with_buffer_pool_pages(2),
+        KEK,
+    )
+    .await
+    .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+
+    let source = make_db_with_options(
+        &src_dir,
+        OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(2)),
+    )
+    .await;
+    for delta_dir in &delta_dirs[..2] {
+        let base = source.latest_commit();
+        source.begin_write().await.unwrap().commit().await.unwrap();
+        source
+            .snapshot_incremental_to(base, delta_dir)
+            .await
+            .unwrap();
+        follower.apply_incremental(delta_dir).await.unwrap();
+    }
+
+    let base = source.latest_commit();
+    {
+        let mut write = source.begin_write().await.unwrap();
+        for index in 0u32..64 {
+            write
+                .put(
+                    format!("claim-{index:05}").as_bytes(),
+                    &vec![0xC3; PAGE * 2],
+                )
+                .await
+                .unwrap();
+        }
+        write.commit().await.unwrap();
+    }
+    source
+        .snapshot_incremental_to(base, &delta_dirs[2])
+        .await
+        .unwrap();
+
+    let (history_root_before, history_pages) = {
+        let (root, next) = {
+            let state = follower.writer.lock().await;
+            (state.commit_history_root_page_id, state.next_page_id)
+        };
+        let tree = crate::btree::BTree::open(
+            follower.pager.clone(),
+            follower.realm_id,
+            root,
+            next,
+            follower.page_size,
+        );
+        let mut pages = std::collections::BTreeSet::new();
+        tree.collect_all_page_ids(&mut pages).await.unwrap();
+        (root, pages)
+    };
+    assert!(
+        history_pages.len() > 2,
+        "setup error: the history tree fits the pool, pages {history_pages:?}"
+    );
+    assert!(
+        !history_pages.is_disjoint(&delta_page_ids(&delta_dirs[2])),
+        "setup error: the delta claims no history page, so nothing relocates"
+    );
+
+    follower.apply_incremental(&delta_dirs[2]).await.unwrap();
+
+    let history_root_after = follower.writer.lock().await.commit_history_root_page_id;
+    assert_ne!(
+        history_root_after, history_root_before,
+        "setup error: the history tree did not relocate"
+    );
+
+    // Drop every cached page, so each read below fetches from the published image.
+    follower.pager.reset_main_pages().unwrap();
+    let next_page_id = follower.writer.lock().await.next_page_id;
+    let reported_oldest = follower
+        .oldest_retained_history_commit(history_root_after, next_page_id)
+        .await
+        .unwrap()
+        .expect("the relocated tree holds rows");
+    let relocated = crate::btree::BTree::open(
+        follower.pager.clone(),
+        follower.realm_id,
+        history_root_after,
+        next_page_id,
+        follower.page_size,
+    );
+    let mut relocated_pages = std::collections::BTreeSet::new();
+    relocated
+        .collect_all_page_ids(&mut relocated_pages)
+        .await
+        .unwrap();
+    assert!(
+        relocated_pages.len() > 2,
+        "setup error: the relocated tree fits the pool, pages {relocated_pages:?}"
+    );
+    let rows = relocated.collect_all().await.unwrap();
+    let last_commit = first_commit.0 + 299;
+    assert_eq!(
+        rows.len() as u64,
+        last_commit - reported_oldest + 1,
+        "the relocated tree lost a row at or above the oldest it reports"
+    );
+    for commit in reported_oldest..=last_commit {
+        let commit = CommitId(commit);
+        let reader = follower
+            .begin_read_at(commit)
+            .await
+            .unwrap_or_else(|error| panic!("{commit:?} is unreachable: {error:?}"));
+        assert_eq!(reader.commit_id(), commit);
+        let index = commit.0 - first_commit.0;
+        assert_eq!(
+            reader
+                .get(&history_key(index.min(DATA_COMMITS - 1)))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"row".as_slice()),
+            "{commit:?} lost its newest row"
+        );
+        if index + 1 < DATA_COMMITS {
+            assert_eq!(
+                reader.get(&history_key(index + 1)).await.unwrap(),
+                None,
+                "{commit:?} holds a row from a later commit"
+            );
+        }
+    }
+
+    drop(follower);
+    drop(source);
+    for dir in [&src_dir, &snap_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+    for dir in &delta_dirs {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+const PINNED_KEYS: u32 = 400;
+const PINNED_VALUE: [u8; 128] = [1u8; 128];
+const REWRITTEN_VALUE: [u8; 128] = [4u8; 128];
+
+fn pinned_key(index: u32) -> Vec<u8> {
+    format!("k{index:05}").into_bytes()
+}
+
+/// Export a full snapshot at one commit and three chained deltas after it. The
+/// last delta rewrites pages the snapshot's commit reaches.
+///
+/// A source recycles a page only once the commit that freed it is the oldest
+/// retained one. Each delta also needs its base retained. Under the smallest
+/// retention that works, the rewrite arrives in a third delta.
+///
+/// Delta 0 frees the pinned pages. Delta 1 retires the commit before that free.
+/// Delta 2 draws the freed ids back.
+async fn export_deltas_rewriting_a_pinned_commit(
+    src_dir: &std::path::Path,
+    snap_dir: &std::path::Path,
+    delta_dirs: &[std::path::PathBuf; 3],
+) -> CommitId {
+    let source = make_db_with_options(
+        src_dir,
+        OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(2)),
+    )
+    .await;
+    let pinned_commit = {
+        let mut write = source.begin_write().await.unwrap();
+        for index in 0..PINNED_KEYS {
+            write.put(&pinned_key(index), &PINNED_VALUE).await.unwrap();
+        }
+        write.commit().await.unwrap()
+    };
+    let pinned_pages = {
+        let reader = source.begin_read().await.unwrap();
+        let tree = crate::btree::BTree::open(
+            source.pager.clone(),
+            source.realm_id,
+            reader.root_page_id(),
+            reader.next_page_id(),
+            source.page_size,
+        );
+        let mut pages = std::collections::BTreeSet::new();
+        tree.collect_all_page_ids(&mut pages).await.unwrap();
+        pages
+    };
+    source.snapshot_to(snap_dir).await.unwrap();
+
+    for (round, delta_dir) in delta_dirs.iter().enumerate() {
+        let base = source.latest_commit();
+        let mut write = source.begin_write().await.unwrap();
+        if round == 1 {
+            write.put(b"filler", b"row").await.unwrap();
+        } else {
+            let value = [(round + 2) as u8; 128];
+            for index in 0..PINNED_KEYS {
+                write.put(&pinned_key(index), &value).await.unwrap();
+            }
+        }
+        write.commit().await.unwrap();
+        source
+            .snapshot_incremental_to(base, delta_dir)
+            .await
+            .unwrap();
+    }
+    assert!(
+        !pinned_pages.is_disjoint(&delta_page_ids(&delta_dirs[2])),
+        "setup error: the last delta rewrites no page the pinned commit reaches"
+    );
+    pinned_commit
+}
+
+async fn assert_reads_pinned_values<V: Vfs + Clone>(reader: &crate::ReadTxn<'_, V>) {
+    for index in 0..PINNED_KEYS {
+        assert_eq!(
+            reader.get(&pinned_key(index)).await.unwrap().as_deref(),
+            Some(PINNED_VALUE.as_slice()),
+            "key {index} left the pinned snapshot"
+        );
+    }
+}
+
+async fn assert_reads_rewritten_values<V: Vfs + Clone>(follower: &Db<V>) {
+    let reader = follower.begin_read().await.unwrap();
+    for index in 0..PINNED_KEYS {
+        assert_eq!(
+            reader.get(&pinned_key(index)).await.unwrap().as_deref(),
+            Some(REWRITTEN_VALUE.as_slice()),
+            "key {index} did not reach the applied target"
+        );
+    }
+}
+
+/// A delta screen covers the current base only. So a reader pinned further back
+/// can reach a page a later commit freed and a still later commit rewrote. The
+/// apply carrying that rewrite is refused by type and changes no byte. The reader
+/// keeps its own values, and the same delta applies once the reader finishes.
+#[tokio::test(flavor = "current_thread")]
+async fn reader_pinned_across_two_applies_keeps_its_snapshot() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dirs = [tempdir(), tempdir(), tempdir()];
+    let pinned_commit =
+        export_deltas_rewriting_a_pinned_commit(&src_dir, &snap_dir, &delta_dirs).await;
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    let pinned_reader = follower.begin_read().await.unwrap();
+    assert_eq!(pinned_reader.commit_id(), pinned_commit);
+
+    // The first two deltas reach no page the reader can read, so a pin costs them
+    // nothing.
+    for delta_dir in &delta_dirs[..2] {
+        follower.apply_incremental(delta_dir).await.unwrap();
+    }
+
+    let commit_before = follower.latest_commit();
+    let image_before = std::fs::read(dst_dir.join("main.db")).unwrap();
+    let refusal = follower.apply_incremental(&delta_dirs[2]).await;
+    assert!(
+        matches!(
+            refusal,
+            Err(PagedbError::ApplyBlockedByPinnedReader { reader_commit })
+                if reader_commit == pinned_commit
+        ),
+        "got: {refusal:?}"
+    );
+    assert_eq!(follower.latest_commit(), commit_before);
+    assert!(
+        std::fs::read(dst_dir.join("main.db")).unwrap() == image_before,
+        "a refused apply changed main.db"
+    );
+    assert_reads_pinned_values(&pinned_reader).await;
+
+    drop(pinned_reader);
+    follower.apply_incremental(&delta_dirs[2]).await.unwrap();
+    assert!(follower.latest_commit().0 > commit_before.0);
+    assert_reads_rewritten_values(&follower).await;
+
+    drop(follower);
+    for dir in [&src_dir, &snap_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+    for dir in &delta_dirs {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// The screen at the start of an apply runs with reader admission open. A reader
+/// admitted after it still blocks the apply, because the screen repeats once
+/// admission closes. The image staged in between is discarded.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_refused_by_a_reader_admitted_after_the_first_screen_succeeds_after_it_finishes() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dirs = [tempdir(), tempdir(), tempdir()];
+    let pinned_commit =
+        export_deltas_rewriting_a_pinned_commit(&src_dir, &snap_dir, &delta_dirs).await;
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    drop(restored);
+    let fault_vfs = RenameFaultVfs::new(&dst_dir);
+    let follower = Db::open_read_only(fault_vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap()
+        .promote_to_follower()
+        .await
+        .unwrap();
+    for delta_dir in &delta_dirs[..2] {
+        follower.apply_incremental(delta_dir).await.unwrap();
+    }
+
+    let commit_before = follower.latest_commit();
+    let image_before = std::fs::read(dst_dir.join("main.db")).unwrap();
+    fault_vfs.park_next_staged_open();
+    let (refusal, late_reader) = tokio::join!(follower.apply_incremental(&delta_dirs[2]), async {
+        fault_vfs.staged_open_parked.notified().await;
+        let reader = follower.begin_read_at(pinned_commit).await.unwrap();
+        fault_vfs.staged_open_released.notify_one();
+        reader
+    });
+    assert!(
+        matches!(
+            refusal,
+            Err(PagedbError::ApplyBlockedByPinnedReader { reader_commit })
+                if reader_commit == pinned_commit
+        ),
+        "got: {refusal:?}"
+    );
+    assert_eq!(follower.latest_commit(), commit_before);
+    assert!(
+        std::fs::read(dst_dir.join("main.db")).unwrap() == image_before,
+        "a refused apply changed main.db"
+    );
+    assert!(
+        !dst_dir.join("main.db.applying").exists(),
+        "a refused apply left its staged image behind"
+    );
+    assert_reads_pinned_values(&late_reader).await;
+
+    drop(late_reader);
+    follower.apply_incremental(&delta_dirs[2]).await.unwrap();
+    assert!(follower.latest_commit().0 > commit_before.0);
+    assert_reads_rewritten_values(&follower).await;
+
+    drop(follower);
+    for dir in [&src_dir, &snap_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+    for dir in &delta_dirs {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// A follower's history rows stay frozen from its restore, while applies rewrite the pages they name.
+/// No reader exists during these applies, so nothing refuses the rewrite.
+/// A later `begin_read_at` of the restored commit reads that commit's values, or refuses by type.
+/// Newer values or an authentication error is the bug.
+#[tokio::test(flavor = "current_thread")]
+async fn historical_read_on_a_follower_after_an_apply_is_correct_or_refused() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dirs = [tempdir(), tempdir(), tempdir()];
+    let pinned_commit =
+        export_deltas_rewriting_a_pinned_commit(&src_dir, &snap_dir, &delta_dirs).await;
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    assert_eq!(
+        follower.latest_commit(),
+        pinned_commit,
+        "setup error: the follower did not restore at the commit under test"
+    );
+
+    for delta_dir in &delta_dirs {
+        follower
+            .apply_incremental(delta_dir)
+            .await
+            .unwrap_or_else(|error| panic!("setup error: an apply failed: {error:?}"));
+    }
+    assert!(
+        follower.latest_commit().0 > pinned_commit.0,
+        "setup error: the applies did not advance the follower"
+    );
+    {
+        let latest = follower.begin_read().await.unwrap();
+        for index in 0..PINNED_KEYS {
+            let value = latest
+                .get(&pinned_key(index))
+                .await
+                .unwrap_or_else(|error| panic!("setup error: key {index} failed: {error:?}"));
+            assert_eq!(
+                value.as_deref(),
+                Some(REWRITTEN_VALUE.as_slice()),
+                "setup error: key {index} did not reach the applied target"
+            );
+        }
+    }
+
+    match follower.begin_read_at(pinned_commit).await {
+        Ok(reader) => assert_reads_pinned_values(&reader).await,
+        Err(PagedbError::CommitGone { commit, .. }) => assert_eq!(commit, pinned_commit),
+        Err(error) => panic!("begin_read_at({pinned_commit:?}) failed: {error:?}"),
+    }
+
+    drop(follower);
+    for dir in [&src_dir, &snap_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+    for dir in &delta_dirs {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// Three retained commits of one restored follower.
+struct RetainedCommits {
+    oldest: CommitId,
+    overwritten: CommitId,
+    untouched: CommitId,
+}
+
+const OLDEST_VALUE: [u8; 128] = [1u8; 128];
+const OVERWRITTEN_VALUE: [u8; 128] = [2u8; 128];
+const UNTOUCHED_FIRST_VALUE: [u8; 128] = [3u8; 128];
+
+async fn reachable_pages_at<V: Vfs + Clone>(
+    db: &Db<V>,
+    commit: CommitId,
+) -> std::collections::BTreeSet<u64> {
+    let reader = db.begin_read_at(commit).await.unwrap();
+    let mut pages = std::collections::BTreeSet::new();
+    for root_page_id in [reader.root_page_id(), reader.catalog_root_page_id()] {
+        crate::btree::BTree::open(
+            db.pager.clone(),
+            db.realm_id,
+            root_page_id,
+            reader.next_page_id(),
+            db.page_size,
+        )
+        .collect_all_page_ids(&mut pages)
+        .await
+        .unwrap();
+    }
+    pages
+}
+
+/// Export a full snapshot holding three retained rows and three chained deltas.
+/// The last delta overwrites pages of the two older rows and none of the newest.
+///
+/// `untouched` rewrites one key, so it frees a leaf and a root `overwritten` reaches.
+/// Under `Count(3)` those pages become drawable once `untouched` is the oldest row.
+/// Pages `untouched` itself reaches are freed later, so their tags stay above the floor.
+/// The last delta draws more pages than the free list can supply, so it takes them all.
+async fn export_deltas_overwriting_older_rows(
+    src_dir: &std::path::Path,
+    snap_dir: &std::path::Path,
+    delta_dirs: &[std::path::PathBuf; 3],
+) -> RetainedCommits {
+    let source = make_db_with_options(
+        src_dir,
+        OpenOptions::default().with_commit_history_retain(RetainPolicy::Count(3)),
+    )
+    .await;
+    let mut commits = Vec::new();
+    for value in [&OLDEST_VALUE, &OVERWRITTEN_VALUE] {
+        let mut write = source.begin_write().await.unwrap();
+        for index in 0..PINNED_KEYS {
+            write.put(&pinned_key(index), value).await.unwrap();
+        }
+        commits.push(write.commit().await.unwrap());
+    }
+    let (oldest, overwritten) = (commits[0], commits[1]);
+    let untouched = {
+        let mut write = source.begin_write().await.unwrap();
+        write
+            .put(&pinned_key(0), &UNTOUCHED_FIRST_VALUE)
+            .await
+            .unwrap();
+        write.commit().await.unwrap()
+    };
+    let overwritten_pages = reachable_pages_at(&source, overwritten).await;
+    let untouched_pages = reachable_pages_at(&source, untouched).await;
+    source.snapshot_to(snap_dir).await.unwrap();
+
+    for (round, delta_dir) in delta_dirs.iter().enumerate() {
+        let base = source.latest_commit();
+        let mut write = source.begin_write().await.unwrap();
+        if round == 2 {
+            for index in 0u32..64 {
+                write
+                    .put(
+                        format!("claim-{index:05}").as_bytes(),
+                        &vec![0xC3; PAGE * 2],
+                    )
+                    .await
+                    .unwrap();
+            }
+        } else {
+            write.put(b"filler", &[round as u8]).await.unwrap();
+        }
+        write.commit().await.unwrap();
+        source
+            .snapshot_incremental_to(base, delta_dir)
+            .await
+            .unwrap();
+        assert!(
+            untouched_pages.is_disjoint(&delta_page_ids(delta_dir)),
+            "setup error: delta {round} overwrites a page of the newest row"
+        );
+    }
+    assert!(
+        !overwritten_pages.is_disjoint(&delta_page_ids(&delta_dirs[2])),
+        "setup error: the last delta overwrites no page of the middle row"
+    );
+    RetainedCommits {
+        oldest,
+        overwritten,
+        untouched,
+    }
+}
+
+async fn assert_reads_untouched_commit<V: Vfs + Clone>(reader: &crate::ReadTxn<'_, V>) {
+    for index in 0..PINNED_KEYS {
+        let expected = if index == 0 {
+            UNTOUCHED_FIRST_VALUE
+        } else {
+            OVERWRITTEN_VALUE
+        };
+        assert_eq!(
+            reader.get(&pinned_key(index)).await.unwrap().as_deref(),
+            Some(expected.as_slice()),
+            "key {index} left the retained commit"
+        );
+    }
+    assert_eq!(reader.get(b"filler").await.unwrap(), None);
+}
+
+/// The row reads its values, and each older row reports `CommitGone` with the row as oldest.
+async fn assert_only_the_untouched_row_remains<V: Vfs + Clone>(
+    follower: &Db<V>,
+    commits: &RetainedCommits,
+) {
+    let reader = follower.begin_read_at(commits.untouched).await.unwrap();
+    assert_eq!(reader.commit_id(), commits.untouched);
+    assert_reads_untouched_commit(&reader).await;
+    drop(reader);
+    for commit in [commits.overwritten, commits.oldest] {
+        match follower.begin_read_at(commit).await {
+            Err(PagedbError::CommitGone {
+                commit: gone,
+                oldest_available,
+            }) => {
+                assert_eq!(gone, commit);
+                assert_eq!(oldest_available, commits.untouched);
+            }
+            Err(error) => panic!("begin_read_at({commit:?}) failed: {error:?}"),
+            Ok(_) => panic!("begin_read_at({commit:?}) admitted a reader over newer pages"),
+        }
+    }
+}
+
+/// A delta overwrites pages of one retained row. That row and every older row leave
+/// the history. A newer row the delta does not reach keeps reading its own values.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_prunes_only_the_retained_commits_it_overwrote() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dirs = [tempdir(), tempdir(), tempdir()];
+    let commits = export_deltas_overwriting_older_rows(&src_dir, &snap_dir, &delta_dirs).await;
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    assert_eq!(
+        follower.latest_commit(),
+        commits.untouched,
+        "setup error: the follower did not restore at the newest retained row"
+    );
+    assert!(
+        follower.begin_read_at(commits.overwritten).await.is_ok(),
+        "setup error: the follower does not retain the middle row"
+    );
+
+    for delta_dir in &delta_dirs {
+        follower.apply_incremental(delta_dir).await.unwrap();
+    }
+
+    assert_only_the_untouched_row_remains(&follower, &commits).await;
+    let report = run_deep_walk(&follower).await.unwrap();
+    assert!(report.is_clean(), "follower after a prune: {report:?}");
+
+    drop(follower);
+    for dir in [&src_dir, &snap_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+    for dir in &delta_dirs {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// A prune reaches disk with the apply that made it. A reopen keeps a partial cut,
+/// and keeps a cut that removed every row.
+#[tokio::test(flavor = "current_thread")]
+async fn pruned_history_stays_pruned_after_a_reopen() {
+    let src_dir = tempdir();
+    let snap_dir = tempdir();
+    let dst_dir = tempdir();
+    let delta_dirs = [tempdir(), tempdir(), tempdir()];
+    let commits = export_deltas_overwriting_older_rows(&src_dir, &snap_dir, &delta_dirs).await;
+
+    let restored = Db::<TokioVfs>::restore_from(&snap_dir, &dst_dir, OpenOptions::default(), KEK)
+        .await
+        .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    for delta_dir in &delta_dirs {
+        follower.apply_incremental(delta_dir).await.unwrap();
+    }
+    drop(follower);
+
+    let reopened = Db::<TokioVfs>::open_read_only(
+        TokioVfs::new(&dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_only_the_untouched_row_remains(&reopened, &commits).await;
+    let report = run_deep_walk(&reopened).await.unwrap();
+    assert!(report.is_clean(), "reopen after a prune: {report:?}");
+    drop(reopened);
+
+    let whole_src_dir = tempdir();
+    let whole_snap_dir = tempdir();
+    let whole_dst_dir = tempdir();
+    let whole_delta_dirs = [tempdir(), tempdir(), tempdir()];
+    let pinned_commit =
+        export_deltas_rewriting_a_pinned_commit(&whole_src_dir, &whole_snap_dir, &whole_delta_dirs)
+            .await;
+    let restored =
+        Db::<TokioVfs>::restore_from(&whole_snap_dir, &whole_dst_dir, OpenOptions::default(), KEK)
+            .await
+            .unwrap();
+    let follower = restored.promote_to_follower().await.unwrap();
+    for delta_dir in &whole_delta_dirs {
+        follower.apply_incremental(delta_dir).await.unwrap();
+    }
+    assert_eq!(
+        follower.writer.lock().await.commit_history_root_page_id,
+        0,
+        "setup error: the cut left a history row"
+    );
+    drop(follower);
+
+    let reopened = Db::<TokioVfs>::open_read_only(
+        TokioVfs::new(&whole_dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            reopened.begin_read_at(pinned_commit).await,
+            Err(PagedbError::CommitGone { commit, .. }) if commit == pinned_commit
+        ),
+        "a reopen restored a pruned commit"
+    );
+    assert_reads_rewritten_values(&reopened).await;
+    let report = run_deep_walk(&reopened).await.unwrap();
+    assert!(report.is_clean(), "reopen after a whole cut: {report:?}");
+
+    drop(reopened);
+    for dir in [
+        &src_dir,
+        &snap_dir,
+        &dst_dir,
+        &whole_src_dir,
+        &whole_snap_dir,
+        &whole_dst_dir,
+    ] {
+        std::fs::remove_dir_all(dir).ok();
+    }
+    for dir in delta_dirs.iter().chain(&whole_delta_dirs) {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
 /// Chaining deltas is not a two-delta trick: an ordinary write-churn workload
 /// must keep replicating by delta indefinitely.
 ///
@@ -4485,6 +5262,66 @@ impl VfsFile for HeaderFaultFile {
 
     fn supports_direct_io(&self) -> bool {
         self.inner.supports_direct_io()
+    }
+}
+
+/// The stamp must beat the delta to disk. A byte copy interrupted at its image swap
+/// holds no delta page in `main.db`, and it already refuses `Standalone`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_byte_copy_interrupted_at_its_first_image_swap_already_refuses_standalone() {
+    let src_dir = tempdir();
+    let delta_dir = tempdir();
+    let dst_dir = tempdir();
+
+    let source = make_db(&src_dir).await;
+    let mut txn = source.begin_write().await.unwrap();
+    txn.put(b"base", b"base-value").await.unwrap();
+    let base_commit = txn.commit().await.unwrap();
+    drop(source);
+    std::fs::copy(src_dir.join("main.db"), dst_dir.join("main.db")).unwrap();
+
+    let source = make_db(&src_dir).await;
+    let mut txn = source.begin_write().await.unwrap();
+    txn.put(b"target", b"target-value").await.unwrap();
+    txn.commit().await.unwrap();
+    source
+        .snapshot_incremental_to(base_commit, &delta_dir)
+        .await
+        .unwrap();
+    drop(source);
+
+    let fault_vfs = RenameFaultVfs::new(&dst_dir);
+    let follower = Db::open_follower(fault_vfs.clone(), KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
+    fault_vfs.fail_main_db_renames(true);
+    assert!(follower.apply_incremental(&delta_dir).await.is_err());
+    fault_vfs.fail_main_db_renames(false);
+    drop(follower);
+
+    let standalone = Db::open(
+        TokioVfs::new(&dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await;
+    assert!(matches!(standalone, Err(PagedbError::RestoredNotPromoted)));
+    let reopened = Db::<TokioVfs>::open_read_only(
+        TokioVfs::new(&dst_dir),
+        KEK,
+        PAGE,
+        REALM,
+        OpenOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.latest_commit(), base_commit);
+
+    drop(reopened);
+    for dir in [&src_dir, &delta_dir, &dst_dir] {
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 

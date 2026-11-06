@@ -130,6 +130,9 @@ pub enum PagedbError {
     /// explicitly promoted before they can be opened normally; open with the
     /// restore-completion path (or discard the directory and restore again)
     /// instead of the standard open.
+    ///
+    /// A byte copy of a store that took an `apply_incremental` reports this too.
+    /// It shares the source's key and nonce space, as a restored directory does.
     #[error("restored directory not promoted")]
     RestoredNotPromoted,
 
@@ -250,6 +253,9 @@ pub enum PagedbError {
     /// structures out of the incoming page space instead of refusing an
     /// otherwise-healthy delta.
     ///
+    /// A record that matches the base page byte for byte is not this condition.
+    /// A catalog root moved under one commit id produces such a record.
+    ///
     /// Not a corruption of this store: both states are internally sound, they
     /// simply cannot be related by this delta — which is why this is distinct
     /// from [`CorruptionDetail::SnapshotArtifactInvalid`]. The remedy is a full
@@ -266,18 +272,84 @@ pub enum PagedbError {
     #[error("commit {commit:?} is durable but unpublished; reopen required")]
     DurablyCommittedButUnpublished { commit: CommitId },
 
-    /// A rekey resume began writing pages under the target epoch — an
-    /// operation with no safe in-process rollback — and then failed before
-    /// recovery could complete. The handle is poisoned at `commit` and
-    /// `source` carries the underlying failure. The remedy is the same as
-    /// [`Self::DurablyCommittedButUnpublished`]: reopen the store, which
-    /// drives recovery from the durable header rather than resuming on a
-    /// handle with mixed-epoch state in flight.
+    /// A header write for `commit` failed partway, so this handle cannot tell
+    /// which A/B header is durable. A failed sync can leave the new header on
+    /// disk, and a failed write can leave none of it. The handle is poisoned, and
+    /// every later state-dependent call on it returns this error. `source` is the
+    /// failure, such as [`Self::NoSpace`] or [`Self::Io`].
+    ///
+    /// An encode or open failure writes no byte, so it returns its own error and
+    /// does not poison. `source` is an `Arc` because the poison repeats it on later
+    /// calls, and this error type is not `Clone`.
+    ///
+    /// Distinct from [`Self::DurablyCommittedButUnpublished`], which says the
+    /// commit is durable. Reopen the store: the reopen reads the durable header,
+    /// and [`Db::latest_commit`](crate::Db::latest_commit) then reports the
+    /// outcome. A set of realm quotas names the latest commit and writes no new one.
+    #[error(
+        "the header write for commit {commit:?} failed and its outcome is unknown; \
+         reopen required: {source}"
+    )]
+    CommitOutcomeUnknown {
+        commit: CommitId,
+        #[source]
+        source: std::sync::Arc<PagedbError>,
+    },
+
+    /// A mutating [`WriteTxn`](crate::WriteTxn) call did not finish: its future was
+    /// dropped, or it returned an error other than input validation. The
+    /// transaction's trees can be partly updated. Every later read, mutation, and
+    /// `commit` on that transaction returns this error, and nothing it wrote is
+    /// published. The store and the handle are unaffected. Drop or `abort` the
+    /// transaction, then start a new one.
+    #[error("a mutation on this write transaction did not finish; abort it")]
+    WriteTxnInterrupted,
+
+    /// A rekey reached the rename of its rebuilt `main.db`, or passed it, and
+    /// then failed before it finished. The handle is poisoned at `commit` and
+    /// `source` carries the underlying failure. Reopen the store. The open reads
+    /// which file the rename left and finishes the rekey from there.
     #[error("rekey activated a target epoch at commit {commit:?}; reopen required: {source}")]
     RekeyTargetEpochActivated {
         commit: CommitId,
         #[source]
         source: Box<PagedbError>,
+    },
+
+    /// The device filled while a rekey built its replacement `main.db`.
+    /// `main.db` is intact and its scratch copy is gone. The rebuild needs free
+    /// space up to the size of `main.db`. Free that space, then reopen the store
+    /// or call `rekey_db` again.
+    #[error(
+        "rekey from epoch {source_epoch} to epoch {target_epoch} needs free space for a full copy of main.db. main.db is intact. To continue, free disk space, then reopen the store or call rekey_db again"
+    )]
+    RekeyNoSpace {
+        source_epoch: u64,
+        target_epoch: u64,
+    },
+
+    /// `link_segment` or `replace_segment` named a segment sealed under another
+    /// master-key epoch. A rekey moved the store on while this segment was still
+    /// being written, so no later open holds its key. The catalog stays as it was.
+    /// Write the segment again on this handle, then link the new one.
+    #[error(
+        "segment sealed under epoch {segment_epoch} cannot link into a store at epoch {store_epoch}. Write it again, then link the new one"
+    )]
+    SegmentEpochStale {
+        segment_epoch: u64,
+        store_epoch: u64,
+    },
+
+    /// An export found a rekey intent that a dropped or failed `rekey_db` left
+    /// durable. A restored copy has no writer that can settle that intent, and
+    /// `rekey_into_writer` refuses it, so the export refuses it first. Call
+    /// `rekey_db` again or reopen the store to settle it, then retry the export.
+    #[error(
+        "export refused: the rekey from epoch {source_epoch} to epoch {target_epoch} is pending. Call rekey_db again or reopen the store, then retry"
+    )]
+    RekeyPending {
+        source_epoch: u64,
+        target_epoch: u64,
     },
 
     /// `begin_read_at(commit)` named a commit that has been pruned from the
@@ -413,6 +485,17 @@ pub enum PagedbError {
     #[error("readers pinning truncated range")]
     ReadersPinningTruncatedRange,
 
+    /// An incremental apply was refused before it changed the store. Either its
+    /// delta rewrites a page a registered reader can still reach, or that
+    /// reader's pages cannot be walked to prove otherwise. This differs from
+    /// [`Self::ReadersPinningTruncatedRange`], which reports a target already
+    /// durable and published. Here the handle stays at its base commit. Finish
+    /// the reader pinned at `reader_commit`, then retry the same delta.
+    #[error(
+        "apply refused: the reader pinned at {reader_commit:?} reaches a page this delta rewrites; finish that reader and retry the apply"
+    )]
+    ApplyBlockedByPinnedReader { reader_commit: CommitId },
+
     /// Resuming a rekey whose source and target epochs use different KEKs
     /// (`same_kek == false`) requires both the primary and counterpart KEK,
     /// but only the primary was supplied. Retry the resume with the
@@ -471,6 +554,22 @@ pub enum PagedbError {
     VfsContractViolated {
         operation: &'static str,
         detail: &'static str,
+    },
+
+    /// The in-memory page cache broke one of its own invariants. `operation` names
+    /// what was running, `detail` what it found, `slot` the slab slot when one is
+    /// known. The cache is memory only, so no fault is known in the store files and
+    /// quarantine does not apply. Every later operation on this cache reports
+    /// this error. Close the handle and reopen, which rebuilds the cache.
+    #[error(
+        "page cache state invalid during {operation}: {detail} (slot {slot:?}); no fault is \
+         known in the store files, do not quarantine; close this handle and reopen to rebuild \
+         the cache"
+    )]
+    PageCacheStateInvalid {
+        operation: &'static str,
+        detail: &'static str,
+        slot: Option<usize>,
     },
 
     /// The requested operation is not implemented by the current backend or

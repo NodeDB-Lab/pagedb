@@ -6,6 +6,8 @@ pub(crate) mod core;
 pub(crate) mod format;
 pub(crate) mod freelist;
 pub(crate) mod header;
+#[cfg(test)]
+pub(crate) mod page_nonce_ledger;
 pub(crate) mod page_space;
 #[cfg(test)]
 mod tests;

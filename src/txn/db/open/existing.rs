@@ -249,6 +249,10 @@ impl<V: Vfs + Clone> Db<V> {
             pager.set_read_only();
         }
         pager.recover_main_nonce(fields.counter_anchor);
+        // Before open recovery, so every seal of this handle uses the prefix.
+        if capabilities.seals_under_a_local_nonce_prefix() {
+            pager.use_local_nonce_prefix()?;
+        }
 
         let catalog_root_page_id = {
             let mut bytes = [0u8; 8];
@@ -270,6 +274,8 @@ impl<V: Vfs + Clone> Db<V> {
             free_list_root_page_id: super::super::core::decode_free_list_root(
                 &fields.free_list_root,
             ),
+            // Recovery counts the chain once it has settled the free-list root.
+            free_list_entries: None,
             commit_history_root_page_id: fields.commit_history_root_page_id,
             commit_history_root_version: fields.commit_history_root_version,
             commit_history_count: None,
@@ -311,6 +317,10 @@ impl<V: Vfs + Clone> Db<V> {
             cipher_id,
             format_version: fields.format_version,
             header_flags: fields.flags,
+            #[cfg(not(target_arch = "wasm32"))]
+            first_apply_unstamped: std::sync::atomic::AtomicBool::new(
+                fields.restore_mode == super::super::restore_mode::STANDALONE,
+            ),
             mk_epoch: AtomicU64::new(mk_epoch),
             file_id,
             kek_salt,
@@ -339,7 +349,13 @@ impl<V: Vfs + Clone> Db<V> {
                 free_list_root_page_id: super::super::core::decode_free_list_root(
                     &fields.free_list_root,
                 ),
+                free_list_entries: None,
                 commit_history_root_page_id: fields.commit_history_root_page_id,
+                history_rows_abandoned:
+                    super::super::catalog::history_policy::history_rows_abandoned(
+                        fields.commit_retain_policy_tag,
+                        fields.commit_history_root_page_id,
+                    ),
             })),
             poisoned_commit: parking_lot::Mutex::new(None),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),

@@ -5,8 +5,12 @@
 //! truncation and segment garbage collection.
 //!
 //! Entry points: [`compact_now`] (full one-shot) and [`compact_step`]
-//! (incremental, budget-bounded) on a [`crate::Db`] handle.
+//! (one atomic pass with a progress report) on a [`crate::Db`] handle.
 
+#[cfg(test)]
+mod cancel_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod catalog_move_tests;
 mod full;
 mod helpers;
 mod repack;

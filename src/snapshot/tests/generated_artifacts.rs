@@ -154,6 +154,8 @@ proptest! {
         let before = write_follower_main_db(&main_db);
 
         let _ = block_on(plan_delta_stream(
+            &TokioVfs::new(dir.path()),
+            "/main.db",
             dir.path(),
             DELTA_PAGE_SIZE,
             &BTreeSet::new(),
@@ -194,6 +196,8 @@ proptest! {
         let base_live: BTreeSet<u64> = base_live.into_iter().collect();
 
         let outcome = block_on(plan_delta_stream(
+            &TokioVfs::new(dir.path()),
+            "/main.db",
             dir.path(),
             DELTA_PAGE_SIZE,
             &base_live,

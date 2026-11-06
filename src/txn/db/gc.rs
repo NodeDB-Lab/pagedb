@@ -2,15 +2,25 @@
 
 use crate::Result;
 use crate::segment::types::GcStats;
+use crate::txn::mode::DbMode;
 use crate::vfs::Vfs;
 
+use super::DbModeCapabilities;
 use super::core::{Db, PendingTombstone};
 
 impl<V: Vfs + Clone> Db<V> {
     /// Process pending deferred tombstones and delete files in `seg/.tombstone/`.
     /// Returns statistics on reclaimed segments and bytes.
+    ///
+    /// Returns `PagedbError::WrongMode` on a `ReadOnly` or `Observer` handle.
+    /// `Standalone` and `Follower` handles can collect.
     pub async fn gc_now(&self) -> Result<GcStats> {
         self.ensure_usable()?;
+        self.require_mode(
+            "gc_now",
+            DbMode::Standalone,
+            DbModeCapabilities::collects_garbage,
+        )?;
         let _span = tracing::debug_span!("gc.run");
         self.retry_pending_apply_journal().await?;
         // Writer before visibility is the global destructive-operation order.
@@ -18,6 +28,7 @@ impl<V: Vfs + Clone> Db<V> {
         // physical tombstone deletion.
         let _writer = self.writer.lock().await;
         let _visibility = self.visibility_gate.write().await;
+        self.ensure_usable()?;
         let (drained, drained_bytes) = self.try_drain_pending_tombstones().await?;
         // Retirement reclaims each file as it happens, so the drain above is
         // where almost everything is freed. The sweep still runs because a
@@ -37,30 +48,20 @@ impl<V: Vfs + Clone> Db<V> {
     /// the mechanism.
     ///
     /// An entry whose reclamation fails is put back as well, along with every
-    /// entry this call had taken but not yet reached. The queue is the only
-    /// record that a retired file still needs deleting, so dropping an entry on
-    /// an I/O error leaks that file for the life of the store — and the caller
-    /// surfaces the error, so a retry has somewhere to resume from.
+    /// entry this call had taken but not yet reached. A dropped future does the
+    /// same. The queue is the only record that a retired file still needs
+    /// deleting. Losing an entry leaks that file for the life of the store. The
+    /// caller surfaces an error, so a retry has somewhere to resume from.
     async fn try_drain_pending_tombstones(&self) -> Result<(u64, u64)> {
-        let pending = std::mem::take(&mut *self.pending_tombstones.lock());
+        let mut taken = self.take_pending_tombstones(usize::MAX);
         let mut count: u64 = 0;
         let mut bytes: u64 = 0;
-        let mut pending = pending.into_iter();
-        while let Some(entry) = pending.next() {
-            match self.reclaim_pending_tombstone(&entry).await {
-                Ok(None) => {}
-                Ok(Some(len)) => {
-                    count += 1;
-                    bytes = bytes.saturating_add(len);
-                }
-                Err(error) => {
-                    self.enqueue_pending_tombstone(entry);
-                    for remaining in pending {
-                        self.enqueue_pending_tombstone(remaining);
-                    }
-                    return Err(error);
-                }
+        while let Some(entry) = taken.front() {
+            if let Some(len) = self.reclaim_pending_tombstone(&entry).await? {
+                count += 1;
+                bytes = bytes.saturating_add(len);
             }
+            taken.finish_front();
         }
         Ok((count, bytes))
     }

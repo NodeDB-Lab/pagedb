@@ -35,6 +35,12 @@ impl PagedbError {
         }
     }
 
+    /// Canonical constructor for an apply refused to protect a pinned reader.
+    #[must_use]
+    pub const fn apply_blocked_by_pinned_reader(reader_commit: CommitId) -> Self {
+        Self::ApplyBlockedByPinnedReader { reader_commit }
+    }
+
     /// Canonical constructor for authenticated catalog/file metadata disagreement.
     ///
     /// Was `const fn` before diagnostics capture moved into [`Self::corruption`];
@@ -214,6 +220,28 @@ impl PagedbError {
         Self::DurablyCommittedButUnpublished { commit }
     }
 
+    /// Canonical constructor for a handle that got `source` from a header write
+    /// and cannot tell which header is durable.
+    #[must_use]
+    pub fn commit_outcome_unknown(commit: CommitId, source: PagedbError) -> Self {
+        Self::commit_outcome_unknown_shared(commit, std::sync::Arc::new(source))
+    }
+
+    /// [`Self::commit_outcome_unknown`] for a cause the handle's poison also holds.
+    #[must_use]
+    pub(crate) fn commit_outcome_unknown_shared(
+        commit: CommitId,
+        source: std::sync::Arc<PagedbError>,
+    ) -> Self {
+        Self::CommitOutcomeUnknown { commit, source }
+    }
+
+    /// Canonical constructor for a write transaction with a dropped mutation.
+    #[must_use]
+    pub const fn write_txn_interrupted() -> Self {
+        Self::WriteTxnInterrupted
+    }
+
     /// Canonical constructor for a rekey that cannot safely continue after
     /// activating target-key routing before recovery completes.
     #[must_use]
@@ -235,6 +263,49 @@ impl PagedbError {
     #[must_use]
     pub const fn vfs_contract_violated(operation: &'static str, detail: &'static str) -> Self {
         Self::VfsContractViolated { operation, detail }
+    }
+
+    /// Canonical constructor for a page cache that broke its own invariant.
+    /// It raises no corruption report, because no fault is known in the store.
+    #[cold]
+    #[must_use]
+    pub const fn page_cache_state_invalid(
+        operation: &'static str,
+        detail: &'static str,
+        slot: Option<usize>,
+    ) -> Self {
+        Self::PageCacheStateInvalid {
+            operation,
+            detail,
+            slot,
+        }
+    }
+
+    /// Canonical constructor for a rekey rebuild that ran out of disk space.
+    #[must_use]
+    pub const fn rekey_no_space(source_epoch: u64, target_epoch: u64) -> Self {
+        Self::RekeyNoSpace {
+            source_epoch,
+            target_epoch,
+        }
+    }
+
+    /// Canonical constructor for a link of a segment from an earlier epoch.
+    #[must_use]
+    pub const fn segment_epoch_stale(segment_epoch: u64, store_epoch: u64) -> Self {
+        Self::SegmentEpochStale {
+            segment_epoch,
+            store_epoch,
+        }
+    }
+
+    /// Canonical constructor for an export that found a pending rekey intent.
+    #[must_use]
+    pub const fn rekey_pending(source_epoch: u64, target_epoch: u64) -> Self {
+        Self::RekeyPending {
+            source_epoch,
+            target_epoch,
+        }
     }
 
     /// Canonical constructor for a rekey admission that needs both KEKs.

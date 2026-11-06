@@ -18,6 +18,7 @@ impl<V: Vfs + Clone> WriteTxn<'_, V> {
     where
         I: IntoIterator<Item = Result<(Vec<u8>, Bytes)>>,
     {
+        self.ensure_mutations_finished()?;
         {
             let mut loader = self.btree.bulk_loader()?;
             let mut batch = Vec::with_capacity(BULK_LOAD_BATCH_MAX_RECORDS);

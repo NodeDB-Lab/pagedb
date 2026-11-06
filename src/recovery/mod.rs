@@ -4,6 +4,7 @@
 pub(crate) mod deep_walk;
 pub(crate) mod fork;
 pub(crate) mod gc;
+pub(crate) mod history_report;
 pub(crate) mod journal;
 pub(crate) mod provenance;
 pub(crate) mod quarantine;
@@ -13,6 +14,7 @@ pub(crate) mod scratch;
 mod tests;
 
 pub use deep_walk::{DeepWalkReport, DriftIssue, PageIssue, SegmentIssue, run_deep_walk};
+pub use history_report::{HistorySealVerdict, SealOrderVoid, StaleHistoryRow, StaleRowEvidence};
 // `pub` here is crate-scoped in effect: the `recovery` module itself is
 // `pub(crate)`, so these do not escape the crate. The deep-walk items above are
 // re-exported from the crate root and are the only public part of recovery.

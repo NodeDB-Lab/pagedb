@@ -21,10 +21,10 @@ const LOCK_PATH: &str = ".writer.lock";
 fn wait_for_report(path: &std::path::Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Ok(report) = std::fs::read_to_string(path) {
-            if !report.is_empty() {
-                return report;
-            }
+        if let Ok(report) = std::fs::read_to_string(path)
+            && !report.is_empty()
+        {
+            return report;
         }
         assert!(
             std::time::Instant::now() < deadline,

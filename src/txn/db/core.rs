@@ -71,9 +71,14 @@ pub(crate) struct VisibilityTestHook {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RekeyTestFault {
+    /// The intent is durable in the live file, and no scratch exists.
     Intent,
+    /// Every named page is in the scratch. Its header and intent are not.
     MainPagesTargetReadable,
+    /// The scratch is a complete `main.db`, and the rename has not run.
     HeaderTargetPublished,
+    /// The rename has landed, and the directory sync has not run.
+    MainFileRenamed,
     /// The main database is fully target-sealed and the intent says so, but no
     /// segment has been touched yet. Without a fault here a crash landing in
     /// `MainDone` cannot be produced at all, so the resume path that starts
@@ -103,6 +108,9 @@ pub(crate) struct WriterState {
     /// A/B header's `free_list_root` slot and rewritten atomically with each
     /// commit. See [`crate::pager::freelist`].
     pub free_list_root_page_id: u64,
+    /// Entries in the free-list chain, copied into [`ReaderSnapshot`] at
+    /// publication. `None` until a commit or an open reads the chain head.
+    pub free_list_entries: Option<u64>,
     /// Root page id of the commit-history B+ tree (0 = not yet created).
     pub commit_history_root_page_id: u64,
     /// Version / `txn_id` of the commit-history tree's last write.
@@ -118,7 +126,9 @@ pub(crate) struct WriterState {
     pub pending_apply_journal_id: [u8; 16],
     /// Header mode preserved by every recovery header rewrite.
     pub restore_mode: u8,
-    /// Header commit-history retention fields preserved by recovery rewrites.
+    /// The retention fields of the last header this store wrote. Every header
+    /// that is not a commit repeats them. Tag 3 beside a non-zero history root
+    /// marks abandoned rows, so a commit must update these with its own header.
     pub commit_retain_policy_tag: u8,
     pub commit_retain_policy_value: u64,
 }
@@ -154,6 +164,9 @@ pub struct Db<V: Vfs + Clone> {
     /// Lock ordering is fixed: writer and apply locks are acquired before this
     /// write lock; reader admission acquires only this read lock. Tokio guards
     /// may cross awaits, while no guard from `parking_lot` may do so.
+    ///
+    /// A metadata walk holds the read side instead of registering a reader. See
+    /// [`Self::hold_published_snapshot`].
     pub(crate) visibility_gate: AsyncRwLock<()>,
     pub(crate) tracked_readers: parking_lot::Mutex<Vec<TrackedReader>>,
     pub(crate) reader_seq: AtomicU64,
@@ -163,6 +176,11 @@ pub struct Db<V: Vfs + Clone> {
     /// non-ordinary writers (including rekey) can preserve them verbatim.
     pub(crate) format_version: u16,
     pub(crate) header_flags: u32,
+    /// Whether the store's restore mode can still need its first-apply stamp.
+    /// An apply prepares without the writer lock, so a store already stamped
+    /// answers from here and takes no lock.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) first_apply_unstamped: std::sync::atomic::AtomicBool,
     pub(crate) mk_epoch: AtomicU64,
     pub(crate) file_id: [u8; 16],
     pub(crate) kek_salt: [u8; 16],
@@ -220,10 +238,10 @@ pub struct Db<V: Vfs + Clone> {
     /// publication channel, so readers see either the prior complete commit or
     /// the next complete commit.
     pub(crate) snapshot: Arc<parking_lot::RwLock<ReaderSnapshot>>,
-    /// The durable commit that could not be reconciled into `snapshot`.
+    /// Why this handle stopped describing the durable store, if it did.
     /// Existing readers retain their pinned snapshots; all new state-dependent
     /// operations fail until the database is reopened.
-    pub(crate) poisoned_commit: parking_lot::Mutex<Option<CommitId>>,
+    pub(crate) poisoned_commit: parking_lot::Mutex<Option<HandlePoison>>,
     /// Cross-commit cache of page IDs known to be safely reusable. Populated
     /// after each commit with the pages it freed that no live reader and no
     /// retained commit-history root can still observe; the next writer txn's
@@ -257,6 +275,18 @@ pub struct Db<V: Vfs + Clone> {
 #[cfg(test)]
 pub(crate) type RetirementDeferHook<V> = Arc<dyn Fn(&Db<V>) + Send + Sync>;
 
+/// Why a handle refuses every new state-dependent operation.
+#[derive(Debug, Clone)]
+pub(crate) enum HandlePoison {
+    /// `commit` could not be reconciled into the published snapshot.
+    Unpublished(CommitId),
+    /// A header write for `commit` failed partway, so the durable header is unknown.
+    HeaderOutcomeUnknown {
+        commit: CommitId,
+        source: Arc<PagedbError>,
+    },
+}
+
 /// Reader-visible state, refreshed by the writer at commit time.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_field_names)]
@@ -266,10 +296,16 @@ pub(crate) struct ReaderSnapshot {
     pub next_page_id: u64,
     pub catalog_root_page_id: u64,
     pub free_list_root_page_id: u64,
+    /// Entries in the free-list chain this snapshot names. `None` means open
+    /// failed to read the chain head and no commit has counted it since.
+    pub free_list_entries: Option<u64>,
     /// Commit-history root accompanying this published snapshot. Historical
     /// reader admission resolves from this immutable root without taking the
     /// writer lock.
     pub commit_history_root_page_id: u64,
+    /// The header pair behind this snapshot proves the rows went unmaintained.
+    /// Historical reader admission serves none of them.
+    pub history_rows_abandoned: bool,
 }
 
 /// Encode a 16-byte catalog/free-list root reference: `page_id` (LE u64) in the
@@ -412,16 +448,31 @@ impl<V: Vfs + Clone> Db<V> {
     }
 
     pub(crate) fn ensure_usable(&self) -> Result<()> {
-        match *self.poisoned_commit.lock() {
-            Some(commit) => Err(PagedbError::durably_committed_but_unpublished(commit)),
+        match &*self.poisoned_commit.lock() {
+            Some(HandlePoison::Unpublished(commit)) => {
+                Err(PagedbError::durably_committed_but_unpublished(*commit))
+            }
+            Some(HandlePoison::HeaderOutcomeUnknown { commit, source }) => Err(
+                PagedbError::commit_outcome_unknown_shared(*commit, Arc::clone(source)),
+            ),
             None => Ok(()),
         }
     }
 
     pub(crate) fn poison(&self, commit: CommitId) {
+        self.poison_with(HandlePoison::Unpublished(commit));
+    }
+
+    /// Record a header write that returned an error. The durable header is unknown.
+    pub(crate) fn poison_header_outcome_unknown(&self, commit: CommitId, source: Arc<PagedbError>) {
+        self.poison_with(HandlePoison::HeaderOutcomeUnknown { commit, source });
+    }
+
+    /// The first poison stands, because it names the earliest unknown state.
+    fn poison_with(&self, poison: HandlePoison) {
         let mut poisoned = self.poisoned_commit.lock();
         if poisoned.is_none() {
-            *poisoned = Some(commit);
+            *poisoned = Some(poison);
         }
     }
 

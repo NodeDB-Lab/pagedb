@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::Result;
 use crate::errors::PagedbError;
+use crate::pager::core::RebuildImage;
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::page_space::is_reserved;
 use crate::vfs::Vfs;
@@ -28,10 +29,17 @@ impl<V: Vfs> BTree<V> {
     /// entry point exists so tests can exercise a walk in isolation.
     #[cfg(test)]
     pub async fn rekey_walk(&self) -> Result<u64> {
-        self.rekey_walk_unique(&mut BTreeMap::new()).await
+        let image = self.pager.rebuild_image(
+            self.realm_id,
+            "/rekey-walk.scratch".to_string(),
+            self.pager.active_mk_epoch(),
+            &self.pager.mk()?,
+        )?;
+        self.rekey_walk_unique(&mut BTreeMap::new(), &image).await
     }
 
-    /// Rekey this tree while sharing traversal state with other live roots.
+    /// Rekey this tree into `image`, sharing traversal state with other live
+    /// roots. A flush at budget goes to `image`, never to the live file.
     ///
     /// Copy-on-write snapshots share most of their physical pages, so a caller
     /// rewriting several roots — the live tree plus every root a retained
@@ -52,6 +60,27 @@ impl<V: Vfs> BTree<V> {
     pub(crate) async fn rekey_walk_unique(
         &self,
         visited: &mut BTreeMap<u64, PageKind>,
+        image: &RebuildImage,
+    ) -> Result<u64> {
+        self.walk_unique(visited, Some(image)).await
+    }
+
+    /// Run the walk [`Self::rekey_walk_unique`] runs and change nothing.
+    ///
+    /// Each failure matches the one the rewriting walk reports over the same map.
+    /// A page reached under two roles fails here too. A caller can therefore find
+    /// such a page before it commits to rewriting.
+    pub(crate) async fn verify_walk_unique(
+        &self,
+        visited: &mut BTreeMap<u64, PageKind>,
+    ) -> Result<()> {
+        self.walk_unique(visited, None).await.map(drop)
+    }
+
+    async fn walk_unique(
+        &self,
+        visited: &mut BTreeMap<u64, PageKind>,
+        reseal_to: Option<&RebuildImage>,
     ) -> Result<u64> {
         if self.root_page_id == 0 {
             return Ok(0);
@@ -108,7 +137,7 @@ impl<V: Vfs> BTree<V> {
 
                     for overflow_root in overflow_roots {
                         count += self
-                            .rekey_overflow_unique(page_id, overflow_root, visited)
+                            .walk_overflow_unique(page_id, overflow_root, visited, reseal_to)
                             .await?;
                     }
                 }
@@ -128,16 +157,19 @@ impl<V: Vfs> BTree<V> {
                 }
             }
 
-            self.pager
-                .rewrite_page_under_current_epoch(page_id, self.realm_id, page_kind)
-                .await?;
+            if let Some(dest) = reseal_to {
+                self.pager
+                    .reseal_page_to(page_id, self.realm_id, page_kind, dest)
+                    .await?;
+            }
             count += 1;
         }
         Ok(count)
     }
 
-    /// Rewrite the overflow chain rooted at `root` — referenced by leaf
-    /// `leaf_page_id` — returning the number of pages this call rewrote.
+    /// Walk the overflow chain rooted at `root` — referenced by leaf
+    /// `leaf_page_id` — returning the number of pages this call covered. With
+    /// `reseal_to` set, it rewrites each page into that image.
     ///
     /// Overflow roots are reference-counted, so a chain reached a second time
     /// through a different leaf (in this tree or in another snapshot's tree)
@@ -145,11 +177,12 @@ impl<V: Vfs> BTree<V> {
     /// twice therefore cannot be a legitimate share: either the chain loops, or
     /// two distinct roots claim one page. Both mean the chain has no honest
     /// terminator, which is why neither is treated as a stopping condition.
-    async fn rekey_overflow_unique(
+    async fn walk_overflow_unique(
         &self,
         leaf_page_id: u64,
         root: u64,
         visited: &mut BTreeMap<u64, PageKind>,
+        reseal_to: Option<&RebuildImage>,
     ) -> Result<u64> {
         // Unlike an internal child slot or a chain terminator, zero is not a
         // valid overflow root: an `Overflow` leaf value always owns at least
@@ -172,9 +205,11 @@ impl<V: Vfs> BTree<V> {
         visited.insert(root, PageKind::OverflowRoot);
 
         let root_info = overflow::read_root_page(&self.pager, self.realm_id, root).await?;
-        self.pager
-            .rewrite_page_under_current_epoch(root, self.realm_id, PageKind::OverflowRoot)
-            .await?;
+        if let Some(dest) = reseal_to {
+            self.pager
+                .reseal_page_to(root, self.realm_id, PageKind::OverflowRoot, dest)
+                .await?;
+        }
         let mut count = 1;
         let mut next = root_info.next;
         while next != 0 {
@@ -198,9 +233,11 @@ impl<V: Vfs> BTree<V> {
                 .await?;
             let (following, _) = overflow::decode_overflow(guard.body_ref())?;
             drop(guard);
-            self.pager
-                .rewrite_page_under_current_epoch(next, self.realm_id, PageKind::Overflow)
-                .await?;
+            if let Some(dest) = reseal_to {
+                self.pager
+                    .reseal_page_to(next, self.realm_id, PageKind::Overflow, dest)
+                    .await?;
+            }
             count += 1;
             next = following;
         }
@@ -221,15 +258,31 @@ impl<V: Vfs> BTree<V> {
         &self,
         out: &mut std::collections::BTreeSet<u64>,
     ) -> Result<()> {
-        if self.root_page_id == 0 {
-            return Ok(());
-        }
         // Track traversal separately from `out`. `out` is the caller's
         // accumulator across every tree in the database and arrives pre-seeded
         // with the reserved pages, so doubling it as the visited set would let
         // whatever the caller happened to put in it silently truncate this
         // walk — the walk's own progress must not depend on that.
         let mut visited = std::collections::BTreeSet::new();
+        self.collect_unvisited_page_ids(&mut visited, out).await
+    }
+
+    /// Collect into `out` the pages this tree reaches that `visited` does not
+    /// hold, and add them to `visited`.
+    ///
+    /// A page in `visited` ends the walk below it. So `visited` must also hold
+    /// every page reachable from each page it holds. Several roots that share
+    /// one set read each shared page once.
+    ///
+    /// Authoritative on the same terms as [`Self::collect_all_page_ids`].
+    pub(crate) async fn collect_unvisited_page_ids(
+        &self,
+        visited: &mut std::collections::BTreeSet<u64>,
+        out: &mut std::collections::BTreeSet<u64>,
+    ) -> Result<()> {
+        if self.root_page_id == 0 {
+            return Ok(());
+        }
         let mut stack: Vec<(u64, u64)> = vec![(0, self.root_page_id)];
 
         while let Some((parent_page_id, page_id)) = stack.pop() {
@@ -259,7 +312,7 @@ impl<V: Vfs> BTree<V> {
                     drop(guard);
 
                     for overflow_root in overflow_roots {
-                        self.collect_overflow_chain(page_id, overflow_root, &mut visited, out)
+                        self.collect_overflow_chain(page_id, overflow_root, visited, out)
                             .await?;
                     }
                 }
@@ -485,6 +538,19 @@ mod tests {
     const KEK: [u8; 32] = [0x7B; 32];
     const REALM: RealmId = RealmId::new([0x7C; 16]);
 
+    /// Rebuild image for these walks. The fixture stays inside the page budget,
+    /// so nothing flushes here.
+    fn scratch_image(db: &Db<MemVfs>) -> crate::pager::core::RebuildImage {
+        db.pager
+            .rebuild_image(
+                REALM,
+                "/main.db.rekey".to_string(),
+                db.pager.active_mk_epoch(),
+                &db.pager.mk().unwrap(),
+            )
+            .unwrap()
+    }
+
     /// A tree deep enough to hold internal nodes, plus one overflow value so
     /// the walk covers both the node and the chain path.
     async fn populated_db() -> Db<MemVfs> {
@@ -525,14 +591,20 @@ mod tests {
         let tree = data_tree(&db).await;
 
         let mut shared = BTreeMap::new();
-        let first = tree.rekey_walk_unique(&mut shared).await.unwrap();
+        let first = tree
+            .rekey_walk_unique(&mut shared, &scratch_image(&db))
+            .await
+            .unwrap();
         assert!(
             first > 1,
             "fixture must span more than a single page, walked {first}"
         );
         let recorded = shared.len();
 
-        let second = tree.rekey_walk_unique(&mut shared).await.unwrap();
+        let second = tree
+            .rekey_walk_unique(&mut shared, &scratch_image(&db))
+            .await
+            .unwrap();
         assert_eq!(
             second, 0,
             "every page was already covered by the first walk"
@@ -551,7 +623,10 @@ mod tests {
         let db = populated_db().await;
         let tree = data_tree(&db).await;
 
-        let first = tree.rekey_walk_unique(&mut BTreeMap::new()).await.unwrap();
+        let first = tree
+            .rekey_walk_unique(&mut BTreeMap::new(), &scratch_image(&db))
+            .await
+            .unwrap();
         let second = tree.rekey_walk().await.unwrap();
         assert_eq!(first, second);
     }
@@ -567,7 +642,9 @@ mod tests {
         let tree = data_tree(&db).await;
 
         let mut shared = BTreeMap::new();
-        tree.rekey_walk_unique(&mut shared).await.unwrap();
+        tree.rekey_walk_unique(&mut shared, &scratch_image(&db))
+            .await
+            .unwrap();
         let (&overflow_root, _) = shared
             .iter()
             .find(|(_, kind)| **kind == PageKind::OverflowRoot)
@@ -580,7 +657,10 @@ mod tests {
             overflow_root + 1,
             db.page_size,
         );
-        let error = aliased.rekey_walk_unique(&mut shared).await.unwrap_err();
+        let error = aliased
+            .rekey_walk_unique(&mut shared, &scratch_image(&db))
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 error,
@@ -592,6 +672,48 @@ mod tests {
             ),
             "expected an alias naming the page and both roles, got {error:?}"
         );
+    }
+
+    /// The read-only walk reports the alias the rewriting walk reports. A plain
+    /// page set skips this page, so a caller finds it only after it rewrites.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_read_only_walk_reports_an_alias_and_dirties_no_page() {
+        use crate::pager::core::FileKey;
+
+        let db = populated_db().await;
+        let tree = data_tree(&db).await;
+        db.pager.flush_main(REALM).await.unwrap();
+
+        let mut shared = BTreeMap::new();
+        tree.verify_walk_unique(&mut shared).await.unwrap();
+        let (&overflow_root, _) = shared
+            .iter()
+            .find(|(_, kind)| **kind == PageKind::OverflowRoot)
+            .expect("the fixture stores one overflow value");
+        let aliased = BTree::open(
+            db.pager.clone(),
+            REALM,
+            overflow_root,
+            overflow_root + 1,
+            db.page_size,
+        );
+        let error = aliased.verify_walk_unique(&mut shared).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                PagedbError::Corruption(CorruptionDetail::PageKindAliased { page_id, .. })
+                    if page_id == overflow_root
+            ),
+            "expected an alias naming the page, got {error:?}"
+        );
+        let dirty = db
+            .pager
+            .inner
+            .buffer_pool
+            .lock()
+            .dirty_for_file(FileKey::Main);
+        assert!(dirty.is_empty(), "the walk dirtied {dirty:?}");
     }
 
     /// Rekey re-seals each page under the kind it walked it as. Taking that
@@ -638,7 +760,7 @@ mod tests {
             .await
             .unwrap();
         db.pager.flush_main(REALM).await.unwrap();
-        db.pager.reset_main_pages();
+        db.pager.reset_main_pages().unwrap();
 
         let tree = BTree::open(db.pager.clone(), REALM, forged, forged + 1, db.page_size);
         let error = tree.rekey_walk().await.unwrap_err();

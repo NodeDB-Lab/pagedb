@@ -64,6 +64,7 @@ impl<V: Vfs + Clone> Db<V> {
             catalog_root_page_id: 0,
             catalog_root_txn_id: 0,
             free_list_root_page_id: 0,
+            free_list_entries: Some(0),
             commit_history_root_page_id: 0,
             commit_history_root_version: 0,
             commit_history_count: Some(0),
@@ -100,6 +101,10 @@ impl<V: Vfs + Clone> Db<V> {
             cipher_id,
             format_version: initial.format_version,
             header_flags: initial.flags,
+            #[cfg(not(target_arch = "wasm32"))]
+            first_apply_unstamped: std::sync::atomic::AtomicBool::new(
+                initial.restore_mode == super::super::restore_mode::STANDALONE,
+            ),
             mk_epoch: AtomicU64::new(mk_epoch),
             file_id,
             kek_salt,
@@ -126,7 +131,9 @@ impl<V: Vfs + Clone> Db<V> {
                 next_page_id: 4,
                 catalog_root_page_id: 0,
                 free_list_root_page_id: 0,
+                free_list_entries: Some(0),
                 commit_history_root_page_id: 0,
+                history_rows_abandoned: false,
             })),
             poisoned_commit: parking_lot::Mutex::new(None),
             free_page_cache: Arc::new(parking_lot::Mutex::new(Vec::new())),

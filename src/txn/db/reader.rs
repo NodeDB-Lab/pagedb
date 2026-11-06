@@ -13,6 +13,7 @@ use super::super::policy::ReaderStallPolicy;
 use super::super::read::ReadTxn;
 use super::super::write::WriteTxn;
 use super::DbModeCapabilities;
+use super::catalog::history_policy::history_rows_abandoned;
 use super::core::{Db, ReaderSnapshot, TrackedReader, WriterState, decode_commit_meta};
 
 impl<V: Vfs + Clone> Db<V> {
@@ -22,6 +23,8 @@ impl<V: Vfs + Clone> Db<V> {
     pub async fn begin_read(&self) -> Result<ReadTxn<'_, V>> {
         self.ensure_usable()?;
         let _admission = self.visibility_gate.read().await;
+        // A holder of the write side can poison the handle while this call waits.
+        self.ensure_usable()?;
         let snap = *self.snapshot.read();
         #[cfg(test)]
         self.pause_after_snapshot_selection().await;
@@ -45,6 +48,8 @@ impl<V: Vfs + Clone> Db<V> {
     pub async fn begin_read_non_abortable(&self) -> Result<ReadTxn<'_, V>> {
         self.ensure_usable()?;
         let _admission = self.visibility_gate.read().await;
+        // A holder of the write side can poison the handle while this call waits.
+        self.ensure_usable()?;
         // The snapshot and registration remain under the admission gate, so a
         // destructive writer cannot decide reader-pin eligibility between them.
         let snap = *self.snapshot.read();
@@ -69,8 +74,43 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id: state.next_page_id,
             catalog_root_page_id: state.catalog_root_page_id,
             free_list_root_page_id: state.free_list_root_page_id,
+            free_list_entries: state.free_list_entries,
             commit_history_root_page_id: state.commit_history_root_page_id,
+            history_rows_abandoned: history_rows_abandoned(
+                state.commit_retain_policy_tag,
+                state.commit_history_root_page_id,
+            ),
         };
+    }
+
+    /// Keep the published snapshot intact for a short metadata walk, without
+    /// registering a reader.
+    ///
+    /// Every operation that publishes, relocates, or truncates takes the write
+    /// side of the gate. None of them runs while the returned guard lives. A page
+    /// the snapshot reaches is reused only after a newer snapshot is published.
+    /// Its bytes therefore stay in place for the walk.
+    ///
+    /// A registered reader gives the same guarantee at a cost a metrics poll
+    /// cannot justify. It makes a concurrent compaction decline. It shows in
+    /// `DbStats`. The stall policy can abort it.
+    ///
+    /// The cost here is that a commit waits at publication for the walk to end.
+    /// The walk also waits for any compaction, apply, or publication that holds
+    /// the write side.
+    ///
+    /// The caller must not hold the write side of the gate.
+    ///
+    /// A holder of the write side can poison the handle during the wait. The
+    /// published snapshot then names roots over a file it does not describe, so
+    /// this returns the poison error instead.
+    pub(crate) async fn hold_published_snapshot(
+        &self,
+    ) -> Result<(tokio::sync::RwLockReadGuard<'_, ()>, ReaderSnapshot)> {
+        let hold = self.visibility_gate.read().await;
+        self.ensure_usable()?;
+        let snapshot = *self.snapshot.read();
+        Ok((hold, snapshot))
     }
 
     /// Register a reader with a snapshot pin. Stores the reader in the
@@ -110,6 +150,20 @@ impl<V: Vfs + Clone> Db<V> {
         )
     }
 
+    /// Commit id below which free-list entries are recyclable: the older of the
+    /// oldest live-reader pin and the oldest retained commit-history root.
+    /// Same derivation the write path uses at `begin`.
+    pub(in crate::txn::db) async fn reclamation_floor(&self, state: &WriterState) -> Result<u64> {
+        let min_reader = {
+            let readers = self.tracked_readers.lock();
+            readers.iter().map(|reader| reader.commit_id.0).min()
+        };
+        let history_bound = self.history_reclamation_bound(state).await?;
+        Ok(min_reader
+            .unwrap_or(u64::MAX)
+            .min(history_bound.unwrap_or(u64::MAX)))
+    }
+
     /// Unregister a reader by its unique `entry_id`. Called from `ReadTxn::drop`.
     /// Uses `swap_remove` for O(1) amortised removal; order in the Vec is
     /// not semantically significant.
@@ -121,10 +175,8 @@ impl<V: Vfs + Clone> Db<V> {
             }
             readers.is_empty()
         };
-        if readers_drained {
-            if let Err(error) = self.drain_pending_key_retirements() {
-                tracing::error!(error = %error, "deferred rekey source retirement failed");
-            }
+        if readers_drained && let Err(error) = self.drain_pending_key_retirements() {
+            tracing::error!(error = %error, "deferred rekey source retirement failed");
         }
     }
 
@@ -234,9 +286,16 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Look up `commit` in the commit-history B+ tree and, if found, return a
     /// `ReadTxn` pinned to that historical snapshot.
+    ///
+    /// Under [`RetainPolicy::Disabled`](crate::options::RetainPolicy::Disabled)
+    /// this serves the latest commit only. Rows a store's header proves went
+    /// unmaintained are gone under every policy. Each other commit then returns
+    /// [`PagedbError::CommitGone`] with the latest commit as `oldest_available`.
     pub async fn begin_read_at(&self, commit: CommitId) -> Result<ReadTxn<'_, V>> {
         self.ensure_usable()?;
         let _admission = self.visibility_gate.read().await;
+        // A holder of the write side can poison the handle while this call waits.
+        self.ensure_usable()?;
         let snap = *self.snapshot.read();
         if commit.0 == snap.commit_id {
             #[cfg(test)]
@@ -249,7 +308,13 @@ impl<V: Vfs + Clone> Db<V> {
                 false,
             ));
         }
-        let history_root = snap.commit_history_root_page_id;
+        // These rows stay on disk for a handle that cannot remove them, so the
+        // root alone does not say whether they can be served.
+        let history_root = if self.history_disabled() || snap.history_rows_abandoned {
+            0
+        } else {
+            snap.commit_history_root_page_id
+        };
         let history_next = snap.next_page_id;
         let latest_commit_id = snap.commit_id;
 

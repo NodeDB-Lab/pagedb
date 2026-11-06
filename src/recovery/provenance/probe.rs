@@ -81,8 +81,10 @@ pub struct PageProvenance {
     pub next_page_id: u64,
     /// Whether the free-list half of the answer could be computed at all.
     ///
-    /// `false` means the chain would not read, so `freed_by_commit` is `None`
-    /// for lack of evidence rather than because the page is not free.
+    /// `false` means the chain does not read, or the writer was busy and the
+    /// chain was not walked. `unwalkable_roots` names `"free-list"` in the second
+    /// case. Either way `freed_by_commit` is `None` for lack of evidence rather
+    /// than because the page is not free.
     pub free_list_readable: bool,
     /// Roots whose walk could not be completed, by name.
     ///
@@ -91,6 +93,9 @@ pub struct PageProvenance {
     /// is silence, not a negative. The common cause is the failure being
     /// diagnosed: a walk cannot descend past the page that will not
     /// authenticate.
+    ///
+    /// `"free-list"` here means the writer was busy. A writer can reuse chain
+    /// pages at any time, so the probe skips that walk rather than misread it.
     pub unwalkable_roots: Vec<&'static str>,
 }
 
@@ -140,24 +145,38 @@ impl<V: Vfs + Clone> Db<V> {
     /// own documentation says to call it. When the writer is busy this answers
     /// against the last published snapshot instead, which is the state a reader
     /// that met the failure was looking at anyway.
+    ///
+    /// A busy writer has two more effects. The answer leaves out the free list,
+    /// so it is not conclusive. The call also waits while a compaction, an
+    /// incremental apply, or a commit publication holds the visibility gate.
+    /// An idle writer stays locked for the walk, so writers wait for the probe.
     pub async fn page_provenance(&self, page_id: u64) -> Result<PageProvenance> {
-        let (data_root, catalog_root, history_root, next_page_id, free_list_root) =
-            if let Ok(state) = self.writer.try_lock() {
+        // Both guards live until this function returns. Each keeps the pages the
+        // walks below read in place. Every holder of the gate's write side takes
+        // the writer first. A caller holding a write transaction therefore never
+        // blocks on the gate.
+        let writer = self.writer.try_lock().ok();
+        // A poisoned handle's roots can name pages over a file they do not describe.
+        self.ensure_usable()?;
+        let (data_root, catalog_root, history_root, next_page_id, free_list_root, _published_hold) =
+            if let Some(state) = writer.as_ref() {
                 (
                     state.root_page_id,
                     state.catalog_root_page_id,
                     state.commit_history_root_page_id,
                     state.next_page_id,
                     state.free_list_root_page_id,
+                    None,
                 )
             } else {
-                let snapshot = self.snapshot.read();
+                let (hold, snapshot) = self.hold_published_snapshot().await?;
                 (
                     snapshot.root_page_id,
                     snapshot.catalog_root_page_id,
                     snapshot.commit_history_root_page_id,
                     snapshot.next_page_id,
                     snapshot.free_list_root_page_id,
+                    Some(hold),
                 )
             };
 
@@ -203,9 +222,15 @@ impl<V: Vfs + Clone> Db<V> {
         // matters, so an unreadable chain narrows the verdict instead of
         // replacing it: root reachability alone still separates "live page that
         // something also freed" from "page no root refers to".
-        let free_list = free_list_entry(self, self.realm_id, free_list_root, page_id).await;
-        let free_list_readable = free_list.is_ok();
-        let freed_by_commit = free_list.unwrap_or(None);
+        //
+        // No reader floor gates chain pages, so a busy writer can reuse them
+        // under this walk. Only an idle writer, locked above, makes it sound.
+        let (free_list_readable, freed_by_commit) = if writer.is_some() {
+            let free_list = free_list_entry(self, self.realm_id, free_list_root, page_id).await;
+            (free_list.is_ok(), free_list.unwrap_or(None))
+        } else {
+            (false, None)
+        };
 
         // Ordered by how much each fact is worth, and never stated beyond the
         // evidence that supports it. Reachability comes first because a live
@@ -235,6 +260,12 @@ impl<V: Vfs + Clone> Db<V> {
         } else {
             PageStanding::Live
         };
+
+        // Recorded after the standing, which judges tree walks against this list
+        // and takes the free-list half from `free_list_readable`.
+        if writer.is_none() {
+            unwalkable_roots.push("free-list");
+        }
 
         Ok(PageProvenance {
             page_id,
@@ -496,5 +527,9 @@ mod tests {
                 .unwrap();
 
         assert_eq!(provenance.page_id, root);
+        assert_eq!(provenance.standing, PageStanding::LiveFreeUnknown);
+        assert!(!provenance.free_list_readable);
+        assert!(provenance.unwalkable_roots.contains(&"free-list"));
+        assert!(!provenance.is_conclusive());
     }
 }

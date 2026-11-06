@@ -97,10 +97,8 @@ impl<'a, V: Vfs> BulkLoader<'a, V> {
     /// directly — a caller streaming record by record allocates nothing per
     /// record beyond the record itself.
     ///
-    /// Carries the same reachability as [`BTree::bulk_load`], its only caller
-    /// outside tests: the repack hands over the bounded batch it already holds
-    /// and so goes through [`Self::push_batch`].
-    #[cfg(any(test, not(target_arch = "wasm32")))]
+    /// The history carry is its only caller outside tests. The repack hands over
+    /// the bounded batch it already holds and so goes through [`Self::push_batch`].
     pub async fn push(&mut self, key: Vec<u8>, value: Bytes) -> Result<()> {
         batch::push_one(self, key, value).await
     }
@@ -249,8 +247,9 @@ impl<V: Vfs> BTree<V> {
     /// Start a streaming bulk load into this (empty) tree.
     ///
     /// The returned loader packs records into leaves and builds internal nodes
-    /// bottom-up as they arrive, writing each page exactly once. Callers holding
-    /// the whole input already can use [`Self::bulk_load`] instead.
+    /// bottom-up as they arrive, writing each page exactly once. A flush at the
+    /// dirty budget goes to the live file. A caller building an image beside the
+    /// live file uses [`Self::bulk_loader_to`] instead.
     ///
     /// Returns `Err` if the tree is not empty.
     pub fn bulk_loader(&mut self) -> Result<BulkLoader<'_, V>> {
@@ -281,10 +280,9 @@ impl<V: Vfs> BTree<V> {
     ///
     /// Returns `Err` if the tree is not empty.
     ///
-    /// The repack streams through [`Self::bulk_loader`] instead, so the only
-    /// caller holding a whole input is the incremental-apply history carry,
-    /// which is native-only.
-    #[cfg(any(test, not(target_arch = "wasm32")))]
+    /// Every library caller streams through a loader, so this form serves tests
+    /// only.
+    #[cfg(test)]
     pub async fn bulk_load(&mut self, pairs: Vec<(Vec<u8>, Bytes)>) -> Result<()> {
         let mut loader = self.bulk_loader()?;
         for (key, value) in pairs {

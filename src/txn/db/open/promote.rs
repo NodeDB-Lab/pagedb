@@ -1,6 +1,9 @@
 //! Follower mode: opening into it, promoting into it, and trading a handle's
 //! sentinel for the exclusive writer one.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::Ordering;
+
 use crate::crypto::SecretKey;
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
@@ -22,6 +25,8 @@ impl<V: Vfs + Clone> Db<V> {
     ///
     /// A restored directory records the promotion in its header. A later
     /// open still refuses to make it a Standalone writer.
+    ///
+    /// The handle seals its own pages under a random nonce prefix from here on.
     pub async fn promote_to_follower(mut self) -> Result<Self> {
         self.ensure_usable()?;
         self.require_mode(
@@ -30,6 +35,7 @@ impl<V: Vfs + Clone> Db<V> {
             DbModeCapabilities::promotes_to_follower,
         )?;
         self.take_exclusive_writer_sentinel("follower").await?;
+        self.pager.use_local_nonce_prefix()?;
         self.pager.enable_write_access().await;
         self.record_follower_mode().await?;
         self.lock_required = true;
@@ -46,6 +52,9 @@ impl<V: Vfs + Clone> Db<V> {
     /// - Reports `NotFound` for a missing store.
     /// - Records the promotion on a restored directory, as
     ///   [`Db::promote_to_follower`] does.
+    /// - Changes nothing on an unstamped store until its first apply. That apply
+    ///   makes every later `Standalone` open report `RestoredNotPromoted`.
+    /// - Seals its own pages under a random nonce prefix drawn for this open.
     pub async fn open_follower(
         vfs: V,
         kek: impl Into<SecretKey>,
@@ -68,6 +77,33 @@ impl<V: Vfs + Clone> Db<V> {
             self.persist_restore_mode(&mut state, restore_mode::FOLLOWER)
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Record that this store takes delta pages, before the first one lands.
+    ///
+    /// Only a byte copy of a store reaches this with an unstamped header. A delta
+    /// names the source's identity, and no API gives a second directory that
+    /// identity unstamped. Later `Standalone` commits on the copy mix the source's
+    /// counter stream with a local one, and they repeat the source's nonces.
+    /// So from here it refuses `Standalone` as a restored directory does.
+    ///
+    /// The header reaches disk before the staged image copies it, so the image
+    /// carries the stamp too. The target header lands in the other slot, so both
+    /// slots of the published image hold it. A store already stamped takes no
+    /// lock and writes nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::txn::db) async fn record_first_apply(&self) -> Result<()> {
+        if !self.first_apply_unstamped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut state = self.writer.lock().await;
+        self.ensure_usable()?;
+        if state.restore_mode == restore_mode::STANDALONE {
+            self.persist_restore_mode(&mut state, restore_mode::FOLLOWER)
+                .await?;
+        }
+        self.first_apply_unstamped.store(false, Ordering::SeqCst);
         Ok(())
     }
 

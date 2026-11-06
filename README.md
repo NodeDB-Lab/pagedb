@@ -74,7 +74,7 @@ pagedb's answer: **one substrate, two surfaces.** Engines that want their own fo
 - **Format-portable.** A directory created on any target opens byte-identically on every other target. Identity-keyed segment paths keep UTF-8 names out of the filesystem layer.
 - **Bounded memory.** Explicit `OpenOptions` budgets + SIEVE eviction. No mmap surprises, no uncapped OS page cache.
 - **Realms.** Per-realm DEK + AAD-bound `RealmId` for cryptographic multi-tenancy within one DB.
-- **Online rekey, online compact, incremental snapshots.** Throttled, cancellable, resumable.
+- **Online rekey, online compact, incremental snapshots.** A caller can drop any of these futures at any await, and the store stays safe. A drop past the commit point requires a reopen. A rekey resumes at that reopen. A compact restarts from the beginning on the next call. Neither is throttled. A rekey and a compact each build a replacement `main.db` beside the live one, so they need free space up to its size.
 - **No `unsafe`** outside the VFS and the opt-in `mmap_view` over decrypted scratch.
 
 ## Position in the stack
@@ -142,10 +142,15 @@ defend against, stated plainly so nobody has to infer it.
   moved to another offset, another realm, another segment, or reinterpreted as
   another kind without failing verification.
 - **Key separation.** One key per `(realm, file, master-key epoch, cipher)`,
-  derived by HKDF-SHA-256 from the embedder's KEK. Because the nonce is
-  `file_identity[0..6] ‖ counter48`, scoping the key by the _full_ file identity
-  is what makes nonce reuse impossible by construction rather than merely
-  improbable — two files can never share a nonce space.
+  derived by HKDF-SHA-256 from the embedder's KEK. The nonce is
+  `file_identity[0..6] ‖ counter48`, and the key is scoped by the _full_ file
+  identity, so two files never share a nonce space.
+- **Follower pages.** A follower holds its source's key and file identity, and
+  delta pages keep the source's nonces. Its local pages use a random 6-byte
+  prefix drawn at each open. Those pages are its free-list chain and a relocated
+  commit history. An
+  open refuses a draw equal to `file_identity[0..6]`. Two followers can still draw
+  one prefix, so a match between them is improbable rather than impossible.
 - **Torn writes.** A crash mid-write cannot corrupt committed state: the B+
   tree uses copy-on-write shadow paging behind alternating A/B headers, and a
   segment is committed by its seal record or not at all.
@@ -189,7 +194,9 @@ defend against, stated plainly so nobody has to infer it.
   directory `restore_from` fills, shares the source's key and nonce space. A
   Standalone open of one reports `RestoredNotPromoted`. Open it with
   `open_read_only`, track the source with `open_follower`, or call
-  `rekey_into_writer` to fork an independent writer under a fresh identity.
+  `rekey_into_writer` to fork an independent writer under a fresh identity. A
+  byte copy of a store gets the same refusal from its first `apply_incremental`
+  on.
 - **`main.db` is not reconstructible from `seg/`.** Segment files are
   identity-keyed and the mapping from embedder name to segment id lives only in
   the catalog inside `main.db`. Losing `main.db` while `seg/` survives is

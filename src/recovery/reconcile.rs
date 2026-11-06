@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::btree::BTree;
-use crate::catalog::codec::{Catalog, CatalogRowKind};
+use crate::catalog::codec::{Catalog, CatalogRowKind, SegmentMeta};
 use crate::errors::{CorruptionDetail, PagedbError};
 use crate::pager::Pager;
 use crate::segment::authenticated_metadata::{
@@ -178,7 +178,9 @@ async fn authenticate_row<V: Vfs + Clone>(
     match vfs.open(&live, OpenMode::Read).await {
         Ok(file) => {
             validate_expected_path(&meta, &live, ExpectedSegmentPath::Live)?;
-            authenticate_segment_metadata(pager, &file, &meta, parent_file_id, page_size).await?;
+            let authenticated =
+                authenticate_segment_metadata(pager, &file, &meta, parent_file_id, page_size).await;
+            keep_row_for_the_embedder(authenticated, &meta)?;
             Ok((meta.segment_id, None))
         }
         Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -195,12 +197,49 @@ async fn authenticate_row<V: Vfs + Clone>(
                 Err(error) => return Err(error),
             };
             validate_expected_path(&meta, &staging, ExpectedSegmentPath::Staging)?;
-            authenticate_segment_metadata(pager, &file, &meta, parent_file_id, page_size).await?;
+            let authenticated =
+                authenticate_segment_metadata(pager, &file, &meta, parent_file_id, page_size).await;
+            let verified = keep_row_for_the_embedder(authenticated, &meta)?;
             drop(file);
-            Ok((meta.segment_id, Some((staging, live))))
+            // An unverified file never reaches the live path.
+            Ok((meta.segment_id, verified.then_some((staging, live))))
         }
         Err(error) => Err(error),
     }
+}
+
+/// Turn one row's authentication outcome into `Ok(true)`, `Ok(false)`, or the error
+/// that stops this open.
+///
+/// A file that cannot authenticate stays in place and its row stays in the catalog,
+/// so `Ok(false)` changes nothing on disk. The read of that segment reports the
+/// damage, and the embedder quarantines it with `WriteTxn::unlink_segment`. An open
+/// that fails here leaves no handle to do that with, and one bad segment
+/// locks away every other row.
+///
+/// A foreign segment still stops the open, because that file must never be served
+/// under this store's identity. So does anything that is not a verdict about the
+/// file's bytes, such as an I/O error.
+fn keep_row_for_the_embedder<T>(outcome: Result<T>, meta: &SegmentMeta) -> Result<bool> {
+    let Err(error) = outcome else {
+        return Ok(true);
+    };
+    let verdict_on_the_file = match &error {
+        PagedbError::Corruption(CorruptionDetail::ForeignSegment { .. }) => false,
+        PagedbError::Corruption(_)
+        | PagedbError::ChecksumFailure
+        | PagedbError::MissingPersistedKey { .. } => true,
+        _ => false,
+    };
+    if !verdict_on_the_file {
+        return Err(error);
+    }
+    tracing::error!(
+        %error,
+        segment_id = %crate::hex::to_hex_lower(&meta.segment_id),
+        "a linked segment cannot authenticate, so its reads report the damage"
+    );
+    Ok(false)
 }
 
 async fn has_orphans<V: Vfs>(vfs: &V, expected: &[[u8; 16]]) -> Result<bool> {

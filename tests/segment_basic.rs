@@ -90,12 +90,24 @@ async fn catalog_referenced_corruption_is_not_reclaimed_during_recovery() {
     drop(file);
     drop(db);
 
-    let error = Db::open(vfs.clone(), [9u8; 32], PAGE, realm, OpenOptions::default())
+    // One bad segment does not lock away the store. The read reports the damage,
+    // the file stays in place, and an open handle is what the quarantine needs.
+    let reopened = Db::open(vfs.clone(), [9u8; 32], PAGE, realm, OpenOptions::default())
         .await
-        .err()
         .unwrap();
-    assert!(matches!(error, PagedbError::Corruption(_)));
+    assert!(matches!(
+        reopened.open_segment(realm, "referenced").await.map(drop),
+        Err(PagedbError::Corruption(_))
+    ));
     assert!(vfs.open(&path, OpenMode::Read).await.is_ok());
+
+    let mut txn = reopened.begin_write().await.unwrap();
+    txn.unlink_segment("referenced").await.unwrap();
+    txn.commit().await.unwrap();
+    assert!(matches!(
+        reopened.open_segment(realm, "referenced").await.map(drop),
+        Err(PagedbError::NotFound)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

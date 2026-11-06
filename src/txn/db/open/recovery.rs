@@ -2,12 +2,13 @@
 
 use crate::Result;
 use crate::crypto::SecretKey;
-use crate::errors::PagedbError;
 use crate::pager::freelist;
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::{Vfs, remove_if_present};
 
+use super::super::catalog::history_policy::proves_unreadable_pages;
 use super::super::core::Db;
+use super::super::rekey::recovery::RekeyAdmission;
 
 pub(super) async fn recover_open_state<V: Vfs + Clone>(
     db: &Db<V>,
@@ -16,7 +17,7 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     fields: &MainDbHeaderFields,
 ) -> Result<()> {
     let capabilities = db.mode.open_capabilities();
-    let rekey_in_flight = db
+    let admission = db
         .admit_rekey_recovery(primary_kek, counterpart_kek)
         .await?;
 
@@ -28,10 +29,11 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     }
 
     if capabilities.runs_standalone_recovery() {
-        // Compaction and `rekey_into_writer` each build a replacement
+        // Compaction, `rekey_db`, and `rekey_into_writer` each build a replacement
         // `main.db` beside the live one and publish it by rename. A scratch
-        // still present at open is one whose rename never happened.
-        for suffix in [".compact", ".fork"] {
+        // still present at open is one whose rename never happened. A rekey's
+        // durable intent starts its rebuild over below.
+        for suffix in [".compact", ".fork", ".rekey"] {
             remove_if_present(&*db.vfs, &format!("{}{suffix}", db.main_db_path)).await?;
         }
 
@@ -83,11 +85,28 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         }
     }
 
-    if rekey_in_flight {
-        if !capabilities.runs_standalone_recovery() {
-            return Err(crate::errors::PagedbError::Unsupported);
+    match admission {
+        RekeyAdmission::NotPending => {}
+        RekeyAdmission::Resume if capabilities.runs_standalone_recovery() => {
+            // A resume reads the chain, and a torn page fails that read. Admission
+            // above installed both intent keys, so the classifier can trust a key
+            // error here. The next rekey header persists root 0.
+            db.drop_unreadable_free_list().await;
+            db.resume_rekey_intent().await?;
         }
-        db.resume_rekey_intent().await?;
+        // A handle without recovery authority reads a store that holds one key,
+        // and refuses a store that needs a resume first.
+        RekeyAdmission::Resume => {
+            if !db.pending_rekey_left_source_intact().await? {
+                return Err(crate::errors::PagedbError::Unsupported);
+            }
+        }
+        RekeyAdmission::SourceKeyOnly => {
+            if capabilities.runs_standalone_recovery() {
+                db.drop_unreadable_free_list().await;
+                db.withdraw_rekey_with_source_key().await?;
+            }
+        }
     }
 
     let (catalog_root_page_id, next_page_id) = {
@@ -128,10 +147,37 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
         db.drop_unreadable_free_list().await;
     }
 
+    db.publish_free_list_count().await;
+
     Ok(())
 }
 
 impl<V: Vfs + Clone> Db<V> {
+    /// Count the settled free-list chain and publish the count, so `stats` never
+    /// reads the chain on a healthy store.
+    ///
+    /// This costs one page read. A read error leaves the count unknown and never
+    /// fails the open. A free list records reclaimable space and holds no data.
+    async fn publish_free_list_count(&self) {
+        let mut state = self.writer.lock().await;
+        let entries =
+            match freelist::count_chain(&self.pager, self.realm_id, state.free_list_root_page_id)
+                .await
+            {
+                Ok(entries) => Some(entries),
+                Err(error) => {
+                    tracing::warn!(
+                        free_list_root = state.free_list_root_page_id,
+                        %error,
+                        "free-list head read failed at open; stats reads it on demand"
+                    );
+                    None
+                }
+            };
+        state.free_list_entries = entries;
+        self.snapshot.write().free_list_entries = entries;
+    }
+
     /// Detach the free-list chain when it cannot be read, so a store with a
     /// damaged chain still opens.
     ///
@@ -150,6 +196,9 @@ impl<V: Vfs + Clone> Db<V> {
     /// root into the header, so the next one persists the detachment; a crash
     /// before then leaves the same unreadable chain to be dropped again on the
     /// following open, which is why repeating this is safe.
+    ///
+    /// The published snapshot moves with the writer state. An export reads the
+    /// chain through that snapshot, so a stale root fails the export.
     ///
     /// Rebuilding the free set instead — walking the roots and treating every
     /// unreachable page as free — is deliberately NOT done here. It would
@@ -177,10 +226,10 @@ impl<V: Vfs + Clone> Db<V> {
             match walk.advance(&self.pager, self.realm_id).await {
                 Ok(Some(_)) => {}
                 Ok(None) => return,
-                // Corruption only. A transient I/O failure says nothing about
-                // the chain's content, and detaching on one would leak every
+                // Proof about the chain's bytes only. A transient I/O failure says
+                // nothing about its content, and detaching on one leaks every
                 // page it names because a disk hiccuped during startup.
-                Err(error @ PagedbError::Corruption(_)) => break error,
+                Err(error) if proves_unreadable_pages(&error) => break error,
                 Err(error) => {
                     tracing::warn!(
                         free_list_root = head,
@@ -202,5 +251,7 @@ impl<V: Vfs + Clone> Db<V> {
         );
         let mut state = self.writer.lock().await;
         state.free_list_root_page_id = 0;
+        state.free_list_entries = Some(0);
+        self.publish_snapshot(&state);
     }
 }

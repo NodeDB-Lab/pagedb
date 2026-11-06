@@ -2,7 +2,7 @@
 name = "pagedb-engine-comparison"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 license = "MIT OR Apache-2.0"
 description = "Benchmark-only cross-engine comparison harness for PageDB"

@@ -10,6 +10,10 @@
 //!
 //! `fsync`, `ftruncate` and `metadata` have no `dispatch_io` equivalent and do
 //! park the caller, so those run on the blocking pool instead.
+//!
+//! A submitted write runs to completion after a caller drops its future. Writes,
+//! syncs, and truncates therefore hold the file's [`WriteOrder`] turn until the
+//! handler or the pool call finishes, so the next one cannot overtake it.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -26,6 +30,7 @@ use crate::errors::PagedbError;
 use crate::vfs::blocking::offload;
 use crate::vfs::traits::{VfsFile, checked_signed_file_len};
 use crate::vfs::types::{ReadReq, WriteReq};
+use crate::vfs::write_order::{FileTurn, WriteOrder};
 
 pub struct GcdFile {
     /// Shared so a blocking-pool call can own a reference to the descriptor
@@ -34,6 +39,7 @@ pub struct GcdFile {
     writable: bool,
     channel: DispatchRetained<DispatchIO>,
     queue: DispatchRetained<DispatchQueue>,
+    order: WriteOrder,
 }
 
 impl GcdFile {
@@ -41,6 +47,7 @@ impl GcdFile {
         file: std::fs::File,
         writable: bool,
         queue: DispatchRetained<DispatchQueue>,
+        order: WriteOrder,
     ) -> Result<Self> {
         // Duplicate the fd for dispatch_io. The kernel keeps the underlying
         // open file description alive as long as either fd is open; dispatch
@@ -82,6 +89,7 @@ impl GcdFile {
             writable,
             channel,
             queue,
+            order,
         })
     }
 
@@ -195,15 +203,19 @@ fn submit_read(
 /// synchronous for the same reasons as [`submit_read`]: `dispatch_io_write`
 /// enqueues without waiting, and the handler block, its raw pointer, and the
 /// `DispatchData` are all `!Send` and must not cross an await point.
+///
+/// The handler owns `turn`, so the file's next write waits for this one even when
+/// the caller drops its future. Releasing the block releases the turn too.
 fn submit_write(
     channel: &DispatchIO,
     queue: &DispatchQueue,
     offset: libc::off_t,
     buf: &[u8],
     tx: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    turn: FileTurn,
 ) {
     let data = DispatchData::from_bytes(buf);
-    let sender = Arc::new(Mutex::new(Some(tx)));
+    let sender = Arc::new(Mutex::new(Some((tx, turn))));
 
     // Same bool→u8 / *mut DispatchData→*mut c_void workaround as `submit_read`.
     let handler: RcBlock<dyn Fn(u8, *mut c_void, libc::c_int)> = RcBlock::new(
@@ -214,7 +226,8 @@ fn submit_write(
                 } else {
                     Ok(())
                 };
-                if let Some(s) = sender.lock().take() {
+                if let Some((s, turn)) = sender.lock().take() {
+                    drop(turn);
                     let _ = s.send(result);
                 }
             }
@@ -284,9 +297,10 @@ impl VfsFile for GcdFile {
         }
         let len = buf.len();
         let offset = Self::checked_dispatch_offset(offset, len)?;
+        let turn = self.order.enter().await;
         let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
         // `!Send` handler/data confined to a synchronous helper; see `read_at`.
-        submit_write(&self.channel, &self.queue, offset, buf, tx);
+        submit_write(&self.channel, &self.queue, offset, buf, tx, turn);
 
         rx.await
             .map_err(|_| PagedbError::Io(std::io::Error::other("dispatch_io write cancelled")))?
@@ -310,8 +324,10 @@ impl VfsFile for GcdFile {
     async fn sync(&mut self) -> Result<()> {
         // `fsync` waits on the device — it can outlast a whole commit, so it
         // never runs on the executor.
+        let turn = self.order.enter().await;
         let file = Arc::clone(&self.file);
         offload(move || {
+            let _turn = turn;
             // SAFETY: the `Arc` keeps the fd open for the whole call, and
             // `fsync` is a self-contained syscall with no aliasing needs.
             let rc = unsafe { libc::fsync(file.as_raw_fd()) };
@@ -328,8 +344,10 @@ impl VfsFile for GcdFile {
             return Err(PagedbError::ReadOnly);
         }
         let len = checked_signed_file_len(len, "ftruncate")?;
+        let turn = self.order.enter().await;
         let file = Arc::clone(&self.file);
         offload(move || {
+            let _turn = turn;
             // SAFETY: the `Arc` keeps the fd valid, and `len` was checked to
             // fit the signed native file-offset type before the syscall.
             let rc = unsafe { libc::ftruncate(file.as_raw_fd(), len) };

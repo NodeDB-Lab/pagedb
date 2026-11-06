@@ -81,11 +81,25 @@ impl DbModeCapabilities {
         self.runs_standalone_recovery()
     }
 
+    /// Deleting retired segment files and replaying a pending apply journal. A
+    /// handle without write access holds no authority over those files.
+    #[must_use]
+    pub(crate) const fn collects_garbage(self) -> bool {
+        matches!(self.persistent_access, PersistentAccess::ReadWrite)
+    }
+
     /// Applying an incremental snapshot. Only an apply-authority handle
     /// carries the base-commit identity a delta reconciles against, and only
     /// it is licensed to install a producer's page space over its own.
     #[must_use]
     pub(crate) const fn applies_incremental_snapshots(self) -> bool {
+        matches!(self.recovery_authority, RecoveryAuthority::ApplyOnly)
+    }
+
+    /// A handle that takes a producer's pages holds the producer's key and
+    /// `file_id`. Its own seals therefore need a nonce prefix of their own.
+    #[must_use]
+    pub(in crate::txn::db) const fn seals_under_a_local_nonce_prefix(self) -> bool {
         matches!(self.recovery_authority, RecoveryAuthority::ApplyOnly)
     }
 

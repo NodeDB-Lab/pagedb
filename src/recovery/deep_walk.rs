@@ -19,8 +19,9 @@ use crate::pager::format::data_page::extract_page_header_ids;
 use crate::pager::format::page_kind::PageKind;
 use crate::pager::page_space::{FIRST_ALLOCATABLE_PAGE_ID, is_reserved, page_offset};
 use crate::pager::{PageGuard, Pager};
+use crate::recovery::history_report::{HistorySealVerdict, StaleHistoryRow};
 use crate::segment::authenticated_metadata::authenticate_segment_metadata;
-use crate::txn::db::Db;
+use crate::txn::db::{Db, WriterState};
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile, read_exact_at};
 
@@ -71,6 +72,11 @@ pub struct DeepWalkReport {
     pub pages_examined: u64,
     /// Total segment files examined.
     pub segments_examined: u64,
+    /// Retained commits whose pages are provably not that commit's bytes.
+    /// The walk removes nothing. A later apply or rekey prunes them.
+    pub stale_history_rows: Vec<StaleHistoryRow>,
+    /// Whether the store could show the seal order those rows were judged by.
+    pub history_seal_verdict: HistorySealVerdict,
 }
 
 impl DeepWalkReport {
@@ -101,6 +107,7 @@ impl DeepWalkReport {
             && self.segment_issues.is_empty()
             && self.drift_issues.is_empty()
             && self.orphan_page_ids.is_empty()
+            && self.stale_history_rows.is_empty()
     }
 
     /// Write a human-readable text report to `out`.
@@ -164,6 +171,17 @@ impl DeepWalkReport {
         }
         writeln!(out)?;
 
+        writeln!(
+            out,
+            "--- stale commit-history rows ({}): {:?} ---",
+            self.stale_history_rows.len(),
+            self.history_seal_verdict
+        )?;
+        for row in &self.stale_history_rows {
+            writeln!(out, "  commit {}: {:?}", row.commit.value(), row.evidence)?;
+        }
+        writeln!(out)?;
+
         if self.is_clean() {
             writeln!(out, "result: CLEAN")?;
         } else {
@@ -195,15 +213,19 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     // that conservative reading if `DbMode` ever grows a variant.
     let owns_page_space = db.is_writer();
 
-    let (next_page_id, catalog_root, catalog_next, free_list_root) = {
-        let state = db.writer.lock().await;
-        (
-            state.next_page_id,
-            state.catalog_root_page_id,
-            state.next_page_id,
-            state.free_list_root_page_id,
-        )
-    };
+    // Held for the whole walk. Free-chain pages are not protected by any reader
+    // floor, and the next commit can reuse them. The walk also reads every page,
+    // so a commit or compaction running beside it reports false damage. Every
+    // writer takes this lock before the visibility gate. The walk takes neither
+    // the gate nor this lock again, so holding it cannot deadlock.
+    let state = db.writer.lock().await;
+    db.ensure_usable()?;
+    let (next_page_id, catalog_root, catalog_next, free_list_root) = (
+        state.next_page_id,
+        state.catalog_root_page_id,
+        state.next_page_id,
+        state.free_list_root_page_id,
+    );
 
     // ------------------------------------------------------------------ //
     // 1. Walk every page in main.db from page 0 to next_page_id.
@@ -213,7 +235,18 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
     let realm_id = db.realm_id;
 
     // Collect the set of page IDs reachable from all live roots.
-    let mut reachable = collect_reachable_pages(db, &mut report).await;
+    let mut reachable = collect_reachable_pages(db, &state, &mut report).await;
+
+    // Read-only, under the writer lock taken above. Only a deep walk pays for it.
+    let (stale_rows, seal_verdict, scan_error) = db.report_stale_history_rows(&state).await;
+    report.stale_history_rows = stale_rows;
+    report.history_seal_verdict = seal_verdict;
+    if let Some(error) = scan_error {
+        report.page_issues.push(PageIssue {
+            page_id: state.commit_history_root_page_id,
+            description: format!("commit-history row scan stopped: {error}"),
+        });
+    }
 
     // Walk and validate the durable free-list chain. Reading it verifies each
     // chain page's AEAD; a corrupt chain surfaces as a page issue. Validate the
@@ -346,15 +379,20 @@ pub async fn run_deep_walk<V: Vfs + Clone>(db: &Db<V>) -> Result<DeepWalkReport>
                     realm_id,
                     segment_id: MAIN_DB_SEGMENT_ID,
                 });
-                let mk_snapshot = db.pager.mk()?;
+                // The key this page's own envelope names. Deriving under the
+                // active key caches a wrong cipher for the page's epoch in the
+                // pool the read path shares.
+                let mk_snapshot = db.pager.mk_for(on_disk_epoch, on_disk_cipher_id);
                 let mut lru = db.pager.dek_lru().lock();
-                let cipher_res = lru.get_or_derive(
-                    realm_id,
-                    db.pager.main_db_file_id(),
-                    on_disk_epoch,
-                    on_disk_cipher_id,
-                    &mk_snapshot,
-                );
+                let cipher_res = mk_snapshot.and_then(|mk| {
+                    lru.get_or_derive(
+                        realm_id,
+                        db.pager.main_db_file_id(),
+                        on_disk_epoch,
+                        on_disk_cipher_id,
+                        &mk,
+                    )
+                });
                 match cipher_res {
                     Ok(cipher) => {
                         let mut buf2 = buf.clone();
@@ -607,6 +645,7 @@ async fn describe_page_read_failure<F: VfsFile>(
 /// Pages 0..=3 (reserved) are always considered reachable.
 async fn collect_reachable_pages<V: Vfs + Clone>(
     db: &Db<V>,
+    state: &WriterState,
     report: &mut DeepWalkReport,
 ) -> BTreeSet<u64> {
     let mut reachable: BTreeSet<u64> = BTreeSet::new();
@@ -616,15 +655,12 @@ async fn collect_reachable_pages<V: Vfs + Clone>(
         reachable.insert(pid);
     }
 
-    let (root, cat_root, hist_root, next) = {
-        let state = db.writer.lock().await;
-        (
-            state.root_page_id,
-            state.catalog_root_page_id,
-            state.commit_history_root_page_id,
-            state.next_page_id,
-        )
-    };
+    let (root, cat_root, hist_root, next) = (
+        state.root_page_id,
+        state.catalog_root_page_id,
+        state.commit_history_root_page_id,
+        state.next_page_id,
+    );
 
     for (tree_name, tree_root) in [
         ("main tree", root),
@@ -954,7 +990,7 @@ mod tests {
             .await
             .unwrap();
         db.pager.flush_main(REALM).await.unwrap();
-        db.pager.reset_main_pages();
+        db.pager.reset_main_pages().unwrap();
     }
 
     fn issue_matching(report: &DeepWalkReport, page_id: u64, needle: &str) -> bool {
@@ -1187,6 +1223,74 @@ mod tests {
             }),
             "validation must reject the record before any offset arithmetic runs: {report:?}"
         );
+    }
+
+    /// A walk derives each page's key from that page's own epoch. The walk fills
+    /// the key pool the read path shares, so a wrong derive there poisons every
+    /// later read of a page under that epoch.
+    ///
+    /// The live trees sit under epoch 1, so the reachability pass never derives
+    /// the epoch 0 key. Only the unreferenced page reaches the physical sweep under
+    /// epoch 0, which is the shape an interrupted rekey leaves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_walk_over_an_older_epoch_page_leaves_the_shared_key_pool_correct() {
+        let db = Db::open_internal_with_options(
+            MemVfs::new(),
+            [9u8; 32],
+            PAGE,
+            REALM,
+            OpenOptions::default().with_commit_history_retain(crate::RetainPolicy::Disabled),
+        )
+        .await
+        .unwrap();
+        let mut txn = db.begin_write().await.unwrap();
+        txn.put(b"live", b"value").await.unwrap();
+        txn.commit().await.unwrap();
+
+        let older_page = db.writer.lock().await.next_page_id;
+        let older_body = vec![0x5A; body_capacity(PAGE)];
+        persist_page(&db, older_page, PageKind::BTreeLeaf, &older_body).await;
+
+        let next_key = crate::crypto::kdf::derive_mk(&[9u8; 32], &db.kek_salt, 1).unwrap();
+        db.pager.set_active_mk_epoch(next_key, 1);
+        let (roots, next_page_id, free_list_root) = {
+            let mut state = db.writer.lock().await;
+            state.next_page_id = older_page + 1;
+            (
+                [state.root_page_id, state.catalog_root_page_id],
+                state.next_page_id,
+                state.free_list_root_page_id,
+            )
+        };
+        assert_eq!(free_list_root, 0, "setup error: a chain page holds epoch 0");
+        let mut resealed = std::collections::BTreeMap::new();
+        let image = db
+            .pager
+            .rebuild_image(REALM, db.main_db_path.clone(), 1, &db.pager.mk().unwrap())
+            .unwrap();
+        for root in roots {
+            BTree::open(db.pager.clone(), REALM, root, next_page_id, PAGE)
+                .rekey_walk_unique(&mut resealed, &image)
+                .await
+                .unwrap();
+        }
+        db.pager.flush_main(REALM).await.unwrap();
+        db.pager.reset_main_pages().unwrap();
+        let cipher_id = db.pager.cipher_id();
+        db.pager.dek_lru().lock().invalidate_epoch(0, cipher_id);
+
+        let report = run_deep_walk(&db).await.unwrap();
+
+        assert!(
+            !issue_matching(&report, older_page, "AEAD verification failed"),
+            "the walk used the wrong key for the page's own epoch: {report:?}"
+        );
+        let guard = db
+            .pager
+            .read_main_page(older_page, REALM, PageKind::BTreeLeaf)
+            .await
+            .expect("a later read must find a correct key in the shared pool");
+        assert_eq!(guard.body_ref(), older_body.as_slice());
     }
 
     async fn sole_overflow_root(db: &Db<MemVfs>, leaf_page_id: u64) -> u64 {

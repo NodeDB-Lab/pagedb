@@ -79,6 +79,17 @@ impl SharedRing {
         self.poisoned.store(true, Ordering::Release);
     }
 
+    /// Hold the ring lock until the returned stall drops. Every submit cycle on
+    /// this ring then parks on a pool thread, with its bytes not yet written.
+    #[cfg(test)]
+    pub(crate) fn stall(self: &Arc<Self>) -> crate::vfs::gated::LockStall {
+        let ring = Arc::clone(self);
+        crate::vfs::gated::LockStall::hold(move |park| {
+            let _held = ring.ring.lock();
+            park();
+        })
+    }
+
     /// Submit `entries` and return their results in submission order.
     ///
     /// # Safety

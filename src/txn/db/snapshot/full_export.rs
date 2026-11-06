@@ -36,6 +36,8 @@ impl<V: Vfs + Clone> Db<V> {
         let (target_commit, next_page_id) = { (txn.commit_id().0, txn.next_page_id()) };
         let target_active_root_page_id = txn.root_page_id();
         let target_catalog_root_page_id = txn.catalog_root_page_id();
+        self.refuse_export_with_pending_rekey(target_catalog_root_page_id, next_page_id)
+            .await?;
 
         // Collect live segment ids from the pinned catalog snapshot.
         let segments = txn.list_segments("").await?;
@@ -90,11 +92,12 @@ impl<V: Vfs + Clone> Db<V> {
             // it keeps a `Db::open` of the snapshot directory from taking
             // independent writes under this store's key.
             let hk = self.hk.read().clone();
-            crate::txn::db::restore_mode::stamp_read_only(
+            crate::txn::db::restore_mode::stamp_exported_read_only(
                 &TokioVfs::new(dst_path),
                 "/main.db",
                 self.page_size,
-                crate::txn::db::restore_mode::HeaderKey::Hk(&hk),
+                &hk,
+                published_snapshot.free_list_root_page_id,
             )
             .await?;
             Ok::<_, crate::errors::PagedbError>(stats)

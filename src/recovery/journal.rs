@@ -517,7 +517,7 @@ mod tests {
         pager.flush_journal(journal_id, realm).await.unwrap();
 
         // Drop cache pages so replay reads back from disk and must AEAD-decrypt.
-        pager.drop_journal_cache(journal_id);
+        pager.drop_journal_cache(journal_id).unwrap();
 
         let replayed = replay_apply_journal(&pager, realm, journal_id)
             .await

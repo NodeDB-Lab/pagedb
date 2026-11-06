@@ -57,6 +57,7 @@ fn every_variant_displays() {
             "read_at",
             "reported more bytes than the caller requested",
         ),
+        PagedbError::page_cache_state_invalid("unpin_at", "release without a pin", Some(3)),
         PagedbError::footer_framing_invalid("magic"),
         PagedbError::node_body_malformed("slot_directory"),
         PagedbError::node_kind_mismatch(Some(7), "leaf", "internal"),
@@ -101,6 +102,8 @@ fn every_variant_displays() {
             commit: CommitId::new(10),
             oldest_available: CommitId::new(20),
         },
+        PagedbError::commit_outcome_unknown(CommitId::new(10), PagedbError::NoSpace),
+        PagedbError::write_txn_interrupted(),
         PagedbError::NotFound,
         PagedbError::AlreadyLinked,
         PagedbError::NotLinked,
@@ -114,6 +117,7 @@ fn every_variant_displays() {
         },
         PagedbError::Aborted,
         PagedbError::ReadersPinningTruncatedRange,
+        PagedbError::apply_blocked_by_pinned_reader(CommitId::new(10)),
         PagedbError::Unsupported,
     ];
     for c in &cases {

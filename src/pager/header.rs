@@ -197,6 +197,25 @@ pub async fn open_header<V: Vfs>(
     }
 }
 
+/// Why [`commit_header`] returned an error, split by what the file can now hold.
+#[derive(Debug)]
+pub enum HeaderWriteError {
+    /// Encoding or opening failed before the write. No byte landed, so the
+    /// previous header stays authoritative.
+    NotStarted(PagedbError),
+    /// The write or its sync failed. The new header can be durable, in whole or
+    /// in part, and only a reopen can read which slot won.
+    OutcomeUnknown(PagedbError),
+}
+
+impl From<HeaderWriteError> for PagedbError {
+    fn from(error: HeaderWriteError) -> Self {
+        match error {
+            HeaderWriteError::NotStarted(cause) | HeaderWriteError::OutcomeUnknown(cause) => cause,
+        }
+    }
+}
+
 /// Commit a new header. Writes `fields` into the *inactive* slot (toggle of
 /// `previous`), fsyncs, and returns the new active slot.
 ///
@@ -204,6 +223,9 @@ pub async fn open_header<V: Vfs>(
 /// supersedes — that is the caller's responsibility (typically `prev_seq +
 /// 1`). The header layer does not bump `seq` automatically because the
 /// transaction layer owns sequencing.
+///
+/// The error says whether any byte can have reached the file. A caller that needs
+/// only the cause converts it to [`PagedbError`] with `?`.
 pub async fn commit_header<V: Vfs>(
     vfs: &V,
     path: &str,
@@ -211,16 +233,23 @@ pub async fn commit_header<V: Vfs>(
     fields: &MainDbHeaderFields,
     previous: ActiveSlot,
     page_size: usize,
-) -> Result<ActiveSlot> {
+) -> std::result::Result<ActiveSlot, HeaderWriteError> {
     let next = previous.other();
-    let bytes = encode_main_db_header(fields, hk, page_size)?;
-    let mut f = vfs.open(path, OpenMode::ReadWrite).await?;
+    let bytes =
+        encode_main_db_header(fields, hk, page_size).map_err(HeaderWriteError::NotStarted)?;
     let offset = u64::try_from(page_size)
         .ok()
         .map(|s| next.page_id().saturating_mul(s))
-        .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset arithmetic overflow")))?;
-    write_all_at(&mut f, offset, &bytes).await?;
-    f.sync().await?;
+        .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset arithmetic overflow")))
+        .map_err(HeaderWriteError::NotStarted)?;
+    let mut f = vfs
+        .open(path, OpenMode::ReadWrite)
+        .await
+        .map_err(HeaderWriteError::NotStarted)?;
+    write_all_at(&mut f, offset, &bytes)
+        .await
+        .map_err(HeaderWriteError::OutcomeUnknown)?;
+    f.sync().await.map_err(HeaderWriteError::OutcomeUnknown)?;
     // No `sync_dir` here: a header rewrite is a data write to an existing,
     // already-durable inode (main.db). Architecture §883 requires `sync_dir`
     // only after rename/remove/create, none of which happen on the commit

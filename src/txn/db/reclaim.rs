@@ -46,6 +46,9 @@ use super::core::{Db, WriterState};
 pub(super) struct StagedFreeList {
     pub free_list_root_page_id: u64,
     pub next_page_id: u64,
+    /// Entry count of the staged chain. `None` when an untouched chain never
+    /// had a readable head.
+    pub entries: Option<u64>,
 }
 
 impl<V: Vfs + Clone> Db<V> {
@@ -94,6 +97,7 @@ impl<V: Vfs + Clone> Db<V> {
             return Ok(StagedFreeList {
                 free_list_root_page_id: state.free_list_root_page_id,
                 next_page_id: alloc_cursor,
+                entries: state.free_list_entries,
             });
         }
 
@@ -158,9 +162,13 @@ impl<V: Vfs + Clone> Db<V> {
             freelist::ChainTail::EMPTY,
         )
         .await?;
+        // The head is dirty in the cache, so this count costs no file read.
+        let entries =
+            freelist::count_chain(&self.pager, self.realm_id, free_list_root_page_id).await?;
         Ok(StagedFreeList {
             free_list_root_page_id,
             next_page_id,
+            entries: Some(entries),
         })
     }
 
@@ -203,21 +211,5 @@ impl<V: Vfs + Clone> Db<V> {
         }
         file.set_len(required).await?;
         file.sync().await
-    }
-
-    /// Commit id below which free-list entries are recyclable: the older of the
-    /// oldest live-reader pin and the oldest retained commit-history root.
-    /// Same derivation the write path uses at `begin`.
-    async fn reclamation_floor(&self, state: &WriterState) -> Result<u64> {
-        let min_reader = {
-            let readers = self.tracked_readers.lock();
-            readers.iter().map(|reader| reader.commit_id.0).min()
-        };
-        let history_floor = self
-            .oldest_retained_history_commit(state.commit_history_root_page_id, state.next_page_id)
-            .await?;
-        Ok(min_reader
-            .unwrap_or(u64::MAX)
-            .min(history_floor.map_or(u64::MAX, |commit| commit.saturating_add(1))))
     }
 }

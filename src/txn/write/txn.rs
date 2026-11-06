@@ -37,6 +37,11 @@ pub(crate) enum SegmentSideEffect {
 /// any time — the writer mutex enforces this. Either `commit` or `abort` must
 /// be called; if the `WriteTxn` is dropped without either, dirty pages are
 /// silently discarded (equivalent to abort).
+///
+/// Dropping the future of a mutating call can leave the trees partly updated. So
+/// can an error from one, other than input validation. Every later read, mutation,
+/// and `commit` on the transaction then returns
+/// [`PagedbError::WriteTxnInterrupted`]. Dropping or aborting it stays clean.
 pub struct WriteTxn<'db, V: Vfs + Clone> {
     pub(super) db: &'db Db<V>,
     pub(super) guard: MutexGuard<'db, WriterState>,
@@ -44,6 +49,10 @@ pub struct WriteTxn<'db, V: Vfs + Clone> {
     pub(super) catalog_tree: BTree<V>,
     pub(super) pending_segments: Vec<SegmentSideEffect>,
     pub(super) committed_or_aborted: bool,
+    /// Set while a call changes a tree. Each call takes `&mut self`, so a set marker
+    /// seen by any later call means an earlier change did not finish. This is a
+    /// plain byte store on the hot path, with no allocation and no lock.
+    pub(super) mutation_pending: bool,
     /// Monotonic per-txn sequence number; assigned at `begin` from
     /// `Db::txn_seq.fetch_add(1, Relaxed) + 1`. The first `WriteTxn` on a
     /// fresh Db gets `txn_seq == 1`, making `tmp/scratch-1` predictable in
@@ -141,12 +150,10 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         // The reader pin is kept separately. Recycling has to respect both
         // bounds, but the reader-stall policy is about readers alone — see
         // [`WriteTxn::reader_floor`].
-        let history_floor = db
-            .oldest_retained_history_commit(guard.commit_history_root_page_id, guard.next_page_id)
-            .await?;
+        let history_bound = db.history_reclamation_bound(&guard).await?;
         let floor = min_reader
             .unwrap_or(u64::MAX)
-            .min(history_floor.map_or(u64::MAX, |h| h.saturating_add(1)));
+            .min(history_bound.unwrap_or(u64::MAX));
 
         // Rebuild the shared allocator cache from the durable free list.
         //
@@ -236,6 +243,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
             catalog_tree,
             pending_segments: Vec::new(),
             committed_or_aborted: false,
+            mutation_pending: false,
             txn_seq,
             spill_cipher: None,
             spill_path: None,
@@ -248,6 +256,62 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         })
     }
 
+    /// Refuse the call when an earlier mutation's future was dropped.
+    #[inline]
+    pub(super) fn ensure_mutations_finished(&self) -> Result<()> {
+        if self.mutation_pending {
+            return Err(PagedbError::write_txn_interrupted());
+        }
+        Ok(())
+    }
+
+    /// Mark a mutation as running. A future dropped before
+    /// [`Self::finish_mutation`] leaves the mark set.
+    #[inline]
+    fn start_mutation(&mut self) -> Result<()> {
+        self.ensure_mutations_finished()?;
+        self.mutation_pending = true;
+        Ok(())
+    }
+
+    /// Validate an insert, then mark it as running. A rejected record changes no
+    /// tree, so the transaction stays usable. The tree validates again, because
+    /// other callers reach it directly.
+    #[inline]
+    fn start_insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_mutations_finished()?;
+        self.btree.validate_insert_record_fits(key, value)?;
+        self.mutation_pending = true;
+        Ok(())
+    }
+
+    /// Clear the mark, unless the call can have left a tree partly updated.
+    ///
+    /// A split frees the old leaf and moves its records to fresh leaves before it
+    /// updates the spine. A read error during that update leaves the spine naming a
+    /// freed leaf, and the moved records reachable from nothing. An earlier error
+    /// in a batch leaves part of the batch applied. So any `Err` keeps the mark.
+    ///
+    /// The one exception is [`PagedbError::AppendNotMonotonic`]. `BTree::put_append`
+    /// raises it only before it changes the tree.
+    #[inline]
+    fn finish_mutation<T>(&mut self, outcome: &Result<T>) {
+        if matches!(outcome, Ok(_) | Err(PagedbError::AppendNotMonotonic)) {
+            self.mutation_pending = false;
+        }
+    }
+
+    /// Write one catalog row under the mutation mark.
+    async fn write_catalog_row(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.sync_allocator_to_catalog();
+        self.start_mutation()?;
+        let outcome = self.catalog_tree.put(key, value).await;
+        self.finish_mutation(&outcome);
+        outcome?;
+        self.sync_allocator_from_catalog();
+        Ok(())
+    }
+
     /// Look up `key`, seeing this transaction's own uncommitted writes.
     ///
     /// Returns [`Bytes`] on the same terms as
@@ -255,11 +319,15 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// earlier in this transaction is copied rather than shared: it has no
     /// committed page to borrow from yet.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.ensure_mutations_finished()?;
         self.btree.get(key).await
     }
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.btree.put(key, value).await
+        self.start_insert(key, value)?;
+        let outcome = self.btree.put(key, value).await;
+        self.finish_mutation(&outcome);
+        outcome
     }
 
     /// Append a key-value pair under the monotonic-key invariant.
@@ -278,17 +346,24 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// Returns [`PagedbError::AppendNotMonotonic`] if `key` is not
     /// strictly greater than the previously-appended key in this txn.
     pub async fn put_append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.btree.put_append(key, value).await
+        self.start_insert(key, value)?;
+        let outcome = self.btree.put_append(key, value).await;
+        self.finish_mutation(&outcome);
+        outcome
     }
 
     pub async fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        self.btree.delete(key).await
+        self.start_mutation()?;
+        let outcome = self.btree.delete(key).await;
+        self.finish_mutation(&outcome);
+        outcome
     }
 
     /// Read `len` bytes of `key`'s value from byte `offset`. `None` if absent.
     ///
     /// Reads a window of a large value without materialising it.
     pub async fn get_range(&self, key: &[u8], offset: u64, len: u64) -> Result<Option<Bytes>> {
+        self.ensure_mutations_finished()?;
         self.btree.get_range(key, offset, len).await
     }
 
@@ -299,17 +374,20 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// transaction rather than a read transaction paired with a write one.
     /// Materialising — see [`scan_from`](Self::scan_from) to bound by count.
     pub async fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        self.ensure_mutations_finished()?;
         self.btree.collect_range(start, end).await
     }
 
     /// Forward scan of at most `limit` records at or after `start`, ascending.
     /// Resume at the last key returned plus `0x00`.
     pub async fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Bytes, Bytes)>> {
+        self.ensure_mutations_finished()?;
         self.btree.collect_batch_from(start, limit).await
     }
 
     /// Records whose key starts with `prefix`, ascending.
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        self.ensure_mutations_finished()?;
         self.btree.scan_prefix(prefix).await
     }
 
@@ -320,6 +398,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.ensure_mutations_finished()?;
         self.btree
             .collect_prefix_batch_from(prefix, start, limit)
             .await
@@ -327,6 +406,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
 
     /// Reverse range scan: `start` inclusive, `end` exclusive, descending.
     pub async fn scan_rev(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        self.ensure_mutations_finished()?;
         self.btree.scan_rev(start, end).await
     }
 
@@ -337,16 +417,19 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         before: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.ensure_mutations_finished()?;
         self.btree.collect_rev_batch_before(before, limit).await
     }
 
     /// Smallest key in the tree, or `None` if empty. O(tree height).
     pub async fn first_key(&self) -> Result<Option<Vec<u8>>> {
+        self.ensure_mutations_finished()?;
         self.btree.first_key().await
     }
 
     /// Largest key in the tree, or `None` if empty. O(tree height).
     pub async fn last_key(&self) -> Result<Option<Vec<u8>>> {
+        self.ensure_mutations_finished()?;
         self.btree.last_key().await
     }
 
@@ -357,16 +440,32 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// lets consecutive keys in one leaf share a single descent. Any other
     /// order costs a descent per key and is otherwise equivalent to calling
     /// [`put`](Self::put) for each pair.
+    ///
+    /// Every pair is validated before the first one is applied, so a rejected
+    /// record leaves the whole batch unapplied and the transaction usable.
     pub async fn put_batch(&mut self, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
-        self.btree.put_batch(pairs).await
+        self.ensure_mutations_finished()?;
+        for (key, value) in &pairs {
+            self.btree.validate_insert_record_fits(key, value)?;
+        }
+        self.start_mutation()?;
+        let outcome = self.btree.put_batch(pairs).await;
+        self.finish_mutation(&outcome);
+        outcome
     }
 
     pub async fn delete_batch(&mut self, sorted: Vec<Vec<u8>>) -> Result<()> {
-        self.btree.delete_batch(sorted).await
+        self.start_mutation()?;
+        let outcome = self.btree.delete_batch(sorted).await;
+        self.finish_mutation(&outcome);
+        outcome
     }
 
     pub async fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<u64> {
-        self.btree.delete_range(start, end).await
+        self.start_mutation()?;
+        let outcome = self.btree.delete_range(start, end).await;
+        self.finish_mutation(&outcome);
+        outcome
     }
 
     /// Return a `CounterRef` scoped to this transaction for the named counter.
@@ -376,10 +475,12 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// operations. The name must be at most `MAX_SEGMENT_NAME_LEN` bytes
     /// (`PagedbError::NameTooLong` otherwise).
     pub fn counter<'tx>(&'tx mut self, name: &str) -> Result<CounterRef<'tx, V>> {
+        self.ensure_mutations_finished()?;
         let key = Catalog::counter_key(name.as_bytes())?;
         Ok(CounterRef {
             catalog_tree: &mut self.catalog_tree,
             main_tree: &mut self.btree,
+            mutation_pending: &mut self.mutation_pending,
             key,
         })
     }
@@ -387,6 +488,8 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// Register a segment under `name` in the catalog and schedule promotion
     /// of its staging file to the live path on commit.
     pub async fn link_segment(&mut self, name: &str, meta: &SegmentMeta) -> Result<()> {
+        self.ensure_mutations_finished()?;
+        self.refuse_segment_from_another_epoch(meta)?;
         let key = Catalog::segment_key(self.db.realm_id, name.as_bytes())?;
         if self.catalog_tree.get(&key).await?.is_some() {
             return Err(PagedbError::AlreadyLinked);
@@ -394,17 +497,30 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         self.enforce_segment_bytes_quota(meta.realm_id, meta.total_bytes, 0)
             .await?;
         let value = Catalog::encode_segment_meta(meta);
-        self.sync_allocator_to_catalog();
-        self.catalog_tree.put(&key, &value).await?;
-        self.sync_allocator_from_catalog();
+        self.write_catalog_row(&key, &value).await?;
         self.pending_segments.push(SegmentSideEffect::Promote {
             segment_id: meta.segment_id,
         });
         Ok(())
     }
 
+    /// Refuse a segment sealed under an epoch other than the store's.
+    ///
+    /// A store derives only its header epoch's key at open. A row naming another
+    /// epoch reads nowhere after that open, even while this handle's keyring still
+    /// holds the key for a reader. This transaction holds the writer slot, so no
+    /// rekey can move the epoch before its commit.
+    fn refuse_segment_from_another_epoch(&self, meta: &SegmentMeta) -> Result<()> {
+        let store_epoch = self.db.mk_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        if meta.mk_epoch != store_epoch {
+            return Err(PagedbError::segment_epoch_stale(meta.mk_epoch, store_epoch));
+        }
+        Ok(())
+    }
+
     /// Remove the catalog row for `name` and schedule a tombstone rename on commit.
     pub async fn unlink_segment(&mut self, name: &str) -> Result<()> {
+        self.ensure_mutations_finished()?;
         let key = Catalog::segment_key(self.db.realm_id, name.as_bytes())?;
         let value = self
             .catalog_tree
@@ -413,7 +529,10 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
             .ok_or(PagedbError::NotLinked)?;
         let meta = Catalog::decode_segment_meta(&value)?;
         self.sync_allocator_to_catalog();
-        let removed = self.catalog_tree.delete(&key).await?;
+        self.start_mutation()?;
+        let removed = self.catalog_tree.delete(&key).await;
+        self.finish_mutation(&removed);
+        let removed = removed?;
         self.sync_allocator_from_catalog();
         if !removed {
             return Err(PagedbError::NotLinked);
@@ -428,6 +547,8 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// Atomically swap the segment recorded under `name`: tombstone the old
     /// segment id and promote `new_meta`'s staging file on commit.
     pub async fn replace_segment(&mut self, name: &str, new_meta: &SegmentMeta) -> Result<()> {
+        self.ensure_mutations_finished()?;
+        self.refuse_segment_from_another_epoch(new_meta)?;
         let key = Catalog::segment_key(self.db.realm_id, name.as_bytes())?;
         let existing = self
             .catalog_tree
@@ -442,9 +563,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
         )
         .await?;
         let value = Catalog::encode_segment_meta(new_meta);
-        self.sync_allocator_to_catalog();
-        self.catalog_tree.put(&key, &value).await?;
-        self.sync_allocator_from_catalog();
+        self.write_catalog_row(&key, &value).await?;
         self.pending_segments.push(SegmentSideEffect::Tombstone {
             segment_id: old_meta.segment_id,
             tombstone_commit_id: None,
@@ -500,7 +619,7 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
     /// errors are ignored).
     pub async fn abort(mut self) {
         tracing::debug!(name = "txn.abort", "write transaction aborted");
-        self.db.pager.discard_dirty_main(self.db.realm_id);
+        self.db.pager.discard_dirty_main();
         self.committed_or_aborted = true;
         self.db
             .spill_bytes_in_use
@@ -529,20 +648,21 @@ impl<'db, V: Vfs + Clone> WriteTxn<'db, V> {
 impl<V: Vfs + Clone> Drop for WriteTxn<'_, V> {
     fn drop(&mut self) {
         if !self.committed_or_aborted {
-            self.db.pager.discard_dirty_main(self.db.realm_id);
-            // The gauge describes the live writer's scratch, and the writer
-            // lock this drop is about to release means there is no other one to
-            // account for. Leaving it set would report bytes of a transaction
-            // that no longer exists.
-            self.db
-                .spill_bytes_in_use
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-            // Removal has to await, which a drop cannot. Hand the exact path to
-            // the next `begin_write`; if the handle closes first, the next open
-            // sweeps it.
-            if let Some(path) = self.spill_path.take() {
-                self.db.orphaned_spill_paths.lock().push(path);
-            }
+            self.db.pager.discard_dirty_main();
+        }
+        // These two run however the transaction ended. A caller can drop `commit`
+        // or `abort` during their spill cleanup, after that flag is set.
+        //
+        // The gauge describes the live writer's scratch. This drop is about to
+        // release the writer lock, so no other writer has scratch to account for.
+        // A gauge left set reports bytes of a transaction that no longer exists.
+        self.db
+            .spill_bytes_in_use
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Removal has to await, which a drop cannot. Hand the exact path to the
+        // next `begin_write`. If the handle closes first, the next open sweeps it.
+        if let Some(path) = self.spill_path.take() {
+            self.db.orphaned_spill_paths.lock().push(path);
         }
     }
 }

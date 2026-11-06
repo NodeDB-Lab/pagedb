@@ -9,6 +9,7 @@ pub(crate) mod page_source;
 pub(crate) mod read;
 pub(crate) mod scan;
 pub(crate) mod scan_bounded;
+pub(crate) mod seals;
 pub(crate) mod write;
 
 pub use core::BTree;
