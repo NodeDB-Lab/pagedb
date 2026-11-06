@@ -126,7 +126,7 @@ CI additionally checks the feature matrix, the MSRV, the cross-platform matrix (
 
 Key rules:
 
-- No `.unwrap()` in library code; tests may unwrap.
+- No `.unwrap()` or `.expect()` in library code. Tests may use both.
 - `mod.rs` contains only `pub mod` and `pub use` — no types, no logic, no impls.
 - **Directory-first modules.** A module with any chance of growing starts as `foo/mod.rs` with its concerns in sibling files. Splitting after the fact churns imports, history, and review diffs.
 - Prefer many small, focused files over few large ones. 500 lines is a smell, not a limit — by then the split should already have happened structurally.
